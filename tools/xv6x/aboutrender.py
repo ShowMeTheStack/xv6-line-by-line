@@ -1,3 +1,6 @@
+# SPDX-License-Identifier: GPL-3.0-or-later
+# Copyright (c) 2026 Jyotiprakash Mishra. Based on "xv6, line by line" by Jyotiprakash Mishra
+# (https://xv6.jyotiprakash.org); see NOTICE for the attribution term (GPLv3 section 7(b)).
 """The "About the creator" page, from annotations/about.yaml."""
 
 from html import escape
@@ -13,6 +16,31 @@ ICONS = {
     "company": '<path d="M4 20V8l8-4 8 4v12z M9 20v-5h6v5 M8 10h2 M14 10h2"/>',
     "linkedin": '<path d="M4 4h16v16H4z M8 10v6 M8 7.5v.5 M12 16v-6 M12 13c0-2 4-2 4 0v3"/>',
 }
+
+
+NOTICE_URL = "https://github.com/ShowMeTheStack/xv6-line-by-line/blob/main/NOTICE"
+LICENSE_HTML = (
+    '<div class="ab-prose ab-lic">'
+    '<p><b>&ldquo;xv6, line by line&rdquo; is created by Jyotiprakash Mishra.</b> '
+    '&copy; 2026 Jyotiprakash Mishra.</p><ul>'
+    '<li><b>Text, tours, concept pages, glossary, questions, lab write-ups and figures:</b> '
+    '<a href="https://creativecommons.org/licenses/by-nc-sa/4.0/">CC BY-NC-SA 4.0</a>. Share and '
+    'adapt them for non-commercial purposes, under the same license, crediting '
+    '&ldquo;xv6, line by line&rdquo; by Jyotiprakash Mishra, https://xv6.jyotiprakash.org.</li>'
+    '<li><b>The site software</b> (generator and browser code): GNU GPL v3.0 or later, with an '
+    'additional term under section 7(b): derived works must keep the attribution '
+    '&ldquo;Based on &lsquo;xv6, line by line&rsquo; by Jyotiprakash Mishra '
+    '(https://xv6.jyotiprakash.org)&rdquo;.</li>'
+    '<li><b>The extension-lab reference solutions</b> '
+    '(<a href="https://github.com/ShowMeTheStack/xv6-riscv-labs">xv6-riscv-labs</a>): the author&rsquo;s '
+    'changes are GPL v3.0 or later with the same attribution term; xv6 itself stays MIT.</li>'
+    '<li><b>This page</b> (biography, photograph, screenshots) and the product names: all rights '
+    'reserved.</li>'
+    '<li><b>xv6</b> is by Frans Kaashoek, Robert Morris and Russ Cox at MIT, under the MIT license; '
+    'its source code shown on this site remains under that license.</li></ul>'
+    f'<p>The full map of what covers what is in the <a href="{NOTICE_URL}">NOTICE</a>. '
+    'For commercial use, write to <a href="mailto:mail@jyotiprakash.org">mail@jyotiprakash.org</a>.</p>'
+    '</div>')
 
 
 def _icon(name: str) -> str:
@@ -113,6 +141,7 @@ def render(linker, problems: list[str]) -> str:
                       "Sixteen papers")
             + section("honors", "Honors", f'<ul class="ab-honors">{honors}</ul>')
             + section("skills", "Expertise", f'<div class="ab-chips">{skills}</div>')
+            + section("license", "Credits and license", LICENSE_HTML)
             + "</main>")
     return (HEAD.format(title=f"About the creator · xv6, line by line", root=root)
             + f'<body class="about-page" data-root="{root}" data-file="">\n'

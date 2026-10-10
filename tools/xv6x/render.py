@@ -1,3 +1,6 @@
+# SPDX-License-Identifier: GPL-3.0-or-later
+# Copyright (c) 2026 Jyotiprakash Mishra. Based on "xv6, line by line" by Jyotiprakash Mishra
+# (https://xv6.jyotiprakash.org); see NOTICE for the attribution term (GPLv3 section 7(b)).
 """Write the static site: one page per source file plus shared data files."""
 
 import json
@@ -154,12 +157,17 @@ def file_tree(files: list[SrcFile], current: str, root: str) -> str:
     return "\n".join(out)
 
 
+REPO = "https://github.com/ShowMeTheStack/xv6-line-by-line"
+
 HEAD = """<!doctype html>
 <html lang="en">
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>{title}</title>
+<meta name="author" content="Jyotiprakash Mishra">
+<meta name="copyright" content="© 2026 Jyotiprakash Mishra. Content CC BY-NC-SA 4.0; software GPL-3.0-or-later; xv6 MIT.">
+<link rel="license" href="https://creativecommons.org/licenses/by-nc-sa/4.0/">
 <link rel="stylesheet" href="{root}assets/app.css">
 <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='7' fill='%232456b8'/%3E%3Ctext x='16' y='22' font-family='monospace' font-size='15' font-weight='700' fill='white' text-anchor='middle'%3Exv6%3C/text%3E%3C/svg%3E">
 <script>try{{var t=localStorage.getItem("theme");if(t)document.documentElement.dataset.theme=t}}catch(e){{}}</script>
@@ -387,6 +395,12 @@ def render_index(files: list[SrcFile], table: SymbolTable, tour_list=()) -> str:
             f'<p class="foot">{len(files)} files &middot; {total:,} lines &middot; '
             f'{len(table.syms):,} named symbols. Source: <a href="{UPSTREAM}/tree/{COMMIT}">'
             f'mit-pdos/xv6-riscv @ {COMMIT}</a> (MIT license).</p>\n'
+            f'<p class="foot lic">&copy; 2026 Jyotiprakash Mishra. Text, tours, questions and labs: '
+            f'<a href="https://creativecommons.org/licenses/by-nc-sa/4.0/">CC BY-NC-SA 4.0</a>; '
+            f'site software: GPL-3.0-or-later; xv6 itself: MIT. '
+            f'<a href="{REPO}/blob/main/NOTICE">What covers what</a>. '
+            f'Credit derived work as &ldquo;xv6, line by line&rdquo; by Jyotiprakash Mishra, '
+            f'https://xv6.jyotiprakash.org.</p>\n'
             '</main>\n</div>\n' + SCRIPTS.format(root=root) + "</body>\n</html>\n")
 
 

@@ -1,3 +1,6 @@
+/* SPDX-License-Identifier: GPL-3.0-or-later
+   Copyright (c) 2026 Jyotiprakash Mishra. Based on "xv6, line by line" by Jyotiprakash Mishra
+   (https://xv6.jyotiprakash.org); see NOTICE for the attribution term (GPLv3 section 7(b)). */
 // xv6, line by line: hover cards, go-to-definition, the symbol panel and search.
 // Data comes from xref.js (window.XREF) and src.js (window.SRC), both generated.
 (function () {

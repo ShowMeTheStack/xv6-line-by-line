@@ -183,8 +183,33 @@ Systems*.
   in one simulator), NetSim (networks) and Compy (a C89 compiler opened up).
 - Contact: <mail@jyotiprakash.org>
 
-## xv6
+## License
+
+© 2026 Jyotiprakash Mishra. This repository is under three sets of terms; [`NOTICE`](NOTICE)
+lists exactly which files each one covers.
+
+| What | License |
+|---|---|
+| The content: annotations, tours, concept pages, glossary, questions, lab write-ups, figures, and the generated website | [CC BY-NC-SA 4.0](LICENSE-CONTENT): share and adapt for non-commercial purposes, under the same license, with credit |
+| The software: the generator (`tools/`) and the browser code (`web/`) | [GNU GPL v3.0 or later](LICENSE), with an additional term under section 7(b) that derived works keep the author attribution |
+| The About page (biography, photograph, screenshots) and the product names | All rights reserved |
+| xv6 itself (`xv6/`, and xv6 code quoted on the site) | MIT, by Frans Kaashoek, Robert Morris and Russ Cox; see `xv6/LICENSE` |
+
+**How to credit this work** in anything derived from it:
+
+> "xv6, line by line" by Jyotiprakash Mishra, https://xv6.jyotiprakash.org, licensed under
+> CC BY-NC-SA 4.0.
+
+Software derived from the generator must keep, in its source and in its legal notices:
+
+> Based on "xv6, line by line" by Jyotiprakash Mishra (https://xv6.jyotiprakash.org)
+
+For commercial use of the content, write to mail@jyotiprakash.org.
+
+The reference solutions of the extension labs are in
+[xv6-riscv-labs](https://github.com/ShowMeTheStack/xv6-riscv-labs), which has its own notice:
+the author's changes are GPL v3.0 or later with the same attribution term, and xv6 stays MIT.
 
 xv6 is developed by Frans Kaashoek, Robert Morris and Russ Cox at MIT
-([mit-pdos/xv6-riscv](https://github.com/mit-pdos/xv6-riscv)) and is distributed under the
-MIT license; see `xv6/LICENSE`. This project includes it unmodified as a submodule.
+([mit-pdos/xv6-riscv](https://github.com/mit-pdos/xv6-riscv)). This project includes it
+unmodified as a submodule.
