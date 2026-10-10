@@ -8,7 +8,7 @@
 [xv6-riscv](https://github.com/mit-pdos/xv6-riscv), MIT's teaching operating system for
 RISC-V. It takes all 83 source files of the kernel, the user programs, the file-system
 builder and the build system, pinned at upstream commit `06aad25`, and turns them into a
-website where nothing is left unexplained. Every line is annotated. Every identifier is
+website where nothing is left unexplained. Every non-blank line is annotated. Every identifier is
 cross-referenced. Every guided tour carries the machine's state at each step. Every
 statement about what the kernel does was checked against xv6 itself, running on QEMU.
 
@@ -25,7 +25,7 @@ Kernel Development* (De Gruyter Brill, 2026).
 | | |
 |---|---|
 | Source files | **83**, every one of them, nothing skipped |
-| Lines of source | **13,249**, every line covered by an annotation |
+| Lines of source | **13,249**; every non-blank line (11,666 of 11,666) is covered by an annotation |
 | Named symbols cross-referenced | **2,457**: functions, structs, fields, macros, assembly labels, linker symbols, Makefile variables |
 | Glossary terms | **229**, underlined wherever they appear |
 
@@ -157,7 +157,7 @@ A push to `main` builds and deploys the site to GitHub Pages
 | `xv6/` | Upstream xv6-riscv as a git submodule, pinned at `06aad25` and never edited |
 | `annotations/` | The content: one YAML file per source file (line annotations), the tours, the concept pages, the glossary, the question bank and the labs |
 | `tools/build.py` | Builds the whole site into `site/` |
-| `tools/annot.py` | Validates the content: every line covered, every link resolves, every question well formed, every lab step pointing at real lines of a real commit |
+| `tools/annot.py` | Validates the content: every non-blank line covered, every link resolves, every question well formed, every lab step pointing at real lines of a real commit |
 | `tools/xv6x/` | The generator: libclang for C, hand-written scanners for RISC-V assembly, linker scripts, the Makefile and `usys.pl`; the renderers for files, tours, concepts, questions and labs |
 | `tools/shim/` | A minimal `stdarg.h` so libclang can parse xv6 without a RISC-V compiler |
 | `web/` | The browser side: hover cards, go-to-definition, references panel, search, the tour player, the quiz engine, light and dark themes |

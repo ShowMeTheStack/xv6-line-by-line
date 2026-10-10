@@ -201,9 +201,9 @@ def render_lab(lab: Lab, ctx: _Ctx, hl: Highlighter, tours, concepts) -> str:
                   'head (or on paper) before opening a hint. Hints get more specific; the '
                   'reference answer comes last.</p>' + "".join(think))
             + sec("build", "3. Build it", md(r.get("build", "")))
-            + sec("clinic", "4. Debugging clinic", '<p class="lede">Each of these bugs was put '
-                  'into the reference solution on purpose and run on three harts. The symptom is '
-                  'exactly what happened. Try to explain it before revealing why.</p>' + "".join(clinic))
+            + sec("clinic", "4. Debugging clinic", '<p class="lede">Each bug below was built into '
+                  'the reference solution and run on three harts; the symptom shown is exactly '
+                  'what happened. Try to explain it before revealing why.</p>' + "".join(clinic))
             + sec("reveal", "5. The reference solution", reveal)
             + sec("verify", "6. Verify and measure", md(r.get("verify", "")) + md(r.get("measure", "")))
             + sec("further", "7. Go further", md(r.get("further", ""))))
