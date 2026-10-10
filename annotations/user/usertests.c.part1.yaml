@@ -1,0 +1,1045 @@
+summary: |
+  `usertests` is xv6's test suite: one user program, about seventy small tests, each a C
+  function that pokes at the kernel through [[g:system-call|system calls]] and checks the
+  answers. Many are [[g:regression-test|regression tests]] for bugs that were once real.
+
+  Tests come in two tables. [[quicktests]] holds most of them; [[slowtests]] holds a few
+  that fill the disk or make huge directories. [[drivetests]] runs the tables in order, and
+  [[run@user/usertests.c]] runs each test in its own forked child: the test fails if that
+  child exits with a non-zero status. Each test gets its own name as `s`, and most use it
+  as the prefix of their error messages. Before and after a run, [[countfree]] counts free memory
+  pages, so a kernel that leaks pages fails even when every test passed.
+
+  At the xv6 shell prompt you type `usertests` (all tests), `usertests -q` (quick tests
+  only), or `usertests copyin` (one test by name). `-c` repeats until something fails;
+  `-C` repeats forever and ignores failures. Only one argument is accepted, so options
+  cannot be combined. A run prints
+
+      usertests starting
+      test copyin: OK
+      test copyout: OK
+      ...
+      ALL TESTS PASSED
+
+  A failing test prints `FAILED` and the run stops with `SOME TESTS FAILED` (with `-C` it
+  carries on). Leaked pages print `FAILED -- lost some free pages`. Kernel
+  `usertrap(): unexpected scause` lines between tests are expected when the test still
+  says `OK`. From the host, `./test-xv6.py usertests` runs it under QEMU.
+
+blocks:
+  - lines: 1-9
+    title: Headers, including kernel headers
+    note: |
+      A user program normally needs only [[user/user.h]] (the system-call and library
+      declarations) plus the types and `stat` structure. `usertests` also includes kernel
+      headers to test against the kernel's own limits: [[kernel/param.h]] gives
+      [[kernel:MAXOPBLOCKS]] and [[kernel:MAXPATH]], [[kernel/fs.h]] gives
+      [[kernel:BSIZE]], [[kernel:MAXFILE]] and [[kernel:DIRSIZ]],
+      [[kernel/fcntl.h]] the `O_` flags for `open`, and [[kernel/memlayout.h]] and
+      [[kernel/riscv.h]] the addresses and page size ([[kernel:KERNBASE]],
+      [[kernel:MAXVA]], [[kernel:PGSIZE]]) that the memory tests aim at.
+      [[kernel/syscall.h]] is included but no `SYS_` number is used anywhere in this file
+      at this commit.
+
+  - lines: 11-18
+    title: What the file says about itself
+    note: |
+      The opening comment is accurate but incomplete. Besides "no arguments" and a test
+      name, [[main@user/usertests.c]] also accepts `-q`, `-c` and `-C` (see the file
+      summary). "Based on the exit status" is the key rule for anyone writing a test: a
+      test signals failure by calling `exit` with a non-zero value. A test that detects a
+      problem and only `return`s is reported as `OK`, because
+      [[run@user/usertests.c]] calls `exit(0)` after the test function returns. Two tests
+      below fall into that trap ([[:777]] and [[:897]]).
+
+      The `usertrap` messages come from [[kernel:usertrap]] ([[kernel/trap.c:76]]),
+      which prints them when a process causes an exception the kernel cannot handle, and
+      then kills that process. Several later tests do that on purpose.
+
+  - lines: 20-22
+    title: A shared buffer bigger than one transaction
+    note: |
+      [[buf@user/usertests.c]] is a global scratch buffer used by many tests. Its size,
+      `(MAXOPBLOCKS + 2) * BSIZE` = (10 + 2) * 1024 = 12288 bytes, is deliberately larger
+      than the 10 blocks one file-system [[g:transaction]] may write. (The kernel already
+      splits any `write` larger than 3072 bytes into several transactions,
+      [[kernel/file.c:153]]; the size here simply guarantees that a full-buffer write is
+      more than one transaction could ever hold.)
+
+      The tests do not interfere through this global: each one runs in its own forked
+      process, and `fork` gives the child a private copy of all memory.
+
+  - lines: 24-28
+    title: The quick tests start here
+    note: |
+      Almost every test from here to [[quicktests]] is in the quick table, the tests `-q`
+      runs (the exception is `fsfull`, which nothing calls). The slow ones follow that
+      table.
+
+  - lines: 30-74
+    title: "copyin: refuse to read memory the process does not own"
+    note: |
+      `write` makes the kernel *read* from user memory: it copies the bytes at the user's
+      pointer with [[kernel:copyin]] (through [[kernel:either_copyin]]). This test hands
+      `write` five pointers that a correct kernel must refuse:
+
+      - `0x80000000` ([[kernel:KERNBASE]], 2 GiB): where RAM starts. The kernel maps it in
+        its own page table, but a user page table does not.
+      - `0x3fffffe000` and `0x3ffffff000`: the [[g:trapframe]] and [[g:trampoline]] pages
+        ([[kernel/memlayout.h:63]], [[kernel/memlayout.h:48]]). They *are* mapped in every
+        user page table, but without the `PTE_U` bit, so [[kernel:walkaddr]] refuses them
+        ([[kernel/vm.c:135]]).
+      - `0x4000000000`: [[kernel:MAXVA]] itself, the first address past the user range.
+        [[kernel:walk]] panics on such an address ([[kernel/vm.c:101]]), so the copy code
+        must reject it first ([[kernel/vm.c:127]]).
+      - `0xffffffffffffffff`: all ones, where address arithmetic overflows.
+
+      Each address is tried on three kinds of [[g:open-file]] (an [[g:inode]] file, the
+      [[g:console]] and a [[g:pipe]]), because each has its own copy loop and each must
+      handle the failure. A broken kernel either panics or returns a positive count.
+
+  - lines: 76-118
+    title: "copyout: refuse to write into memory the process may not write"
+    note: |
+      The mirror image of [[copyin@user/usertests.c]]: `read` makes the kernel *write* into
+      user memory with [[kernel:copyout]]. The addresses are the same, plus `0`.
+
+      Address 0 is mapped: it is the start of the program's code. But the [[g:elf]] file
+      marks the code segment read and execute only, so [[kernel:kexec]] maps it without
+      `PTE_W` ([[kernel/exec.c:19]]), and `copyout` refuses pages without `PTE_W`
+      ([[kernel/vm.c:364]]). Without that check, `read` could overwrite the program's own
+      code even though the hardware forbids the program to store there. That is also why
+      [[copyin@user/usertests.c]] leaves 0 out: *reading* code is allowed.
+
+      The data source is the `README` file, which `make` copies into `fs.img`, and a
+      pipe. [[kernel:readi]] returns -1 when the copy fails ([[kernel/fs.c:526]]);
+      [[kernel:piperead]] returns -1 if the very first byte fails ([[kernel/pipe.c:133]]).
+
+  - lines: 120-136
+    title: "copyinstr1: bad pointers as path names"
+    note: |
+      Path names reach the kernel by a different route from `write` data: [[kernel:argstr]]
+      calls [[kernel:fetchstr]], which calls [[kernel:copyinstr]] ([[kernel/syscall.c:29]]),
+      a loop that copies one byte at a time until it sees the terminating zero. The test
+      passes the same bad addresses as [[copyin@user/usertests.c]] as the path for
+      `open(..., O_CREATE | O_WRONLY)` and expects -1 each time. `O_CREATE` matters: if the
+      kernel misread the name, it would *create* a file with a garbage name instead of
+      failing quietly.
+
+  - lines: 138-200
+    title: "copyinstr2: a string exactly one byte too long"
+    note: |
+      A boundary test. System calls that take a path copy it into a kernel array of
+      [[kernel:MAXPATH]] (128) bytes, such as `path` in [[kernel:sys_open]]. Here the user
+      string has 128 `x`s and its zero in byte 129. A correct [[kernel:copyinstr]] copies
+      at most 128 bytes, never sees the zero, and returns -1. An off-by-one version would
+      store the zero one byte past the end of the kernel array, on the
+      [[g:kernel-stack]], overwriting whatever lies there.
+
+      The test tries four path-taking calls (`unlink`, `open`, `link`, `exec`),
+      because each one calls `argstr` itself. Then it checks the same limit for `exec`'s
+      *arguments*, which [[kernel:sys_exec]] copies into one-page kernel buffers
+      ([[kernel/sysfile.c:484]]).
+
+      Two `printf`s (lines 171 and 188) print `fd` where they mean `ret`; only the
+      error message is affected.
+
+  - lines: 202-244
+    title: "copyinstr3: a string that runs off the end of memory"
+    note: |
+      This time the string is short but has no terminating zero inside the process's
+      memory at all: its one `x` is the very last byte the process owns. [[kernel:copyinstr]]
+      copies the `x`, moves to the next page, finds it unmapped and beyond `p->sz`, and
+      must return -1 ([[kernel/vm.c:463]]). A kernel that read past the last page, or
+      treated "ran out of memory" as "end of string", would accept the one-letter name `x`.
+
+      The setup makes sure the top of memory is page aligned, so the byte after the `x` is
+      in a page that is not mapped at all.
+
+      As in `copyinstr2`, the `printf` on line 241 prints `fd` where it means `ret`.
+
+  - lines: 246-291
+    title: "rwsbrk: memory given back must stay given back"
+    note: |
+      The process grows its memory by two pages with `sbrk` and immediately shrinks it
+      again. [[kernel:growproc]] and [[kernel:uvmdealloc]] free those pages and remove
+      their [[g:pte|PTEs]]. The test then asks `write` to read from, and `read` to write
+      into, the second of those pages.
+
+      This matters more in this xv6 than in older ones, because the kernel's copy routines
+      now *create* missing pages: if [[kernel:walkaddr]] finds no mapping, they call
+      [[kernel:vmfault]] to support lazy `sbrk`. The only thing stopping `vmfault` from
+      giving the process back the page it just returned is the check `va >= psz`
+      ([[kernel/vm.c:463]]), with `psz` the process size `p->sz`. Both calls must return -1.
+
+      The test dates from the change that made `read` and `write` return an error when the
+      copy fails (`git log` commit `6750608`, which changed [[kernel:readi]] and
+      [[kernel:writei]]); before it, `read` and `write` on a *file* returned the count of
+      bytes copied so far.
+
+  - lines: 293-347
+    title: "truncate1: O_TRUNC and other descriptors on the same file"
+    note: |
+      `open` with `O_TRUNC` empties an existing file: [[kernel:sys_open]] calls
+      [[kernel:itrunc]] ([[kernel/sysfile.c:387]]), which frees the file's blocks and sets
+      its size to 0. The interesting question is what happens to *other* descriptors
+      already open on that file. Each `struct file` has its own offset, which truncation
+      does not touch.
+
+      So `fd2`, which had read 4 bytes, still has offset 4 after the truncation. Reading at
+      an offset past the end returns 0 ([[kernel/fs.c:515]]). After 6 new bytes are
+      written, `fd3` (offset 0) sees all 6, and `fd2` (offset 4) sees the last 2. A
+      kernel that cached the size per descriptor, or failed to free and reuse blocks
+      correctly, would report other counts.
+
+      The `aaa` and `bbb` lines are leftover debugging output.
+
+  - lines: 349-372
+    title: "truncate2: writing past the end after a truncate"
+    note: |
+      `fd1` has written 4 bytes, so its offset is 4. Opening the file again with `O_TRUNC`
+      makes the size 0 under `fd1`'s feet. The next write through `fd1` would start at
+      offset 4, beyond the end of the file.
+
+      POSIX systems allow this and fill the gap with zeros. xv6 does not:
+      [[kernel:writei]] returns -1 for any write that starts beyond the current size
+      ([[kernel/fs.c:549]]–550), and [[kernel:filewrite]] passes that -1 on. The
+      comment above the test says it plainly: the test checks that this case is refused
+      cleanly rather than crashing the kernel.
+
+  - lines: 374-425
+    title: "truncate3: truncating while another process writes"
+    note: |
+      Two processes race on one file. The child, 100 times, opens it, writes 10 bytes at
+      offset 0, closes it, and reads it back. The parent, 150 times, opens it with
+      `O_TRUNC` (freeing all its blocks) and writes 3 bytes.
+
+      Every write and truncate takes the inode's [[g:sleeplock]] ([[kernel:ilock]]) inside
+      a [[g:transaction]] (reads take the sleeplock without one), so they should happen
+      one at a time: a truncate never runs in the
+      middle of a write. If that locking were wrong, a write could put data into a block
+      that a concurrent truncate had just freed, and the kernel would panic or a write
+      would come back short. Because the child always writes at offset 0, its writes
+      should succeed no matter how the two interleave.
+
+      The parent ends with `exit(xstatus)` so that a failure in the child also fails the
+      test.
+
+  - lines: 427-447
+    title: "iputtest: chdir must drop the old directory inside a transaction"
+    note: |
+      The test makes a directory, moves into it, and deletes it while it is still the
+      current directory. This is legal: [[kernel:sys_unlink]] only checks that the
+      directory is empty. The directory's [[g:link-count]] drops to 0, but its
+      [[g:inode]] stays in memory because `p->cwd` still holds a
+      [[g:reference-count|reference]].
+
+      `chdir("/")` then drops that last reference with [[kernel:iput]]. Because nothing
+      links to the inode any more, `iput` frees it on disk, and that writes blocks.
+      Every disk write must be part of a [[g:transaction]]; [[kernel:log_write]] panics
+      with `log_write outside of trans` otherwise ([[kernel/log.c:231]]). So the test
+      checks that [[kernel:sys_chdir]] calls `iput(p->cwd)` between `begin_op` and
+      `end_op` ([[kernel/sysfile.c:452]]). If it did not, the kernel would panic.
+
+  - lines: 449-477
+    title: "exitiputtest: exit must drop the cwd inside a transaction"
+    note: |
+      The same trap as [[iputtest]], sprung by a different call. The child leaves an
+      unlinked directory as its current directory and exits. [[kernel:kexit]] must drop
+      `p->cwd` with `iput` inside `begin_op`/`end_op` ([[kernel/proc.c:342]]–344), or the
+      freeing of the directory would hit the "outside of transaction" panic.
+
+      The child does the work so that the parent's own current directory stays `/`; the
+      parent passes on the child's status with `exit(xstatus)`.
+
+  - lines: 479-519
+    title: "openiputtest: an error path in open that frees an inode"
+    note: |
+      The child tries to open a directory for writing, which [[kernel:sys_open]] refuses
+      ([[kernel/sysfile.c:355]]). On that error path it calls `iunlockput` on the inode it
+      looked up. Meanwhile the parent unlinks the directory. The child holds the inode's
+      lock from its `ilock` ([[kernel/sysfile.c:354]]) until that `iunlockput`, and
+      `unlink` needs the same lock ([[kernel/sysfile.c:226]]), so the dangerous order is
+      narrower: if the whole unlink completes between the child's `namei` and its `ilock`,
+      the child holds the last reference, so its `iput` frees the inode, which writes to disk and must be inside the transaction.
+      `sys_open` does have one ([[kernel/sysfile.c:341]]).
+
+      As the comment says, the window is so small that the test only proves anything
+      with a kernel modified to pause right after `namei`. With the normal kernel it
+      passes either way: if the parent wins the race, the child's lookup fails and
+      `open` returns -1 as well. `pause(1)` waits one clock tick (about 0.1 s) to give
+      the child time to reach the lookup.
+
+  - lines: 521-539
+    title: "opentest: open an existing file and a missing one"
+    note: |
+      The simplest file-system test. `echo` exists in the root directory (every user
+      program is copied into `fs.img` by `make`), so opening it read-only must succeed;
+      `doesnotexist` does not, so opening it without `O_CREATE` must fail. The path goes
+      through [[kernel:sys_open]] and [[kernel:namei]]. `usertests` never changes
+      directory itself; it inherits `/` from the shell (and `init`), which is why the
+      relative name `echo` works.
+
+  - lines: 541-580
+    title: "writetest: write a small file and read it back"
+    note: |
+      Creates `small`, writes 100 pairs of 10-byte strings (2000 bytes, two blocks),
+      reopens it, reads all 2000 bytes back in one call, and unlinks it. This covers the
+      ordinary path: [[kernel:create]], [[kernel:filewrite]] and [[kernel:writei]]
+      allocating blocks with [[kernel:bmap]], [[kernel:readi]] across a block boundary,
+      and [[kernel:sys_unlink]] freeing the file when its last descriptor is gone. Any
+      short count fails the test. The contents are not checked, only the lengths.
+
+  - lines: 582-633
+    title: "writebig: the largest file xv6 allows"
+    note: |
+      Writes [[kernel:MAXFILE]] blocks: 12 direct blocks plus 256 reached through the
+      [[g:indirect-block]], 268 blocks or 274,432 bytes. That is the largest file xv6's
+      [[g:inode]] can describe. Each block starts with its own number, written as an `int`
+      in the first 4 bytes, so the read-back checks both the count and the order.
+
+      What this catches: a mistake in [[kernel:bmap]]'s indirect-block path (data landing
+      in the wrong block, or two file blocks sharing one disk block), a wrong limit in
+      [[kernel:writei]] ([[kernel/fs.c:551]]), or [[kernel:balloc]] running out of
+      blocks. Each `write` of one block is its own small transaction.
+
+  - lines: 635-656
+    title: "createtest: many files in one directory"
+    note: |
+      Creates 52 empty files named `a` plus one more character, then unlinks them all.
+      The second characters are `'0' + i`, so they run from `0` through `9` and on through
+      punctuation and letters up to `c`; the names only need to be distinct.
+
+      The 52 names take 52 × 16 = 832 bytes of entries. On a fresh file system most of
+      them fill empty slots left in the root directory's first block (`mkfs` rounds its
+      size up to a full block), and the rest spill into a newly allocated second block.
+      The unlinks leave empty slots that later calls to [[kernel:dirlink]] reuse, so on a
+      second run the directory does not grow. Return values are not checked, so this test
+      only fails if the kernel panics.
+
+  - lines: 658-680
+    title: "dirtest: mkdir, chdir and remove a directory"
+    note: |
+      Makes `dir0`, enters it, leaves it with `..`, and removes it. It exercises
+      [[kernel:sys_mkdir]] (which writes the `.` and `..` entries in [[kernel:create]]),
+      [[kernel:sys_chdir]], `..` lookup in [[kernel:namex]], and removal of an empty
+      [[g:directory]] by [[kernel:sys_unlink]], which also lowers the parent's
+      [[g:link-count]] for the vanished `..`.
+
+  - lines: 682-741
+    title: "exectest: redirect output, then exec"
+    note: |
+      This is how a [[g:shell]] runs `echo OK > echo-ok`. The child closes its standard
+      output, opens a file, which gets descriptor 1 because the kernel always hands out
+      the lowest free number ([[kernel:fdalloc]]), and then calls `exec`. The new program
+      keeps the process's open files, so `echo` writes `OK` into the file without knowing
+      it was redirected.
+
+      The parent checks that the child exited with status 0 (from `echo`'s `exit(0)`)
+      and that the file starts with `OK`. This exercises [[kernel:kexec]] loading a
+      program from disk and the rule that `exec` replaces memory but keeps the
+      [[g:file-descriptor|file descriptors]].
+
+      If `exec` succeeds, the code after it never runs, as the comment on line 715 says.
+
+  - lines: 743-796
+    title: "pipe1: data through a pipe arrives complete and in order"
+    note: |
+      The child writes 5 chunks of 1033 bytes into a [[g:pipe]], each byte the low 8 bits
+      of a running counter. The parent reads with request sizes 1, 2, 4, 8, ... (capped at
+      the buffer size) and checks every byte against its own counter.
+
+      The sizes are chosen to stress [[kernel:pipewrite]] and [[kernel:piperead]]. The
+      kernel's pipe buffer holds 512 bytes ([[kernel/pipe.c:11]]), so each 1033-byte write
+      must fill the buffer, sleep until the reader drains it, and continue; the data wraps
+      around the circular buffer at changing positions; and reads ask for less and more
+      than is available. Lost, duplicated or reordered bytes show up as a mismatch.
+
+      At the end, `read` must return 0 once the child has exited and the last write end
+      is closed. If the parent had not closed its own write end (line 770), it would
+      wait forever.
+
+  - lines: 798-825
+    title: "killstatus: a killed process exits with status -1"
+    note: |
+      `kill` in xv6 does not stop a process at once. [[kernel:kkill]] only sets
+      `p->killed` ([[kernel/proc.c:611]]) and wakes the victim if it is sleeping; the victim notices the next time it is in
+      [[kernel:usertrap]] (on a system call, [[kernel/trap.c:57]], or any other trap,
+      [[kernel/trap.c:81]]) and calls `kexit(-1)`. This test checks that the parent's
+      `wait` then reports exactly -1.
+
+      The child loops on `getpid` so it enters the kernel constantly. Repeating 100 times
+      covers the different moments at which the kill can arrive: while the child is in
+      user code, in the middle of a system call, or not yet running.
+
+  - lines: 827-852
+    title: "killzero: kill(0) must not poison the next process"
+    note: |
+      A [[g:regression-test]] for a bug fixed just before this commit (`git log` commit
+      `bd77f8e`, "prevent kill(0) from marking UNUSED proc as killed").
+
+      An unused slot in the process table has `pid` 0, because [[kernel:freeproc]] resets
+      it. Before the fix, [[kernel:kkill]] searched for `pid == 0`, found the first unused
+      slot, and set its `killed` flag. [[kernel:allocproc]] does not clear `killed` (only
+      `freeproc` does, [[kernel/proc.c:168]]), and it picks the first unused slot,
+      normally the same one. So the next `fork` usually produced a child that was already
+      killed: at its first trap into the kernel (here typically the `exit(7)` system
+      call) [[kernel:usertrap]] ended it with status -1. The fix is
+      the check at [[kernel/proc.c:605]].
+
+  - lines: 854-908
+    title: "preempt: CPU-hogging processes cannot starve the others"
+    note: |
+      Two children spin forever without making a system call. If the kernel never took
+      the CPU away from a running process, they would occupy two CPUs indefinitely, and
+      the third child and the parent could only run on a third CPU. xv6 preempts with the
+      [[g:timer-interrupt]]: every tick [[kernel:usertrap]] calls [[kernel:yield]]
+      ([[kernel/trap.c:85]]–86), so the [[g:scheduler]] can run someone else.
+
+      The test passes if the parent receives the third child's byte through the pipe and
+      can then kill and reap all three. Killing spinners also tests that a timer interrupt
+      alone (no system call) is enough for a process to notice `killed`.
+
+      As the comment says, it proves something only with at most two CPUs. xv6 boots with
+      three by default (`CPUS := 3` in the Makefile), so a free CPU usually exists and
+      the test would pass even without preemption. The output shows `kill... wait... ` before `OK`.
+
+  - lines: 910-936
+    title: "exitwait: exit and wait, 100 times"
+    note: |
+      The parent forks a child that exits at once with status `i`, then waits for it,
+      checking that [[kernel:kwait]] returns the right [[g:pid]] and status. It is a race
+      test: the child may already be a [[g:zombie]] when the parent calls `wait`, or the
+      parent may already be asleep in `wait` when the child exits.
+
+      The kernel code that makes both orders work is the pairing of `wait_lock` and the
+      child's `p->lock`. [[kernel:kexit]] holds the child's `p->lock` from setting
+      `ZOMBIE` until it has switched away; [[kernel:kwait]] takes that lock
+      ([[kernel/proc.c:384]]) before freeing the slot, so the slot is never freed and reused
+      while the child is still running on its [[g:kernel-stack]]. The [[g:sleep-wakeup]] under
+      [[kernel:wait_lock]] makes sure the parent's sleep cannot miss the child's wakeup.
+
+  - lines: 938-966
+    title: "reparent: children of an exiting parent must not leak"
+    note: |
+      Each round, the test's child forks a grandchild and exits at once. The grandchild
+      also exits. Whichever order these happen in, the grandchild loses its parent, and
+      [[kernel:reparent]] must hand it to `init` ([[user/init.c]]), whose `wait` loop
+      reaps it.
+
+      If reparenting ever lost a process, it would stay a [[g:zombie]] forever, occupying
+      one of the 64 ([[kernel:NPROC]]) slots in the process table. 200 rounds is more
+      than 64, so leaked zombies would fill the table and a `fork` would fail.
+
+      The child cannot report that failure through its exit status, because the parent
+      waits with `wait(0)` and ignores it. Instead the child kills the parent itself
+      (line 959): the parent then exits with -1, and [[run@user/usertests.c]] reports
+      `FAILED`.
+
+  - lines: 968-994
+    title: "twochildren: two exits at the same moment"
+    note: |
+      1000 times, the parent forks two children that both exit immediately, then waits
+      twice. With several CPUs, both children can be in [[kernel:kexit]] at the same time,
+      each calling `wakeup` on the same parent while the parent may be anywhere in
+      [[kernel:kwait]]. The test checks only that both `wait` calls return, so it fails by
+      hanging (a lost wakeup) or by a kernel panic, not by a message.
+
+  - lines: 996-1031
+    title: "forkfork: forking on several CPUs at once"
+    note: |
+      Two children each fork and reap 200 grandchildren, concurrently. On a
+      multiprocessor this has several CPUs inside [[kernel:kfork]], [[kernel:allocproc]],
+      [[kernel:kexit]] and [[kernel:kwait]] at the same time, competing for the
+      process-table locks, `pid_lock` (in [[kernel:allocpid]]) and
+      [[kernel:wait_lock]]. A missing lock shows up as two processes given the same slot
+      or [[g:pid]], a panic, or a hang. If any grandchild `fork` fails, its parent exits
+      with 1 and the test reports `fork in child failed`.
+
+  - lines: 1033-1061
+    title: "forkforkfork: a fork bomb that must stop cleanly"
+    note: |
+      The child starts a fork bomb: every process loops forever, forking a copy of
+      itself each time round, so the number of processes doubles until the 64-slot
+      process table is full. At that point `fork` fails, and the kernel must report it
+      as -1 ([[kernel:allocproc]] returns 0) instead of crashing.
+
+      The way to stop the bomb is a file. A process that sees a `fork` fail creates
+      `stopforking`, and every process checks for that file each time round and exits
+      when it appears. The parent also creates it after about two seconds, in case
+      `fork` never fails.
+
+      Most of the processes are grandchildren or deeper, so when their parents exit they
+      are handed to `init` ([[kernel:reparent]]), which has to reap dozens of
+      [[g:zombie|zombies]] at once. The final `pause(10)` gives them a second to finish
+      before the next test needs free process slots.
+
+  - lines: 1063-1086
+    title: "reparent2: regression test for an exit/wait deadlock"
+    note: |
+      The comment describes two bugs fixed in 2019 (`git log` commit `d175bea`). Back
+      then each process's `parent` field was protected by per-process locks, and `exit`
+      had to lock its parent and then itself and its children. Handing children to `init`
+      could take locks in an order that deadlocked against `init`'s own `wait`. And
+      because the parent could change while `exit` waited for the lock, `exit` sometimes
+      released a different parent's lock than it had acquired, which triggered
+      `panic: release`.
+
+      Today one global lock, [[kernel:wait_lock]] ([[kernel/proc.c:27]]), protects every
+      `parent` field and is always taken before any `p->lock`, so neither bug can occur.
+      The test stays as a guard: 800 times, a child forks twice (4 processes in all) and
+      they all exit at once. Each one that outlives its parent is handed to `init`, so
+      `init` keeps receiving new children while it is reaping others.
+
+  - lines: 1088-1123
+    title: "mem: use up all memory, free it, allocate again"
+    note: |
+      The child calls [[malloc]] for 10001-byte blocks until it fails, so the process
+      grows with `sbrk` until the kernel runs out of physical pages. [[kernel:uvmalloc]]
+      then has to undo the partial growth and return an error ([[kernel/vm.c:229]]), not
+      panic. Then the child frees every block and asks for 20 KiB. That request is bigger
+      than any single freed block, so it succeeds only if [[free]] in
+      [[user/umalloc.c]] merged neighbouring free blocks back together.
+
+      Doing this in a child matters: when the child exits, all its pages go back to the
+      kernel, which [[drivetests]] later verifies by counting free pages.
+
+      The special case for status -1 is for students' versions of xv6 from a lab that
+      makes `sbrk` lazy: there, running out of memory can show up as a page fault that
+      kills the child instead of `malloc` returning 0.
+
+  - lines: 1125-1182
+    title: "sharedfd: two processes writing through one descriptor"
+    note: |
+      After `fork`, parent and child hold the *same* `struct file`, because
+      [[kernel:kfork]] copies descriptors with [[kernel:filedup]]
+      ([[kernel/proc.c:287]]). So they share one offset. Both write 1000 ten-byte
+      chunks through it, the child `c`s and the parent `p`s, at the same time.
+
+      If the shared offset works, every chunk lands at a fresh offset and the file ends up
+      with exactly 10000 of each letter. [[kernel:filewrite]] makes that so by calling
+      [[kernel:writei]] and advancing `f->off` while holding the inode's
+      [[g:sleeplock]] ([[kernel/file.c:161]]–164): one process's write and offset update
+      finish before the other's begin. If two writes read the same offset before either
+      advanced it, one chunk would overwrite another and a count would come up short.
+
+  - lines: 1184-1249
+    title: "fourfiles: four processes allocate blocks at once"
+    note: |
+      Four children each write 6000 bytes into their own file at the same time, so
+      several CPUs can be inside [[kernel:balloc]] at once, searching the same
+      [[g:free-bitmap]] block for free blocks. The [[g:buffer-cache]] gives each block
+      buffer a [[g:sleeplock]], so only one process at a time examines and updates the
+      bitmap. Without that, two files could be handed the same disk block.
+
+      The check reads each file back and requires 6000 bytes, all equal to that file's
+      own digit. A shared block would show up as another file's digit.
+
+  - lines: 1251-1321
+    title: "createdelete: four processes edit one directory"
+    note: |
+      Four children create and delete files in the same [[g:directory]] at the same
+      time, each with its own first letter (`p`, `q`, `r`, `s`). Each creates 20 files and,
+      after every even-numbered one, deletes the file with half that number, so files 1
+      to 9 end up deleted and files 0 and 10 to 19 remain.
+
+      Every create and delete reads and rewrites [[g:directory]] entries of the same
+      directory inode; [[kernel:create]] and [[kernel:sys_unlink]] hold its
+      [[g:sleeplock]] while doing so. A locking mistake could let two processes claim the
+      same free slot ([[kernel:dirlink]]), losing one entry, or let an unlink clear the
+      wrong one. The parent then checks for exactly the expected survivors and removes
+      them.
+
+  - lines: 1323-1366
+    title: "unlinkread: an unlinked file lives on while open"
+    note: |
+      Unix lets you delete a file that is still open: the name goes away at once, but the
+      [[g:inode]] and its data stay until the last descriptor is closed. In xv6,
+      [[kernel:sys_unlink]] lowers the [[g:link-count]] to 0, and [[kernel:iput]] frees
+      the inode only when both the link count and the in-memory
+      [[g:reference-count]] reach zero ([[kernel/fs.c:357]]).
+
+      The test unlinks `unlinkread` while `fd` is open, creates a new file under the same
+      name, and checks that `fd` still reads the old `hello` and can still be written.
+      The final `close` is what frees the old inode.
+
+  - lines: 1368-1425
+    title: "linktest: hard links and the cases link must refuse"
+    note: |
+      `link("lf1", "lf2")` gives the same [[g:inode]] a second name, a
+      [[g:hard-link]]. After `lf1` is unlinked, the data must still be reachable as `lf2`.
+      Then three calls that [[kernel:sys_link]] must refuse:
+
+      - linking to a name that already exists (`dirlink` fails),
+      - linking from a name that does not exist (`namei` fails),
+      - linking a directory (`.`), refused at [[kernel/sysfile.c:139]]. Links to
+        directories could create loops in the tree.
+
+      On the first of these, `sys_link` has already increased the link count before it
+      discovers the clash, so its `bad:` path ([[kernel/sysfile.c:176]]) must lower it
+      again. A mistake there would leave `lf2` with a count of 2, so the `unlink` on
+      line 1415 would not free it. The test itself would not notice: the leak shows up
+      only as a lost inode.
+
+  - lines: 1427-1466
+    title: "concreate: race create and link on the same names"
+    note: |
+      For each of 40 names `C0`, `C1`, ..., the parent and a fresh child both try to make
+      the name exist at the same moment. Depending on `i`, each one either creates it with
+      `open(O_CREATE)` or makes it a [[g:hard-link]] to `C0`. So two processes race to add
+      the same name to the same directory, sometimes by different system calls.
+
+      Exactly one directory entry per name must result. [[kernel:create]] and
+      [[kernel:dirlink]] both check whether the name exists and add it while holding the
+      directory's [[g:sleeplock]], so the second process finds the name already there:
+      `create` opens the existing file, and `link` fails. If the check and the add were not
+      under one lock, both could see "absent" and both add an entry.
+
+  - lines: 1468-1493
+    title: "Read the directory itself and count the C files"
+    note: |
+      The parent opens `.` and reads it as raw data. In xv6 a directory is a file of
+      16-byte entries ([[kernel:dirent]]): a 2-byte [[g:inode-number]] and a 14-byte
+      name. Reading it with `read` is allowed because the directory is opened read-only.
+      The local struct `de` has the same layout as `struct dirent`.
+
+      Every `C` name must appear exactly once: a duplicate means the race above added two
+      entries, and fewer than 40 means one was lost.
+
+  - lines: 1495-1522
+    title: "Race open against unlink"
+    note: |
+      Now, for each name, one process opens and closes it six times while the other
+      unlinks it six times (for `i % 3 == 2`, both unlink). Only the first unlink can
+      succeed; the rest must fail cleanly.
+
+      This exercises the hand-off between lookup and freeing. An `open` that has found the
+      name holds a reference, so [[kernel:iput]] in the unlinking process must not free the
+      inode until that `open`'s `close`. And once the name is gone, the repeated unlinks
+      must fail at the lookup instead of lowering the link count a second time. Several
+      names are hard links to `C0`, so unlinking them only lowers `C0`'s
+      [[g:link-count]].
+
+  - lines: 1524-1554
+    title: "linkunlink: random link, unlink and create on one name"
+    note: |
+      Parent and child each perform 100 random operations on the name `x`: create it,
+      make it a link to the `cat` program, or remove it. The pseudo-random numbers come
+      from a linear congruential generator, seeded differently in each process so they do
+      different things: a small case of [[g:randomized-testing]].
+
+      The comment says what it looks for: [[g:deadlock|deadlocks]]. [[kernel:sys_unlink]]
+      locks the directory and then, while still holding it, the file's inode.
+      [[kernel:sys_link]] needs both too, but it releases the file's lock
+      ([[kernel/sysfile.c:153]]) before taking the directory's. If it held the file's
+      lock while waiting for the directory's, it could wait on an unlink that is in turn
+      waiting for the file: each would hold what the other needs.
+
+      Linking `cat` is harmless: unlinking `x` again only lowers `cat`'s
+      [[g:link-count]] back to 1.
+
+  - lines: 1556-1617
+    title: "subdir: build a two-level tree"
+    note: |
+      A tour of [[g:path-name]] resolution in [[kernel:namex]]. The test builds `/dd`
+      containing a file `ff` and a subdirectory `dd`, which contains `ff`. Along the way it
+      checks that a non-empty directory cannot be unlinked ([[kernel:isdirempty]],
+      [[kernel/sysfile.c:230]]), that an absolute path (`/dd/dd`) and relative paths reach
+      the same place, and that `dd/dd/../ff` names `dd/ff` (contents `ff`, not `FF`).
+      It also makes a second link `dd/dd/ffff` and removes the original name.
+
+      Because file names are fixed, a leftover `dd` from an earlier failed run makes
+      the first `mkdir` fail.
+
+  - lines: 1619-1650
+    title: "Walk up and down with .."
+    note: |
+      Four `chdir`s with `..` in them. Starting in `/dd`, `dd/../../dd` goes down to
+      `/dd/dd`, up twice to `/`, and down to `/dd` again. `dd/../../../dd` goes one more
+      level up than exists: `..` in the root directory points to the root itself (that is
+      how `mkfs` builds it), so the extra `..` stays at `/` and the path still ends in
+      `/dd`. `./..` returns to `/`. Then the second link made earlier must still give
+      the 2 bytes `FF`, and the removed name must stay gone.
+
+  - lines: 1652-1711
+    title: Operations that must fail
+    note: |
+      A list of requests that [[kernel:namex]], [[kernel:create]] and the system calls must
+      reject, each with its reason:
+
+      - `dd/ff/ff`: `ff` is a file, not a directory, so nothing can be inside it
+        ([[kernel/fs.c:703]]). Tried with `open`, `link`, `mkdir` and `unlink`.
+      - `dd/xx/ff`: `xx` does not exist.
+      - `open("dd", O_CREATE)`: `create` finds an existing directory where a file was asked
+        for ([[kernel/sysfile.c:283]]).
+      - `open("dd", O_RDWR)` and `O_WRONLY`: directories cannot be opened for writing
+        ([[kernel/sysfile.c:355]]); only the kernel writes directory entries.
+      - `link("dd/ff", "dd/dd/ffff")`, `mkdir("dd/dd/ffff")`: the new name exists.
+      - `chdir("dd/ff")`: not a directory ([[kernel/sysfile.c:446]]).
+
+      Each must return -1 without changing anything.
+
+  - lines: 1713-1733
+    title: Tear the tree down in order
+    note: |
+      Removal must go from the bottom up. `unlink("dd")` fails while `dd/dd` still exists,
+      and succeeds after `dd/dd` is gone. Removing a subdirectory also lowers the parent's
+      [[g:link-count]] (the subdirectory's `..` entry counted as a link to it,
+      [[kernel/sysfile.c:238]]), which is what lets `dd` be freed completely.
+
+      The error message on line 1714 says `dd/dd/ff` where the call is about `dd/dd/ffff`.
+
+  - lines: 1735-1759
+    title: "bigwrite: writes bigger than one transaction"
+    note: |
+      A single file-system [[g:transaction]] may write at most [[kernel:MAXOPBLOCKS]] (10)
+      blocks, so [[kernel:filewrite]] splits a large `write` into pieces of 3 blocks
+      (3072 bytes) and commits each in its own transaction ([[kernel/file.c:153]]–172).
+      This test writes sizes from 499 up to just under 12 KiB, in steps of 471 bytes so
+      the pieces start and end at many different offsets within a block, twice per file.
+
+      The comment says "larger than the log", which overstates it: the largest write here
+      touches 13 data blocks (the second 12274-byte write spans file blocks 11 to 23),
+      more than one transaction may use but less than the 30-block log
+      ([[kernel:LOGBLOCKS]]). A write that skipped the split would use more log space than
+      [[kernel:begin_op]] reserved for it; that only overflows the log (and makes
+      [[kernel:log_write]] panic with `too big a transaction`) when other file-system
+      operations are running at the same time, so `bigwrite` alone would not catch it.
+      Mainly it checks that a split write still reports the full count.
+
+lines:
+  "35-36": |
+    The five addresses to try: the start of RAM (2 GiB), the trapframe page, the trampoline
+    page, the first address past [[kernel:MAXVA]], and the largest 64-bit value.
+  41: |
+    Create the file fresh each round; it is unlinked again on line 52.
+  46: |
+    Ask the kernel to copy 8192 bytes from the bad address into a file. The first call to
+    [[kernel:copyin]] fails, so [[kernel:writei]] writes nothing and [[kernel:filewrite]]
+    returns -1 ([[kernel/file.c:173]]). Anything `>= 0` is a failure.
+  54: |
+    The same from the console (descriptor 1). [[kernel:consolewrite]] returns how many
+    bytes it copied before the error ([[kernel/console.c:72]]), here 0, so 0 is accepted
+    as well as -1.
+  65: |
+    The same into a pipe. [[kernel:pipewrite]] copies one byte at a time and returns -1
+    if the very first byte fails ([[kernel/pipe.c:96]]–99).
+  "81-82": |
+    The same addresses as [[copyin@user/usertests.c]] plus 0, the start of the program's
+    read-only code.
+  92: |
+    Read up to 8192 bytes of `README` into the bad address. [[kernel:readi]] returns -1 at
+    the first failed [[kernel:copyout]].
+  104: |
+    Put one byte into the pipe first, so the `read` below has data and does not sleep
+    waiting for a writer.
+  109: |
+    [[kernel:piperead]] takes the byte out of the pipe and tries to store it at `addr`.
+  130: |
+    The bad address is the *path* argument. [[kernel:sys_open]] copies it with
+    [[kernel:argstr]] ([[kernel/sysfile.c:338]]), which must fail.
+  "144-148": |
+    Build a string of exactly [[kernel:MAXPATH]] (128) `x`s; its terminating zero is the
+    129th byte. `b` has room for it in user space, but the kernel's `path` array does not.
+  150: |
+    `unlink` copies the path with [[kernel:argstr]] into a 128-byte array; the copy must
+    fail because no zero appears within 128 bytes.
+  162: |
+    [[kernel:sys_link]] copies both names into `MAXPATH` arrays; the first copy already fails.
+  169: |
+    [[kernel:sys_exec]] also copies its path with `argstr` ([[kernel/sysfile.c:466]]).
+  181: |
+    A 4097-byte array: 4096 `x`s and a zero. `static` puts it in the program's [[g:bss]]
+    instead of on the stack, which is only one page and too small to hold it.
+  "185-186": |
+    Pass three such strings as arguments to `echo`. [[kernel:sys_exec]] copies each into
+    a one-page (4096-byte) kernel buffer with `fetchstr(uarg, argv[i], PGSIZE)`
+    ([[kernel/sysfile.c:484]]); 4096 characters plus the zero do not fit, so `exec` must
+    fail. Had it succeeded, `echo` would run and exit with 0.
+  191: |
+    A status no other path produces, so the parent can tell "exec failed as it should"
+    (747) from "exec succeeded and echo exited 0".
+  196: |
+    The status from `wait` is what the child passed to `exit`; anything but 747 means
+    `exec` did not fail.
+  "206-215": |
+    Grow memory by two pages, then grow again if needed until `sbrk(0)`, the current end
+    of memory, is a multiple of the page size. If it still is not, the test cannot set up
+    its trap and gives up.
+  "217-218": |
+    Put an `x` in the last byte the process owns. Writing it also proves the page is
+    really there. `b` points to a "string" that has no terminating zero before the end of
+    memory.
+  220: |
+    [[kernel:copyinstr]] copies the `x`, crosses into the next page, and must fail there
+    instead of reading beyond the end of the process.
+  253: |
+    Grow by two pages; `a` is the old end of memory, the start of the new region. This is
+    the eager `sbrk` ([[sbrk@user/ulib.c]] passes `SBRK_EAGER`), so the pages are really
+    allocated and mapped.
+  260: |
+    Shrink by the same amount. [[kernel:growproc]] calls [[kernel:uvmdealloc]], which
+    unmaps the pages and frees them.
+  270: |
+    Ask `write` to read 1024 bytes from the freed region. The test uses `a + PGSIZE`
+    rather than `a` because, if `a` was not page aligned, the page containing `a` is still
+    partly the process's and still mapped; `a + PGSIZE` is surely in a freed page.
+  283: |
+    Ask `read` to store into the freed region. [[kernel:copyout]] finds no mapping, and
+    [[kernel:vmfault]] must refuse to create one because the address is at or above
+    `p->sz`.
+  290: |
+    Explicit success. Returning would have the same effect, since
+    [[run@user/usertests.c]] calls `exit(0)` after the test.
+  300: |
+    Create the file (or empty it, if it exists) and write 4 bytes.
+  311: |
+    Truncate the file again while `fd2` is open with offset 4. The size becomes 0.
+  "313-314": |
+    A new descriptor starts at offset 0 and must see an empty file.
+  321: |
+    `fd2`'s offset (4) is now past the end of the file; [[kernel:readi]] returns 0 for
+    that ([[kernel/fs.c:515]]).
+  328: |
+    `fd1` is at offset 0, so this write is allowed and makes the file 6 bytes long.
+  336: |
+    `fd2`, still at offset 4, now gets the last 2 of the 6 bytes.
+  358: |
+    Create the file and leave `fd1` at offset 4 after writing.
+  361: |
+    A second `open` with `O_TRUNC` sets the size to 0 while `fd1` is still open.
+  363: |
+    This write would start at offset 4 in a 0-byte file. [[kernel:writei]] returns -1
+    ([[kernel/fs.c:549]]), and the system call must report -1, not crash.
+  379: |
+    Create an empty file and close it straight away, so both processes can open it by name.
+  "388-404": |
+    The child: open, write 10 bytes at offset 0, close, then reopen and read. Each open
+    gets a new descriptor at offset 0, so its write is always legal.
+  "408-420": |
+    The parent: truncate and write 3 bytes, 150 times, racing the child.
+  439: |
+    Remove the directory from inside it. `../iputdir` names this very directory through
+    its parent.
+  443: |
+    Leaving drops the last reference to the unlinked directory; this is the `iput` that
+    must be inside a transaction.
+  473: |
+    The child exits with an unlinked directory as its current directory; [[kernel:kexit]]
+    does the final `iput`.
+  505: |
+    Opening a directory with `O_RDWR` must fail ([[kernel/sysfile.c:355]]). The error path
+    is the `iunlockput` under test.
+  "512-513": |
+    Wait one tick, then unlink the directory, hoping to complete the unlink between the
+    child's `namei` and its `ilock`.
+  593: |
+    [[kernel:MAXFILE]] (268) iterations, one block each.
+  594: |
+    Stamp the block with its index in the first 4 bytes of [[buf@user/usertests.c]].
+  622: |
+    Every block must carry its own index: this catches blocks written to the wrong place.
+  696: |
+    Keep a copy of standard output in `errfd`, so the child can still report errors after
+    descriptor 1 is redirected.
+  "701-702": |
+    Close descriptor 1, then open the file. [[kernel:fdalloc]] returns the lowest free
+    descriptor, which is now 1, so the file becomes standard output. This is how
+    [[g:io-redirection]] works in the shell.
+  707: |
+    Check that assumption; if the file got another number, `echo`'s output would go to
+    the console.
+  711: |
+    Replace the child with `echo OK`. On success this never returns; `echo` writes `OK\n`
+    to descriptor 1, the file, and exits with 0.
+  717: |
+    Wait for the child. A mismatched pid only prints a message, but a wrong status fails
+    the test below.
+  "730-735": |
+    The file must start with `OK`, proving that `echo` ran and wrote to the redirected
+    descriptor.
+  762: |
+    Fill the buffer with consecutive numbers. `buf` is `char`, so each byte keeps only the
+    low 8 bits of `seq`.
+  763: |
+    Write 1033 bytes, more than the 512-byte pipe buffer holds, so this call must block
+    partway and resume after the parent reads.
+  773: |
+    Keep reading until `read` returns 0, which happens once the child has exited and
+    closed its write end and the pipe is empty.
+  775: |
+    Compare only the low 8 bits, matching what the child stored.
+  777: |
+    A bug in the test: on a mismatch it prints a message but *returns* instead of calling
+    `exit(1)`, so [[run@user/usertests.c]] exits with 0 and the test is reported `OK`.
+    The other failure paths here use `exit(1)`.
+  "781-783": |
+    Double the next request size, up to the size of [[buf@user/usertests.c]]: 1, 2, 4,
+    ..., 8192, then 12288.
+  "811-813": |
+    The child loops on a cheap system call, so it enters [[kernel:usertrap]] all the time
+    and sees `killed` within one call.
+  816: |
+    Wait one clock tick so the child is usually running before the kill arrives.
+  817: |
+    Ask the kernel to kill the child. This only sets a flag; it does not wait for the
+    child to die.
+  819: |
+    A killed process exits through `kexit(-1)` in [[kernel:usertrap]], so its status
+    must be -1.
+  833: |
+    The trigger: ask to kill "process 0". No process has pid 0; only unused slots do.
+    With the fix, [[kernel:kkill]] returns -1 at once.
+  841: |
+    The child's very first system call is `exit`. If its slot had been marked killed,
+    [[kernel:usertrap]] would end it with -1 before `exit(7)` ran.
+  847: |
+    Seeing 7 means the child was not born killed.
+  "866-868": |
+    The first child spins forever in user code. It makes no system calls, so only a timer
+    interrupt can take its CPU away.
+  "879-892": |
+    The third child sends one byte through a pipe, then also spins forever. It can send
+    the byte only if it gets a CPU.
+  "894-895": |
+    The parent blocks until that byte arrives. With two CPUs taken by spinners, this
+    happens only if the scheduler preempts them.
+  897: |
+    Another `return` where `exit(1)` was probably meant: the test would be reported `OK`,
+    and the three spinning children would be left running forever.
+  "900-907": |
+    Kill the three children and reap them. A spinner notices `killed` on its next timer
+    interrupt ([[kernel/trap.c:81]]). `wait(0)` passes a null pointer: the parent does not
+    need the statuses.
+  924: |
+    [[kernel:kwait]] must return the pid of the child it reaped; this parent has only one.
+  928: |
+    The status must be the `i` the child passed to `exit`, copied out of the
+    [[g:zombie]]'s `xstate`.
+  933: |
+    The child exits at once, so its exit races with the parent's call to `wait`.
+  944: |
+    Remember the test process's pid, so a grandchild-level failure can be reported by
+    killing it.
+  957: |
+    The child forks a grandchild and, without waiting for it, exits on line 962. The
+    grandchild runs the same line 962 and exits too.
+  959: |
+    A failing `fork` most likely means leaked processes have filled the table. Kill the
+    test process so the failure is reported.
+  "1045-1048": |
+    Each process checks whether it is time to stop.
+  "1049-1050": |
+    Fork again. If the process table is full, `fork` returns -1, and this process raises
+    the stop signal by creating the file.
+  1057: |
+    20 ticks; a tick is about 0.1 s ([[kernel/trap.c:177]]), so this is about two seconds.
+  1058: |
+    Create the stop file, in case no `fork` ever failed.
+  1060: |
+    Wait another second for the orphaned processes to see the file, exit, and be reaped
+    by `init`.
+  "1078-1079": |
+    Two forks make four processes (the child, two of its children, and one grandchild),
+    all exiting immediately. As each parent exits, its living children are reparented to
+    `init`, possibly while `init` is in `wait`.
+  "1097-1100": |
+    Allocate until [[malloc]] returns 0, chaining the blocks into a list: the first 8
+    bytes of each block hold a pointer to the previous block. The list needs no memory of
+    its own.
+  "1101-1105": |
+    Walk the list and free every block. Each next pointer is read before the block
+    holding it is freed.
+  1106: |
+    20 KiB is more than any one freed block, so this fits only if [[free]] merged
+    adjacent blocks.
+  1116: |
+    -1 is the status of a process killed by the kernel, for example after an unexpected
+    [[g:page-fault]]. The test accepts it for the reason in the comment above.
+  "1142-1143": |
+    After `fork`, both processes run the same loop. They choose different letters, `c`
+    for the child and `p` for the parent, and `buf` here is a local array, not the global.
+  1145: |
+    Both processes write through the same `fd`, which refers to one shared `struct file`
+    and so one shared offset.
+  "1166-1172": |
+    Read the file back and count the letters. The file is a whole number of 10-byte
+    chunks, so every `read` fills `buf` completely.
+  1176: |
+    Both counts must be exactly 1000 × 10: no chunk lost or overwritten.
+  1211: |
+    Each child fills its copy of [[buf@user/usertests.c]] with its own digit, `0` to `3`.
+  "1277-1278": |
+    After creating file number `i` (for even `i > 0`), delete file number `i / 2`. Over
+    the run, files 1 to 9 are deleted.
+  "1302-1305": |
+    Files 0 and 10 to 19 of every child must exist; files 1 to 9 must not.
+  1338: |
+    Open the file again and keep `fd` open across the unlink.
+  1343: |
+    Remove the name. The [[g:link-count]] becomes 0, but `fd` still references the inode.
+  1348: |
+    A new file under the old name. It gets a different inode, so it must not affect `fd`.
+  1352: |
+    `fd` still reads the old 5 bytes, `hello`, not the new file's `yyy`.
+  1360: |
+    Writing to an unlinked but open file must also work.
+  1364: |
+    The last reference goes away; now [[kernel:iput]] frees the old inode and its blocks.
+  1410: |
+    The new name `lf2` already exists, so the link must fail.
+  1416: |
+    `lf2` was just removed, so the source does not exist.
+  1421: |
+    `.` is a directory; [[kernel:sys_link]] refuses to link directories.
+  "1435-1438": |
+    A local struct laid out like [[kernel:dirent]]: a 2-byte inode number and a 14-byte
+    name, 16 bytes in all.
+  "1446-1449": |
+    Who links and who creates depends on `i`: the parent links when `i % 3 == 1`, the
+    child when `i % 5 == 1`, and otherwise each creates. For `i` = 1, 16 and 31 both link.
+  1471: |
+    Read the directory 16 bytes, one entry, at a time.
+  1472: |
+    An entry with inode number 0 is a free slot.
+  "1474-1475": |
+    Pick out two-character names starting with `C` and turn the second character back
+    into the index `i`.
+  1480: |
+    The same name seen twice: two processes both added it.
+  1502: |
+    For `i % 3 == 0` the child opens and the parent unlinks; for `i % 3 == 1` the roles
+    are swapped; for `i % 3 == 2` both unlink.
+  1538: |
+    Different seeds in parent and child, so the two processes make different choices.
+  1540: |
+    Advance the generator. The multiplier and increment are the classic constants from
+    the example `rand` in the C standard; `unsigned` arithmetic wraps around without
+    undefined behavior.
+  1544: |
+    Make `x` another name for the `cat` program. This fails harmlessly if `x` already
+    exists.
+  1575: |
+    `dd` contains `ff`, so it is not empty and must not be removable.
+  1580: |
+    An absolute path: `namex` starts from the root instead of the current directory.
+  1593: |
+    `..` inside `dd/dd` leads back to `dd`, so this opens `dd/ff`. Its content `ff`
+    (lowercase) distinguishes it from `dd/dd/ff`, which holds `FF`.
+  "1605-1613": |
+    Give `dd/dd/ff` a second name, then remove the first. The file lives on as
+    `dd/dd/ffff`.
+  1619: |
+    Change into `dd`. The following paths are relative to `/dd`.
+  1627: |
+    One `..` too many: the root's `..` is the root, so the path still works.
+  1631: |
+    Back to `/`, so the rest of the test uses paths relative to the root.
+  1721: |
+    `dd` still contains `dd/dd`, so this must fail.
+  1742: |
+    Sizes 499, 970, 1441, ..., up to 12274, the largest below 12288 bytes (12 blocks'
+    worth).
+  1750: |
+    Each `write` must report the full size, even though the kernel commits it as several
+    transactions.

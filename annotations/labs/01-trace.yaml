@@ -1,0 +1,1557 @@
+published: true
+title: "trace: logging system calls"
+area: The system-call and trap path
+stars: 1
+branch: ext/01-trace
+prerequisites: {tours: [5, 6, 20, 22, 38], concepts: [stacks, locks]}
+summary: |
+  You add a new system call, `trace(mask)`, and a command, `trace MASK command args...`.
+  While a process's mask has bit *i* set, the kernel prints one line each time system call
+  number *i* returns: `3: syscall read -> 1023`. Children made by `fork` inherit the mask, and
+  `exec` keeps it, so `trace 32 grep hello README` shows every `read` that `grep` makes.
+
+  The feature is small (about fifty lines of kernel code, half of them a table of names), but building it walks you through
+  every layer a system call crosses, from the three-instruction user stub to the
+  [[g:trapframe]] and back. You will see every place a new system call must be registered and
+  why each one exists, where per-process state lives and what `fork` copies under which lock,
+  and why the only place that can print the return value is right after the call in
+  [[syscall]]. On three [[g:hart|harts]], you will also see that `printk`'s lock keeps trace
+  lines whole with respect to each other, but not with respect to a user program's output.
+learn:
+  - "The full path of a system call: the [[g:syscall-stub]] puts the number in `a7`, `ecall` traps, [[uservec]] saves every register in the trapframe, [[usertrap]] calls [[syscall]], which indexes `syscalls[]`, and the return value travels back to user space through the saved `a0`."
+  - "Every place a new system call must be registered (the number, the stub generator, the user prototype, the kernel table and its prototype) and what breaks, at compile time, link time or run time, when one is missing."
+  - "Where per-process state lives in `struct proc`, which fields need `p->lock` and which are private to the process, and what [[kfork]] copies while it holds the child's lock."
+  - "Why a forked child never passes through [[syscall]] on its way back from `fork`, and why a successful `exit` never returns to it."
+  - "What `pr.lock` in [[printk]] guarantees on three harts (whole lines among kernel messages) and what it does not (it does not exclude user output written through [[uartwrite]])."
+  - "How [[argint]] reads an integer argument from the trapframe, and why pointer arguments need [[copyin]] instead."
+spec: |
+  **The system call.** `int trace(int mask)` sets the calling process's trace mask and
+  returns the previous mask. Bit *i* of the mask enables tracing of system call number *i*
+  (the numbers in [[kernel/syscall.h]]; `trace` itself gets number 23). It never fails.
+
+  **What gets printed.** When a traced system call returns to the process, the kernel prints
+  one line on the console:
+
+  ```text
+  <pid>: syscall <name> -> <return value>
+  ```
+
+  The value is printed as a signed 64-bit number, so a failure shows as `-1`. A system call
+  that never returns (a successful `exit`) prints nothing.
+
+  **Inheritance.** A child created by `fork` starts with its parent's mask. `exec` keeps the
+  mask. A child changing its own mask does not change its parent's.
+
+  **The command.** `trace MASK command args...` sets the mask, then execs the command:
+
+  ```text
+  $ trace 32 grep hello README
+  3: syscall read -> 1023
+  3: syscall read -> 965
+  3: syscall read -> 453
+  3: syscall read -> 0
+  ```
+
+  (32 is `1 << 5`, and `SYS_read` is 5. `2147483647` sets every bit up to 30 and traces
+  everything.)
+
+  **The test.** `tracetest` checks, and prints `OK` or `FAIL` for each: that `trace` returns
+  the previous mask, that `fork` copies the mask to the child, that a child's change leaves
+  the parent alone, and that `exec` keeps the mask. A program cannot read the console, so the
+  printing itself is checked by eye: between a `begin` and an `end` marker only `getpid` is
+  traced, the parent and a child each call `getpid` once (plus untraced `uptime`, `fork` and
+  `wait` calls, and the child's `exit`; the markers themselves are printed outside that
+  window), and the test then prints the two lines that should have
+  appeared:
+
+  ```text
+  tracetest: begin
+  3: syscall getpid -> 3
+  6: syscall getpid -> 6
+  tracetest: end
+  tracetest: expected between the markers, and nothing else:
+  3: syscall getpid -> 3
+  6: syscall getpid -> 6
+  tracetest: 4 checks OK; now compare the lines between the markers by eye
+  ```
+
+  The last line deliberately does not claim the printing is right: only your comparison
+  can say that.
+
+  **Constraints.** Untraced processes must behave exactly as before, and `usertests -q` must
+  still print `ALL TESTS PASSED` on three harts. Do not change any existing system call's
+  number.
+think:
+  - title: Where must a new system call be registered?
+    q: |
+      List every file you must touch before a user program can call `trace(32)` and reach a
+      kernel function `sys_trace`. For each, say what would go wrong without it: a compile
+      error, a link error, or a failure at run time.
+    hints:
+      - |
+        Follow `write` through the tree: grep for `SYS_write`, for `sys_write` and for
+        `write` in [[user/usys.pl]] and [[user/user.h]]. Then look at how the Makefile builds
+        `user/usys.S` and `fs.img`.
+      - |
+        The kernel and user programs are compiled separately and share nothing at run time
+        except the number in `a7`. So the number must come from one header both sides
+        include, and each side needs its own declaration of the function it uses.
+      - |
+        Five places in the source, plus the Makefile for the new user program: a `#define`
+        in `kernel/syscall.h`; an `entry("trace")` in `user/usys.pl`; a prototype in
+        `user/user.h`; an `extern` prototype and a `[SYS_trace] = sys_trace` entry in
+        `kernel/syscall.c`; and the function itself, in `kernel/sysproc.c`.
+    answer: |
+      | Where | What it provides | Without it |
+      |---|---|---|
+      | `kernel/syscall.h`: `#define SYS_trace 23` | the one number both sides agree on; the kernel table and the generated stub both include this header | the kernel table and the stub both use the name `SYS_trace`, so neither builds |
+      | `user/usys.pl`: `entry("trace")` | generates the stub `trace: li a7, SYS_trace; ecall; ret` in `user/usys.S` | the C compiler is happy (user.h declares `trace`), but the [[g:linker]] finds no symbol `trace`: `undefined reference to 'trace'` (clinic 4) |
+      | `user/user.h`: `int trace(int);` | tells the C compiler the stub's type | `-Werror` turns the implicit declaration into a compile error |
+      | `kernel/syscall.c`: `extern uint64 sys_trace(void);` | lets the table refer to a function defined in another file | compile error in the table |
+      | `kernel/syscall.c`: `[SYS_trace] = sys_trace,` | maps 23 to the handler; [[syscall]] dispatches only through this table | builds fine, but every call prints `unknown sys call 23` and returns -1 |
+      | `kernel/sysproc.c`: `sys_trace` | the handler | link error in the kernel |
+      | `Makefile`: `$U/_trace` in `UPROGS` | builds the program and puts it in `fs.img` | `exec trace failed` from the shell (clinic 6) |
+
+      The table uses [[g:designated-initializer|designated initializers]] (`[SYS_trace] =`),
+      so the order of the lines does not matter and a missing entry is a null pointer that
+      [[syscall]] checks for ([[kernel/syscall.c:143]]). The user side never sees the kernel's
+      function names at all: the only thing that crosses the boundary is the number in `a7`.
+    checks:
+      - id: lab01-01
+        level: 1
+        type: match
+        q: |
+          Match each change to what it provides.
+        pairs:
+          - left: "`#define SYS_trace 23` in kernel/syscall.h"
+            right: the number both the stub and the kernel table use
+            why: |
+              You may have thought the header is only for the kernel. `user/usys.S` includes
+              `kernel/syscall.h` too, which is how `li a7, SYS_trace` becomes `li a7,23`.
+          - left: "`entry(\"trace\")` in user/usys.pl"
+            right: the code that loads a7 and executes ecall
+            why: |
+              You may have confused the stub generator with the prototype. The Perl script
+              writes assembly: `li a7, SYS_trace`, `ecall`, `ret`.
+          - left: "`int trace(int);` in user/user.h"
+            right: the type the C compiler checks calls against
+            why: |
+              You may have thought the prototype generates code. It only declares the type;
+              without the stub, linking still fails.
+          - left: "`[SYS_trace] = sys_trace` in kernel/syscall.c"
+            right: the mapping syscall() uses to find the handler
+            why: |
+              You may have thought the kernel finds `sys_trace` by name. It never does: it
+              indexes the table with the number from `a7`.
+          - left: "`$U/_trace` in UPROGS"
+            right: the program file in fs.img
+            why: |
+              You may have thought the Makefile entry affects the kernel. It only decides which
+              user programs are built and copied into the disk image by `mkfs`.
+        explain: |
+          The two halves of the system meet in exactly one value, the number in `a7`. Everything
+          else is per side: a stub and a prototype for user programs, a table entry and a
+          prototype for the kernel. See [[g:syscall-number]] and [[tour:5]].
+  - title: How do the number and the mask reach sys_trace?
+    q: |
+      The `trace` program calls `trace(32)`. Trace the two values, 23 and 32, from that call
+      to the moment `sys_trace` holds 32 in a local variable. Name the register each value
+      travels in, where it is saved, and who reads it back.
+    hints:
+      - |
+        Read [[tour:5]] steps 2 to 10, or the code: the stub in `user/usys.S`, [[uservec]]
+        in [[kernel/trampoline.S]], [[usertrap]] and [[syscall]], then [[argraw]].
+      - |
+        `ecall` changes no general-purpose register. Whatever is in `a0` and `a7` at the
+        `ecall` is what the kernel sees, and it sees it in the [[g:trapframe]], not in the
+        registers, because C code in the kernel reuses every register.
+      - |
+        `a0 = 32` by the [[g:calling-convention]]; `a7 = 23` by the stub; `uservec` stores
+        both in the trapframe (offsets 112 and 168); `syscall()` reads `trapframe->a7`;
+        `argint(0, ...)` reads `trapframe->a0` through `argraw`.
+    answer: |
+      1. The C call `trace(32)` puts 32 in `a0`: the first argument register.
+      2. The stub runs `li a7,23` (in this build at address `0x3c0` of the program) and
+         `ecall`.
+      3. `ecall` switches to supervisor mode and jumps to [[uservec]]; `a0` and `a7` still
+         hold 32 and 23.
+      4. `uservec` saves all 31 user registers in the process's trapframe: `a0` at offset 112
+         (through `sscratch`, [[kernel/trampoline.S:72]]), `a7` at offset 168. Then it
+         switches to the kernel stack and page table and jumps to [[usertrap]].
+      5. `usertrap` sees `scause` 8, adds 4 to the saved `epc`, turns interrupts on, and calls
+         [[syscall]].
+      6. `syscall()` reads `num = p->trapframe->a7` ([[kernel/syscall.c:142]]), checks it is
+         in range and calls `syscalls[23]`, which is `sys_trace`.
+      7. `sys_trace` calls [[argint]]`(0, &mask)`, which reads `p->trapframe->a0` through
+         [[argraw]]: 32.
+
+      The way back is the mirror image: `syscall()` stores the result in `trapframe->a0`,
+      and [[userret]] reloads `a0` from the trapframe last ([[kernel/trampoline.S:149]]), so
+      `trace()` returns that value in `a0`.
+    checks:
+      - id: lab01-02
+        level: 2
+        type: order
+        q: |
+          Put the steps of `trace(32)` in the order they happen.
+        items:
+          - "The compiler's call puts 32 in a0"
+          - "The stub executes li a7,23"
+          - "ecall: the hart enters supervisor mode at uservec"
+          - "uservec saves a0 and a7 in the trapframe"
+          - "usertrap adds 4 to the saved epc and turns interrupts on"
+          - "syscall() reads trapframe->a7 and calls syscalls[23]"
+          - "argint reads trapframe->a0"
+        why_wrong: |
+          You may have placed a kernel step before the trap. Nothing in the kernel runs until
+          `ecall`, and nothing reads the trapframe until `uservec` has filled it. Inside the
+          kernel, `usertrap` dispatches to `syscall()`, which dispatches to `sys_trace`, which
+          calls `argint`.
+        explain: |
+          The values ride in registers until `uservec` saves them, then live in the trapframe
+          for the rest of the system call. `syscall()` and `argint` read the saved copies,
+          never the live registers. See [[tour:5]] and [[g:syscall-arguments]].
+      - id: lab01-03
+        level: 2
+        type: state
+        q: |
+          `sys_trace` is running its first line, `argint(0, &mask)`. Fill in the machine state
+          of the hart running it.
+        state: {mode: S, stack: kernel, satp: kernel, sie: "on", noff: "0", intena: "-"}
+        why:
+          mode: You may have thought a system call handler runs in user mode on the process's behalf. It runs in supervisor mode; the process is in the kernel.
+          stack: You may have thought the kernel uses the user's stack or a per-hart stack. uservec switched to the process's own kernel stack ([[kernel/trampoline.S:76]]).
+          satp: You may have thought the user page table stays installed. uservec switched to the kernel page table before calling usertrap ([[kernel/trampoline.S:92]]).
+          sie: You may have thought interrupts stay off for the whole trap. usertrap turned them on with intr_on() before calling syscall() ([[kernel/trap.c:66]]).
+          noff: You may have thought some lock is held. Nothing on this path takes a spinlock before sys_trace; sys_trace itself takes none.
+          intena: With noff 0 there is no saved interrupt state to report.
+        why_wrong: |
+          Ask the three questions of [[concept:mode-stack-page-table]]: which mode, which
+          stack, which page table. Then ask whether any spinlock is held.
+        explain: |
+          A system call handler runs in supervisor mode, on the process's kernel stack, with
+          the kernel page table and interrupts on, holding no lock. That is why `sys_trace`
+          can be interrupted by the timer and even resume on another hart; it is safe because
+          it touches only its own process's state.
+  - title: Why is argint enough here?
+    q: |
+      `sys_trace` reads its argument with one call to [[argint]] and never checks it. Is that
+      safe? What would you have to do differently if the argument were a pointer, say
+      `trace(int *mask)`?
+    hints:
+      - |
+        Read [[argraw]] ([[kernel/syscall.c:35]]), [[argint]] and [[argaddr]]
+        ([[kernel/syscall.c:67]]), then [[copyin]].
+      - |
+        What could go wrong with an `int` value? With a pointer value, whose page table
+        gives it meaning, and which page table is installed while `sys_trace` runs?
+      - |
+        For an `int`, nothing to check. For a pointer, fetch it with `argaddr` and copy the
+        value with `copyin(p->pagetable, ...)`, which checks the address against the process's
+        page table and returns -1 instead of faulting.
+    answer: |
+      [[argint]] copies the saved `a0` out of the trapframe ([[kernel/syscall.c:58]]). The
+      trapframe is kernel memory that `uservec` filled, so reading it is always safe, and any
+      32-bit value is a valid mask: bit 30, for example, matches no system call and is never
+      tested. So `sys_trace` needs no check and cannot fail.
+
+      A pointer argument is a different matter. The value in `a0` would be a user virtual
+      address: meaningless under the kernel page table, and possibly pointing at nothing or
+      at the guard page. The kernel never dereferences it. It fetches it with [[argaddr]] and
+      copies through [[copyin]], which translates the address with the process's page table
+      (refusing pages without `PTE_U`), allocates a lazily allocated page only if the address
+      is below the process's size, and otherwise returns -1. See [[tour:6]] and [[tour:28]].
+    checks:
+      - id: lab01-10
+        level: 2
+        type: choice
+        q: |
+          Suppose `trace` took `int *mask` and `sys_trace` did `argaddr(0, &a); mask = *(int *)a;`.
+          What is wrong?
+        options:
+          - text: "`a` is a user virtual address; the kernel runs with its own page table, so the load reads the wrong memory or faults."
+            correct: true
+            why: |
+              User addresses are translated by the user's page table, which is not installed in
+              the kernel. The kernel must copy through [[copyin]], which translates the address
+              with the process's page table and checks it.
+          - text: Nothing, because argaddr already checked that the address is valid.
+            why: |
+              You may have trusted the name. [[argaddr]] only copies the raw value from the
+              trapframe; its comment says it does not check legality.
+          - text: The load needs interrupts off, because the user could change the value meanwhile.
+            why: |
+              You may have thought the danger is a race. xv6 processes have one thread, and the
+              real problem is translation: the address belongs to another page table.
+          - text: It works, but only on hart 0, which has the user's page table installed.
+            why: |
+              You may have thought page tables belong to harts. Every hart runs kernel code with
+              the kernel page table; no hart has the user table installed while in C code.
+        explain: |
+          The kernel never trusts or dereferences a user pointer. It copies with
+          [[copyin]]/[[copyout]], which translate through the process's own page table and fail
+          cleanly. An `int` argument needs none of this, which is why `trace` takes one. See
+          [[tour:28]].
+  - title: Where does the mask live, and who may touch it?
+    q: |
+      The mask belongs to a process. Which structure gets the new field, in which section,
+      and which lock (if any) must be held to read or write it? Consider the three places
+      that will touch it: `sys_trace`, `syscall()` and `kfork`.
+    hints:
+      - |
+        Read the comments inside `struct proc` in [[kernel/proc.h]]: the fields are grouped
+        by the lock that protects them.
+      - |
+        A field needs a lock only if two threads can touch it at the same time. xv6
+        processes have one thread each. Who else, apart from the process itself, could
+        ever read or write its mask?
+      - |
+        Only the process itself reads and writes its own mask, so it goes in the "private to
+        the process" section with `sz`, `ofile` and `name`, with no lock. The one exception,
+        `kfork` writing the *child's* mask, happens before the child can run.
+    answer: |
+      Put `int tracemask;` in `struct proc`, in the section headed "these are private to the
+      process, so p->lock need not be held" ([[kernel/proc.h:95]]).
+
+      - `sys_trace` and `syscall()` run *as* the process, on its kernel stack. A process runs
+        on one hart at a time, and nothing else reads its mask (not even [[procdump]]), so no
+        lock is needed. If the process is preempted and moves to another hart in between, it
+        still is the only thread that touches the field.
+      - `kfork` reads the parent's mask (the parent is the running process: private) and
+        writes the child's. It writes it while it still holds the child's `np->lock`, taken by
+        [[allocproc]], and before `np->state = RUNNABLE`, so no scheduler can pick the child
+        and run it. It is the same reasoning that lets `kfork` write `np->sz` and
+        `np->ofile[]` there.
+      - [[freeproc]] clears it with the other fields, under `p->lock`, when the parent reaps
+        the child in [[kwait]].
+
+      Putting the field under `p->lock` would work too, but every `syscall()` would then take
+      and release a spinlock on the hottest path in the kernel for nothing.
+    checks:
+      - id: lab01-04
+        level: 2
+        type: tf
+        q: |
+          True or false: in `kfork`, reading the parent's `p->tracemask` must be done while
+          holding the **parent's** `p->lock`.
+        answer: false
+        why_tf: |
+          You may have thought every `struct proc` field needs its own `p->lock`. Only the
+          fields in the first section do (`state`, `chan`, `killed`, `xstate`, `pid`), because
+          other processes and interrupt handlers read or write them.
+        reasons:
+          - text: "False: the parent is the process running kfork, and the mask is private to it; no other thread reads or writes it."
+            correct: true
+            why: This is the reason. Private fields need no lock because only their owner touches them, and the owner is running this code.
+          - text: "True: a timer interrupt could change the mask in the middle of the read."
+            why: You may have thought interrupt handlers touch process fields. No handler touches the mask, and a 4-byte aligned load is a single instruction.
+          - text: "False: kfork already holds the parent's p->lock for its whole run."
+            why: You may have confused the two locks. kfork holds the child's np->lock (from allocproc), never the parent's p->lock.
+          - text: "True: another hart could be running the parent at the same time."
+            why: You may have thought a process can run on two harts at once. An xv6 process has one thread, and the scheduler runs it on at most one hart.
+        explain: |
+          Locks protect data that two threads can touch at once. The parent's mask is touched
+          only by the parent. The child's mask is written by the parent, but the child cannot
+          run yet: it is not RUNNABLE, and `np->lock` is held. See
+          [[concept:locks#lock-proc]] and [[kernel/proc.h:95]].
+  - title: Where exactly do you print?
+    q: |
+      You need the system call's number, its name and its return value. Which function is
+      the one place every system call passes through, and on which line must the print go
+      so that the return value is known?
+    hints:
+      - |
+        Read [[syscall]] ([[kernel/syscall.c:136]]). Every system call passes through it. Which
+        variable holds the number, and which one will hold the result?
+      - |
+        Before line 146 runs, `p->trapframe->a0` still holds what the user put in `a0`: the
+        first argument. After it, `a0` holds the result. And some calls never come back to
+        this line at all.
+      - |
+        Print right after line 146, inside the `if`, when `p->tracemask & (1 << num)` is
+        nonzero, and print `p->trapframe->a0`.
+    answer: |
+      In [[syscall]], immediately after `p->trapframe->a0 = syscalls[num]();`
+      ([[kernel/syscall.c:146]]):
+
+      ```c
+      if (p->tracemask & (1 << num))
+        printk("%d: syscall %s -> %ld\n", p->pid, syscallnames[num],
+               p->trapframe->a0);
+      ```
+
+      - Before the call, `a0` in the trapframe is still the user's first argument: a file
+        descriptor for `read`, a pointer for `exec` (clinic 2 shows `read -> 3` and
+        `exec -> 16336`).
+      - Inside each `sys_*` function would mean twenty-three edits, and the handler does not
+        know its own number.
+      - In [[usertrap]] after `syscall()` returns would work for system calls, but `usertrap`
+        also handles interrupts and faults, so it would need to remember whether this trap
+        was a system call.
+
+      Two consequences of "after the call": a successful `exit` never prints, because
+      [[kexit]] never returns; and `trace` traces itself with the *new* mask, because the
+      check runs after `sys_trace` installed it. `trace 8388608 echo x` (bit 23) prints
+      `trace -> 0`, and `trace(0)` called with the trace bit set prints nothing.
+
+      `%ld` prints the full 64-bit `a0` as a signed number, so `-1` shows as `-1` and an
+      `sbrk` result shows as an address. `1 << num` is an `int` shift, fine for numbers up to
+      30; a kernel with more than 31 system calls would need a 64-bit mask and `1L << num`.
+    checks:
+      - id: lab01-06
+        level: 1
+        type: line
+        q: |
+          Click the line right after which the trace check must go.
+        code: kernel/syscall.c:136-151
+        answer: 146
+        lines:
+          142: |
+            You may have thought you only need the number. You need the return value too, and
+            it does not exist until the handler has run.
+          144: |
+            That is a comment. You may have wanted to print before the call, but at that point
+            `trapframe->a0` still holds the first argument.
+          148: |
+            You may have confused the two branches. The `else` branch handles numbers with no
+            handler; the traced call has already returned on line 146.
+          149: |
+            That line runs only for an unknown number. A real system call never reaches it.
+        why_wrong: |
+          You may have picked a line outside the successful-call path. The print must run after
+          the handler has stored its result, and only when there was a handler.
+        explain: |
+          Line 146 is the only point where the number (`num`), the process (`p`) and the return
+          value (`p->trapframe->a0`) are all known. Printing before it shows the first
+          argument instead of the result. See [[tour:5]].
+      - id: lab01-07
+        level: 2
+        type: number
+        q: |
+          Suppose the print is placed *before* line 146. `grep` calls `read(3, buf, 1023)` and
+          the call returns 1023. What number does the trace line show after `->`?
+        answer: 3
+        wrong:
+          1023: |
+            You may have thought the return value is already known. Before the call nothing
+            has written `trapframe->a0` since `uservec` saved the user's `a0`.
+          5: |
+            You may have confused the number with the result. 5 is `SYS_read`, which is in
+            `a7`, not `a0`.
+          0: |
+            You may have thought the kernel clears `a0` on entry. It saves the user's `a0`
+            unchanged; for `read` that is the file descriptor.
+        why_wrong: |
+          Think about which value is in the trapframe's `a0` slot when the system call has not
+          run yet: the first argument the user passed.
+        explain: |
+          `trapframe->a0` does double duty: on entry it is the first argument, on return it is
+          the result. Before line 146 it is still the argument, here the descriptor 3. The
+          recorded run of this mistake printed `3: syscall read -> 3` four times.
+  - title: What should fork, exec and exit do with the mask?
+    q: |
+      The spec says children inherit the mask and `exec` keeps it. Which functions must
+      change? And when a traced `sh` forks, how many `fork` lines should the trace print,
+      one or two? You know where the print is now (the previous question); use that.
+    hints:
+      - |
+        Read [[kfork]], [[kexec]] and [[freeproc]]. Which of them builds a new `struct proc`,
+        which reuses one, and which clears one?
+      - |
+        `exec` replaces the memory image but not the process: the `struct proc` (and
+        everything in it) stays. A forked child returns from `fork` without ever having made
+        a system call itself.
+      - |
+        Copy the mask in `kfork` next to `safestrcpy(np->name, ...)`, before `release(&np->lock)`.
+        Clear it in `freeproc`. Leave `kexec` alone. The child's first return to user space
+        goes through `forkret`, which never calls `syscall()`.
+    answer: |
+      - **fork**: [[kfork]] copies `np->tracemask = p->tracemask` while it holds the child's
+        lock (before [[kernel/proc.c:294]]). The child slot came from [[allocproc]], whose
+        fields were cleared by `freeproc` when the slot was last freed (or are zero from
+        boot), so without this line the child is untraced (clinic 1).
+      - **exec**: nothing. [[kexec]] builds a new page table and user memory but keeps the
+        `struct proc`, so the mask survives. That is exactly what makes the `trace` command
+        work: it sets the mask, then execs the command.
+      - **exit/wait**: [[freeproc]] sets `tracemask = 0` with the other fields. At this
+        commit every caller of `allocproc` either copies a mask (`kfork`) or runs at boot,
+        when the table is all zeros (`userinit`), so this is hygiene rather than a fix, but a
+        future caller of `allocproc` would otherwise inherit a stranger's mask.
+      - **One fork line, not two.** The parent's `fork` returns through [[syscall]] and prints
+        the child's pid. The child never executed `ecall`: [[kfork]] gave it a copy of the
+        trapframe with `a0 = 0`, and [[allocproc]] gave it a fresh kernel stack and a
+        context whose `ra` is [[forkret]], so its first `swtch` lands there.
+        `forkret` goes straight to [[prepare_return]] and [[userret]]. The child never
+        passes through `syscall()`, so it prints nothing.
+    checks:
+      - id: lab01-05
+        level: 2
+        type: choice
+        q: |
+          A shell running with every bit of its mask set forks a child. How many lines
+          mention `fork`?
+        options:
+          - text: One, printed by the parent, showing the child's pid.
+            correct: true
+            why: |
+              The parent's `fork` returns through `syscall()`. The child's "return" from fork
+              is manufactured by `kfork` (`a0 = 0` in its trapframe) and reaches user space
+              through `forkret`, never through `syscall()`.
+          - text: Two, one from the parent showing the child's pid and one from the child showing 0.
+            why: |
+              You may have thought the child returns from the same system call. It never made
+              one: it starts life in [[forkret]] on a fresh kernel stack and goes straight to
+              user space. Only the parent passes through `syscall()`. (The recorded run shows
+              `3: syscall fork -> 4` and no `4: syscall fork` line.)
+          - text: One, printed by the child, showing 0.
+            why: |
+              You may have thought only the child "returns" from fork. Both return to user
+              space, but only the parent's return goes through `syscall()`.
+          - text: None, because the parent's mask is copied after the child has started running.
+            why: |
+              You may have thought the copy races with the child. `kfork` copies the mask while
+              holding `np->lock` and before setting `RUNNABLE`, so the child cannot run yet;
+              and in any case the parent's own line depends only on the parent's mask.
+        explain: |
+          Printing happens in `syscall()`, so a line appears only for a process that is
+          returning from a call it made. A forked child made none. See [[tour:20]] for how
+          `kfork` sets up the child's first return.
+  - title: How do you turn a number into a name?
+    q: |
+      The output needs `read`, not `5`. Where do the names come from, and how do you make sure
+      name *i* really is system call *i*, even if someone later adds a number in the middle?
+    hints:
+      - |
+        Look at how `syscalls[]` is written ([[kernel/syscall.c:109]]): `[SYS_fork] = sys_fork`.
+      - |
+        Numbering starts at 1, not 0. A plain list `{"fork", "exit", ...}` puts "fork" at
+        index 0.
+      - |
+        Use the same designated initializers: `[SYS_read] = "read"`. Then the index is the
+        constant itself, and the array has exactly as many slots as `syscalls[]`.
+    answer: |
+      A second table, indexed like the first:
+
+      ```c
+      static char *syscallnames[] = {
+        [SYS_fork]    = "fork",
+        ...
+        [SYS_trace]   = "trace",
+      };
+      ```
+
+      With [[g:designated-initializer|designated initializers]] the position in the source
+      does not matter; slot 0 stays empty, as in `syscalls[]`; and the array's length is
+      `SYS_trace + 1`, the same as `syscalls[]`, so the range check in [[syscall]] covers
+      both. A plain list starting with `"fork"` is off by one: `read` (5) prints the sixth
+      name, `kill`, and the last number indexes one slot past the end (clinic 3, which
+      panicked).
+    checks:
+      - id: lab01-08
+        level: 2
+        type: choice
+        q: |
+          The names are written as a plain list, `{"fork", "exit", "wait", "pipe", "read",
+          "kill", ...}`, in the order of `syscall.h`. What does `trace 32 grep hello README`
+          print?
+        options:
+          - text: "Lines like `3: syscall kill -> 1023`"
+            correct: true
+            why: |
+              `SYS_read` is 5, and index 5 of a list that starts at 0 is the sixth name,
+              `kill`. The value is still right: only the name is shifted.
+          - text: "Lines like `3: syscall pipe -> 1023`"
+            why: |
+              You may have shifted the wrong way. Index 5 in a 0-based list is the sixth
+              element. `pipe` is the fourth name, at index 3.
+          - text: "Correct lines, because the list is in the same order as syscall.h"
+            why: |
+              You may have thought order is enough. The order is right but the numbering
+              starts at 1, so every name is one slot early.
+          - text: The kernel panics at the first read
+            why: |
+              You may have expected an out-of-bounds read. Index 5 is inside the array; only
+              the highest number, 23, falls off the end (and that did panic in the clinic).
+        explain: |
+          `syscall.h` numbers from 1, so a 0-based plain list is off by one everywhere and
+          short by one slot at the end. Designated initializers make the index explicit. See
+          [[g:designated-initializer]].
+  - title: Three harts, one console. Will the lines come out whole?
+    q: |
+      With three harts, two traced processes can return from system calls at the same moment,
+      and a third process can be writing its own output. What keeps a trace line from being
+      mixed with another trace line? Is anything keeping it from being mixed with a user
+      program's output?
+    hints:
+      - |
+        Read [[printk]] ([[kernel/printk.c:63]]) and how a user `write` to the console reaches
+        the UART: [[consolewrite]] and [[uartwrite]]. Which lock does each path take?
+      - |
+        `pr.lock` is held for a whole `printk` call. `uartwrite` holds the sleep-lock
+        `tx_lock` for at most 32 bytes at a time. The two paths share the UART but not a lock.
+      - |
+        List the lock each path holds while it writes the UART's transmit register:
+        `printk`'s path holds ?, `consolewrite`'s path holds ?. A lock excludes only code
+        that takes the same lock.
+    answer: |
+      [[printk]] holds `pr.lock` (a [[g:spinlock]]) from before the first character to after
+      the last ([[kernel/printk.c:70]], [[kernel/printk.c:131]]). Every kernel message takes it
+      (except while the kernel is panicking), so two `printk` calls never interleave: a trace line printed on hart 1 and one printed
+      on hart 2 come out one after the other, in some order. While the lock is held,
+      interrupts are off on the printing hart (`noff` 1, then 2 inside [[uartputc_sync]]),
+      and each character is sent by spinning on the UART's status register.
+
+      User output does not take `pr.lock`. `write(1, ...)` goes through [[consolewrite]] to
+      [[uartwrite]], which holds the sleep-lock `tx_lock` for each 32-byte batch. Nothing makes
+      `printk` and `uartwrite` exclude each other, so their characters can alternate at the
+      UART. That happened in a recorded run of `cat README &; trace 65536 echo hello`
+      (see Measure): `Behnam` and `write` came out as `Bwehritena`.
+
+      The trace line for one process's own `write` always comes *after* that write's text,
+      because the same process prints it after the call returns: `hi4: syscall write -> 2` in the recorded run.
+      (The text has no newline, so the trace line continues it.)
+    checks:
+      - id: lab01-09
+        level: 3
+        type: multi
+        q: |
+          Which of these does `pr.lock` guarantee on three harts?
+        options:
+          - text: Two trace lines printed on different harts never have their characters mixed.
+            correct: true
+            why: Both printk calls take pr.lock for the whole line, so one waits for the other.
+          - text: While a trace line is printing, interrupts are off on the hart printing it.
+            correct: true
+            why: Holding any spinlock means interrupts are off on that hart (acquire calls push_off).
+          - text: A trace line never lands in the middle of another process's write() output.
+            why: |
+              You may have thought all console output goes through printk. User writes go
+              through consolewrite and uartwrite, which take tx_lock, not pr.lock. The recorded
+              run shows a trace line interleaved character by character with cat's output.
+          - text: Other harts stop running while a trace line prints.
+            why: |
+              You may have thought turning interrupts off affects other harts. SIE is per hart;
+              the others keep running, and only a hart that also calls printk waits.
+          - text: Trace lines appear in the order the system calls returned.
+            why: |
+              You may have thought the lock is first-come, first-served. A spinlock gives no
+              fairness or order: whichever hart's `amoswap` wins next goes next, and a call
+              that returned first may still print second.
+        explain: |
+          A lock only excludes code that takes the same lock. `pr.lock` makes kernel messages
+          atomic with respect to each other; user output uses a different lock (`tx_lock`) and
+          is not excluded. See [[concept:locks#lock-pr]] and [[tour:38]].
+build: |
+  **Start from the frozen commit**, in your own clone of xv6 (not this site's `xv6/`):
+
+  ```sh
+  git checkout -b my-trace 06aad25
+  ```
+
+  Work in this order; each milestone can be tested before the next.
+
+  1. **The plumbing.** Add `SYS_trace` (23) to `kernel/syscall.h`, `entry("trace")` to
+     `user/usys.pl` and `int trace(int);` to `user/user.h`. Run `make`. Nothing calls it
+     yet, but `user/usys.S` should now contain a `trace:` stub. Check with
+     `grep -A3 'trace:' user/usys.S`.
+  2. **The mask and the handler.** Add `int tracemask;` to `struct proc` (in the private
+     section), write `sys_trace` in `kernel/sysproc.c`, add its `extern` and table entry in
+     `kernel/syscall.c`, and clear the field in `freeproc`. A quick test: a tiny program that
+     calls `trace(5)` and prints `trace(0)` should print 5. Without the table entry you would
+     see `unknown sys call 23` instead.
+  3. **Inheritance.** One line in `kfork`, before `release(&np->lock)`.
+  4. **The print.** The names table and the `printk` in `syscall()`. Now `trace` works from
+     a test program: set a mask, make a call, see the line.
+  5. **The command.** `user/trace.c` (check `argc`, `trace(atoi(argv[1]))`, `exec`, print an
+     error if `exec` returns) and `$U/_trace` in `UPROGS`. Try `trace 32 grep hello README`
+     and `trace 2147483647 echo hi`.
+  6. **The test.** `tracetest` (or your own), then `usertests -q`.
+
+  **Debugging.** Run QEMU with three harts (`make qemu` uses `CPUS := 3`). If a line is
+  missing, ask in order: is the bit set (print the mask in `sys_trace`)? Did the call
+  come through `syscall()` (a forked child's first return does not)? Is the name table
+  indexed like `syscalls[]`? For a crash inside the print, attach [[g:gdb]] (`make qemu-gdb`
+  in one terminal, `${TOOLPREFIX}gdb kernel/kernel` and `target remote` in another), `break
+  panic`, and look at `bt`, `p/x $scause`, `p/x $stval` and `p/x $sepc`: clinic 3 shows
+  what that looks like. `TOOLPREFIX` is your RISC-V toolchain's prefix, the same one xv6's
+  Makefile detects (`riscv64-unknown-elf-`, `riscv64-linux-gnu-` or `riscv64-elf-`); set it
+  with `export TOOLPREFIX=riscv64-unknown-elf-` or whichever you have. On
+  Debian/Ubuntu/WSL, `gdb-multiarch` also works as the debugger.
+clinic:
+  - bug: Forgot to copy the mask in kfork
+    change: |
+      The one line in `kfork` is missing:
+
+      ```diff
+         safestrcpy(np->name, p->name, sizeof(p->name));
+
+      -  // the child inherits the parent's trace mask.
+      -  np->tracemask = p->tracemask;
+      -
+         pid = np->pid;
+      ```
+    symptom: |
+      $ tracetest
+      tracetest: trace returns the previous mask: OK
+      tracetest: fork copies the mask to the child: FAIL
+      tracetest: the child's trace(0) leaves the parent alone: OK
+      tracetest: exec keeps the mask: FAIL
+      tracetest: begin
+      3: syscall getpid -> 3
+      tracetest: end
+      tracetest: expected between the markers, and nothing else:
+      3: syscall getpid -> 3
+      6: syscall getpid -> 6
+      tracetest: 2 FAILED
+      $ trace 65536 sh
+      $ 7: syscall write -> 2
+      echo hi
+      hi
+      $ 7: syscall write -> 2
+    why: |
+      The child's `struct proc` comes from [[allocproc]], and its mask is whatever
+      [[freeproc]] left there: 0. So the child starts untraced. "exec keeps the mask" fails
+      too, though `exec` is fine: the test runs `exec` in a forked child, which had already
+      lost the mask at the `fork`. Between the markers only the parent's `getpid` is
+      printed. In the traced shell, `sh` itself is traced (its `write` of the two-byte
+      prompt `$ ` prints `write -> 2`), but `echo`, forked by `sh`, prints `hi` with no trace
+      line. Bugs in inheritance are invisible when the traced program never forks: `trace 32
+      grep hello README` still works perfectly, because `trace` execs `grep` in the same
+      process.
+  - bug: Printed before calling the handler
+    change: |
+      The check moved above the call in `syscall()`:
+
+      ```diff
+      -    p->trapframe->a0 = syscalls[num]();
+           if (p->tracemask & (1 << num))
+             printk("%d: syscall %s -> %ld\n", p->pid, syscallnames[num],
+                    p->trapframe->a0);
+      +    p->trapframe->a0 = syscalls[num]();
+      ```
+    symptom: |
+      $ trace 32 grep hello README
+      3: syscall read -> 3
+      3: syscall read -> 3
+      3: syscall read -> 3
+      3: syscall read -> 3
+      $ trace 2147483647 echo hi
+      4: syscall exec -> 16336
+      4: syscall write -> 1
+      hi4: syscall write -> 1
+
+      4: syscall exit -> 0
+      $
+
+      (a separate boot, same kernel:)
+      $ tracetest
+      tracetest: trace returns the previous mask: OK
+      tracetest: fork copies the mask to the child: OK
+      tracetest: the child's trace(0) leaves the parent alone: OK
+      tracetest: exec keeps the mask: OK
+      tracetest: begin
+      3: syscall getpid -> 0
+      6: syscall getpid -> 0
+      tracetest: end
+      tracetest: expected between the markers, and nothing else:
+      3: syscall getpid -> 3
+      6: syscall getpid -> 6
+      tracetest: 4 checks OK; now compare the lines between the markers by eye
+    why: |
+      Before the handler runs, `p->trapframe->a0` still holds the user's `a0`, saved by
+      [[uservec]]: the **first argument**. Every `read` shows the descriptor 3, both `write`s
+      show the descriptor 1, and `exec` shows the address of its path string in `trace`'s
+      memory (16336 is `0x3fd0`). Three more differences give the bug away: `exit` now prints
+      (the line comes out before [[kexit]] gets the chance not to return); the `trace` call
+      itself is missing, because the mask was still 0 when it was checked; and each `write`
+      line comes out *before* its text, so `hi` appears in front of the second line instead
+      of the first.
+
+      `tracetest`'s four checks all pass, because they test only the mask, never the printed
+      value: only the comparison by eye catches this bug. `getpid` takes no argument, so the
+      `a0` it shows is whatever the program last left there: in the parent, the 0 returned
+      by the `trace` call just before it; in the child, the 0 that `fork` returned. This is
+      why the test's last line asks you to compare instead of claiming that all is well.
+  - bug: Off-by-one in the names table
+    change: |
+      The names are a plain list in `syscall.h` order, without designated initializers:
+
+      ```diff
+       static char *syscallnames[] = {
+         // clang-format off
+      -  [SYS_fork]    = "fork",
+      -  [SYS_exit]    = "exit",
+      +  "fork",
+      +  "exit",
+         ...
+      -  [SYS_trace]   = "trace",
+      +  "trace",
+      ```
+    symptom: |
+      $ trace 32 grep hello README
+      3: syscall kill -> 1023
+      3: syscall kill -> 965
+      3: syscall kill -> 453
+      3: syscall kill -> 0
+      $ trace 2147483647 echo hi
+      4: syscall panic: acquire
+
+      (a second run, fresh boot, `trace 2147483647 echo hi` as the first command,
+      with gdb attached and a breakpoint on panic, on hart 1:)
+      #0  panic (s=s@entry=0x80007048 "acquire") at kernel/printk.c:139
+      #1  0x0000000080000c28 in acquire (lk=lk@entry=0x8000faa8 <pr>) at kernel/spinlock.c:26
+      #2  0x000000008000057a in printk (fmt=fmt@entry=0x80007350 "scause=0x%lx sepc=0x%lx stval=0x%lx\n") at kernel/printk.c:71
+      #3  0x0000000080002758 in kerneltrap () at kernel/trap.c:151
+      #4  0x0000000080005648 in kernelvec () at kernel/kernelvec.S:38
+      (gdb) p/x $scause
+      $1 = 0xd
+      (gdb) p/x $stval
+      $2 = 0x400000000
+      (gdb) p/x $sepc
+      $3 = 0x8000072c
+      (gdb) x/2wx 0x80007908+23*8
+      0x800079c0 <first.1>:	0x00000000	0x00000004
+    why: |
+      The list starts at index 0, but the numbers start at 1. `read` is 5, and index 5 is the
+      sixth name, `kill`. The values are right; only the names are shifted.
+
+      The panic is the interesting part. The first traced call is `trace` itself, number 23,
+      and a 23-entry list has indices 0 to 22. `syscallnames[23]` reads the 8 bytes after the
+      array. In that build the array sits at `0x80007908` and its 184 bytes are followed by
+      `forkret`'s `static int first` (0 by now) and, in the next word, `nextpid` (address
+      `0x800079c4` from the symbol table; `x/2wx` showed it held 4), which
+      together make the "pointer" `0x400000000`. [[printk]]'s `%s` loop loads from it (the
+      `lbu` at `0x8000072c`), and the kernel page table maps nothing there: a load page fault
+      (`scause` 13) in supervisor mode, so [[kerneltrap]] runs. It finds no device
+      interrupt and calls `printk` to report `scause`, and that `printk` tries to acquire
+      `pr.lock`, which this hart already holds, because it faulted in the middle of a
+      `printk`. [[acquire]] notices that the holder is this very hart and panics
+      ([[kernel/spinlock.c:25]]) before the real report can print. The first run, where
+      `nextpid` was 5, faulted the same way at `0x500000000`.
+  - bug: Forgot the usys.pl entry
+    change: |
+      Everything else is in place (`syscall.h`, `user.h`, the kernel side), but `user/usys.pl`
+      has no `entry("trace");`.
+    symptom: |
+      ${TOOLPREFIX}ld -z max-page-size=4096 -T user/user.ld -o user/_trace user/trace.o user/ulib.o user/usys.o user/printf.o user/umalloc.o
+      ${TOOLPREFIX}ld: user/trace.o: in function `main':
+      ./user/trace.c:12:(.text+0x3e): undefined reference to `trace'
+      make: *** [user/_trace] Error 1
+    why: |
+      The compiler is satisfied: `user/user.h` declares `int trace(int)`, so `trace.c`
+      compiles to an object file with an unresolved call. The [[g:linker]] then looks for a
+      symbol named `trace` in `ulib.o`, `usys.o`, `printf.o` and `umalloc.o`, and nobody
+      defines it: the only definition would have been the stub that `usys.pl` generates. The
+      kernel side builds fine, because the kernel never refers to the user stub. (The line
+      number in the message is ld's approximation from the optimized code's debug
+      information; the call is on line 15. Your output shows your own toolchain prefix where
+      this one shows `${TOOLPREFIX}`.)
+  - bug: Declared the mask as a char
+    change: |
+      A learner saves space in `struct proc`:
+
+      ```diff
+      -  int tracemask;               // bit i set: trace system call i
+      +  char tracemask;              // bit i set: trace system call i
+      ```
+
+      Everything else is unchanged, including `p->tracemask & (1 << num)`.
+    symptom: |
+      $ tracetest
+      tracetest: trace returns the previous mask: FAIL
+      tracetest: fork copies the mask to the child: FAIL
+      tracetest: the child's trace(0) leaves the parent alone: FAIL
+      tracetest: exec keeps the mask: FAIL
+      tracetest: begin
+      tracetest: end
+      tracetest: expected between the markers, and nothing else:
+      3: syscall getpid -> 3
+      6: syscall getpid -> 6
+      tracetest: 4 FAILED
+      $ trace 32 grep hello README
+      7: syscall read -> 1023
+      7: syscall read -> 965
+      7: syscall read -> 453
+      7: syscall read -> 0
+      $ trace 65536 echo hi
+      hi
+      $
+    why: |
+      `p->tracemask = mask` silently keeps only the low 8 bits (C converts the `int` to
+      `char` without a warning under xv6's flags). So only system calls 1 to 7 can ever be
+      traced. `read` is 5, so `trace 32` works perfectly and hides the bug; `write` is 16,
+      and `1 << 16` truncates to 0. Every `tracetest` mask is above bit 7 (`uptime` is 14,
+      `getpid` is 11), so every check fails and nothing prints between the markers.
+
+      The shift itself is not the problem here: `1 << num` is an `int` shift and
+      fine for `num` up to 30. It would become one if you widened the mask to 64 bits to
+      support more than 31 system calls: then you need `1L << num`, because shifting an
+      `int` by 32 or more is undefined in C.
+  - bug: Forgot to add trace to UPROGS
+    change: |
+      The program is written, but the Makefile is unchanged:
+
+      ```diff
+         $U/_sync\
+      -  $U/_trace\
+         $U/_tracetest\
+      ```
+    symptom: |
+      $ trace 32 grep hello README
+      exec trace failed
+      $ tracetest
+      tracetest: trace returns the previous mask: OK
+      tracetest: fork copies the mask to the child: OK
+      tracetest: the child's trace(0) leaves the parent alone: OK
+      tracetest: exec keeps the mask: OK
+      tracetest: begin
+      4: syscall getpid -> 4
+      7: syscall getpid -> 7
+      tracetest: end
+      tracetest: expected between the markers, and nothing else:
+      4: syscall getpid -> 4
+      7: syscall getpid -> 7
+      tracetest: 4 checks OK; now compare the lines between the markers by eye
+    why: |
+      `make` builds only the user programs listed in `UPROGS`, and `mkfs` copies only those
+      into `fs.img`. The kernel is complete, which is why `tracetest` passes, but there is no
+      file `/trace` on the disk. The shell's child calls `exec("trace", ...)`, [[kexec]]'s
+      [[namei]] finds nothing and returns -1, and [[user:runcmd]] prints `exec trace failed`
+      ([[user/sh.c:80]]). The message comes from the shell, not from your program, which never
+      ran.
+reveal:
+  - title: A number both sides agree on
+    commit: 1
+    file: kernel/syscall.h
+    lines: 1-24
+    focus: 24
+    diff: true
+    state:
+      hart: 1
+      mode: U
+      proc: trace (pid 3)
+      intr: "on"
+      satp: user
+      locks: []
+      stack: [main, trace]
+      sp: {"on": user, detail: "the trace program's user stack"}
+    note: |
+      The story for this tour: you type `trace 2147483647 sh` at a fresh shell, then
+      `echo hi`, then Ctrl-D. That run was recorded on three harts. The `trace` program is
+      pid 3, running on hart 1; it becomes `sh` by `exec`, forks `echo` as pid 4, and the
+      first shell (pid 2) and `init` (pid 1) are asleep in `wait` meanwhile.
+
+      The first commit adds the number. `SYS_trace` is 23, the next free one. This header is
+      the only thing the kernel and user programs share about system calls: the kernel's
+      table is indexed by these constants, and the generated `user/usys.S` includes this same
+      file, so its `li a7, SYS_trace` assembles to `li a7,23`. The same commit adds
+      `int trace(int);` to [[user/user.h]] so that C programs can call it.
+
+      At this commit, a call to `trace` gets as far as [[syscall]] and no further: there is
+      no handler yet.
+  - title: The stub that makes the trap
+    commit: 1
+    file: user/usys.pl
+    lines: 9-46
+    focus: 19-21
+    diff: true
+    state:
+      hart: 1
+      mode: U
+      proc: trace (pid 3)
+      intr: "on"
+      satp: user
+      locks: []
+      stack: [main, trace]
+      sp: {"on": user, detail: "`ecall` does not change `sp`"}
+    note: |
+      `entry("trace")` makes this Perl script emit three instructions into `user/usys.S`:
+
+      ```text
+      trace:
+       li a7, SYS_trace
+       ecall
+       ret
+      ```
+
+      In the built `trace` program the stub is at address `0x3c0`, and its first instruction
+      is the 2-byte `li a7,23`. When `main` calls `trace(2147483647)`, the
+      [[g:calling-convention]] has already put the mask in `a0`; the stub adds the number in
+      `a7` and executes [[g:insn-ecall|ecall]]. From here the path is the one [[tour:5]]
+      follows in detail: [[uservec]] saves every register in the [[g:trapframe]], switches
+      to the kernel stack and page table, and jumps to [[usertrap]].
+
+      Forget this line and the C compiler still accepts `trace(...)` (the prototype is in
+      `user.h`), but the linker finds no `trace` symbol anywhere (clinic 4).
+  - title: usertrap hands the call to syscall()
+    commit: 1
+    file: kernel/trap.c
+    lines: 49-68
+    focus: 66-68
+    state:
+      hart: 1
+      mode: S
+      proc: trace (pid 3)
+      intr: "on"
+      satp: kernel
+      locks: []
+      stack: [usertrap]
+      sp: {"on": kernel, detail: "trace's kernel stack, holding only `usertrap`'s frame"}
+      irq: 0
+    note: |
+      Nothing in the trap path changes for a new system call. [[usertrap]] saw `scause` 8,
+      added 4 to the saved `epc` so the process will resume after the `ecall`, and turned
+      interrupts back on (line 66). Then it calls [[syscall]].
+
+      That `intr_on` matters for everything `trace` adds. From here on, a timer interrupt can
+      arrive between any two instructions, and [[kerneltrap]] may [[yield]]: the process can
+      stop in the middle of `sys_trace` or the print, and continue on hart 0 or hart 2. So
+      any state the new code uses must belong to the *process* (its `struct proc`, its
+      trapframe), never to the hart.
+
+      The stack is `trace`'s kernel stack. It was empty when the trap arrived (every
+      return to user space resets `kernel_sp` to the top), and `uservec` loaded it at
+      [[kernel/trampoline.S:76]]; see [[concept:stacks#kernel]].
+    others: |
+      Hart 0 and hart 2 are idle in their schedulers: each scan takes every slot's
+      `p->lock`, finds nothing RUNNABLE, and the hart waits in `wfi` until an interrupt
+      ([[kernel/proc.c:463]]). They never touch pid 3's trapframe or its future mask:
+      a process's own fields are used only by the hart running it.
+  - title: Without a table entry, 23 is unknown
+    commit: 1
+    file: kernel/syscall.c
+    lines: 136-151
+    focus: 142-150
+    state:
+      hart: 1
+      mode: S
+      proc: trace (pid 3)
+      intr: "on"
+      satp: kernel
+      locks: []
+      stack: [usertrap, syscall]
+      sp: kernel
+      irq: 0
+    note: |
+      [[syscall]] reads the number from the saved `a7`: 23. At commit 1, `syscalls[]` has 23
+      slots (0 to 22), so `num < NELEM(syscalls)` fails, and the `else` branch prints the
+      message and stores -1 in the saved `a0`. (The `trace` command does not exist yet at
+      this commit. A run of a commit-1 kernel with a tiny test program called `t1` that
+      calls `trace(5)` printed `3 t1: unknown sys call 23`, and the program saw -1.)
+
+      This is the kernel's only defence against a bad number, and it is enough: a program can
+      put anything in `a7`, but the kernel only ever indexes the table after this range check
+      and the null check. Notice also line 146: whatever a handler returns goes into
+      `p->trapframe->a0`. That one line is how every system call returns a value, and the
+      print we add later must come after it.
+  - title: The mask is private to the process
+    commit: 2
+    file: kernel/proc.h
+    lines: 81-105
+    focus: 95-104
+    diff: true
+    state:
+      hart: 1
+      mode: S
+      proc: trace (pid 3)
+      intr: "on"
+      satp: kernel
+      locks: []
+      stack: [usertrap, syscall, sys_trace]
+      sp: kernel
+      irq: 0
+    note: |
+      The mask is state of one process, so it lives in `struct proc`. The struct is divided
+      by lock: fields that other processes or interrupt handlers read or write (`state`,
+      `chan`, `killed`, `xstate`, `pid`) need `p->lock`; `parent` needs `wait_lock`; the rest
+      are "private to the process": only the process itself uses them, so no lock is needed.
+
+      `tracemask` goes in the private section, next to `name`. Only two pieces of code ever
+      touch a process's own mask, `sys_trace` and `syscall()`, and both run *as* that
+      process. An xv6 process has one thread and runs on at most one hart at a time, so
+      there is never a second party. The exceptions are `kfork` (which writes a child's
+      mask before the child can run) and [[freeproc]] (which clears it, under `p->lock`,
+      when the process is gone), both coming up.
+
+      The state shown is for the moment `sys_trace` uses the field, two steps from now.
+  - title: sys_trace swaps the mask
+    commit: 2
+    file: kernel/sysproc.c
+    lines: 102-126
+    focus: 114-126
+    diff: true
+    state:
+      hart: 1
+      mode: S
+      proc: trace (pid 3)
+      intr: "on"
+      satp: kernel
+      locks: []
+      stack: [usertrap, syscall, sys_trace]
+      sp: kernel
+      irq: 0
+    note: |
+      The handler is four lines. [[argint]] fetches argument 0, the mask, from the
+      trapframe; the old mask is saved and the new one installed; the old one is returned,
+      and [[syscall]] stores it in `p->trapframe->a0`.
+
+      Returning the previous mask costs nothing and makes the feature testable: a program
+      cannot read the console, but it can call `trace(m)` twice and check that the second
+      call returns `m`. `tracetest` is built on that.
+
+      Compare `sys_uptime` just above it: it takes `tickslock`, because `ticks` is shared
+      with the timer interrupt on hart 0. `sys_trace` takes no lock, for the reason in the
+      last step. If the timer fires between lines 123 and 124 and the process resumes on
+      hart 2, nothing is lost: the values are in `sys_trace`'s frame on the process's kernel
+      stack, which moves with it.
+    others: |
+      Hart 0 is running its scheduler; hart 2 might be running another process's system
+      call through these very functions, with its own `p`. Same code, different `struct
+      proc`, so no conflict, the same per-process trick [[tour:5]] shows for the trapframe.
+  - title: argint reads the saved a0
+    commit: 2
+    file: kernel/syscall.c
+    lines: 33-77
+    focus: 56-61
+    state:
+      hart: 1
+      mode: S
+      proc: trace (pid 3)
+      intr: "on"
+      satp: kernel
+      locks: []
+      stack: [usertrap, syscall, sys_trace, argint]
+      sp: kernel
+      irq: 0
+    note: |
+      [[argint]] is a one-line wrapper around [[argraw]], which picks the saved register out
+      of the trapframe: argument 0 is `p->trapframe->a0`, the value `uservec` saved from the
+      user's `a0`, here 2147483647. The assignment to `int` keeps the low 32 bits.
+
+      No check is needed, because every `int` is a meaningful mask: bits that match no system
+      call are simply never tested. That is a luxury. Look at [[argaddr]] just below: it
+      fetches a pointer the same way and, as its comment says, does *not* check it. A user
+      pointer means something only in the user's page table; the kernel copies through it
+      with [[copyin]] or [[copyout]], which translate and check every page
+      ([[tour:28]]). `trace` takes an `int` precisely so that none of that is needed.
+  - title: Registering the handler
+    commit: 2
+    file: kernel/syscall.c
+    lines: 104-153
+    focus: 106-136
+    diff: true
+    state:
+      hart: 1
+      mode: S
+      proc: trace (pid 3)
+      intr: "on"
+      satp: kernel
+      locks: []
+      stack: [usertrap, syscall]
+      sp: kernel
+      irq: 0
+    note: |
+      Two lines make the kernel side reachable: an `extern` prototype (the function is
+      defined in `sysproc.c`) and `[SYS_trace] = sys_trace` in the table of
+      [[g:function-pointer|function pointers]].
+
+      The table uses [[g:designated-initializer|designated initializers]]: the index is
+      written out, so the order of the lines does not matter, an unused slot (0) is a null
+      pointer, and the array's size is the highest index plus one, now 24. The range check on
+      line 145 therefore lets 23 through, and line 148 calls `sys_trace`. The `trace` call
+      now returns the old mask (0) instead of -1, with no message.
+  - title: freeproc clears the mask
+    commit: 2
+    file: kernel/proc.c
+    lines: 152-172
+    focus: 170
+    diff: true
+    state:
+      hart: 1
+      mode: S
+      proc: sh (pid 3)
+      intr: "off"
+      satp: kernel
+      locks: [wait_lock, "echo's p->lock (pid 4)"]
+      stack: [usertrap, syscall, sys_wait, kwait, freeproc]
+      sp: kernel
+      irq: {noff: 2, intena: 1}
+    note: |
+      Jump ahead in the story: `echo` (pid 4) has exited, and `sh` (pid 3, the old `trace`
+      process) reaps it in [[kwait]]. `kwait` holds `wait_lock` and the child's `p->lock`
+      when it calls [[freeproc]], so `noff` is 2 and interrupts are off; `intena` is 1
+      because the first `acquire` happened with interrupts on, inside a system call.
+
+      `freeproc` returns the slot to UNUSED and resets its fields, and the commit adds the
+      mask to the list. Strictly, nothing at this commit needs it: [[allocproc]] has two
+      callers, `kfork`, which will overwrite the field, and `userinit`, which runs at boot
+      when every slot is zero. But a field left behind is a trap for the next person who
+      calls `allocproc`: a brand-new process would start out traced by a stranger's mask.
+    others: |
+      While `kwait` holds the child's `p->lock`, a scheduler on hart 0 or hart 2 that
+      reaches this slot in its scan spins in `acquire` until `freeproc` has finished and the
+      lock is released, then sees UNUSED and moves on. That is why `freeproc` requires
+      `p->lock`: the scheduler reads `state` under it.
+  - title: kfork copies the mask while it holds the child's lock
+    commit: 3
+    file: kernel/proc.c
+    lines: 256-308
+    focus: 291-298
+    diff: true
+    state:
+      hart: 1
+      mode: S
+      proc: sh (pid 3)
+      intr: "off"
+      satp: kernel
+      locks: ["echo's np->lock (pid 4)"]
+      stack: [usertrap, syscall, sys_fork, kfork]
+      sp: kernel
+      irq: {noff: 1, intena: 1}
+    note: |
+      `sh` has read `echo hi` and forks. [[allocproc]] found an UNUSED slot and returned it
+      **with `np->lock` held**: one spinlock, `noff` 1, interrupts off. `kfork` keeps it
+      through the copying ([[uvmcopy]], the trapframe, [[filedup]], [[idup]], the name) and
+      now the mask, then releases it on line 298.
+
+      Reading `p->tracemask` needs no lock: `p` is `sh`, the process running this code, and
+      the field is private to it. Writing `np->tracemask` is safe for two reasons at once:
+      the child is still USED, not RUNNABLE, so no scheduler will run it, and its lock is
+      held anyway. This is exactly the reasoning that lets `kfork` set `np->sz` and
+      `np->ofile[]` here.
+
+      `exec` needs no change at all. [[kexec]] builds a new address space but keeps the
+      `struct proc`, so the mask set by `trace` before `exec("sh", ...)` is still there when
+      `sh` starts, and here it passes to `echo`.
+    others: |
+      A scheduler on hart 0 or 2 may reach this slot in its scan right now. It calls
+      `acquire(&p->lock)` on the same lock and spins until line 298 releases it. Then it sees
+      USED, not RUNNABLE, and moves on. Only after line 305 sets RUNNABLE (under the lock
+      again) can a hart pick up `echo`. The lock order matters too: `kfork` releases
+      `np->lock` before taking `wait_lock` (line 300), because the rule is `wait_lock`
+      before `p->lock` ([[concept:locks#unusual]]).
+  - title: A names table indexed like the handler table
+    commit: 4
+    file: kernel/syscall.c
+    lines: 136-165
+    focus: 138-165
+    diff: true
+    state:
+      hart: 1
+      mode: S
+      proc: sh (pid 3)
+      intr: "on"
+      satp: kernel
+      locks: []
+      stack: [usertrap, syscall]
+      sp: kernel
+      irq: 0
+    note: |
+      The output needs `read`, not 5. The names table uses the same designated initializers
+      as `syscalls[]`, so name *i* is the name of system call *i* by construction, slot 0 is
+      empty in both, and both arrays have 24 slots. The range check in [[syscall]] protects
+      both indexings.
+
+      Written as a plain list starting with `"fork"`, the table would be one slot early
+      everywhere and one slot short at the end. Clinic 3 ran that mistake: `read` printed as
+      `kill`, and the first lookup of number 23 read the 8 bytes after the array as a
+      pointer and brought the kernel down.
+
+      Both the strings and, in this build, the array itself land in `.rodata` (`syscallnames`
+      at `0x80007908`, right after `syscalls`): the compiler sees that nothing writes the
+      array, even though it is not declared `const`. Nothing ever writes either, so three
+      harts can read them with no lock.
+  - title: Print after the call, when the result is known
+    commit: 4
+    file: kernel/syscall.c
+    lines: 166-185
+    focus: 177-180
+    diff: true
+    state:
+      hart: 1
+      mode: S
+      proc: sh (pid 3)
+      intr: "on"
+      satp: kernel
+      locks: []
+      stack: [usertrap, syscall]
+      sp: kernel
+      irq: 0
+    note: |
+      The heart of the feature: one `if` guarding a `printk`, right after line 177. When the handler returns, its
+      result is in `p->trapframe->a0`; if bit `num` of the mask is set, one `printk` reports
+      pid, name and that value. In the recorded run, `sh` reading `echo hi` one byte at a
+      time printed `3: syscall read -> 1` eight times, then `3: syscall fork -> 4`.
+
+      Why here and nowhere else: this is the one function every system call passes through,
+      and line 177 is the first moment the return value exists. One line earlier, `a0` still
+      holds the first argument (clinic 2 printed `read -> 3`, the descriptor).
+
+      Three consequences of "after": a successful `exit` prints nothing, because [[kexit]]
+      never returns here; `trace` traces itself under the *new* mask; and a call that slept
+      (a `read` from the console, a `wait`) prints when it finally returns, perhaps on a
+      different hart from the one it started on. `p` stays correct across that move,
+      because it names the process, not the hart.
+
+      `%ld` prints the 64-bit `a0` as signed, so `-1` reads as `-1`; `1 << num` is an `int`
+      shift, fine for numbers below 31.
+  - title: Inside printk, pr.lock keeps the line whole
+    commit: 4
+    file: kernel/printk.c
+    lines: 62-78
+    focus: 70-76
+    state:
+      hart: 1
+      mode: S
+      proc: sh (pid 3)
+      intr: "off"
+      satp: kernel
+      locks: [pr.lock]
+      stack: [usertrap, syscall, printk]
+      sp: kernel
+      irq: {noff: 1, intena: 1}
+    note: |
+      [[printk]] acquires `pr.lock` for the whole line. `acquire` first called
+      [[push_off]]: interrupts are off and `noff` is 1, with `intena` 1 because they were on
+      when the system call started. Each character goes through [[consputc]] to
+      [[uartputc_sync]], which pushes one level deeper (`noff` 2) and spins until the UART
+      can take the byte. So a trace line of about 25 characters means about 25 waits on a device register with
+      interrupts off; at the 38,400 baud that [[uartinit]] programs, a real UART would need
+      about 6.5 milliseconds for it.
+
+      What the lock guarantees: no other `printk` (another trace line, a `usertrap` message
+      from another hart) can put a character between these characters.
+      What it does not guarantee: user output does not take `pr.lock`. See the next box.
+    others: |
+      Hart 2 may be in `printk` for another traced process at this moment: it spins in
+      `acquire(&pr.lock)` until hart 1's line is done, so the two lines come out one after
+      the other. But if hart 2 is running `cat` instead, its `write` goes through
+      [[consolewrite]] and [[uartwrite]], which take the sleep-lock `tx_lock`, not `pr.lock`.
+      Both harts then feed the same UART, one byte at a time, and the bytes interleave. A
+      recorded run of `cat README &; trace 65536 echo hello` printed, in the middle of the
+      README:
+
+      ```text
+      Marcelo helloArroyo, Hirb3: syscall od Bwehritena -> m, S5il
+      as
+      ```
+
+      That is `Hirbod Behnam, Silas` from `cat`, `hello` from `echo` (between two of `cat`'s
+      32-byte batches), and `3: syscall write -> 5` from the kernel, interleaved byte by
+      byte.
+  - title: The value reaches user space in a0
+    commit: 4
+    file: kernel/trampoline.S
+    lines: 114-153
+    focus: 148-149
+    state:
+      hart: 1
+      mode: S
+      proc: sh (pid 3)
+      intr: "off"
+      satp: user
+      locks: []
+      stack: [userret]
+      sp: {"on": none, detail: "`sp` holds the user's stack pointer again (line 118), which S-mode cannot use until `sret`"}
+      irq: 0
+    note: |
+      The way back is unchanged by this lab, and it is where the printed value goes next.
+      [[usertrap]] called [[prepare_return]] (which turned interrupts off), then returned the
+      user `satp` in `a0` to `uservec`'s `jalr` ([[kernel/trampoline.S:98]]), which falls
+      straight into [[userret]]. `userret` installed that `satp` at line 111: the user page
+      table is now in use.
+
+      `userret` reloads every register from the trapframe, and `a0` last (line 149), because
+      `a0` held the trapframe's address until then. The value it loads is the one line 177
+      of `syscall.c` stored and the trace line printed. So the number in the trace line is,
+      by construction, exactly what the program receives: `read` returns 1 in `a0`, `gets`
+      stores the byte, and the shell goes on reading.
+
+      Here `sp` holds `sh`'s user stack pointer again (since line 118), but the hart is
+      still in supervisor mode, which cannot use user pages: no usable stack until `sret`
+      ([[concept:stacks#none]]).
+  - title: The child returns from fork without syscall()
+    commit: 4
+    file: kernel/proc.c
+    lines: 512-547
+    focus: 542-546
+    state:
+      hart: 2
+      mode: S
+      proc: echo (pid 4)
+      intr: "off"
+      satp: kernel
+      locks: []
+      stack: [forkret]
+      sp: {"on": kernel, detail: "pid 4's fresh kernel stack: only `forkret`'s frame"}
+      irq: 0
+    note: |
+      Why does the recorded run show `3: syscall fork -> 4` and no line for the child? Here,
+      on hart 2 in this story, the scheduler picked `echo` (pid 4) and [[swtch]] landed on
+      the `ra` that [[allocproc]] set: [[forkret]], on a fresh, empty kernel stack. `forkret`
+      released the `p->lock` the scheduler handed over; that lock was acquired with
+      interrupts off (`intena` 0), so they stay off. It then goes straight to
+      [[prepare_return]] and [[userret]].
+
+      The child never made a system call: it has no `ecall`, no `usertrap`, no `syscall()`
+      frame. Its "return value" 0 was written into its copy of the trapframe by `kfork`. So
+      there is no point at which the trace check could run for it. Its first traced line is
+      its own next call: `4: syscall sbrk -> 20480` (the shell's child allocates memory while
+      parsing the command), then `4: syscall exec -> 2`.
+    others: |
+      Meanwhile `sh` (pid 3) has returned from `fork` on hart 1 and called `wait`, where it
+      sleeps until `echo` exits. Its trace line for `wait` (`3: syscall wait -> 4`) comes
+      only after `echo`'s writes, because the call returns only then.
+  - title: The trace command is set-mask-then-exec
+    commit: 5
+    file: user/trace.c
+    lines: 1-20
+    focus: 15-19
+    diff: true
+    state:
+      hart: 1
+      mode: U
+      proc: trace (pid 3)
+      intr: "on"
+      satp: user
+      locks: []
+      stack: [main]
+      sp: user
+    note: |
+      The command is ten lines of logic, and all the work is done by where the mask lives.
+      `trace(atoi(argv[1]))` sets the mask of *this* process; `exec(argv[2], &argv[2])`
+      replaces this process's program but keeps its `struct proc`, mask included. So the
+      command runs traced from its first instruction, and so does every child it forks.
+
+      If `exec` returns at all, it failed, so the program reports it and exits. [[atoi]]
+      accepts only decimal digits, which is why the usage check looks at the first character;
+      `2147483647` (bits 0 to 30) is the way to say "everything".
+
+      In the recorded run, the first two lines come from this program before and during the
+      `exec`: `3: syscall trace -> 0` (the trace bit is set, and the check runs after the new
+      mask is installed) and `3: syscall exec -> 1`, printed by the kernel as `exec` returns, when the process's
+      memory already holds `sh` (which has not run an instruction yet) and the return value
+      is its `argc`, 1.
+  - title: The test checks what a program can see
+    commit: 6
+    file: user/tracetest.c
+    lines: 55-96
+    focus: 64-89
+    diff: true
+    state:
+      hart: 1
+      mode: U
+      proc: tracetest (pid 3)
+      intr: "on"
+      satp: user
+      locks: []
+      stack: [main]
+      sp: user
+    note: |
+      A user program cannot read the console, so `tracetest` tests through `trace`'s return
+      value. Lines 64 to 69: set a mask and read it back; fork a child that reads it with
+      `trace(0)` and reports through its [[g:exit-status]]; check the child's `trace(0)` did
+      not touch the parent; fork a child that `exec`s `tracetest exec`, which checks the mask
+      and exits 0 or 1. Each check prints OK or FAIL.
+
+      Lines 74 to 89 cover the printing, checked by eye: only `getpid` (bit 11) is traced, and
+      while the mask is set the parent calls `getpid`, `uptime`, `fork`, `wait` and finally
+      `trace(0)` (bit 23 is clear), and the child calls `getpid` and `exit`; only the two
+      `getpid`s print. The markers are printed outside that window. The parent waits for the child before `trace(0)`, so the order is
+      fixed. Then it prints the lines that should have appeared.
+
+      `$U/_trace` and `$U/_tracetest` are in `UPROGS`, so `mkfs` puts both in `fs.img`.
+verify: |
+  On the branch, on three harts (QEMU `-smp 3`), `tracetest` passes:
+
+  ```text
+  $ tracetest
+  tracetest: trace returns the previous mask: OK
+  tracetest: fork copies the mask to the child: OK
+  tracetest: the child's trace(0) leaves the parent alone: OK
+  tracetest: exec keeps the mask: OK
+  tracetest: begin
+  3: syscall getpid -> 3
+  6: syscall getpid -> 6
+  tracetest: end
+  tracetest: expected between the markers, and nothing else:
+  3: syscall getpid -> 3
+  6: syscall getpid -> 6
+  tracetest: 4 checks OK; now compare the lines between the markers by eye
+  ```
+
+  Compared by eye, the two traced lines are exactly the expected ones, and the untraced `uptime`, `fork` and
+  `wait` calls in that window printed nothing. And the rest of the kernel is
+  unharmed:
+
+  ```text
+  $ usertests -q
+  usertests starting
+  ...
+  test lazy_sbrk: OK
+  test partial_write: OK
+  test unlinkcwd: OK
+  ALL TESTS PASSED
+  ```
+
+  (`tracetest` run again after `usertests` passed too, with pids 6653 and 6656.) No process
+  in `usertests` sets a mask, so the only cost to an untraced process is a few instructions per
+  system call in [[syscall]] (load the mask, shift, test).
+measure: |
+  **How many system calls does `ls` make?** `trace 2147483647 ls` in `/` (26 entries)
+  printed **808** lines: 1 `trace` (by the `trace` program, before the exec), 1 `exec`, then
+  `ls` itself made 65 `read`s (64 directory entries of 16 bytes and one end-of-file read), 27
+  `open`s, 27 `fstat`s, 27 `close`s (one set for `.` and one per entry, through [[user:stat]])
+  and **660 `write`s of 1 byte each**. User-space `printf` calls `write` once per character
+  ([[user/printf.c:12]]), so more than four out of five of the system calls `ls` makes print one character, each paying
+  for a full trap, two `satp` switches and a return.
+
+  **What does the shell do for one command?** `trace 2147483647 sh`, then `echo hi`, then
+  Ctrl-D: 21 lines in all.
+
+  ```text
+  3: syscall trace -> 0
+  3: syscall exec -> 1
+  3: syscall open -> 3
+  3: syscall close -> 0
+  $ 3: syscall write -> 2
+  echo hi
+  3: syscall read -> 1          (eight of these: "echo hi\n", one byte per read)
+  3: syscall fork -> 4
+  4: syscall sbrk -> 20480
+  4: syscall exec -> 2
+  hi4: syscall write -> 2
+
+  4: syscall write -> 1
+  3: syscall wait -> 4
+  $ 3: syscall write -> 2
+  3: syscall read -> 0
+  ```
+
+  For one command, the shell makes 11 calls (8 one-byte `read`s in [[user:gets]], `fork`,
+  `wait`, and the prompt's `write`), and the child makes 4 visible ones: `sbrk`, because the
+  child parses the command and `malloc` grows the heap; `exec`; and `echo`'s two `write`s. The
+  `open`/`close` pair at the start is the shell making sure descriptors 0 to 2 are open
+  ([[user/sh.c:152]]). Neither `exit` prints, and neither does the child's return from `fork`.
+
+  **Interleaving on three harts.** `cat README &; trace 65536 echo hello` printed, in the
+  middle of the README, `Marcelo helloArroyo, Hirb3: syscall od Bwehritena -> m, S5il` and,
+  a line later, `carlc` / `3: syscall write ->lo 1` / `ne`: the kernel's trace lines and
+  `cat`'s text alternated byte by byte, because `printk` and `uartwrite` do not share a lock.
+further: |
+  - **Print the arguments too.** `read(3, 0x1010, 1023) -> 1023` (`0x1010` is `grep`'s buffer) needs a per-call
+    description of the arguments (how many, which are strings). Teaches how [[argstr]] and
+    [[fetchstr]] copy strings safely from user memory, and why the kernel must copy them
+    *before* the call (after `exec`, the old memory is gone).
+  - **Trace other processes.** `trace -p PID MASK` sets another process's mask. Now the field
+    is no longer private: it moves to the `p->lock` section, and both `sys_trace` and
+    `syscall()` must take the lock. Teaches why the private/locked split in `struct proc`
+    exists, and what a lock on the hottest path costs.
+  - **Keep trace lines out of user output.** Make `printk` and `uartwrite` exclude each
+    other, then decide whether a process may sleep holding the lock that `printk` needs.
+    Teaches the spinlock/sleep-lock boundary in [[concept:locks#rules]].
+  - **Count instead of print.** Keep per-process counters of each system call and print a
+    summary when the process exits (like `strace -c`). Teaches where in [[kexit]] a process
+    can still safely print, and what happens to the counters across `fork`.
+  - **More than 31 system calls.** Widen the mask to `uint64` and fix every shift. Teaches
+    C's integer promotion rules and why `1 << 31` is already undefined for an `int`.

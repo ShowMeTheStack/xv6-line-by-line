@@ -1,0 +1,269 @@
+summary: |
+  The kernel's implementation of [[g:pipe|pipes]]: a small in-kernel buffer that one process
+  writes bytes into and another reads them out of, in order. Pipes are how the shell connects
+  commands: in `ls | wc`, `ls` writes into a pipe and `wc` reads from the other end
+  ([[user/sh.c]]).
+
+  A pipe is a [[pipe]] structure holding a 512-byte circular buffer, two byte counters, two
+  "is this end still open" flags, and a [[g:spinlock]] protecting all of them. Each end is an
+  ordinary [[g:open-file]] of type `FD_PIPE` pointing at the structure, so the rest of the
+  kernel treats pipes like any other file: [[fileread]], [[filewrite]] and [[fileclose]] in
+  [[kernel/file.c]] call [[piperead]], [[pipewrite]] and [[pipeclose]].
+
+  The interesting part is waiting. A reader with nothing to read, or a writer facing a full
+  buffer, must sleep until the other side acts. The file shows the full
+  [[g:sleep-wakeup]] pattern of this xv6 version ([[sleep_prepare]], [[sleep]], [[wakeup]])
+  with two channels, one for readers and one for writers.
+
+  **Read before:** [[kernel/file.c]], and [[kernel/proc.c]] for sleep and wakeup. **Read
+  next:** [[sys_pipe]] in [[kernel/sysfile.c]], which creates pipes for user programs.
+
+blocks:
+  - lines: 1-9
+    title: Headers
+    note: |
+      [[kernel/file.h]] defines `struct file`, whose `pipe` field points at the structure
+      below. It needs `struct sleeplock` (for the inode it also declares), hence
+      [[kernel/sleeplock.h]] and [[kernel/fs.h]] before it.
+
+  - lines: 11-20
+    title: The pipe structure
+    note: |
+      `data` is a circular buffer of [[PIPESIZE]] (512) bytes. Instead of a "head" and a
+      "tail" index, the pipe keeps two ever-increasing counters: `nwrite`, the total number
+      of bytes ever written, and `nread`, the total ever read. Then:
+
+      - the number of bytes waiting in the buffer is `nwrite - nread`, always between 0 and
+        512;
+      - the buffer is empty when `nread == nwrite`, and full when
+        `nwrite == nread + PIPESIZE`;
+      - byte number `k` of the stream lives at `data[k % PIPESIZE]`.
+
+      With head and tail indices that wrap at 512, "empty" and "full" would both look like
+      "head equals tail"; the counters make the two cases different.
+
+      The counters are `uint` and do wrap around after 2^32 bytes. That is harmless: unsigned
+      arithmetic in C is done modulo 2^32, so `nwrite - nread` and the full test
+      stay correct across the wrap, and since 512 divides 2^32 evenly, `k % PIPESIZE` picks
+      the same slot before and after.
+
+      `readopen` and `writeopen` record whether each end still has an open file. They decide
+      when a reader sees end-of-file, when a writer gets an error, and when the pipe can be
+      freed. `lock` protects every field.
+
+  - lines: 22-30
+    title: "pipealloc(): make a pipe and its two ends"
+    note: |
+      Called by [[sys_pipe]]. It produces two [[g:open-file|open files]], `*f0` for reading
+      and `*f1` for writing, sharing one new pipe.
+
+      `*f0` and `*f1` are set to 0 first so that the failure path can tell which allocations
+      happened. [[filealloc]] takes entries from the system-wide file table; it can fail if
+      all [[NFILE]] (100) are in use.
+
+  - lines: 31-46
+    title: Allocate and initialize the pipe
+    note: |
+      The pipe structure gets a whole [[g:page]] from [[kalloc]]. It needs only a little over
+      512 bytes, so most of the 4096 are wasted, but `kalloc` is the only memory allocator the
+      kernel has: it hands out whole pages and nothing smaller.
+
+      Both ends start open and the buffer empty. Then the two open files are filled in: the
+      first readable only, the second writable only, both pointing at the pipe. Because
+      [[fileread]] and [[filewrite]] check `readable` and `writable`, reading from the write
+      end (or writing to the read end) fails with -1 before any pipe code runs.
+
+      Each open file starts with a [[g:reference-count]] of 1 (set by [[filealloc]]), owned
+      by the caller.
+
+  - lines: 48-56
+    title: Failure path
+    note: |
+      Undo whatever was allocated. At this point the open files still have type `FD_NONE`
+      (they were never filled in), so [[fileclose]] only returns them to the file table and
+      does not try to close a pipe.
+
+  - lines: 58-74
+    title: "pipeclose(): one end is closed"
+    note: |
+      Called by [[fileclose]] when the last reference to one end's open file goes away
+      (`writable` says which end). The pipe records that the end is closed and wakes anyone
+      waiting on the *other* side, because their situation has changed:
+
+      - **Write end closed.** A reader sleeping on an empty pipe must wake up and see
+        end-of-file (read returns 0) instead of sleeping forever. Readers sleep on the
+        channel `&pi->nread`.
+      - **Read end closed.** A writer sleeping on a full pipe must wake up and fail, since
+        nobody will ever drain the buffer. Writers sleep on `&pi->nwrite`.
+
+      When both ends are closed nobody can reach the pipe any more, and its page is freed.
+      The lock must be released *before* [[kfree]]: the lock lives inside the page, and
+      `kfree` fills the page with junk bytes, so releasing afterwards would write into freed
+      memory.
+
+  - lines: 76-87
+    title: "pipewrite(): copy n bytes from user memory into the pipe"
+    note: |
+      Called by [[filewrite]] for a pipe's write end. `addr` is a user virtual address. The
+      loop runs until all `n` bytes are in the pipe, sleeping whenever the buffer is full; so
+      a large write may be delivered in several pieces, with reads interleaved.
+
+      The pipe's lock is held throughout, except while sleeping. Each time around, the writer
+      first checks whether it should give up:
+
+      - the read end is closed: no one will ever read, so the write fails with -1;
+      - the process has been killed ([[killed]]): return -1 so that it can exit instead of
+        waiting.
+
+      Either way the return value is -1 even if some bytes were already written.
+
+  - lines: 88-93
+    title: Buffer full, so wake the reader and sleep
+    note: |
+      When the buffer holds 512 unread bytes, the writer cannot continue. It first wakes any
+      reader (`&pi->nread`), since there is plenty to read, then sleeps on its own channel,
+      `&pi->nwrite`, until a reader makes room.
+
+      The order of the three calls is what prevents a **lost wakeup**. [[sleep_prepare]]
+      records "this process waits on `&pi->nwrite`" while the pipe lock is still held. Only
+      then is the lock released. If a reader now drains the buffer and calls
+      `wakeup(&pi->nwrite)` before this process has actually gone to sleep, [[wakeup]] still
+      finds the registration and clears it, and [[sleep]] then returns at once instead of
+      sleeping. Had the lock been released before registering, that wakeup could arrive in
+      the gap and be missed. The writer would then sleep on a buffer that is in fact empty,
+      and the reader, finding nothing more to read, would go to sleep too: both asleep
+      forever.
+
+      After waking the writer re-takes the lock and goes round the loop again, rechecking
+      everything: a wakeup only means "something changed", not "there is room".
+
+  - lines: 94-104
+    title: Copy one byte
+    note: |
+      With room in the buffer, one byte is copied from user memory with [[copyin]] and
+      stored at slot `nwrite % PIPESIZE`; then `nwrite` advances. Copying a byte at a time
+      is slow but simple: it never has to split a copy at the buffer's wrap-around point or
+      at a full buffer.
+
+      [[copyin]] fails if `addr + i` is not valid memory of this process. Then the write
+      stops: if nothing was written yet, it reports -1; otherwise it reports the bytes that
+      did go in.
+
+      `copyin` is called while the pipe's [[g:spinlock]] is held. That is allowed only
+      because `copyin` never sleeps: at worst it allocates and maps a page for a lazily
+      grown heap ([[vmfault]]), which does not sleep.
+
+  - lines: 105-109
+    title: Wake readers and return
+    note: |
+      Any bytes written may be what a sleeping reader is waiting for, so readers are woken
+      on the way out. The return value is the number of bytes written, normally `n`.
+
+  - lines: 111-128
+    title: "piperead(): wait until there is something to read"
+    note: |
+      Called by [[fileread]] for a pipe's read end. The loop sleeps while the pipe is empty
+      **and** the write end is still open. It stops in two cases:
+
+      - there is data: go and copy it;
+      - the buffer is empty and the write end is closed: no data will ever come. The copy
+        loop below then copies nothing and `read` returns 0, which programs understand as
+        end-of-file.
+
+      A killed process returns -1 instead of waiting. Sleeping uses the same
+      [[sleep_prepare]] / release / [[sleep]] sequence as [[pipewrite]], on the readers'
+      channel `&pi->nread`, so a wakeup arriving between the release and the sleep is not
+      lost.
+
+      Unlike the writer, the reader does not wait for all `n` bytes: as soon as any data is
+      present it returns what is there. That is the Unix rule for pipes, and the reason
+      programs must call `read` in a loop.
+
+  - lines: 129-143
+    title: Copy out what is available, then wake writers
+    note: |
+      Up to `n` bytes are moved, one at a time, from slot `nread % PIPESIZE` to the user's
+      buffer with [[copyout]], stopping early when the buffer runs empty. `nread` is
+      advanced only after the byte was successfully copied, so a failed copy does not
+      lose data from the pipe.
+
+      Taking data out makes room, so writers sleeping on a full pipe are woken
+      (`&pi->nwrite`). The result is the number of bytes read, or -1 if the very first copy
+      failed.
+
+      The `//DOC:` comments in this file are labels, not explanations: the xv6 book locates
+      these lines by searching for the label text and cites their line numbers. They have no effect on the code.
+
+lines:
+  11: |
+    The buffer size: at most 512 bytes can be written before a reader must take some out.
+  16: |
+    Total bytes ever read; the next byte to read is at `data[nread % PIPESIZE]`.
+  17: |
+    Total bytes ever written; the next free slot is `data[nwrite % PIPESIZE]`.
+  29: |
+    Allocate both open files. `||` stops at the first failure, so `*f1` stays 0 if `*f0`
+    could not be allocated.
+  31: |
+    One page for the pipe structure; the cast turns the `char *` from [[kalloc]] into a
+    `struct pipe *`.
+  37: |
+    Initialize the pipe's [[g:spinlock]]. The name "pipe" is stored in the lock for
+    debugging; no code in this version prints it.
+  38: |
+    `*f0` is a pipe end that can only be read.
+  42: |
+    `*f1` is a pipe end that can only be written.
+  61: |
+    Every update to the open flags is made under the pipe's lock, so a reader or writer
+    checking them sees a consistent state.
+  64: |
+    The write end is gone: wake readers so they can see end-of-file.
+  67: |
+    The read end is gone: wake writers so they can fail.
+  69: |
+    Both ends closed: nothing refers to the pipe any longer.
+  71: |
+    Return the pipe's page to the allocator, after the lock was released.
+  82: |
+    All checks and updates of the pipe's fields below happen under this lock.
+  84: |
+    Give up if no reader can ever take the data, or if this process was killed.
+  88: |
+    Full: exactly 512 bytes are waiting.
+  89: |
+    Make sure a reader is awake to drain the buffer.
+  90: |
+    Register as waiting on the writers' channel, still holding the pipe lock.
+  91: |
+    Release the lock so that a reader can get in.
+  92: |
+    Sleep, unless a wakeup already arrived since line 90.
+  93: |
+    Re-take the lock before looking at the pipe again.
+  96: |
+    Copy one byte from the user's buffer into `ch`. `pr->sz` tells [[copyin]] the size of
+    the process's memory, so it can reject or lazily map addresses.
+  101: |
+    Store the byte in the next free slot and count it. `nwrite++` uses the old value as the
+    index, then increments.
+  105: |
+    Wake readers: there may now be data for them.
+  119: |
+    Wait while the pipe is empty and a writer might still add data.
+  120: |
+    A killed process stops waiting and returns -1.
+  124: |
+    Register on the readers' channel while still holding the lock.
+  126: |
+    Sleep, unless a writer's wakeup has already arrived.
+  130: |
+    Buffer empty: return what has been read so far.
+  132: |
+    The next unread byte.
+  133: |
+    Copy it to the user's buffer; stop if the address is bad.
+  138: |
+    Count the byte as read only after it was delivered.
+  140: |
+    Room was made: wake any writer waiting for space.

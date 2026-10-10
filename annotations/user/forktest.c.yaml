@@ -1,0 +1,134 @@
+summary: |
+  `forktest` is a [[g:stress-test]] for the process table. It calls `fork` until the
+  kernel refuses, then checks that the kernel refused *gracefully*: `fork` returned -1
+  instead of crashing or handing out a slot twice, and every child that was created can be
+  collected with `wait`, no more and no fewer.
+
+  The table has [[NPROC]] = 64 slots ([[kernel/param.h]]). Each child exits at once, but
+  an exited child stays a [[g:zombie]], still holding its slot, until its parent calls
+  `wait`. Since the parent does not wait during the loop, the table fills up. With only
+  `init`, `sh` and `forktest` running, exactly 61 forks succeed (64 − 3) before
+  [[kernel:allocproc]] finds no `UNUSED` slot and returns 0 ([[kernel/proc.c:122]]), so
+  [[kernel:kfork]] returns -1.
+
+  The program is built differently from every other user program: the
+  [[Makefile]] links it with only `ulib.o` and `usys.o` (no `printf`, no `malloc`) and
+  without the user linker script ([[Makefile:117]]; see the note there). That is why it
+  defines its own [[print@user/forktest.c|print]].
+
+  Expected output:
+
+  ```
+  $ forktest
+  fork test
+  fork test OK
+  ```
+
+  **Read before:** [[user/zombie.c]]. **Read next:** [[kernel/proc.c]] ([[kernel:kfork]],
+  [[kernel:kwait]]); [[user/usertests.c]] has a similar test with the same name.
+
+blocks:
+  - lines: 1-8
+    title: Purpose, headers and the fork limit
+    note: |
+      The comment's second line reads garbled; it means "a tiny executable, so that the
+      limit reached is the full process table" (and not, say, running out of memory first).
+      That concern is mostly historical. At this commit each child of `forktest` costs
+      about ten 4096-byte pages (one page of program, a [[g:guard-page]], one stack page, a
+      [[g:trapframe]] page and a few [[g:page-table]] pages), and xv6 has 128 MiB, about
+      32,000 pages, so even a normal-sized program would hit the 64-slot limit long before
+      memory ran out. (Simplified: the exact page count depends on the program's layout.)
+
+      `N` is 1000, far more than [[NPROC]]. It only bounds the loop: if `fork` ever
+      succeeded 1000 times, the kernel's limit would be broken.
+
+  - lines: 10-14
+    title: "print(): output without printf"
+    note: |
+      Writes a string to [[g:standard-streams|standard output]] (file descriptor 1) with a
+      single `write`. The user [[user:printf]] lives in `printf.o`, which the special
+      link rule ([[Makefile:120]]) leaves out to keep the program small, so `forktest`
+      cannot call it. [[strlen]] comes from `ulib.o`, which is linked in.
+
+      One `write` per message has a side benefit: the whole line reaches the console in one
+      system call, so it cannot be interleaved with other output character by character,
+      as `printf`'s one-`write`-per-character output can be.
+
+  - lines: 16-29
+    title: Fork until the kernel says no
+    note: |
+      Each `fork` ([[user/usys.S]] stub → [[kernel:sys_fork]] → [[kernel:kfork]]) either
+      creates a child and returns its [[g:pid]], or returns -1 because no slot is free.
+
+      The child exits immediately (line 28). Because the parent is not calling `wait`,
+      [[kernel:kexit]] leaves the child as a zombie: state `ZOMBIE`, slot still taken. So
+      every successful fork permanently uses up one of the 64 slots until the cleanup
+      loop below. The loop stops at the first failure, with `n` equal to the number of
+      children created.
+
+      What this exercises in the kernel: [[kernel:allocproc]]'s scan of the whole table and
+      its "no `UNUSED` slot" exit, [[kernel:kexit]] turning children into zombies, and
+      [[kernel:kwait]] and [[kernel:freeproc]] returning the slots afterwards. A kernel
+      bug here would show up as a [[kernel:panic]], a hang, or a later `wait` count that
+      does not match.
+
+  - lines: 31-34
+    title: "Check: fork must eventually fail"
+    note: |
+      If all 1000 forks succeeded, the kernel handed out more process slots than exist (or
+      reused a zombie's slot), so the test reports failure with [[g:exit-status]] 1.
+
+  - lines: 36-46
+    title: "Check: wait returns exactly n children"
+    note: |
+      `wait(0)` ([[kernel:sys_wait]] → [[kernel:kwait]]) collects one zombie child, frees
+      its slot with [[kernel:freeproc]], and returns its PID. Passing 0 means "I do not
+      want the exit status". The first loop must succeed exactly `n` times: a failure
+      before that means a child was lost (its slot leaked, or its parent pointer was
+      wrong).
+
+      Then one more `wait` must return -1, because no children remain: [[kernel:kwait]]
+      returns -1 when its scan finds no process whose parent is the caller
+      ([[kernel/proc.c:408]]). Any other value means `fork` created a child it did not
+      count, for example one that was created even though `fork` returned -1.
+
+      After this, all the children's slots are `UNUSED` again, which a later program (or a second run of
+      `forktest`) relies on.
+
+  - lines: 48-49
+    title: Report success
+    note: |
+      Reaching here means all three checks passed.
+
+  - lines: 51-56
+    title: "main(): run the test"
+    note: |
+      Because of the special link rule, execution starts directly at `main` (`-e main`),
+      not at the library's [[user:start]], which would call `exit` with `main`'s return
+      value. So `main` must not return: there is no caller to return to (see the note on
+      line 55). It ends with an explicit `exit(0)`.
+
+lines:
+  2: |
+    Garbled in the original; read it as "tiny executable, so that the limit reached is
+    the full process table".
+  13: |
+    One `write` of the whole string to file descriptor 1.
+  24: |
+    Create a child. Returns the child's PID in the parent, 0 in the child, -1 if the
+    process table is full.
+  25: |
+    The table is full: stop. `n` now counts the children created.
+  27: |
+    In the child: exit at once. It becomes a zombie that keeps its slot until the parent
+    waits.
+  37: |
+    Reap one zombie child. Must succeed `n` times.
+  43: |
+    With every child reaped, one more `wait` must report "no children".
+  55: |
+    Required: `main` was entered directly, not called, so its return-address register
+    `ra` still holds the return address from the shell's own call to `exec` (`0xda` in
+    this build); [[kernel:kexec]] sets only `epc`, `sp` and `a1` (and `a0` through the
+    return value) and leaves every other register as it was. In `forktest`'s image that
+    address is unrelated code, so returning would run whatever happens to be there.

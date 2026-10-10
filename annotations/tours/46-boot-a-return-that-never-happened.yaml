@@ -1,0 +1,601 @@
+title: "Boot: returning from a trap that never happened"
+group: The dance of privilege
+prerequisites: [2, 41, 42]
+summary: |
+  A RISC-V hart can lower its privilege in exactly one way: by **returning from a trap**.
+  `mret` returns from a machine-mode trap, `sret` from a supervisor-mode trap. There is no
+  "enter supervisor mode" instruction. So to get from machine mode, where every hart wakes
+  up, to supervisor mode, where the kernel lives, [[start]] fakes it. It writes into the
+  machine-mode CSRs exactly what a trap from supervisor mode *would* have left there, and
+  then executes `mret`. The hart "returns" to a place it has never been. This is transition
+  **T8**, the only one that involves machine mode.
+
+  [[tour:2]] walked through `start` line by line, and [[tour:42]] followed the boot stack.
+  This tour takes the **state lens**: for each CSR that `start` writes, what it means in the
+  privileged architecture, the value gdb read back on all three harts in this build, and
+  what we saw happen in a scratch copy of xv6 when that line was removed. It ends with a
+  question that matters for every later tour: why machine mode is **never entered again**.
+
+  All three harts do this at the same moment, each on its own slice of [[stack0]], with no
+  lock, because every register `start` touches is private to the hart that writes it.
+cast: |
+  QEMU's `virt` machine has just been switched on with `-smp 3`. When the tour starts:
+
+  | Hart | What it is doing |
+  |---|---|
+  | 0 | In machine mode at `pc = 0x1000`, about to run QEMU's boot ROM |
+  | 1 | The same, at the same address |
+  | 2 | The same, at the same address |
+
+  There are no processes, no page tables, no stacks. The kernel image is already in memory at
+  `0x80000000`, placed there by QEMU's `-kernel` option.
+steps:
+  - title: Reset leaves almost nothing defined
+    file: kernel/memlayout.h
+    lines: 1-19
+    focus: 6-12
+    state:
+      hart: [0, 1, 2]
+      mode: M
+      proc: none
+      intr: off
+      satp: bare
+      locks: []
+      stack: []
+      sp: {"on": none, detail: "sp = 0 in QEMU at reset"}
+    note: |
+      The privileged spec promises little about reset: the hart is in **M-mode**,
+      `mstatus.MIE` and `MPRV` are 0, `pc` is an implementation-defined reset vector, and
+      "all other hart state is unspecified". Here is what gdb read on each of the three harts,
+      stopped at the first instruction:
+
+      | CSR | Value | Meaning |
+      |---|---|---|
+      | `pc` | `0x1000` | QEMU's boot ROM |
+      | `mstatus` | `0xa00000000` | only `SXL` and `UXL` (64-bit S and U modes) |
+      | `mtvec`, `mscratch` | 0, 0 | no machine trap handler |
+      | `mideleg` | `0x1444` | bits 2, 6, 10, 12: the spec makes them read-only one because QEMU implements the hypervisor extension (`misa` bit 7) |
+      | `menvcfg` | `0x2000000000000000` | QEMU already sets `ADUE` (more at step 9) |
+
+      The ROM is six instructions. gdb disassembled them: `auipc t0`, `addi a2, t0, 40`,
+      `csrr a0, mhartid`, `ld a1, 32(t0)`, `ld t0, 24(t0)`, `jr t0`. The word at `0x1018` is
+      `0x80000000`, so every hart jumps to [[_entry]] with its hart number in `a0` and the
+      address of the device tree (`0x87e00000` in our run) in `a1`. xv6 ignores both and asks
+      `mhartid` again. [[tour:2]] has the full walk.
+
+  - title: Three slices of stack0, written by three harts at once
+    file: kernel/entry.S
+    lines: 7-21
+    focus: 17-19
+    state:
+      hart: [0, 1, 2]
+      mode: M
+      proc: none
+      intr: off
+      satp: bare
+      locks: []
+      stack: [_entry]
+      sp: {"on": boot, switched: "`add sp, sp, a0` ([[kernel/entry.S:17]])", detail: "tops 0x80008890, 0x80009890, 0x8000a890"}
+    note: |
+      Each hart computes `sp = stack0 + (hartid + 1) × 4096` and calls [[start]]. In this
+      build [[stack0]] is at `0x80007890`, so the three tops are `0x80008890`,
+      `0x80009890` and `0x8000a890`.
+
+      Machine mode has no address translation (unless `mstatus.MPRV` asks for it, and it is
+      0), so these are physical addresses, and `satp` plays no part. The state of every hart
+      is now the first row of the combination table ([[concept:mode-stack-page-table#table]]):
+
+      | Mode | Stack | Page table |
+      |---|---|---|
+      | M | boot (its own slice of `stack0`) | none: machine mode does not translate |
+
+      [[tour:42]] follows this stack on hart 0 all the way to the first user instruction.
+      Here the point is that three harts are running the same code at the same moment, and
+      nothing coordinates them. Nothing needs to.
+    others: |
+      The three slices are adjacent with no guard page between them. Each grows down toward
+      the slice below it: a hart 1 overflow would run into the top of hart 0's slice, and a
+      hart 0 overflow into whatever the linker placed before [[stack0]]. Boot code is
+      shallow, so it never matters here, but [[tour:48]] shows what happens when two harts
+      are given the *same* slice.
+
+  - title: MPP, the privilege a trap would have come from
+    file: kernel/start.c
+    lines: 13-21
+    focus: 17-21
+    state:
+      hart: [0, 1, 2]
+      mode: M
+      proc: none
+      intr: off
+      satp: bare
+      locks: []
+      stack: [start]
+      sp: {"on": boot, detail: "start's 16-byte frame: 0x80008880 on hart 0"}
+    note: |
+      Every trap into M-mode records where it came from in a tiny "privilege stack" inside
+      `mstatus`: **`MPP`** (bits 12:11) gets the old mode, **`MPIE`** gets the old `MIE`, and
+      `MIE` is cleared. `mret` pops it. That is the only mechanism there is for moving down.
+
+      So `start` pushes by hand what a trap from S-mode would have pushed: `MPP = 01`. In
+      this build gdb shows `mstatus = 0xa00000000` before line 21 and `0xa00000800` at the
+      `mret`, on all three harts: bit 11 set, `MPP` = S.
+
+      | `MPP` | `mret` will enter |
+      |---|---|
+      | `00` | U |
+      | `01` | **S** |
+      | `11` | M |
+
+      Nothing has happened yet. Writing `MPP` changes no privilege; it only arms the pop.
+      The hart is still in M-mode, on the boot stack, with no page table.
+
+      Notice the frame. `start`'s prologue pushed 16 bytes (`sp = 0x80008880` on hart 0).
+      `start` never returns, so those 16 bytes are never popped: they stay at the top of the
+      boot stack, and later the scheduler stack, for as long as the machine runs.
+
+  - title: mepc, the instruction a trap would have interrupted
+    file: kernel/start.c
+    lines: 23-28
+    focus: 23-25
+    state:
+      hart: [0, 1, 2]
+      mode: M
+      proc: none
+      intr: off
+      satp: bare
+      locks: []
+      stack: [start]
+      sp: {"on": boot, detail: "0x80008880 / 0x80009880 / 0x8000a880"}
+    note: |
+      On a real trap, `mepc` holds the address of the interrupted instruction, and `mret`
+      sets `pc = mepc`. `start` writes `mepc = main`: `0x80000e5e` in this build, read back on
+      all three harts.
+
+      The comment "requires gcc -mcmodel=medany" is about how the compiler builds that
+      address: `auipc a5, 0x1` then `addi a5, a5, -538` (`kernel/kernel.asm`), a
+      `pc`-relative computation. With the default `medlow` model the compiler would assume
+      code lives below 2 GiB (`0x80000000`), which the kernel does not.
+
+      After this line the faked trap is complete: from M-mode's point of view, the hart was
+      interrupted in S-mode, at the first instruction of `main`. Of course it never ran
+      there. That is the "trap that never happened".
+
+  - title: satp = 0, so main's first fetch is not translated
+    file: kernel/start.c
+    lines: 23-28
+    focus: 27-28
+    state:
+      hart: [0, 1, 2]
+      mode: M
+      proc: none
+      intr: off
+      satp: bare
+      locks: []
+      stack: [start]
+      sp: {"on": boot}
+    note: |
+      `satp` does not affect machine mode at all: M-mode fetches and loads are physical
+      (with `MPRV = 0`). It matters for the instant *after* `mret`: S-mode translates every
+      access through `satp`. Reset leaves `satp` unspecified, so without this line `main`'s
+      very first instruction fetch could be translated through a garbage page-table address.
+
+      `satp = 0` means mode **Bare**: S-mode addresses are physical. gdb read `satp = 0` at
+      reset on QEMU, but the spec does not promise that, and xv6 does not rely on it.
+      `main` will run with paging off until [[kvminithart]] writes the kernel page table on
+      each hart ([[tour:24]]).
+
+  - title: Delegation, and the rule it cannot bend
+    file: kernel/start.c
+    lines: 29-33
+    focus: 30-32
+    state:
+      hart: [0, 1, 2]
+      mode: M
+      proc: none
+      intr: off
+      satp: bare
+      locks: []
+      stack: [start]
+      sp: {"on": boot}
+    note: |
+      Without delegation, every exception and every interrupt goes to **M-mode**, to
+      `mtvec`. [[g:csr:medeleg|medeleg]] and `mideleg` send them to S-mode instead. Both
+      registers are WARL ("write any, read legal"): you write all ones, and the hardware keeps
+      the bits it supports. gdb read back:
+
+      | CSR | Written | Read back | Delegated |
+      |---|---|---|---|
+      | `medeleg` | `0xffff` | `0xbfff` | causes 0–15 except 14 (reserved). Bit 11 (`ecall` from M-mode) also reads 1, though the spec says it is read-only zero; it could never take effect anyway |
+      | `mideleg` | `0xffff` | `0x3666` | `SSIP`, `STIP`, `SEIP` (bits 1, 5, 9), counter overflow (13), and the read-only-one hypervisor bits 2, 6, 10, 12 |
+
+      The machine-level interrupt bits (3, 7, 11) did **not** stick. The spec forbids
+      hard-wiring these bits to 1 and leaves it to each implementation whether they can be
+      set at all; QEMU makes them read-only zero. So on this machine the machine timer,
+      software and external interrupts stay with M-mode whatever `mideleg` says. That is why xv6 needs Sstc: a machine-timer interrupt would have to be taken in
+      M-mode and passed down by M-mode code, and xv6 has none.
+
+      Two rules from the spec bound what delegation does. A trap **never moves to a less
+      privileged mode**: an exception *in* M-mode, here in `start`, still goes to M-mode.
+      And a delegated interrupt is **masked while in M-mode**, so the supervisor timer armed
+      at step 12 cannot interrupt `start`.
+
+  - title: sie, the individual switches
+    file: kernel/start.c
+    lines: 29-33
+    focus: 33
+    state:
+      hart: [0, 1, 2]
+      mode: M
+      proc: none
+      intr: off
+      satp: bare
+      locks: []
+      stack: [start]
+      sp: {"on": boot}
+    note: |
+      An interrupt is taken only when three things line up: it is **pending** (`sip`), it is
+      **enabled** individually (`sie`), and the mode's global switch allows it (`sstatus.SIE`
+      in S-mode; always in U-mode). Line 33 sets two individual switches: `SEIE` (bit 9,
+      devices through the PLIC) and `STIE` (bit 5, the supervisor timer). `SSIE`, software
+      interrupts, stays off: this xv6 never uses them.
+
+      `sie` is not a separate register. It is a window onto `mie` showing only the delegated
+      bits. gdb read **`mie = 0x220`** after this line, the same value as `sie`. The
+      machine-level enables `MTIE`, `MEIE` and `MSIE` are all 0, and nothing in xv6 ever sets
+      them.
+
+      The global switch `sstatus.SIE` is still 0, and `mret` will leave it 0. Interrupts
+      will reach a hart for the first time at the scheduler's first [[intr_on]], long after
+      boot. The table's "interrupts" column reads **off** from power-on to that line.
+
+  - title: PMP, the permission machine mode must grant
+    file: kernel/start.c
+    lines: 34-41
+    focus: 35-38
+    state:
+      hart: [0, 1, 2]
+      mode: M
+      proc: none
+      intr: off
+      satp: bare
+      locks: []
+      stack: [start]
+      sp: {"on": boot}
+    note: |
+      Physical Memory Protection checks every access by S-mode and U-mode, even with
+      paging. The spec is blunt: if no PMP entry matches an S-mode or U-mode access, and the
+      hart implements at least one PMP entry (QEMU's does), the access **fails**. So a hart that left M-mode without configuring PMP could not even fetch
+      `main`'s first instruction.
+
+      Entry 0 grants everything. gdb read back `pmpcfg0 = 0xf` and
+      `pmpaddr0 = 0x3fffffffffffff`:
+
+      | Field of `pmpcfg0`, entry 0 | Bits | Value |
+      |---|---|---|
+      | R, W, X | 0–2 | 1, 1, 1 |
+      | A (address matching) | 4:3 | `01` = TOR, "top of range" |
+      | L (lock, applies to M-mode too) | 7 | 0 |
+
+      `pmpaddr` holds an address divided by 4, so the range is
+      `[0, 0x3fffffffffffff × 4)`: all 56 bits of physical address space. With `L = 0`,
+      the rule does not apply to M-mode itself. PMP registers are per hart; each hart sets
+      its own.
+
+  - title: menvcfg.ADUE, or the kernel faults on its first fetch
+    file: kernel/start.c
+    lines: 34-41
+    focus: 40-41
+    state:
+      hart: [0, 1, 2]
+      mode: M
+      proc: none
+      intr: off
+      satp: bare
+      locks: []
+      stack: [start]
+      sp: {"on": boot}
+    note: |
+      Every page-table entry has an **A** (accessed) and a **D** (dirty) bit. xv6 never sets
+      them ([[mappages]] writes only `V`, `R`, `W`, `X`, `U`). Under the spec's default rule
+      (Svade), an access through an entry with `A = 0` raises a **page fault**. The
+      [[g:svadu|Svadu]] extension instead lets the hardware set the bits itself, and
+      `menvcfg.ADUE` (bit 61) turns it on for S-mode.
+
+      In our QEMU `ADUE` already reads 1 at reset, so line 41 changes nothing here. To see
+      what it guards, we **cleared** it in a scratch copy of xv6. Result: the console printed
+      `xv6 kernel is booting` and then nothing. gdb found hart 0 at `pc = 0` with
+      `scause = 0xc` (instruction page fault), `satp` = the kernel page table, and
+      `stvec = 0`. The fetch right after [[kvminithart]] turned paging on had faulted; with
+      no `stvec` yet, the trap went to address 0, which faulted again, forever. Harts 1 and 2
+      were still waiting for `started`.
+
+      `menvcfg` is a machine CSR: S-mode cannot fix this later. That is why it is set here.
+
+  - title: Sstc, the timer that never visits machine mode
+    file: kernel/start.c
+    lines: 54-66
+    focus: 58-59
+    state:
+      hart: [0, 1, 2]
+      mode: M
+      proc: none
+      intr: off
+      satp: bare
+      locks: []
+      stack: [start, timerinit]
+      sp: {"on": boot, detail: "timerinit's frame below start's"}
+    note: |
+      [[timerinit]] sets `menvcfg.STCE` (bit 63): the [[g:sstc|Sstc]] extension. With it, each
+      hart has a supervisor CSR **`stimecmp`**, and the hart itself raises the
+      supervisor-timer interrupt (`STIP`) when `time ≥ stimecmp`. That interrupt was delegated
+      at step 6, so it goes straight to S-mode. gdb read `menvcfg = 0xa000000000000000`:
+      bits 63 and 61.
+
+      Without Sstc, the only timer comparator is the CLINT's machine-mode `mtimecmp`; on this
+      machine its interrupt (`MTIP`, bit 7) cannot be delegated (step 6), so some machine-mode
+      code must take every tick and pass it down. xv6 at this commit has no such code.
+
+      We removed line 59 in a scratch copy. The kernel booted, the shell ran, and
+      `usertests preempt` hung. gdb: `ticks = 0`; pid 6 and pid 7 were `RUNNABLE`; one hart
+      spun in pid 5's loop, and the other two sat in the scheduler's `wfi` forever. Without
+      a timer, a spinner is never preempted, and an idle hart that executes `wfi` is woken
+      only by a device interrupt, and in this test none came.
+
+  - title: mcounteren.TM, permission to read the clock
+    file: kernel/start.c
+    lines: 54-66
+    focus: 61-62
+    state:
+      hart: [0, 1, 2]
+      mode: M
+      proc: none
+      intr: off
+      satp: bare
+      locks: []
+      stack: [start, timerinit]
+      sp: {"on": boot}
+    note: |
+      The `time` CSR can be read by S-mode only if machine mode allows it: bit 1 (`TM`) of
+      [[g:csr:mcounteren|mcounteren]]. With Sstc, the same bit also gates S-mode access to
+      `stimecmp`. gdb read `mcounteren = 2` after this line.
+
+      We removed it in a scratch copy. Hart 0 finished `main` and entered the scheduler; at
+      its first `intr_on()` the pending tick was taken, and then:
+
+      ```text
+      scause=0x2 sepc=0x80002500 stval=0xc01027f3
+      panic: kerneltrap
+      ```
+
+      Cause 2 is an **illegal instruction**, and `stval` holds its encoding: `0xc01027f3` is
+      `rdtime a5`, inside [[clockintr]] ([[kernel/trap.c:179]]). The very first tick reached
+      S-mode, and the handler could not read the clock it needed to set the next one. A
+      permission bit in a machine CSR, invisible from S-mode, decided the outcome.
+
+  - title: The first alarm, set from machine mode
+    file: kernel/start.c
+    lines: 54-66
+    focus: 64-65
+    state:
+      hart: [0, 1, 2]
+      mode: M
+      proc: none
+      intr: off
+      satp: bare
+      locks: []
+      stack: [start, timerinit]
+      sp: {"on": boot}
+    note: |
+      `stimecmp = time + 1000000`: about 0.1 s on QEMU's 10 MHz clock. `time` is one counter
+      shared by the whole machine; `stimecmp` is per hart, so each hart's alarm is set for a
+      slightly different moment.
+
+      Where will that first tick land? Not in `start`: a delegated interrupt is masked in
+      M-mode. Not in `main`: `sstatus.SIE` is 0. It becomes pending during boot and waits,
+      and it is taken at the scheduler's first `intr_on()` ([[tour:44]] shows the landing).
+      In our run hart 0 reached the scheduler about 1.2 s after its alarm was set (gdb:
+      `time` ≈ 12,000,000, `sip` = `0x220`), so its tick was long pending.
+
+      `timerinit` returns, popping its frame. `start`'s frame is the only thing on each boot
+      stack.
+
+  - title: tp, the one thing that survives the drop
+    file: kernel/start.c
+    lines: 43-52
+    focus: 46-48
+    state:
+      hart: [0, 1, 2]
+      mode: M
+      proc: none
+      intr: off
+      satp: bare
+      locks: []
+      stack: [start]
+      sp: {"on": boot}
+    note: |
+      `mhartid` is a machine-mode CSR: S-mode cannot read it. So the last thing each hart
+      does in M-mode is copy its number into `tp`, a general-purpose register, which `mret`
+      does not touch. gdb read `tp = 0`, `1`, `2` at the `mret` on harts 0, 1, 2.
+
+      From now on every [[cpuid]] is `return tp`, and protecting `tp` becomes the kernel's
+      job: user code may overwrite it, so [[prepare_return]] stores it in the trapframe and
+      [[uservec]] reloads it ([[tour:7]]). [[kernelvec]] deliberately does **not** restore it,
+      because a kernel thread may come back on a different hart ([[tour:44]]).
+
+      Look at what M-mode leaves behind in S-mode's hands: `tp`, `sp`, the CSR settings, and
+      nothing else. No handler, no data.
+
+  - title: mret, exactly
+    file: kernel/start.c
+    lines: 43-52
+    focus: 50-51
+    state:
+      hart: [0, 1, 2]
+      mode: M
+      proc: none
+      intr: off
+      satp: bare
+      locks: []
+      stack: [start]
+      sp: {"on": boot, detail: "unchanged by mret"}
+    note: |
+      The privileged spec defines `mret` in one sentence. With `y` = the value in `MPP`:
+      `MIE ← MPIE`; the mode becomes `y`; `MPIE ← 1`; `MPP ←` the least-privileged supported
+      mode; and since `y ≠ M`, `MPRV ← 0`. Then `pc ← mepc`.
+
+      We stepped over it on each hart with gdb:
+
+      | | before | after |
+      |---|---|---|
+      | mode (`$priv`) | 3 (M) | **1 (S)** |
+      | `mstatus` | `0xa00000800` | `0xa00000080` |
+      | `MPP` | `01` | `00` (U, least privileged) |
+      | `MPIE` / `MIE` | 0 / 0 | 1 / 0 |
+      | `pc` | `0x800000ca` | `0x80000e5e` ([[main]]) |
+      | `sp` | `0x80008880` (hart 0) | `0x80008880` |
+
+      `MIE` stays 0 because `MPIE` was 0. Resetting `MPP` to U means a stray second `mret`
+      could only go *down*. And `sp`, `satp`, every general register: untouched. This is
+      **T8**. The order in which the harts get here varies from run to run; nothing makes
+      the harts wait for each other.
+    figure: t46-mret
+    caption: |
+      `mret` on one hart, as gdb measured it. The two-bit `MPP` field and the `MPIE` bit act
+      as a one-entry stack: `mret` pops it into the current mode and `MIE`, and refills it
+      with "U" and 1. `sp` and `satp` are not part of the transition.
+
+  - title: Why machine mode never comes back
+    file: kernel/start.c
+    lines: 13-52
+    focus: 30-33
+    state:
+      hart: [0, 1, 2]
+      mode: M
+      proc: none
+      intr: off
+      satp: bare
+      locks: []
+      stack: [start]
+      sp: {"on": boot}
+    note: |
+      After `mret`, nothing in xv6 ever runs in M-mode again. gdb showed `mtvec = 0` and
+      `mscratch = 0` at every hart's `mret`, and no file in `kernel/` writes either one. If
+      the hart did trap into M-mode, it would jump to address 0, where there is no handler.
+      xv6 makes sure it never does:
+
+      | Way into M-mode | Why it never happens here |
+      |---|---|
+      | exception in U-mode or S-mode | causes 0–15 delegated (step 6); higher cause numbers belong to extensions this kernel never uses |
+      | `ecall` from S-mode (cause 9) | delegated anyway, and xv6 never executes `ecall` in the kernel |
+      | machine timer, software, external interrupt | `MTIE`, `MSIE`, `MEIE` are 0 in `mie` (step 7) |
+      | supervisor timer | Sstc raises it in S-mode, delegated (step 10) |
+
+      We checked it. After a sanity stop at the `mret` (mode 3), gdb set a hardware
+      breakpoint at address 0 that fires only in M-mode, and `usertests -q` ran to `ALL TESTS
+      PASSED` on three harts. The breakpoint never fired. ([[tour:48]] shows what
+      kernel bugs that do reach address 0 look like: in S-mode, with `stvec = 0`.)
+
+      So the "M" row of the combination table is visited once per hart, for about 74
+      instructions (6 in QEMU's boot ROM, 68 in `_entry`, `start` and `timerinit`), and then
+      never again.
+
+  - title: Three harts arrive in main, in supervisor mode
+    file: kernel/main.c
+    lines: 9-45
+    focus: 13
+    state:
+      hart: [0, 1, 2]
+      mode: S
+      proc: none
+      intr: off
+      satp: bare
+      locks: []
+      irq: {noff: 0, note: "`main`'s locks (`kmem.lock`, `pr.lock`, ...) are taken with SIE off, so each records intena 0 and every `release` leaves interrupts off"}
+      stack: [main]
+      sp: {"on": boot, detail: "0x80008870, 0x80009870, 0x8000a870 after main's prologue"}
+    note: |
+      Every hart is now at the second row of the table: **S-mode, boot stack, paging off**.
+      `main`'s prologue pushes another 16 bytes below `start`'s abandoned frame, so gdb reads
+      `sp = 0x80008870` on hart 0 at line 13.
+
+      From here the boot stack lives through one change of page table and one change of
+      role, without `sp` ever leaving it:
+
+      | Event | Line | `satp` | Stack |
+      |---|---|---|---|
+      | arrive | 13 | 0 (Bare) | boot |
+      | [[kvminithart]] | 21 or 39 | kernel page table | boot (identity-mapped, so the same addresses work) |
+      | [[trapinithart]] | 24 or 40 | kernel | boot; `stvec` = [[kernelvec]], the first `stvec` write ever |
+      | [[scheduler]] | 44 | kernel | the same memory, now called the **scheduler stack** |
+
+      `trapinithart` is the moment this hart could first *handle* a supervisor trap. Before
+      it, `stvec` held whatever reset left (0 in QEMU), which is why the Svadu experiment
+      ended at address 0.
+    others: |
+      Hart 0 builds the kernel. Harts 1 and 2 spin on `started` with an acquire load
+      ([[kernel/main.c:35]]) and only then turn on paging with the page table hart 0 built.
+      That release/acquire pair is what orders hart 0's setup before the other harts use it,
+      and the subject of [[tour:19]]. [[tour:48]] removes it.
+
+  - title: What start set, and who touches it later
+    file: kernel/main.c
+    lines: 9-45
+    focus: 44
+    state:
+      hart: [0, 1, 2]
+      mode: S
+      proc: none
+      intr: off
+      satp: kernel
+      locks: []
+      irq: 0
+      stack: [main, scheduler]
+      sp: {"on": scheduler, detail: "0x80008810 on hart 0"}
+    note: |
+      Every value `start` wrote is per hart, and most are never written again:
+
+      | Set in `start` | Value (gdb) | Later |
+      |---|---|---|
+      | `mstatus.MPP` / `mepc` | S / `main` | used once by `mret`, never again |
+      | `medeleg` / `mideleg` | `0xbfff` / `0x3666` | never written again |
+      | `mie` (through `sie`) | `0x220` | never written again |
+      | `pmpcfg0` / `pmpaddr0` | `0xf` / `0x3fffffffffffff` | never written again |
+      | `menvcfg` / `mcounteren` | `0xa000000000000000` / 2 | never written again |
+      | `satp` | 0 | every trap entry and exit ([[tour:45]] counted 44 in one slice) |
+      | `stimecmp` | `time + 1000000` | every tick, by [[clockintr]] |
+      | `tp` | hart number | saved and restored around user mode |
+
+      One subtlety: `sstatus` is not a separate register either. It is a view of `mstatus`,
+      so every `SIE`, `SPIE` and `SPP` the kernel writes later lands in the same register
+      `start` prepared. Machine mode's register stays in use; machine mode does not.
+
+      The ledger of T8: one `mret` per hart, one privilege change (M → S), zero stack
+      switches, zero page-table switches, zero locks. It is the simplest transition in xv6,
+      and the only one that is never undone.
+locks:
+  - lock: "(no lock) every CSR in start"
+    where: "[[start]], [[timerinit]]"
+    protects: "Nothing to protect: `mstatus`, `mepc`, `medeleg`, `mideleg`, `mie`, PMP, `menvcfg`, `mcounteren`, `stimecmp` are per-hart registers"
+  - lock: "(no lock) stack0"
+    where: "[[kernel/entry.S:17]]"
+    protects: "One shared array, but each hart writes only its own 4 KiB slice"
+  - lock: "(no lock) time"
+    where: "[[timerinit]]"
+    protects: "Shared, but read-only to software here"
+  - lock: "started (release/acquire, not a lock)"
+    where: "[[kernel/main.c:33]], [[kernel/main.c:35]]"
+    protects: "Orders hart 0's kernel setup before the other harts use it"
+quiz:
+  - q: "Why can't `start` simply \"switch\" to S-mode with an instruction, and what exactly does `mret` read to decide where to go?"
+    a: "RISC-V has no instruction that lowers privilege except a trap return. `mret` reads `mstatus.MPP` for the new mode and `mepc` for the new `pc`; `start` writes both to imitate a trap from S-mode at `main`."
+  - q: "`start` writes `0xffff` to `mideleg`, but the timer xv6 uses is still a *supervisor* timer, enabled through Sstc. Why couldn't xv6 just delegate the machine timer interrupt instead?"
+    a: "The machine-level interrupt bits of `mideleg` (3, 7, 11) do not stick on this machine; gdb read `0x3666` back, with those bits 0. A machine-timer interrupt would therefore always enter M-mode, which has no handler in xv6. Sstc gives S-mode its own comparator whose interrupt (`STIP`, bit 5) is delegable."
+  - q: "In the Svadu experiment the hart ended up at `pc = 0`, in S-mode. Trace how it got there, starting from `kvminithart`."
+    a: "With `ADUE = 0` and every PTE's `A` bit clear, the fetch right after `csrw satp` raised an instruction page fault. Faults are delegated to S-mode, so the hart jumped to `stvec`, which [[trapinithart]] had not yet set: it was 0. The fetch at 0 also faulted, and the hart trapped to 0 again, forever, with `scause = 0xc`."
+  - q: "A timer interrupt becomes pending about 0.1 s after `timerinit`, and hart 0 is still in `main` building the kernel. Why isn't `main` interrupted?"
+    a: "In S-mode, a pending enabled interrupt is taken only if `sstatus.SIE` is 1. `mret` left `SIE` at 0 (it sets `MIE ← MPIE`, not `SIE`), and nothing turns it on until the scheduler's first `intr_on()`. The locks `main` takes don't either: each first `push_off` records `intena` 0, so every `release` leaves `SIE` off ([[concept:locks#intena]]). Had the hart still been in M-mode, the delegated interrupt would have been masked there too."
+  - q: "`mret` sets `MPP` to U after using it. Name a bug this would catch."
+    a: "Code that executes `mret` a second time without setting `MPP` again, for example a buggy machine-mode trap handler returning twice, would land in U-mode rather than silently staying in a higher mode. Privilege can only go down by accident, never up."
+  - q: "Which of the values `start` writes could another hart observe or disturb, and why does `start` need no lock?"
+    a: "None. Every CSR it writes is per hart, and the only memory it touches is its own slice of `stack0`. The shared `time` counter is only read. The first shared data structure appears in `main`, where `started`'s release/acquire orders hart 0's work before the others use it."

@@ -1,0 +1,705 @@
+title: Reading and writing a file
+group: File system
+prerequisites: [31, 33, 34]
+summary: |
+  `wc README` reads 2441 bytes, 512 at a time. `echo hi > f` writes three bytes, two of
+  them in one `write` and the newline in another, and the second lands right after the
+  first. Both look trivial from user space. In the kernel, each `read` and `write` must
+  find the file's current offset, translate it into a disk block, perhaps allocate that
+  block, copy bytes across the user/kernel boundary, and, for writes, put every changed
+  block into the log.
+
+  This tour follows both, through [[fileread]] and [[filewrite]], [[readi]] and
+  [[writei]], and [[bmap]], which maps a position in a file to a block on the disk,
+  allocating with [[balloc]] and [[bzero]] when the file grows. You will see why
+  [[filewrite]] cuts big writes into 3072-byte pieces, each in its own transaction, and
+  what that means when the power fails or when two processes write to the same file.
+
+  The last part puts two processes on two harts writing through **one shared** file
+  descriptor, and shows exactly what the inode lock guarantees about the result and what
+  it leaves to chance.
+cast: |
+  The machine has three [[g:hart|harts]], on a fresh boot. The user runs `wc README` (pid
+  3), then `echo hi > f` (pid 4, which creates `f` as inode 24; [[tour:35]] covers the
+  creation). When the tour starts:
+
+  | Hart | What it is doing |
+  |---|---|
+  | 0 | Idle in its [[kernel:scheduler]] |
+  | 1 | Running `wc` (pid 3), later `echo` (pid 4): the processes this tour follows |
+  | 2 | Idle, or running another process using the same files |
+
+  `README` is inode 2: 2441 bytes in blocks 48, 49 and 50, its dinode in block 33. Block
+  numbers come from this build's `mkfs` and a traced copy of the kernel.
+steps:
+  - title: wc reads 512 bytes at a time
+    file: user/wc.c
+    lines: 8-34
+    focus: 16
+    state:
+      hart: 1
+      mode: U
+      proc: wc (pid 3)
+      intr: on
+      satp: user
+      locks: []
+      stack: [main, wc]
+      sp: user
+    note: |
+      `wc` opened `README` as descriptor 3 and loops on `read(fd, buf, 512)` until it
+      returns 0. It never says *where* to read from. The kernel remembers the position, in
+      the [[g:open-file]] that descriptor 3 points to: `f->off`, starting at 0.
+
+      `README` is 2441 bytes, so the reads return 512, 512, 512, 512, 393, and then 0.
+      That is six `read` system calls, and the output is `48 336 2441 README`.
+
+  - title: sys_read finds the open file
+    file: kernel/sysfile.c
+    lines: 68-80
+    focus: 75-79
+    state:
+      hart: 1
+      mode: S
+      proc: wc (pid 3)
+      intr: on
+      satp: kernel
+      locks: []
+      irq: 0
+      stack: [usertrap, syscall, sys_read]
+      sp: {"on": kernel, switched: "`ld sp, 8(a0)` in `uservec` ([[kernel/trampoline.S:76]]) when `wc` executed `ecall`", detail: "wc's kernel stack: usertrap, syscall, sys_read"}
+    note: |
+      [[sys_read]] fetches the user buffer's address and the count from the trapframe and
+      turns descriptor 3 into a `struct file` with [[argfd]] ([[tour:5]] and [[tour:6]]
+      cover these). Then [[fileread]].
+
+      No transaction: reading never changes the disk. Compare [[sys_write]]'s path, where
+      [[filewrite]] opens one per chunk.
+
+      `wc` is now on its **kernel stack** ([[concept:stacks#kernel]]): `uservec` saved its user
+      `sp` in the trapframe and loaded the top of this empty page ([[kernel/trampoline.S:76]]).
+      `wc`'s user stack waits, untouched, until the read returns.
+
+  - title: The offset is read and advanced under the inode lock
+    file: kernel/file.c
+    lines: 104-130
+    focus: 122-123
+    state:
+      hart: 1
+      mode: S
+      proc: wc (pid 3)
+      intr: on
+      satp: kernel
+      locks: ["inode 2 lock (sleep-lock)"]
+      irq: 0
+      stack: [usertrap, syscall, sys_read, fileread]
+      sp: kernel
+    note: |
+      For an `FD_INODE` file, [[fileread]] is three lines: [[ilock]], [[readi]] at
+      `f->off`, then `f->off += r`, [[iunlock]].
+
+      `f->off` is a field of the `struct file`, not of the inode, and it has no lock of its
+      own. It is protected by the **inode's** sleep-lock: it is read and updated only
+      while the inode is locked. That matters when a `struct file` is shared, as after
+      `fork` or `dup`: two processes reading through it each get the next 512 bytes, never
+      the same 512 twice (step 18 shows the write side).
+
+      The inode lock also makes the read see a consistent file: a writer on another hart
+      cannot change `size` or `addrs[]` halfway through this `readi`.
+
+      The irq strip still reads `noff` 0: a sleep-lock is not a [[push_off]] level, so
+      interrupts stay on, and a timer interrupt may even make `wc` yield the hart while it
+      holds the inode lock. Anyone else who wants the inode then sleeps instead of spinning
+      ([[concept:locks#sleep-locks]]).
+    others: |
+      Another process reading `README` through its **own** `open` has its own
+      `struct file` and its own offset, and waits for the same inode lock only while one
+      `readi` runs. Readers of one file are serialized per call, not per file: a long
+      `cat` does not lock out a short `wc`.
+
+  - title: readi clamps the request to the file
+    file: kernel/fs.c
+    lines: 505-534
+    focus: 515-519
+    state:
+      hart: 1
+      mode: S
+      proc: wc (pid 3)
+      intr: on
+      satp: kernel
+      locks: ["inode 2 lock (sleep-lock)"]
+      irq: 0
+      stack: [usertrap, syscall, sys_read, fileread, readi]
+      sp: kernel
+    note: |
+      [[readi]] first trims the request to what exists:
+
+      - `off > size`, or `off + n` wrapping around a 32-bit `uint`: return 0.
+      - `off + n > size`: shorten `n`.
+
+      On the fifth read, `off = 2048` and `n = 512`, so `n` becomes 2441 − 2048 = 393. On
+      the sixth, `off = 2441 = size`, `n` becomes 0, the loop does not run, and `readi`
+      returns 0: end of file. There is no "EOF flag" anywhere; end of file is simply the
+      offset reaching `size`.
+
+  - title: One block at a time, copied straight to user memory
+    file: kernel/fs.c
+    lines: 505-534
+    focus: 524-531
+    state:
+      hart: 1
+      mode: S
+      proc: wc (pid 3)
+      intr: on
+      satp: kernel
+      locks: ["inode 2 lock (sleep-lock)", "buf 48 (sleep-lock)"]
+      irq: 0
+      stack: [usertrap, syscall, sys_read, fileread, readi]
+      sp: kernel
+    note: |
+      Each loop iteration handles the part of the request inside one 1024-byte block:
+
+      1. [[bmap]]`(ip, off / BSIZE)`: which disk block holds this part? For `off = 0`,
+         file block 0, which is disk block 48.
+      2. [[bread]]: the block, locked, from the [[g:buffer-cache]] (or the disk,
+         [[tour:29]]).
+      3. `m` = the smaller of "bytes still wanted" and "bytes left in this block".
+      4. [[either_copyout]] with `user_dst = 1`: [[copyout]] into `wc`'s `buf`, walking
+         `wc`'s page table by hand ([[tour:28]]).
+      5. [[brelse]].
+
+      For a 512-byte read inside one block the loop runs once. A read that straddles a
+      block boundary, say 512 bytes at offset 768, runs twice: 256 bytes from one block,
+      256 from the next.
+
+      If the user address is bad, `copyout` fails and `readi` returns -1. The kernel
+      does not crash; the program gets an error.
+
+      Notice where the 512 bytes do **not** go: `wc`'s kernel stack. `copyout` moves them
+      straight from the cached block into `buf`, which is a global array in `wc`'s user memory.
+      A kernel stack is a single 4 KiB page, so xv6 keeps what it puts there small (the biggest
+      locals are path copies like `sys_open`'s 128-byte `path`); on this read path the locals
+      are only a few words.
+    others: |
+      `wc` holds block 48's buffer only for the copy. `cat README` on hart 2 never even
+      gets to that buffer: it waits in [[ilock]] for inode 2's lock, which `wc` holds for
+      the whole `readi`, and by the time it gets the lock the buffer is free. A process reading a *different* file in a different block is not
+      affected at all.
+
+  - title: bmap, the direct case
+    file: kernel/fs.c
+    lines: 410-434
+    focus: 426-433
+    state:
+      hart: 1
+      mode: S
+      proc: wc (pid 3)
+      intr: on
+      satp: kernel
+      locks: ["inode 2 lock (sleep-lock)"]
+      irq: 0
+      stack: [usertrap, syscall, sys_read, fileread, readi, bmap]
+      sp: kernel
+    note: |
+      [[bmap]] answers "where is block `bn` of this file?". For `bn < 12` ([[NDIRECT]]),
+      the answer is in the inode itself: `ip->addrs[bn]`. `README`'s are 48, 49, 50, and
+      then zeros. No disk access is needed: [[ilock]] already copied `addrs[]` into memory.
+
+      If the entry is 0, `bmap` **allocates** a block. During a read that cannot happen in
+      xv6: [[writei]] refuses to write past the end of a file (step 10), so every block
+      below `size` has been allocated. The allocation branch is for writes, which come
+      next.
+
+  - title: echo writes two bytes
+    file: user/echo.c
+    lines: 5-19
+    focus: 10-16
+    state:
+      hart: 1
+      mode: U
+      proc: echo (pid 4)
+      intr: on
+      satp: user
+      locks: []
+      stack: [main]
+      sp: user
+    note: |
+      Now `echo hi > f`. The shell's child created `f` (inode 24, empty, no blocks) as
+      descriptor 1 and then `exec`ed `echo` ([[tour:35]]). `echo` makes two calls:
+      `write(1, "hi", 2)` and `write(1, "\n", 1)`.
+
+      Each will be its own system call, its own transaction, its own commit. Our trace:
+
+          [commit pid 4 n=3: 46 1006 34]
+          [commit pid 4 n=2: 1006 34]
+
+      The first allocates a data block (bitmap block 46, data block 1006) and updates the
+      inode (block 34). The second only adds a byte to block 1006 and grows the size.
+
+      The bytes `hi` are on `echo`'s **user stack**. When the shell's child `exec`ed `echo`,
+      [[kexec]] copied each argument string to the top of the new user stack
+      ([[kernel/exec.c:101]]–[[kernel/exec.c:106]]) and passed `main` pointers to them, so `argv[1]` points into the
+      stack page. The `write` below copies two bytes from there into the kernel.
+
+  - title: filewrite cuts writes into 3072-byte pieces
+    file: kernel/file.c
+    lines: 132-158
+    focus: 148-158
+    state:
+      hart: 1
+      mode: S
+      proc: echo (pid 4)
+      intr: on
+      satp: kernel
+      locks: []
+      irq: 0
+      stack: [usertrap, syscall, sys_write, filewrite]
+      sp: {"on": kernel, switched: "`ld sp, 8(a0)` in `uservec` ([[kernel/trampoline.S:76]]) when `echo` executed `ecall`", detail: "echo's kernel stack: usertrap, syscall, sys_write, filewrite"}
+    note: |
+      For an `FD_INODE` file, [[filewrite]] computes `max = ((10 − 1 − 1 − 2) / 2) × 1024
+      = 3072` bytes. Where does that come from? A transaction may write at most
+      [[MAXOPBLOCKS]] = 10 blocks, because [[begin_op]] reserves that much log space per
+      operation ([[tour:31]]). A write of 3072 bytes can dirty:
+
+      | Blocks | Why |
+      |---|---|
+      | 1 | the inode (new `size`, new `addrs[]`) |
+      | 1 | the [[g:indirect-block]], if a new block number goes into it |
+      | 4 | data blocks: 3072 bytes that don't start on a block boundary touch four blocks |
+      | 4 | bitmap updates: at most three of those data blocks are new (the first already exists, because a write never starts past `size`), plus one if the indirect block itself is new |
+
+      4 + 4 + 1 + 1 = 10. The source writes it as 1 (inode) + 1 (indirect) + 3 × 2 (data +
+      bitmap) + 2 "slop for non-aligned writes": the slop is the fourth data block and the
+      new indirect block's bitmap update, **not** a fourth new data block with its own
+      bitmap block. A write that starts on a block boundary touches only 3 data blocks, so
+      it needs at most 9. (In this build there is only one bitmap block, so all the bitmap
+      updates land in one block; the formula is the general worst case.)
+
+      Our `n = 2` is far below 3072, so the loop runs once.
+
+  - title: One transaction per piece
+    file: kernel/file.c
+    lines: 148-176
+    focus: 162-163
+    state:
+      hart: 1
+      mode: S
+      proc: echo (pid 4)
+      intr: on
+      satp: kernel
+      locks: ["inode 24 lock (sleep-lock)"]
+      irq: 0
+      stack: [usertrap, syscall, sys_write, filewrite]
+      sp: kernel
+    note: |
+      Each piece is [[begin_op]], [[ilock]], [[writei]] at `f->off`, `f->off += r`,
+      [[iunlock]], [[end_op]]. The order is fixed: the transaction is begun **before** the
+      inode is locked. `begin_op` may sleep ([[kernel/log.c:138]]) when the log has no
+      room for one more operation, until the current transaction commits, and that
+      commit cannot start until every operation already in it has called `end_op`. If
+      `echo` held `f`'s inode lock while sleeping there, and a process B already in the
+      transaction were waiting in [[ilock]] for that same inode, then `echo` would wait for the
+      commit, the commit for B's `end_op`, and B for `echo`: a deadlock.
+
+      A write of 10,000 bytes is therefore four transactions (3072 + 3072 + 3072 + 784).
+      Two consequences:
+
+      - **Not atomic on disk.** A crash after the second commit leaves 6144 bytes written
+        and the rest not. Each piece is atomic; the `write` is not.
+      - **Not atomic in the file.** Between pieces the inode is unlocked, so another
+        writer's piece can land in between (step 19).
+
+      If [[writei]] writes less than asked (disk full, bad user address), the loop stops,
+      and `filewrite` returns -1, though some bytes may have been written.
+
+      A sleep in `begin_op` costs no hart. `echo`'s frames (`usertrap` … `filewrite`,
+      `begin_op`, `sleep`, `sched`) wait on its kernel stack, and `swtch` moves hart 1 to its
+      scheduler stack ([[kernel/swtch.S:26]]) until the commit wakes `echo` up, on whichever
+      hart runs it next.
+
+  - title: writei refuses holes and huge files
+    file: kernel/fs.c
+    lines: 536-553
+    focus: 549-552
+    state:
+      hart: 1
+      mode: S
+      proc: echo (pid 4)
+      intr: on
+      satp: kernel
+      locks: ["inode 24 lock (sleep-lock)"]
+      irq: 0
+      stack: [usertrap, syscall, sys_write, filewrite, writei]
+      sp: kernel
+    note: |
+      [[writei]] checks two things before writing:
+
+      - `off > size`: writing beyond the end would leave a gap ("hole"). xv6 does not
+        support holes, so this fails. Our write is at `off = 0 = size`: allowed, it
+        appends.
+      - `off + n > MAXFILE * BSIZE`: the largest file is [[MAXFILE]] = 12 + 256 = 268
+        blocks, 274,432 bytes. Beyond that there is nowhere to record a block number.
+
+      Because writes always start at or before the end, a file's blocks below `size` are
+      always allocated, which is what let step 6 say reads never allocate.
+
+  - title: bmap allocates block 0 of f
+    file: kernel/fs.c
+    lines: 417-434
+    focus: 426-433
+    state:
+      hart: 1
+      mode: S
+      proc: echo (pid 4)
+      intr: on
+      satp: kernel
+      locks: ["inode 24 lock (sleep-lock)"]
+      irq: 0
+      stack: [usertrap, syscall, sys_write, filewrite, writei, bmap]
+      sp: kernel
+    note: |
+      [[writei]] asks [[bmap]] for file block 0 of `f`. `ip->addrs[0]` is 0: there is no
+      block yet. So `bmap` calls [[balloc]], and records the answer, 1006, in
+      `ip->addrs[0]`.
+
+      Notice what `bmap` does **not** do: write the inode. `addrs[0]` changed only in
+      memory. It relies on its caller to call [[iupdate]], and [[writei]] always does, at
+      the end, whether or not the size changed (the comment at line 573 says exactly
+      this). Forgetting it would leave a block marked used in the bitmap that no inode
+      points to.
+
+      If the disk is full, `balloc` returns 0 and so does `bmap`; `writei` stops early
+      and reports a short write.
+
+  - title: balloc finds a free bit
+    file: kernel/fs.c
+    lines: 63-90
+    focus: 76-80
+    state:
+      hart: 1
+      mode: S
+      proc: echo (pid 4)
+      intr: on
+      satp: kernel
+      locks: ["inode 24 lock (sleep-lock)", "buf 46 (sleep-lock)"]
+      irq: 0
+      stack: [usertrap, syscall, sys_write, filewrite, writei, bmap, balloc]
+      sp: kernel
+    note: |
+      The [[g:free-bitmap]] has one bit per block of the disk, 8192 per bitmap block
+      ([[BPB]]). This disk has 2000 blocks, so one bitmap block, 46, is enough.
+
+      [[balloc]] reads it and tests bits from 0 upward. `mkfs` reported `balloc: first
+      1006 blocks have been allocated`: blocks 0–1005 (metadata, then the programs' data)
+      are marked used. Bit 1006, bit 6 of byte 125, is the first 0. `balloc` sets it,
+      [[log_write]]s block 46, releases it, and zeroes block 1006 before returning it.
+
+      Like the inode allocator ([[tour:35]]), there is no allocator lock: the bitmap
+      block's buffer sleep-lock, held from the test to the set, is what makes the
+      allocation atomic.
+    others: |
+      `echo` on hart 1 and a process growing another file on hart 2 both call `balloc`:
+
+      | Time | Hart 1 (echo) | Hart 2 |
+      |---|---|---|
+      | t1 | `bread(46)`: holds the buffer | `bread(46)`: sleeps in [[bget]] |
+      | t2 | bit 1006 is 0: set it, `log_write`, `brelse` | |
+      | t3 | | gets block 46: bit 1006 is 1, bit 1007 is 0: takes 1007 |
+
+      Without the buffer lock both could see bit 1006 clear and both use block 1006, and
+      two files would share a data block.
+
+  - title: bzero, so old data never leaks
+    file: kernel/fs.c
+    lines: 51-61
+    focus: 58-59
+    state:
+      hart: 1
+      mode: S
+      proc: echo (pid 4)
+      intr: on
+      satp: kernel
+      locks: ["inode 24 lock (sleep-lock)", "buf 1006 (sleep-lock)"]
+      irq: 0
+      stack: [usertrap, syscall, sys_write, filewrite, writei, bmap, balloc, bzero]
+      sp: kernel
+    note: |
+      A free block may still hold the content of a file deleted earlier. [[bzero]] fills
+      the cached block 1006 with zeros and [[log_write]]s it.
+
+      Why bother, when `writei` is about to overwrite the bytes it needs?
+
+      - Strictly, a data block would not need it: xv6 has no holes, so the 1022 bytes past
+        `hi` can only become part of `f` by being written first, and [[readi]] never reads
+        past `size`. But [[balloc]] doesn't know what the block is for, and…
+      - The same `balloc` provides [[g:indirect-block|indirect blocks]], and there a zero
+        entry means "no block". Garbage would be read as block numbers.
+
+      And why through the log, instead of a direct disk write? Because the zeros must
+      reach the disk in the same transaction as the bitmap bit. Then `writei`'s own
+      `log_write` of block 1006 is absorbed into this one: the block is logged once.
+
+  - title: Copy from user space into the block, and log it
+    file: kernel/fs.c
+    lines: 543-568
+    focus: 558-566
+    state:
+      hart: 1
+      mode: S
+      proc: echo (pid 4)
+      intr: on
+      satp: kernel
+      locks: ["inode 24 lock (sleep-lock)", "buf 1006 (sleep-lock)"]
+      irq: 0
+      stack: [usertrap, syscall, sys_write, filewrite, writei]
+      sp: kernel
+    note: |
+      The loop mirrors [[readi]]'s: [[bread]] block 1006, compute how much fits, and
+      [[either_copyin]] two bytes, `"hi"`, from `echo`'s memory into the buffer at offset 0.
+      Then [[log_write]] instead of [[bwrite]]: the block is pinned and listed for the
+      commit, not written now ([[tour:31]]).
+
+      If the copy fails halfway (a bad user pointer partway through), lines 560–564 still
+      call `log_write`: [[copyin]] may already have changed part of the buffer. A changed
+      buffer that is not in the log is not pinned, so it could be evicted and the change
+      silently lost, leaving the cache and the disk telling different stories about the
+      same block. Logging it keeps the cache and the log consistent.
+    others: |
+      Hart 2 cannot read block 1006 at this moment: `echo` holds its buffer lock. And it
+      cannot be inside `f`'s inode at all: `echo` holds the inode lock. A reader of `f`
+      will see either no `hi` (size 0) or all of it, never a block that has `hi` with
+      a size that says 0, because `size` and the block change under the same inode lock.
+
+  - title: Grow the size, write the inode, commit
+    file: kernel/fs.c
+    lines: 568-579
+    focus: 570-576
+    state:
+      hart: 1
+      mode: S
+      proc: echo (pid 4)
+      intr: on
+      satp: kernel
+      locks: ["inode 24 lock (sleep-lock)"]
+      irq: 0
+      stack: [usertrap, syscall, sys_write, filewrite, writei]
+      sp: kernel
+    note: |
+      `off` is now 2, past the old `size` of 0, so `size = 2`. [[iupdate]] copies the
+      in-memory inode (with `addrs[0] = 1006` and `size = 2`) into block 34 and logs it.
+
+      Back in [[filewrite]], `f->off += 2`, [[iunlock]], [[end_op]]. `echo` is the only
+      operation in the transaction, so it commits: blocks 46, 1006, 34, as the trace
+      showed. The bitmap bit, the data and the inode that points to the data reach the
+      disk together, or not at all.
+
+  - title: The second write appends, because the offset moved
+    file: kernel/file.c
+    lines: 148-176
+    focus: 162-163
+    state:
+      hart: 1
+      mode: S
+      proc: echo (pid 4)
+      intr: on
+      satp: kernel
+      locks: ["inode 24 lock (sleep-lock)"]
+      irq: 0
+      stack: [usertrap, syscall, sys_write, filewrite]
+      sp: {"on": kernel, switched: "`ld sp, 8(a0)` in `uservec` ([[kernel/trampoline.S:76]]), for the second `write`", detail: "echo's kernel stack, refilled from empty"}
+    note: |
+      `write(1, "\n", 1)`: [[writei]] at `f->off = 2`. `bmap(0)` finds 1006 already there,
+      so no allocation. One byte is copied at offset 2, `size` becomes 3, and the commit
+      holds just two blocks: 1006 and 34. `cat f` prints `hi`.
+
+      This is what "appending" means in xv6: writing at an offset that has reached the
+      end. There is no `O_APPEND`. The shell's `>>` opens with `O_WRONLY | O_CREATE`,
+      without `O_TRUNC` ([[user/sh.c:398]]), and the offset starts at **0**. So `>>`
+      overwrites from the beginning. We tried it:
+
+          $ echo xy >> README
+          $ wc README
+          49 336 2441 README
+
+      The size is still 2441, but there is one more line: the first three bytes, `xv6`,
+      became `xy` and a newline.
+
+  - title: Past twelve blocks, the indirect block
+    file: kernel/fs.c
+    lines: 435-459
+    focus: 445-454
+    state:
+      hart: 1
+      mode: S
+      proc: a process writing block 12 or later
+      intr: on
+      satp: kernel
+      locks: ["inode lock (sleep-lock)", "buf of the indirect block (sleep-lock)"]
+      irq: 0
+      stack: [usertrap, syscall, sys_write, filewrite, writei, bmap]
+      sp: kernel
+    note: |
+      `f` will never need it, but a file longer than 12 blocks (12,288 bytes) does. For
+      `bn >= 12`, [[bmap]] subtracts 12 and looks in the [[g:indirect-block]], whose
+      address is `addrs[12]`:
+
+      1. No indirect block yet? [[balloc]] one (zeroed, so all 256 entries mean "none").
+      2. [[bread]] it, and look up entry `bn − 12`.
+      3. Entry 0? `balloc` a data block and store its number in the entry. The indirect
+         block itself changed, so it is [[log_write]]n right here (line 451), unlike
+         `addrs[]`, which waits for [[iupdate]].
+
+      On this disk, `usertests` (inode 15, 209,552 bytes = 205 blocks) has its first 12
+      blocks at 517–528 and its indirect block at 529, listing the other 193.
+
+      Every access to blocks 12 and up costs one extra block read, of the indirect block,
+      usually a cache hit. A new block there can dirty four blocks in one go: the indirect
+      block, the bitmap, the data block, and later the inode; which is why
+      [[filewrite]]'s budget counts the indirect block.
+
+  - title: Two processes, one file descriptor
+    file: kernel/file.c
+    lines: 148-176
+    focus: 162-163
+    state:
+      hart: [1, 2]
+      mode: S
+      proc: echo aaa and echo bbb, sharing one struct file
+      intr: on
+      satp: kernel
+      locks: ["out's inode lock (sleep-lock), one hart at a time"]
+      irq: 0
+      stack: [usertrap, syscall, sys_write, filewrite]
+      sp: kernel
+    note: |
+      We ran `(echo aaa &; echo bbb) > out`. The subshell opens `out` once, then forks both
+      `echo`s; they inherit descriptor 1 pointing at **one** `struct file`, one `f->off`.
+      Each `echo` makes two writes (`"aaa"`, then `"\n"`). What can the file look like?
+
+      The inode lock covers reading `f->off`, writing at it, and advancing it. So each
+      `write` (each piece, for big ones) is placed at a fresh offset; no two can land at
+      the same place, and no byte is lost. But *between* writes the lock is free:
+
+      | Time | Hart 1 (echo aaa) | Hart 2 (echo bbb) |
+      |---|---|---|
+      | t1 | `ilock`; `"aaa"` at 0; `off = 3`; `iunlock` | `ilock`: sleeps |
+      | t2 | | `"bbb"` at 3; `off = 6`; `iunlock` |
+      | t3 | `"\n"` at 6; `off = 7` | |
+      | t4 | | `"\n"` at 7; `off = 8` |
+
+      Result: `aaabbb\n\n`, 8 bytes. In our four runs we always got `aaa\nbbb\n` (the
+      first `echo` is forked first and usually finishes first), but the code permits
+      any interleaving of the four writes that keeps each process's two in order:
+      `aaa\nbbb\n`, `aaabbb\n\n`, `bbbaaa\n\n` or `bbb\naaa\n`. The size is always 8.
+    others: |
+      Compare two **separate** opens of one file: `echo aaa > o2 &; echo bbbbb > o2`. Now
+      each process has its own `struct file` and its own offset, both starting at 0. The
+      inode lock still serializes each write, but nothing stops them from writing at the
+      same offset. Our run produced `bbb\nb\n`: `bbbbb` overwrote `aaa`, then `aaa`'s
+      newline landed at offset 3. Without the inode lock, even the shared-descriptor case
+      would behave like this: both writers could read `f->off = 0` before either advanced
+      it.
+
+      The two writers run on two harts, each with its own `sp` on its own kernel stack, and each
+      `filewrite` call has its own `i`, `n1` and `r`, kept in its own registers and frame. (The
+      one that sleeps in `ilock` at t1 leaves its frames on its kernel stack while its hart runs
+      something else.) What they share is the one `struct file` and its `off`, in global memory,
+      which is why `f->off` is only read and advanced under the inode lock.
+
+  - title: What a big write looks like to a second writer
+    file: kernel/file.c
+    lines: 148-176
+    focus: 155-160
+    state:
+      hart: 1
+      mode: S
+      proc: a process writing 10,000 bytes
+      intr: on
+      satp: kernel
+      locks: []
+      irq: 0
+      stack: [usertrap, syscall, sys_write, filewrite]
+      sp: kernel
+    note: |
+      Make the writes bigger: two processes sharing a descriptor each `write` 10,000
+      bytes. Each `write` is four pieces, and each piece takes and releases the inode lock
+      (and is its own transaction). So the file can end up as
+
+      | Offset | 0 | 3072 | 6144 | … |
+      |---|---|---|---|---|
+      | Written by | A, piece 1 | B, piece 1 | A, piece 2 | … |
+
+      with the two 10,000-byte writes interleaved in 3072-byte pieces. (We have not
+      observed this; it follows from the loop.) Each piece is placed atomically at a fresh offset, so the total is still
+      exactly 20,000 bytes with no overlap.
+
+      The same split shows up after a crash: [[tour:32]]'s `logstress` test wrote 2000-byte
+      pieces from six processes, and recovery installed one transaction containing blocks
+      from several of them.
+
+  - title: What a read and a write cost
+    file: kernel/fs.c
+    lines: 536-579
+    focus: 554-576
+    state:
+      hart: 1
+      mode: S
+      proc: echo (pid 4)
+      intr: on
+      satp: kernel
+      locks: ["inode 24 lock (sleep-lock)"]
+      irq: 0
+      stack: [usertrap, syscall, sys_write, filewrite, writei]
+      sp: kernel
+    note: |
+      `wc README`: six system calls, six inode lock/unlock pairs, five block reads (all
+      cache hits after the first of each block), five copies to user memory, no disk
+      writes.
+
+      `echo hi > f`'s two writes: two transactions; the first scanned 1007 bitmap bits,
+      zeroed a block, and logged 3 blocks (8 disk writes at commit), the second logged 2
+      (6 writes). Three bytes of data cost 14 synchronous disk writes. Batching, in
+      user space or by group commit, is what makes real workloads affordable.
+
+      The ideas:
+
+      - **A position in a file becomes a disk block through [[bmap]]**: 12 direct entries,
+        then one indirect block of 256.
+      - **Allocation is test-and-set under a buffer lock**, in [[balloc]] as in
+        [[ialloc]], and every new block is zeroed in the same transaction.
+      - **The offset lives in the open file, but the inode lock protects it**, which makes
+        each `read` or `write` piece atomic with respect to other users of the same
+        descriptor.
+      - **Big writes are split** to fit the log, so they are neither atomic on disk nor
+        atomic in the file.
+locks:
+  - lock: "inode sleep-lock"
+    where: "[[fileread]], [[filewrite]] (per piece), [[filestat]]"
+    protects: "`size`, `addrs[]`, the file's content, and the open file's `f->off` during each read or write piece"
+  - lock: "no lock of its own: f->off"
+    where: "[[fileread]], [[filewrite]]"
+    protects: "Read and advanced only while holding the inode's sleep-lock"
+  - lock: "buffer sleep-lock on the bitmap block"
+    where: "[[balloc]], [[bfree]] via [[bread]]"
+    protects: "The test and set of a block's bit: the block allocator's only lock"
+  - lock: "buffer sleep-lock on a data or indirect block"
+    where: "[[readi]], [[writei]], [[bmap]], [[bzero]]"
+    protects: "The block's contents while bytes are copied in or out"
+  - lock: "log.lock and the transaction (begin_op / end_op)"
+    where: "[[filewrite]], once per 3072-byte piece; [[log_write]]"
+    protects: "Atomicity of each piece on disk; begun before the inode lock is taken"
+  - lock: "no transaction for reads"
+    where: "[[sys_read]], [[fileread]]"
+    protects: "Nothing to protect: reading never changes the disk (and [[bmap]] cannot allocate below `size`)"
+quiz:
+  - q: "Why does `filewrite` call `begin_op` before `ilock` rather than after?"
+    a: "`begin_op` may sleep, when the log is too full, until the current transaction commits, and the commit waits for every outstanding operation to call `end_op`. If a process slept in `begin_op` holding the inode lock while another operation in the transaction waited for that lock, neither could proceed: a deadlock. Beginning the transaction first means no inode lock is ever held while waiting for the log."
+  - q: "Where does the number 3072 in `filewrite` come from?"
+    a: "A transaction may dirty at most MAXOPBLOCKS = 10 blocks. In the worst case a 3072-byte write that doesn't start on a block boundary touches 4 data blocks, of which at most 3 are new (the first already exists, because writes never start past `size`); add a possibly new indirect block, so up to 4 bitmap updates, plus the indirect block and the inode: 4 + 4 + 1 + 1 = 10. The source writes this as (10 − 1 − 1 − 2) / 2 = 3 blocks: inode, indirect, 2 blocks of slop for unaligned writes, the rest split between data and bitmap. 3 × 1024 = 3072."
+  - q: "Two processes share a file descriptor and each writes `\"aaa\"` once. Can the file end up with only 3 bytes? Why or why not?"
+    a: "No. Both writes read and advance the shared `f->off` while holding the inode lock, so the second one starts at offset 3. The file is `aaaaaa`. With two separate `open`s (two offsets) it could end up 3 bytes long."
+  - q: "`writei` returns early because `copyin` fails halfway through a block. Why does it still call `log_write` on that buffer?"
+    a: "`copyin` may already have changed part of the cached block. A changed buffer must be in the log, or it could be evicted with the change lost, and the cache would disagree with what the transaction commits. Logging it keeps them consistent."
+  - q: "Why does `balloc` zero the block it allocates, and why through `log_write`?"
+    a: "`balloc` doesn't know what the block is for, and an indirect block must start with all entries 0 (\"no block\"), or old data would be read as block numbers. (A data block's old bytes could never be read anyway: no holes, and `readi` stops at `size`.) The zeros must reach the disk in the same transaction as the bitmap bit and the inode pointer, so they go through the log."
+  - q: "A crash happens during a 10,000-byte `write`. What states can the file be in after recovery?"
+    a: "The write was four transactions of 3072, 3072, 3072 and 784 bytes. After recovery the file holds the effects of the committed ones: 0, 3072, 6144, 9216 or all 10,000 bytes of the new data, never a partial piece."

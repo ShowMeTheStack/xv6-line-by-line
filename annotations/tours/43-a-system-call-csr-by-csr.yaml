@@ -1,0 +1,796 @@
+title: A system call, CSR by CSR
+group: The dance of privilege
+prerequisites: [5, 7, 41]
+summary: |
+  [[tour:5]] followed `echo hi`'s `write(1, "hi", 2)` through the kernel's layers. This tour
+  follows the same system call with a different lens: the **control and status registers**
+  ([[g:csr|CSRs]]) and the three answers to the master question, which mode, which stack, which
+  page table, at every instruction that changes one of them.
+
+  The values are not invented. We attached gdb to QEMU, stopped `echo` on its `ecall`, and
+  read every relevant register after each step, in this build (kernel at commit 06aad25, three
+  harts). In our run `echo` was pid 3, in process slot 2, running on **hart 0**.
+
+  The lesson you should leave with: **the hardware does very little.** `ecall` changes the mode,
+  the `pc` and four CSRs. `sret` changes the mode, the `pc` and three bits. Everything else, the
+  stack, the page table, the registers, the trap vector, is a sequence of ordinary instructions
+  that xv6 wrote and that you can read below.
+cast: |
+  The machine has three [[g:hart|harts]]. When the tour starts:
+
+  | Hart | What it is doing |
+  |---|---|
+  | 0 | Running `echo` (pid 3) in user mode: the process this tour follows |
+  | 1 | In its [[kernel:scheduler]], with nothing to run |
+  | 2 | In its [[kernel:scheduler]], with nothing to run |
+
+  The shell (pid 2) is asleep in [[kernel:kwait]]; `init` (pid 1) is asleep too. So `echo` is
+  the only user process that can trap, which is what let us catch its trap with gdb without
+  confusing it with anyone else's.
+steps:
+  - title: Before the ecall, the CSRs hold leftovers
+    file: user/usys.S
+    lines: 28-32
+    focus: 30-31
+    state:
+      hart: 0
+      mode: U
+      proc: echo (pid 3)
+      intr: on
+      satp: user
+      locks: []
+      stack: [main, write]
+      sp: {"on": user, detail: "sp = 0x3f70 in echo's user stack"}
+    note: |
+      `echo` has called the [[g:syscall-stub]] `write`. `li a7, 16` has run; the `ecall` at
+      address `0x354` is next. We stopped hart 0 here with a gdb breakpoint on `0x354` that
+      fires only when `a7` is 16 and `a2` is 2, and read the registers:
+
+      | Register | Value | Meaning |
+      |---|---|---|
+      | `pc` / mode | `0x354` / U | about to execute `ecall` |
+      | `sp` | `0x3f70` | echo's user stack |
+      | `a0`, `a1`, `a2`, `a7` | `1`, `0x3fe0`, `2`, `16` | fd, the address of `"hi"`, count, `SYS_write` |
+      | [[g:csr:satp]] | `0x8000000000087f24` | Sv39, echo's root page table at physical `0x87f24000` |
+      | [[g:csr:stvec]] | `0x3ffffff000` | [[uservec]], in the trampoline |
+      | [[g:csr:sstatus]] | `SPP=0 SPIE=1 SIE=1` | raw `0x200000022` |
+      | `sepc`, `scause` | `0x7c`, `0x8000000000000009` | **stale** |
+      | `sscratch` | `0x2020` | **stale** |
+      | `tp` | `0x0505050505050505` | junk |
+
+      The stale rows matter. A CSR keeps whatever the last trap on *this hart* left in it.
+      `echo`'s last trap on this hart was its own `exec` system call, made while it was still
+      a copy of the shell: `sscratch` still holds that call's `a0`, `0x2020`, the shell's
+      buffer holding the string "echo". `sepc = 0x7c` is what [[prepare_return]] wrote at the
+      end of that `exec`: `0x7c` is `echo`'s entry point, `start`. `scause` is newer. It comes
+      from an interrupt taken *in the kernel* during the `exec` (a UART interrupt in this run,
+      a timer tick in an earlier one), and [[kerneltrap]] puts back `sepc` and `sstatus` but
+      never `scause`. Nothing cleans these leftovers up, because nothing needs to.
+
+      The raw `sstatus` value carries other fields too. `0x200000000` is `UXL = 2` (user
+      code is 64-bit). The tour decodes only the three bits xv6 uses.
+    others: |
+      `tp` is junk in user mode: `0x05` repeated is the pattern [[kalloc]] fills new pages
+      with ([[kernel/kalloc.c:80]]). `init`'s first trapframe came from `kalloc`, `kexec`
+      never sets `tp`, and every `fork` copies the trapframe, so every process in our run
+      inherited that `tp`. User code here doesn't use `tp`, and the kernel never trusts the
+      user's value, as step 6 shows.
+
+  - title: "ecall: the hardware's whole contribution"
+    file: user/usys.S
+    lines: 28-32
+    focus: 31
+    state:
+      hart: 0
+      mode: U
+      proc: echo (pid 3)
+      intr: on
+      satp: user
+      locks: []
+      stack: [main, write]
+      sp: {"on": user, detail: "0x3f70"}
+    note: |
+      We single-stepped the [[g:insn:ecall|ecall]] and compared. Everything the instruction
+      changed:
+
+      | | before | after `ecall` |
+      |---|---|---|
+      | mode | U | **S** |
+      | `pc` | `0x354` | **`0x3ffffff000`** (copied from `stvec`) |
+      | `sepc` | `0x7c` | **`0x354`**, the `ecall` itself |
+      | `scause` | `0x8000000000000009` | **`8`**, "environment call from U-mode" |
+      | `stval` | `0` | `0` (written with zero: an `ecall` has no extra information) |
+      | `sstatus.SPP` | 0 | 0: the trap came from U-mode |
+      | `sstatus.SPIE` | 1 | 1: a copy of the old `SIE` |
+      | `sstatus.SIE` | 1 | **0**: interrupts off in S-mode |
+
+      That is the complete list. The mode becomes S, not M, only because [[kernel:start]]
+      delegated every exception to supervisor mode with `medeleg` ([[kernel/start.c:31]]).
+
+      `sepc` holds the address of the `ecall`, not the next instruction. The privileged spec
+      says so for every synchronous exception: `sepc` points at the instruction that caused
+      it, so that a fault can be retried. A system call is the one case where the kernel
+      wants to *skip* the instruction, and it must add 4 itself (step 10).
+
+  - title: What ecall did not touch
+    file: kernel/trampoline.S
+    lines: 16-38
+    focus: 22-32
+    state:
+      hart: 0
+      mode: S
+      proc: echo (pid 3)
+      intr: off
+      satp: user
+      locks: []
+      irq: 0
+      stack: [uservec]
+      sp: {"on": none, detail: "still echo's user value 0x3f70"}
+    note: |
+      Hart 0 is now at [[uservec]]'s first instruction, in supervisor mode, and the rest of the
+      machine is exactly as `echo` left it:
+
+      | Register | Value now | Changed? |
+      |---|---|---|
+      | `satp` | `0x8000000000087f24` | no: still **echo's** page table |
+      | `sp` | `0x3f70` | no: still echo's user stack |
+      | all 31 general registers | `a0 = 1`, `a7 = 16`, `tp` = junk… | no |
+      | `stvec`, `sscratch` | `0x3ffffff000`, `0x2020` | no |
+
+      This is the most important fact about RISC-V traps, and the most common
+      misunderstanding: **the hardware does not switch page tables, does not switch stacks,
+      and does not save registers.** (Some architectures load a kernel stack pointer as part
+      of a trap; x86 does, from a table the OS fills in. RISC-V leaves it to software.)
+
+      So supervisor code is running with a user page table, a user stack pointer it must not
+      trust, and not one free register. The fetch of this very instruction works only because
+      the [[g:trampoline]] page is mapped at `0x3ffffff000` in echo's page table as well as
+      the kernel's ([[kernel/proc.c:189]]). The `sp` is labelled "none": it holds a
+      value, but the kernel won't push anything through a pointer the user controls.
+      [[concept:mode-stack-page-table#who]] has the full table of who changes what.
+
+  - title: "sscratch: one register's worth of room"
+    file: kernel/trampoline.S
+    lines: 30-38
+    focus: 32-37
+    state:
+      hart: 0
+      mode: S
+      proc: echo (pid 3)
+      intr: off
+      satp: user
+      locks: []
+      irq: 0
+      stack: [uservec]
+      sp: {"on": none, detail: "0x3f70, the user's"}
+    note: |
+      To save registers, the code needs an address in a register, and every register holds
+      user data. `csrw sscratch, a0` parks the user's `a0` in [[g:csr:sscratch|sscratch]],
+      a CSR the hardware never touches on its own, which the spec sets aside for the
+      supervisor's use. Then `li a0, TRAPFRAME` (assembled
+      as three instructions, `lui`/`addiw`/`slli`, at `0x3ffffff004`) loads a constant.
+
+      | Register | before | after line 37 |
+      |---|---|---|
+      | `sscratch` | `0x2020` (stale) | **`0x1`**, echo's `a0` |
+      | `a0` | `0x1` | **`0x3fffffe000`**, `TRAPFRAME` |
+
+      Notice what `sscratch` holds: the user's `a0`, for a few dozen instructions. It does not
+      hold a pointer to the trapframe (some older xv6 releases used it that way). Between traps
+      it holds stale junk, which we saw in step 1.
+
+      Why can a constant address work for every process? Because `TRAPFRAME` is a *virtual*
+      address, and `satp` still holds echo's page table, where it maps to echo's own
+      [[g:trapframe]] page.
+    others: |
+      If hart 1 trapped from another process at this instant, it would execute these same
+      instructions at the same virtual address, and its `TRAPFRAME` would translate through
+      *its* `satp` to a different physical page. Each hart has its own `sscratch` too. Nothing
+      here is shared, so nothing needs a lock.
+
+  - title: Thirty-one stores through the user page table
+    file: kernel/trampoline.S
+    lines: 39-74
+    focus: 40-73
+    state:
+      hart: 0
+      mode: S
+      proc: echo (pid 3)
+      intr: off
+      satp: user
+      locks: []
+      irq: 0
+      stack: [uservec]
+      sp: {"on": none, detail: "0x3f70, the user's"}
+    note: |
+      Every user register goes into the trapframe, at the offsets of `struct trapframe`
+      ([[kernel/proc.h:40]]). The user `a0` comes back out of `sscratch` into `t0` and is
+      stored at offset 112. Here is part of echo's trapframe just before line 76, as gdb read it
+      through the user page table:
+
+      | Field | Value | Written by |
+      |---|---|---|
+      | `ra`, `sp` | `0x62`, `0x3f70` | these stores |
+      | `a0`, `a1`, `a2`, `a7` | `1`, `0x3fe0`, `2`, `0x10` | these stores |
+      | `epc` | `0x7c` | [[kexec]], which set it to the entry point `0x7c`; stale until [[usertrap]] rewrites it |
+      | `kernel_satp` | `0x8000000000087fff` | [[prepare_return]], last time echo left the kernel |
+      | `kernel_sp` | `0x3fffffa000` | the same |
+      | `kernel_trap` | `0x800025ca` | the same: the address of [[usertrap]] |
+      | `kernel_hartid` | `0` | the same |
+
+      The bottom four rows are a message the kernel left for itself. They are the only way
+      [[uservec]] can learn where the kernel's stack and page table are, because it can't
+      reach any kernel memory yet.
+
+  - title: "ld sp: a stack that cannot be used yet"
+    file: kernel/trampoline.S
+    lines: 75-91
+    focus: 76-85
+    state:
+      hart: 0
+      mode: S
+      proc: echo (pid 3)
+      intr: off
+      satp: user
+      locks: []
+      irq: 0
+      stack: [uservec]
+      sp: {"on": none, detail: "0x3fffffa000, echo's kernel stack top, not mapped in echo's page table"}
+    note: |
+      Four loads from the trapframe:
+
+      | Register | before | after |
+      |---|---|---|
+      | `sp` | `0x3f70` | **`0x3fffffa000`**: `kernel_sp` |
+      | `tp` | `0x0505050505050505` | **`0`**: `kernel_hartid` |
+      | `t0` | (user's) | `0x800025ca`: [[usertrap]] |
+      | `t1` | (user's) | `0x8000000000087fff`: the kernel's `satp` |
+
+      `0x3fffffa000` is the top of `KSTACK(2)`, the kernel stack of process slot 2, so it is
+      **empty**: whenever a process is in user mode, its kernel stack holds nothing
+      ([[concept:stacks#kernel]]).
+
+      Yet for the next four instructions, `sp` points at nothing usable. That address
+      exists only in the *kernel* page table, and `satp` still names echo's. A push here
+      would fault. So the stack strip says "none", even though `sp` already holds its final
+      value. [[uservec]] doesn't push anything until line 92 has run.
+
+      `tp`, like `sp`, comes from a field the kernel wrote itself: [[cpuid]] reads the hart
+      number from it for the rest of the trap.
+
+  - title: "csrw satp: the page table changes under the running code"
+    file: kernel/trampoline.S
+    lines: 86-98
+    focus: 89-95
+    state:
+      hart: 0
+      mode: S
+      proc: echo (pid 3)
+      intr: off
+      satp: kernel
+      locks: []
+      irq: 0
+      stack: [uservec]
+      sp: {"on": kernel, switched: "`csrw satp` makes the stack loaded on line 76 reachable", detail: "0x3fffffa000, empty"}
+    note: |
+      | Register | before line 92 | after line 92 |
+      |---|---|---|
+      | `satp` | `0x8000000000087f24` (echo) | **`0x8000000000087fff`** (kernel) |
+
+      A `satp` value has two parts that matter here: the top four bits are `MODE = 8`, which
+      means [[g:sv39|Sv39]] paging, and the low 44 bits are the physical page number of the
+      root page table. The kernel's root is at `0x87fff000`, echo's at `0x87f24000`.
+
+      The instruction after `csrw` is fetched from `0x3ffffff096` using the *new* page table,
+      which also maps the trampoline at that address ([[kernel/vm.c:47]]). The two
+      [[g:insn:sfence.vma|sfence.vma]] instructions bracket the switch: the first makes sure
+      earlier stores (the 31 into the trapframe) are finished with the old translation; the
+      second throws away cached user translations from the [[g:tlb]].
+
+      With that one write, `sp` became real: `0x3fffffa000` is now mapped, and the kernel
+      stack is usable. That is the second half of the stack switch begun on line 76.
+    others: |
+      The kernel page table is shared by all three harts, and nobody modifies it after boot,
+      so loading it needs no lock. Each hart has its own `satp` and its own TLB, so hart 0's
+      switch doesn't disturb harts 1 and 2. The `sfence.vma` affects only this hart.
+
+  - title: "jalr t0: into C, with ra pointing back into the trampoline"
+    file: kernel/trampoline.S
+    lines: 96-102
+    focus: 98
+    state:
+      hart: 0
+      mode: S
+      proc: echo (pid 3)
+      intr: off
+      satp: kernel
+      locks: []
+      irq: 0
+      stack: [uservec]
+      sp: {"on": kernel, detail: "0x3fffffa000, empty"}
+    note: |
+      `jalr t0` jumps to `0x800025ca`, [[usertrap]], and writes the return address into `ra`.
+      gdb at the first instruction of `usertrap`:
+
+      | Register | Value |
+      |---|---|
+      | `pc` | `0x800025ca` |
+      | `ra` | **`0x3ffffff09c`**, the address of [[userret]] |
+      | `sp` | `0x3fffffa000`, still empty |
+      | `sstatus` | `SPP=0 SPIE=1 SIE=0` |
+
+      So `usertrap` is an ordinary C function that, when it returns, lands in [[userret]].
+      The return trip needs no special jump: the `jalr` already arranged it. Note that `ra`
+      is a *virtual* address in the trampoline page, valid in both page tables.
+
+      This is also the first C code of the trap, and C needs a stack: `usertrap`'s prologue
+      moves `sp` to `0x3fffff9fe0`, a 32-byte frame at the top of echo's kernel stack.
+
+  - title: usertrap checks SPP, then moves stvec
+    file: kernel/trap.c
+    lines: 37-50
+    focus: 42-47
+    state:
+      hart: 0
+      mode: S
+      proc: echo (pid 3)
+      intr: off
+      satp: kernel
+      locks: []
+      irq: 0
+      stack: [usertrap]
+      sp: {"on": kernel, detail: "0x3fffff9fe0"}
+    note: |
+      [[usertrap]] first reads `sstatus.SPP`. It is 0, so the trap really came from user mode.
+      This is the only way software can tell where it came from: no CSR reports the
+      *current* mode, only the previous one.
+
+      Then line 47 rewrites the trap vector:
+
+      | Register | before | after |
+      |---|---|---|
+      | `stvec` | `0x3ffffff000` ([[uservec]]) | **`0x800055b0`** ([[kernelvec]]) |
+
+      From now on, any trap on hart 0 is a trap *from the kernel*, and must go to the
+      handler that assumes a kernel stack and the kernel page table. `uservec` assumes the
+      opposite of both. With `SIE = 0` no interrupt can arrive before this line, and the code
+      before it can't fault, so the order is safe.
+
+      This is one of exactly three places that ever write `stvec`: [[trapinithart]] at boot,
+      this line, and [[prepare_return]] on the way out (step 13).
+
+  - title: Copy sepc before anything can overwrite it
+    file: kernel/trap.c
+    lines: 49-63
+    focus: 49-62
+    state:
+      hart: 0
+      mode: S
+      proc: echo (pid 3)
+      intr: off
+      satp: kernel
+      locks: []
+      irq: 0
+      stack: [usertrap]
+      sp: {"on": kernel, detail: "0x3fffff9fe0"}
+    note: |
+      Line 52 copies `sepc` (`0x354`) into `p->trapframe->epc`, replacing the stale `0x7c`.
+      Line 54 reads `scause`: `8`, a system call. Line 62 adds 4, so the trapframe now says
+      `epc = 0x358`, the `ret` after the `ecall` (gdb confirmed both).
+
+      Why copy at all? `sepc`, `scause` and `stval` are **per hart, not per process**. The
+      next trap on hart 0, from any cause, will overwrite them. The trapframe is per process
+      and survives anything. Once the copy is made, the CSRs can be lost without harm.
+
+      [[killed]] takes `echo`'s `p->lock` for an instant to read `p->killed`, so a `kill`
+      from another hart is seen here at the latest.
+    others: |
+      A `kill` running on hart 1 sets `p->killed` under the same `p->lock`. Either it gets
+      there first and `echo` exits here, or it gets there after and `echo` sees it at
+      [[kernel/trap.c:81]], on the way out, or, if the kill lands after that check, at `echo`'s
+      next trap. The lock makes sure the flag is never half-read.
+
+  - title: intr_on, and a tick that was waiting
+    file: kernel/trap.c
+    lines: 60-69
+    focus: 64-66
+    state:
+      hart: 0
+      mode: S
+      proc: echo (pid 3)
+      intr: on
+      satp: kernel
+      locks: []
+      irq: {noff: 0, note: "SIE is now on at noff 0: the first `acquire` in this system call will record intena 1"}
+      stack: [usertrap]
+      sp: {"on": kernel, detail: "0x3fffff9fe0"}
+    note: |
+      [[intr_on]] is one instruction, `csrsi sstatus, 2`, at `0x80002668`:
+
+      | Register | before | after |
+      |---|---|---|
+      | `sstatus.SIE` | 0 | **1** |
+
+      Our run showed exactly why the comment on lines 64–65 exists. The tick went pending
+      while gdb held the hart: `sip` showed the supervisor timer pending (`STIP`) already at
+      the `ecall`. Run freely, it would have been taken in user mode before the `ecall`; our
+      single-stepping kept it pending. The moment `SIE` became 1, the interrupt was taken
+      through [[kernelvec]], at the very next instruction. When we next stopped, in
+      [[sys_write]], the CSRs read:
+
+      | Register | Value |
+      |---|---|
+      | `sepc` | **`0x8000266c`**: the `jal syscall` right after `csrsi` |
+      | `scause` | **`0x8000000000000005`**: supervisor timer |
+
+      The system call's own `sepc` and `scause` were gone. Because `usertrap` had copied them
+      (step 10), nothing was lost. Had `intr_on` come first, `echo` would have resumed at a
+      kernel address, faulted (`scause = 12`) and been killed: we ran it.
+
+      Line 66 is one of only three calls of `intr_on()` (the others are the scheduler's line
+      441 and [[pop_off]], when `noff` drops to 0 with `intena` 1), and like them it runs at
+      `noff` 0, holding no spinlock. From here on, the first [[acquire]] of the system call
+      records `intena` = 1, so the matching `release` turns interrupts back on
+      ([[concept:locks#intena]]).
+
+      Because it was a timer tick and `echo` was the current process, [[kerneltrap]] called
+      [[yield]]: `echo` went through [[swtch]] to hart 0's scheduler and straight back (it was
+      the only runnable process) before `syscall()` began. ([[tour:44]] follows a tick like
+      this one.)
+    others: |
+      With interrupts on, a tick on hart 0 may [[yield]] and move `echo` to hart 1 or 2 in the
+      middle of this system call. The trapframe and the kernel stack go with it; `sepc`,
+      `scause` and `sstatus` stay behind with the hart.
+
+  - title: The system call runs, deeper on the kernel stack
+    file: kernel/syscall.c
+    lines: 136-151
+    focus: 142-146
+    state:
+      hart: 0
+      mode: S
+      proc: echo (pid 3)
+      intr: on
+      satp: kernel
+      locks: []
+      irq: 0
+      stack: [usertrap, syscall, sys_write]
+      sp: {"on": kernel, detail: "0x3fffff9fc0 at sys_write's entry"}
+    note: |
+      [[syscall]] reads `a7` (16) from the trapframe and calls [[sys_write]]. gdb's backtrace
+      at `sys_write`'s first instruction, read on echo's kernel stack:
+
+      ```text
+      #0  sys_write   sysfile.c:84     sp = 0x3fffff9fc0
+      #1  syscall     syscall.c:146
+      #2  usertrap    trap.c:68
+      #3  0x3ffffff09c                  (userret: where usertrap will return)
+      ```
+
+      Line 146 puts the result, `2`, into `p->trapframe->a0`.
+
+      None of the CSRs in this tour describe `echo` any more. They describe the most recent
+      trap on whatever hart `echo` is running on. In our run, the UART's "transmitter ready"
+      interrupt arrived inside [[uartwrite]], right after the byte was stored into the
+      transmit register: when we stopped next, `sepc` was `0x8000094c` and `scause` was
+      `0x8000000000000009`, a supervisor external interrupt. All that matters now lives in
+      memory: the trapframe and the kernel stack.
+
+  - title: "prepare_return: interrupts off, then stvec back to the trampoline"
+    file: kernel/trap.c
+    lines: 97-113
+    focus: 108-112
+    state:
+      hart: 0
+      mode: S
+      proc: echo (pid 3)
+      intr: off
+      satp: kernel
+      locks: []
+      irq: {noff: 0, note: "the system call released every lock, and `pop_off` restored SIE from intena 1; line 108 clears it at noff 0"}
+      stack: [usertrap, prepare_return]
+      sp: {"on": kernel, detail: "0x3fffff9fd0"}
+    note: |
+      [[usertrap]] calls [[prepare_return]]. Two writes, in this order:
+
+      | Instruction | Register | before | after |
+      |---|---|---|---|
+      | `csrci sstatus, 2` (line 108) | `sstatus.SIE` | 1 | **0** |
+      | `csrw stvec, a5` (line 112) | `stvec` | `0x800055b0` | **`0x3ffffff000`** |
+
+      The order is the whole point. From line 112 until `sret`, the hart is in supervisor
+      mode with a trap vector that expects to be entered *from user mode*. An interrupt in
+      that window would jump to [[uservec]] with the *kernel* page table still installed. Its
+      very first store, `sd ra, 40(a0)` into `TRAPFRAME`, would fault, because only user page
+      tables map the trapframe. The fault goes to `stvec`, which is still `uservec`, and the
+      same store faults again, forever: a silent hang. (We forced exactly this: over a million
+      store faults at `0x3ffffff00c` in 20 seconds, no message.) With `SIE = 0`, no interrupt
+      can be taken, so the window is closed. The code between here and `sret` is also written so that it
+      can't fault.
+
+      Line 108 runs at `noff` 0: every lock the system call took is released, and the last
+      `pop_off` turned SIE back on because `intena` was 1. Nothing after line 108 acquires a
+      lock, so nothing can turn SIE on again before `sret` ([[concept:locks#sie]]).
+
+      The `uservec` address is computed (`TRAMPOLINE + (uservec - trampoline)`) because the
+      linker placed the code at `0x80006000`. The hart must use the high alias that every user
+      page table maps.
+
+  - title: The trapframe's message for next time
+    file: kernel/trap.c
+    lines: 114-120
+    focus: 116-119
+    state:
+      hart: 0
+      mode: S
+      proc: echo (pid 3)
+      intr: off
+      satp: kernel
+      locks: []
+      irq: 0
+      stack: [usertrap, prepare_return]
+      sp: {"on": kernel, detail: "0x3fffff9fd0"}
+    note: |
+      Four memory writes, no CSR writes. They refill the fields that [[uservec]] read in step
+      6, for the *next* trap from `echo`:
+
+      | Field | Value in our run |
+      |---|---|
+      | `kernel_satp` | `0x8000000000087fff`, read from this hart's `satp` |
+      | `kernel_sp` | `0x3fffffa000`, `p->kstack + PGSIZE`: the top, so the next trap starts on an **empty** kernel stack |
+      | `kernel_trap` | `0x800025ca`, [[usertrap]] |
+      | `kernel_hartid` | `0`, read from `tp` |
+
+      They are the same values as last time, because `echo` stayed on hart 0. Had a tick
+      moved it to hart 2 during the system call, `kernel_hartid` would now become 2. That is
+      correct: a process in user mode never changes hart, so the next trap will happen on the
+      hart that is sending it there.
+
+  - title: "Arming sret: SPP, SPIE and sepc"
+    file: kernel/trap.c
+    lines: 121-132
+    focus: 124-131
+    state:
+      hart: 0
+      mode: S
+      proc: echo (pid 3)
+      intr: off
+      satp: kernel
+      locks: []
+      irq: 0
+      stack: [usertrap, prepare_return]
+      sp: {"on": kernel, detail: "0x3fffff9fd0"}
+    note: |
+      `sret` takes its orders from two CSRs, so they are written now:
+
+      | Register | before | after | read by `sret` as |
+      |---|---|---|---|
+      | `sstatus.SPP` | 0 | 0 | the mode to return to: U |
+      | `sstatus.SPIE` | 1 | 1 | the value `SIE` will get |
+      | `sepc` | **`0x8000094c`** | **`0x358`** | the address to jump to |
+
+      In our run `SPP` and `SPIE` already had these values, so the `csrw sstatus` changed
+      nothing that xv6 cares about. They are written anyway, because `sstatus` belongs to the
+      hart, and the hart has had other business. A trap taken in the kernel sets `SPP` to 1;
+      its own `sret` resets it to 0, but a thread that [[yield]]s from *inside* such a trap
+      leaves `SPP = 1` behind on its hart, and the next thread that hart runs may come
+      straight here ([[tour:44]] measures exactly that kind of leftover).
+
+      `sepc` shows the problem plainly: it held `0x8000094c`, the kernel address where the UART
+      interrupt struck in [[uartwrite]]. `p->trapframe->epc` (`0x358`) is the only reliable
+      copy of where `echo` should continue.
+
+      One subtlety, which the spec makes clear: while a hart runs in U-mode, supervisor
+      interrupts are taken **whatever `SIE` says**. So `SPIE = 1` is not what lets `echo` be
+      interrupted. We checked by building a kernel that *clears* `SPIE` here: `usertests
+      preempt`, whose children spin in user mode until a timer interrupt delivers a kill,
+      still passed.
+
+  - title: usertrap hands back echo's satp
+    file: kernel/trap.c
+    lines: 84-95
+    focus: 88-94
+    state:
+      hart: 0
+      mode: S
+      proc: echo (pid 3)
+      intr: off
+      satp: kernel
+      locks: []
+      irq: 0
+      stack: [usertrap]
+      sp: {"on": kernel, detail: "back to 0x3fffffa000 at usertrap's ret"}
+    note: |
+      [[MAKE_SATP]] builds `0x8000000000087f24` from `p->pagetable`: `MODE = 8` (Sv39) in the
+      top bits, the root table's page number below. `usertrap` returns it in `a0`.
+
+      gdb on `usertrap`'s final `ret` (`0x80002690`):
+
+      | Register | Value |
+      |---|---|
+      | `a0` | `0x8000000000087f24` |
+      | `ra` | `0x3ffffff09c` ([[userret]], saved by `jalr` in step 8) |
+      | `sp` | `0x3fffffa000`: the kernel stack is **empty again** |
+      | `stvec` | `0x3ffffff000` |
+      | `sepc` | `0x358` |
+      | `sstatus` | `SPP=0 SPIE=1 SIE=0` |
+
+      Everything is ready, and nothing has changed mode or page table yet. The kernel stack
+      is empty because every C frame has been popped: the next trap will find it clean.
+
+  - title: "userret: the page table goes back first"
+    file: kernel/trampoline.S
+    lines: 100-113
+    focus: 111-112
+    state:
+      hart: 0
+      mode: S
+      proc: echo (pid 3)
+      intr: off
+      satp: user
+      locks: []
+      irq: 0
+      stack: [userret]
+      sp: {"on": none, detail: "still 0x3fffffa000, which echo's page table does not map"}
+    note: |
+      [[userret]] runs at `0x3ffffff09c`. `fence.i` (line 107) makes this hart's instruction
+      fetches see the bytes now in memory, in case `echo`'s code was written into memory (by
+      `kexec`, perhaps on another hart) since this hart last fetched instructions from those
+      addresses. Then:
+
+      | Register | before line 111 | after |
+      |---|---|---|
+      | `satp` | `0x8000000000087fff` | **`0x8000000000087f24`** |
+
+      The mirror image of step 7: the code keeps running because the trampoline is mapped
+      in both tables. But `sp` still holds `0x3fffffa000`, and under echo's page table that
+      address means nothing. For the next five instructions the hart is in supervisor mode,
+      on the user page table, with **no usable stack**, and it stays without one until `sret`
+      (step 19). That's fine, because the trampoline pushes nothing.
+    others: |
+      This line is one of only four writes to `satp` in the whole tree, and the only one that
+      installs a user page table ([[concept:mode-stack-page-table#who]]). A system call's round
+      trip executes exactly two of them, each between two `sfence.vma`s.
+
+  - title: "ld sp, then every register, a0 last"
+    file: kernel/trampoline.S
+    lines: 114-149
+    focus: 114-149
+    state:
+      hart: 0
+      mode: S
+      proc: echo (pid 3)
+      intr: off
+      satp: user
+      locks: []
+      irq: 0
+      stack: [userret]
+      sp: {"on": none, switched: "`ld sp, 48(a0)` in [[userret]] ([[kernel/trampoline.S:118]]) loads the user's `sp`", detail: "0x3f70, echo's user stack pointer; supervisor code cannot use it"}
+    note: |
+      `li a0, TRAPFRAME`, then 31 loads. Line 118 is the last of this round trip's four stack
+      switches: line 76, the two `swtch` loads of step 11's `yield`, and this one. A system
+      call that doesn't yield has two.
+
+      | Register | before | after |
+      |---|---|---|
+      | `sp` | `0x3fffffa000` | **`0x3f70`** |
+      | `tp` | `0` | `0x0505050505050505` (echo's junk, restored faithfully) |
+      | `a0` | `0x3fffffe000` | **`2`**, the return value [[syscall]] stored (line 149, last) |
+
+      `a0` must be last, because it is the base register of every other load.
+
+      From line 118 until `sret` the hart is in supervisor mode with the **user** page table,
+      and `sp` holds the **user** stack pointer, which supervisor code cannot use (it cannot
+      access user pages): no usable stack, for 30 instructions, `sret` included. It is the
+      same combination as the start of [[uservec]] before line 76, and `sret`, by switching to
+      user mode, is what makes the user stack usable again.
+      [[concept:mode-stack-page-table#table]] lists every such combination.
+
+  - title: sret, exactly
+    file: kernel/trampoline.S
+    lines: 148-153
+    focus: 151-153
+    state:
+      hart: 0
+      mode: S
+      proc: echo (pid 3)
+      intr: off
+      satp: user
+      locks: []
+      irq: 0
+      stack: [userret]
+      sp: {"on": none, detail: "0x3f70, the user's stack pointer, usable once `sret` changes the mode"}
+    note: |
+      The RISC-V privileged specification defines [[g:insn:sret|sret]] as these actions, all
+      at once (plus bits of extensions xv6 doesn't use):
+
+      1. `pc` ← `sepc`
+      2. mode ← `sstatus.SPP` (0 means U)
+      3. `SIE` ← `SPIE`
+      4. `SPIE` ← 1
+      5. `SPP` ← the least-privileged mode, U (0)
+      6. `mstatus.MPRV` ← 0, because the new mode is less privileged than M (xv6 never sets
+         `MPRV`, so this changes nothing here)
+
+      Measured on hart 0:
+
+      | | at `sret` | after |
+      |---|---|---|
+      | mode | S | **U** |
+      | `pc` | `0x3ffffff120` | **`0x358`** |
+      | `sstatus` | `SPP=0 SPIE=1 SIE=0` | `SPP=0 SPIE=1` **`SIE=1`** |
+      | `satp`, `sp`, `a0` | `…87f24`, `0x3f70`, `2` | unchanged |
+      | `sepc`, `scause`, `stvec` | `0x358`, `0x…09`, `0x3ffffff000` | unchanged |
+
+      Step 5 exists to catch bugs: after any `sret`, `SPP` reads 0. If kernel code ever ran a
+      second `sret` without a new trap in between, it would drop to user mode instead of
+      staying in supervisor mode, and fault at once. It would not quietly keep running with
+      kernel privilege.
+
+  - title: Back in echo, and the ledger
+    file: user/usys.S
+    lines: 28-32
+    focus: 32
+    state:
+      hart: 0
+      mode: U
+      proc: echo (pid 3)
+      intr: on
+      satp: user
+      locks: []
+      stack: [main, write]
+      sp: {"on": user, switched: "`sret` ([[kernel/trampoline.S:153]]) returned to user mode, making the user stack usable", detail: "0x3f70, as before the ecall"}
+    note: |
+      `ret` returns to `main` with `a0 = 2`. From `echo`'s point of view one instruction ran.
+      Here is everything that changed in between, and who changed it:
+
+      | What | Hardware (`ecall` / `sret`) | xv6's instructions |
+      |---|---|---|
+      | mode | U→S, S→U | none |
+      | `pc` | to `stvec`, to `sepc` | `jalr` to [[usertrap]], `ret` to [[userret]] |
+      | `sepc`, `scause`, `stval` | written by `ecall` | `sepc` rewritten by [[prepare_return]] |
+      | `sstatus` `SIE`/`SPIE`/`SPP` | both | [[intr_on]], [[intr_off]], `w_sstatus` |
+      | `sp` | never | 2 loads (trampoline lines 76 and 118), plus 2 in `swtch` if the call yields (ours did, step 11) |
+      | `satp` | never | 2 writes (lines 92 and 111), 4 `sfence.vma` |
+      | `stvec` | never | 2 writes (trap.c lines 47 and 112) |
+      | `sscratch` | never | 1 write (line 32) |
+      | 31 registers | never | 31 stores, 31 loads |
+
+      The hardware's share fits in two rows. Everything else is policy, and RISC-V leaves policy
+      to the kernel: which stack, which page table, what to save. That is why a 150-line
+      trampoline can be the whole of xv6's user/kernel boundary.
+
+      In our run the system call also absorbed two kernel traps (a timer, a UART interrupt),
+      which overwrote `sepc`, `scause` and `sstatus` behind `echo`'s back. Next:
+      [[tour:44]] follows such a trap, and [[tour:42]] follows `sp` from power-on.
+    figure: t43-who-changes-what
+    caption: |
+      One system call on hart 0, left to right. Hardware events (`ecall`, `sret`) are the two
+      dark columns; every other change is an instruction in [[uservec]], [[usertrap]],
+      [[prepare_return]] or [[userret]]. Values are from our gdb run.
+locks:
+  - lock: "p->lock (spinlock)"
+    where: "[[killed]], twice in [[usertrap]]"
+    protects: "`p->killed`: a `kill` from another hart is noticed on the way in or on the way out"
+  - lock: "tx_lock (sleep-lock)"
+    where: "[[uartwrite]], inside [[sys_write]]"
+    protects: "The UART transmitter ([[tour:5]] follows this part)"
+  - lock: "sepc, scause, sstatus, stvec, satp, sscratch (no lock)"
+    where: "every step of this tour"
+    protects: "Nothing to protect: every hart has its own copy of every CSR. The danger is not other harts but *this* hart's next trap, which is why the values are copied to the per-process trapframe before interrupts go on"
+  - lock: "the trapframe (no lock)"
+    where: "[[uservec]], [[usertrap]], [[prepare_return]], [[userret]]"
+    protects: "Only `echo`'s own kernel thread touches it while `echo` is running, and a process runs on one hart at a time"
+quiz:
+  - q: "Right after `ecall`, which of these has the hardware changed: `sp`, `satp`, `sepc`, `a0`, `stvec`, `sstatus.SIE`?"
+    a: "Only `sepc` (to `0x354`, the `ecall`'s address) and `sstatus.SIE` (to 0, with the old value saved in `SPIE`). Besides those it changes `scause`, `stval`, `SPP`, the mode and the `pc`. `sp`, `satp`, `a0` and `stvec` are untouched: switching the stack and page table is the trampoline's job."
+  - q: "Suppose `usertrap` called `intr_on()` before line 52 (`p->trapframe->epc = r_sepc()`). Using what we measured in step 11, what would happen to `echo`'s `write`?"
+    a: "The pending timer would be taken at once. `kerneltrap` writes its own saved `sepc` back before returning, so `sepc` would hold a kernel address (a kernel address, `0x8000266c`-like) and `scause` would say \"timer\" instead of 8. `usertrap` would then copy the kernel address into `epc`, skip `syscall()` (the cause no longer says system call), and treat the trap as a tick. When it returned, `sret` would jump to a kernel address in user mode. That address isn't mapped in echo's page table, so the result is an instruction page fault, which `usertrap` doesn't handle, and `echo` would be killed."
+  - q: "Why does `uservec` save registers into the trapframe instead of pushing them on a stack?"
+    a: "At that point no usable stack exists. The user's `sp` can't be trusted, and the kernel stack is not mapped until `csrw satp`. The trapframe is reachable at a fixed virtual address (`TRAPFRAME`) through the *user* page table, so it can be written before the switch."
+  - q: "`prepare_return` writes `stvec` only after `intr_off()`. What exactly could go wrong if the two lines were swapped and a timer fired between them?"
+    a: "The timer would be taken in S-mode with `stvec` pointing at `uservec`, while `satp` still holds the kernel page table. `uservec`'s first store to `TRAPFRAME` faults, because the kernel page table doesn't map the trapframe. The fault re-enters `uservec`, which faults at the same store again: the hart hangs silently. (`panic: usertrap: not from user mode` needs the interrupt to arrive after `userret`'s `csrw satp`, which [[tour:48]] shows when `intr_off()` is deleted entirely.)"
+  - q: "`sret` does not touch `satp`. Why must `userret` switch the page table *before* `sret`, not after?"
+    a: "After `sret` the hart is in user mode, and user code can't run the trampoline's privileged `csrw satp`. Even if it could, the `sret` would jump to `sepc` (`0x358`) through whatever page table is current, and in the kernel page table that address is not `echo`'s code. So the user page table must already be in place when `sret` executes."
+  - q: "In our run, `sstatus.SPP` and `SPIE` already had the values `prepare_return` writes. Give a concrete sequence in which they would *not*, if the write were deleted."
+    a: "Process A is preempted by a timer taken *in the kernel*: `kerneltrap` calls `yield` with this hart's `SPP` = 1, and `kernelvec`'s `sret` hasn't run yet. The scheduler on that hart then switches to process B, which was preempted from user mode and continues in `usertrap` → `prepare_return`. Without the write, B's `sret` would read `SPP = 1` and \"return\" to supervisor mode at B's user `pc`. That fails at once, because supervisor mode may not execute from pages marked `PTE_U`."

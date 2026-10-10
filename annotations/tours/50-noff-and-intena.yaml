@@ -1,0 +1,879 @@
+title: noff and intena through a sleep, a yield and an interrupt
+group: Locks and interrupt state
+prerequisites: [8, 11, 13, 15, 16]
+summary: |
+  Every hart keeps three small facts about interrupts. **SIE** is one bit in `sstatus`: may an
+  interrupt be taken right now? **noff** (`mycpu()->noff`) counts how many [[push_off]] calls
+  are still open. **intena** (`mycpu()->intena`) remembers whether SIE was on just before the
+  outermost `push_off`. Together they decide, at every [[release]], whether interrupts come
+  back on ([[concept:locks#noff]], [[concept:locks#intena]]).
+
+  This tour watches those three values on **hart 0**, instruction by instruction, through
+  one real stretch of time. The shell goes to sleep in `read`. The scheduler takes over and
+  resets `intena`. A timer tick lands in the scheduler. A process that was preempted on
+  another hart resumes here, inside a trap handler, and leaves with interrupts still off,
+  as it must. A brand-new process starts in [[forkret]]. Finally a tick lands inside that
+  process's kernel code and shows how the preempted process got into its state in the first
+  place.
+
+  Nothing here is invented. We booted this build on three harts, typed `grind &` (a test
+  program that runs random system calls in several processes forever), and attached gdb to
+  QEMU. Breakpoints on hart 0 recorded `sstatus`, `cpus[0].noff` (offset 120 of [[kernel:cpu|struct cpu]]),
+  `cpus[0].intena` (offset 124), `sp` and the relevant registers at each instruction we
+  quote. Every number below comes from that run, or from the build's `kernel/kernel.asm`.
+  [[tour:13]] and [[tour:15]] explained the code; this tour is about the *values*.
+cast: |
+  The run starts at tick 12, about 1.2 s after boot. `grind &` has just been typed.
+
+  | Hart | What it is doing |
+  |---|---|
+  | 0 | Running `sh` (pid 2, slot `proc[1]`): it printed `$ ` and is about to call `read(0, &c, 1)` |
+  | 1 | In its scheduler loop, idle |
+  | 2 | Running pid 4 (slot `proc[3]`), the shell's background grandchild, inside `exec("grind")`: still named `sh` (pid 3, the forked copy of `sh` that started it, has already exited) |
+
+  `sh` uses `KSTACK(1)` (top `0x3fffffc000`), pid 4 uses `KSTACK(3)` (top `0x3fffff8000`).
+  Hart 0's scheduler stack is its slice of [[stack0]], `0x80007890`–`0x80008890`.
+
+  In the state strip, `intena` is shown only while `noff > 0`. When `noff` is 0 the field
+  still holds a stale value; we mention it where it matters.
+steps:
+  - title: "read enters the kernel: usertrap turns SIE on"
+    file: kernel/trap.c
+    lines: 37-68
+    focus: 64-66
+    state:
+      hart: 0
+      mode: S
+      proc: sh (pid 2)
+      intr: "on"
+      satp: kernel
+      locks: []
+      irq: {noff: 0, note: "the stale intena is 0, last written by the acquire inside killed(p) on line 57 (and before that by myproc on line 49), both with SIE off"}
+      stack: [usertrap]
+      sp: {"on": kernel, detail: "KSTACK(1), usertrap's frame, sp = 0x3fffffbfe0"}
+    note: |
+      `sh` executed `ecall` for `read`. The trap cleared SIE, so [[usertrap]] starts with
+      interrupts off. gdb at the `csrsi sstatus,2` of line 66 (`0x80002668`) shows:
+
+      | | `sstatus` | SIE | noff | intena |
+      |---|---|---|---|---|
+      | before line 66 | `0x200000020` | 0 | 0 | 0 (stale) |
+      | after line 66 | `0x200000022` | **1** | 0 | 0 (stale) |
+
+      Bit 1 (`0x2`) is SIE. Bit 5 (`0x20`) is SPIE, the copy of SIE the trap saved; the high
+      `0x200000000` is the UXL field and never changes.
+
+      Look at the stale `intena`. It is 0 because [[myproc]] on line 49, and then the
+      `acquire` inside [[killed]] on line 57, each ran an outermost `push_off` while SIE was
+      still off, and a `push_off` at `noff == 0` always overwrites `intena`. That is the first lesson of this tour: **intena is rewritten
+      every time noff goes from 0 to 1**. It is not a long-lived setting; it is a note about
+      the latest outermost `push_off`.
+
+      Why turn interrupts on at all? A system call may run for a long time, and while it does,
+      the hart should still take timer and device interrupts. Line 66 comes after line 52
+      saved `sepc`, because an interrupt would overwrite it ([[tour:8]]).
+    others: |
+      Hart 2 is in pid 4's `exec`, with `cpus[2].noff = 2`, `intena = 1`. Hart 1 is in its
+      scheduler. Each hart has its own `cpus[i]`; nothing hart 0 does to `noff` or `intena`
+      is visible to them, and no lock protects these fields because none is needed
+      ([[concept:locks#unlocked]]).
+
+  - title: The first push_off that is not a lock
+    file: kernel/proc.c
+    lines: 82-91
+    focus: 85-88
+    state:
+      hart: 0
+      mode: S
+      proc: sh (pid 2)
+      intr: "off"
+      satp: kernel
+      locks: []
+      irq: {noff: 1, intena: 1, note: "myproc's own push_off: no lock is held"}
+      stack: [usertrap, syscall, myproc]
+      sp: {"on": kernel, detail: "sp = 0x3fffffbf80"}
+    note: |
+      [[syscall]] calls [[myproc]] to find the trapframe. `myproc` brackets its read of
+      `c->proc` with `push_off`/`pop_off`, so that a timer interrupt cannot move this thread
+      to another hart between "which hart am I?" and "read that hart's `proc`".
+
+      This is the first `push_off` with SIE on. gdb at the `csrrci a5,sstatus,2`
+      (`0x80000bb8`):
+
+      | | `sstatus` | `a5` | noff | intena |
+      |---|---|---|---|---|
+      | before | `0x200000022` | | 0 | 0 |
+      | after `csrrci` | `0x200000020` | `0x200000022` | 0 | 0 |
+      | end of `push_off` | `0x200000020` | | **1** | **1** |
+
+      `csrrci` read the old `sstatus` into `a5` and cleared SIE in the same instruction. Since
+      `noff` was 0, `intena` took the old SIE bit: 1. Then [[pop_off]] took `noff` back to 0,
+      saw `intena == 1`, and executed `csrsi sstatus,2` (`0x80000c4c`): SIE on again.
+
+      Before `consoleread` was even reached, the same pair ran four more times (three in
+      [[argraw]], via [[argaddr]], [[argint]] and `argfd`'s `argint`, and one in [[argfd]]
+      itself), each time turning SIE off and back on. A
+      `push_off` level is not always a lock. `myproc` and [[uartputc_sync]] use it too, which
+      is why `noff` can be larger than the number of locks held.
+
+  - title: "consoleread takes cons.lock: noff 1, intena 1"
+    file: kernel/spinlock.c
+    lines: 88-103
+    focus: 97-102
+    state:
+      hart: 0
+      mode: S
+      proc: sh (pid 2)
+      intr: "off"
+      satp: kernel
+      locks: [cons.lock]
+      irq: {noff: 1, intena: 1}
+      stack: [usertrap, syscall, sys_read, fileread, consoleread, acquire, push_off]
+      sp: {"on": kernel, detail: "sp = 0x3fffffbec0 inside push_off"}
+    note: |
+      [[consoleread]] was entered with SIE on (`sstatus = 0x200000022`, `a2 = 1`: `sh` reads
+      one byte at a time). Its first act is `acquire(&cons.lock)`, and [[acquire]]'s first act
+      is `push_off`:
+
+      ```text
+      0x80000bb8  csrrci a5,sstatus,2   a5 = 0x200000022   sstatus -> 0x200000020
+      0x80000bc2  lw     a5,120(a0)     noff was 0, so ...
+      0x80000be4  sw     a5,124(a0)     intena = 1         (cpus[0] + 124 = 0x8000fa4c)
+      0x80000bce  sw     a5,120(a0)     noff   = 1         (cpus[0] + 120 = 0x8000fa48)
+      ```
+
+      Only then does the `amoswap.w.aq` spin take `cons.lock` (at `0x8000f890`). The order
+      matters: interrupts are off **before** the lock is held, so there is no instant where
+      this hart holds `cons.lock` with SIE on. If there were, a keystroke interrupt could
+      arrive, [[consoleintr]] would try to take `cons.lock` on the same hart, and spin
+      forever, because the holder is the code it interrupted
+      ([[concept:locks#handlers]]).
+
+      From here on, `intena = 1` records one fact: "when `sh`'s thread started holding things
+      on this hart, interrupts were on". Every `release` below consults it.
+    others: |
+      Another hart that wanted `cons.lock` now would spin in `acquire`, with its own SIE off.
+      Typing a key now would raise the UART interrupt; the PLIC can deliver it to any hart
+      with SIE on, and that hart's `consoleintr` would wait for hart 0 to release the lock.
+
+  - title: "noff 2: a myproc inside the critical section"
+    file: kernel/console.c
+    lines: 87-108
+    focus: 99-104
+    state:
+      hart: 0
+      mode: S
+      proc: sh (pid 2)
+      intr: "off"
+      satp: kernel
+      locks: [cons.lock]
+      irq: {noff: 2, intena: 1, note: "the second level is myproc's push_off, not a lock"}
+      stack: [usertrap, syscall, sys_read, fileread, consoleread, myproc]
+      sp: {"on": kernel, detail: "sp = 0x3fffffbec0"}
+    note: |
+      The buffer is empty (`cons.r == cons.w`), so line 100 calls `killed(myproc())`.
+      `myproc`'s `push_off` now runs **inside** the critical section:
+
+      | | `a5` (old `sstatus`) | noff | intena |
+      |---|---|---|---|
+      | `csrrci` | `0x200000020` (SIE already 0) | 1 | 1 |
+      | end of `push_off` | | **2** | 1 (untouched) |
+      | end of `pop_off` | | 1 | 1 |
+
+      This is why `push_off` only writes `intena` when `noff == 0`. The old SIE here is 0,
+      because `acquire` already cleared it. If the nested call recorded that 0, the final
+      release would leave interrupts off for the rest of the system call. And this `pop_off`
+      at `noff` 2 → 1 must not turn interrupts on, or `cons.lock` would be held with SIE on.
+      The counter handles both.
+
+      Then [[killed]] acquires `sh`'s `p->lock`: `noff` 2 again, this time with two real
+      locks, and back to 1 at its release.
+
+  - title: "sleep_prepare: two locks, noff 2"
+    file: kernel/proc.c
+    lines: 545-556
+    focus: 549-555
+    state:
+      hart: 0
+      mode: S
+      proc: sh (pid 2)
+      intr: "off"
+      satp: kernel
+      locks: [cons.lock, "sh's p->lock"]
+      irq: {noff: 2, intena: 1}
+      stack: [usertrap, syscall, sys_read, fileread, consoleread, sleep_prepare]
+      sp: {"on": kernel, detail: "sp = 0x3fffffbee0"}
+    note: |
+      [[sleep_prepare]] registers `sh` on the channel `&cons.r`. First a `myproc` (noff
+      1 → 2 → 1, as before). Then `acquire(&p->lock)` for `sh`'s lock at `0x8000ff38`:
+
+      - `csrrci` returns `a5 = 0x200000020`: SIE was already off.
+      - `noff` becomes 2. `intena` stays 1.
+
+      Two spinlocks are held, `cons.lock` and `sh`'s `p->lock`, in that order, which matches
+      the measured edge `cons.lock → p->lock` ([[concept:locks#order]]). `p->chan` is set,
+      and the `release` at line 555 drops `noff` to 1. Its `pop_off` sees `noff == 1` and
+      leaves SIE alone.
+
+      Why is it safe to register before letting go of `cons.lock`? Because a
+      [[wakeup]] that runs any time after this point finds `chan == &cons.r` and clears it,
+      so the coming [[sleep]] will return at once instead of sleeping through it
+      ([[concept:locks#sleep-wakeup]]).
+    others: |
+      A [[wakeup]] on another hart would scan all 64 `p->lock`s and spin on `sh`'s for the
+      few instructions hart 0 holds it. The UART interrupt handler is the one that calls
+      `wakeup(&cons.r)`; it cannot run here on hart 0 while SIE is off.
+
+  - title: "release(&cons.lock): the pop_off that turns SIE back on"
+    file: kernel/spinlock.c
+    lines: 105-116
+    focus: 111-115
+    state:
+      hart: 0
+      mode: S
+      proc: sh (pid 2)
+      intr: "on"
+      satp: kernel
+      locks: []
+      irq: 0
+      stack: [usertrap, syscall, sys_read, fileread, consoleread, release, pop_off]
+      sp: {"on": kernel, detail: "sp = 0x3fffffbed0"}
+    note: |
+      Line 105 of `consoleread` releases `cons.lock`. [[release]] stores 0 into the lock word
+      (after `fence rw,w`) and then calls [[pop_off]]:
+
+      ```text
+      0x80000c42  addiw a5,a5,-1     noff 1 -> 0
+      0x80000c48  lw    a5,124(a0)   intena = 1
+      0x80000c4c  csrsi sstatus,2    sstatus 0x200000020 -> 0x200000022
+      ```
+
+      This is the **only** way a `release` turns interrupts on: the counter reaches 0 *and*
+      `intena` says they were on before. From here until the next `acquire`, `sh` can be
+      interrupted. Notice what the window is for: if the Enter key (completing a line) arrives
+      now, the UART interrupt can run on this very hart, take `cons.lock`, and call
+      `wakeup(&cons.r)`, which
+      clears `sh`'s `chan`. The coming `sleep()` would then return at once.
+
+      Note the address `0x80000c50`, the instruction right after this `csrsi`. It will come
+      back three times in this tour.
+
+  - title: "sleep(): intena is re-recorded, noff 1"
+    file: kernel/proc.c
+    lines: 558-572
+    focus: 564-569
+    state:
+      hart: 0
+      mode: S
+      proc: sh (pid 2)
+      intr: "off"
+      satp: kernel
+      locks: ["sh's p->lock"]
+      irq: {noff: 1, intena: 1}
+      stack: [usertrap, syscall, sys_read, fileread, consoleread, sleep]
+      sp: {"on": kernel, detail: "sp = 0x3fffffbee0"}
+    note: |
+      [[sleep]] calls `myproc` (another 0 → 1 → 0, SIE off and on), then `acquire(&p->lock)`.
+      gdb at that `push_off`:
+
+      - before: `sstatus = 0x200000022`, `noff = 0`
+      - `csrrci`: `a5 = 0x200000022`, so the old SIE is 1
+      - after: `noff = 1`, `intena = 1`
+
+      `intena` was already 1, but it was **written again**: this is a new outermost
+      `push_off`. The value that matters for the coming switch is this one, recorded with
+      `sh`'s `p->lock` as the only lock.
+
+      `p->chan` is still `&cons.r` (no key yet), so `sh` becomes `SLEEPING` and calls
+      [[sched]]. It holds exactly one spinlock, its own `p->lock`, which the scheduler will
+      release for it ([[concept:locks#handoff]]).
+
+  - title: sched's checks read noff and SIE
+    file: kernel/proc.c
+    lines: 479-497
+    focus: 483-492
+    state:
+      hart: 0
+      mode: S
+      proc: sh (pid 2)
+      intr: "off"
+      satp: kernel
+      locks: ["sh's p->lock"]
+      irq: {noff: 1, intena: 1}
+      stack: [usertrap, syscall, sys_read, fileread, consoleread, sleep, sched]
+      sp: {"on": kernel, detail: "sp = 0x3fffffbeb0"}
+    note: |
+      [[sched]]'s own `myproc()` takes `noff` to 2 and back to 1 (the trace shows both). Then
+      the checks, as compiled:
+
+      - line 487: `lw a4,168(a5)` at `0x80001e54` loads `cpus[0].noff` (168 is 120 plus the
+        48 bytes from `pid_lock`, the base the compiler uses, to `cpus`). It is **1**. Had
+        `consoleread` called `sleep` while still holding `cons.lock`, it would be 2 and the
+        kernel would `panic("sched locks")`.
+      - line 491: `csrr a5,sstatus` at `0x80001e66` reads `0x200000020`: SIE is 0, so no
+        `panic("sched interruptible")`.
+
+      The `noff == 1` rule is the code version of "never sleep holding a spinlock". A sleeping
+      thread cannot release anything, so a second lock would stay held, with interrupts off on
+      whatever hart wants it, for as long as `sh` sleeps. Sleep-locks are not counted in
+      `noff`, which is why they may be held across a sleep ([[concept:locks#rules]]).
+
+  - title: "sched saves intena in s3: the value is 1"
+    file: kernel/proc.c
+    lines: 479-497
+    focus: 494-495
+    state:
+      hart: 0
+      mode: S
+      proc: sh (pid 2)
+      intr: "off"
+      satp: kernel
+      locks: ["sh's p->lock"]
+      irq: {noff: 1, intena: 1}
+      stack: [usertrap, syscall, sys_read, fileread, consoleread, sleep, sched, swtch]
+      sp: {"on": kernel, detail: "sp = 0x3fffffbeb0 at the call"}
+    note: |
+      Line 494 compiles to one load:
+
+      ```text
+      0x80001e7e  lw   s3,172(a5)    a5 = 0x8000f9a0, so this reads 0x8000fa4c = cpus[0].intena
+                                     s3 = 1
+      0x80001e98  jal  swtch         swtch(&p->context, &cpus[0].context)
+      ```
+
+      `s3` is a callee-saved register, so [[swtch]] stores it into `sh`'s `p->context`
+      along with `ra` and `sp`. From this moment, `sh`'s "interrupts were on" no longer lives
+      in `cpus[0]`. It lives in `sh`'s saved context, and it will come back wherever and
+      whenever `sh` runs again, possibly on hart 1 or 2.
+
+      `noff` is not saved. It is 1 on both sides of every `swtch`, because the one lock held
+      is the one being handed over. The comment above `sched` ([[kernel/proc.c:472]]) says
+      why `intena` is not simply a field of `struct proc`: some code holds locks with no
+      process at all (the scheduler, boot).
+    others: |
+      At this instant hart 2 is still running pid 4's `exec`, with `cpus[2].noff = 2` and
+      `cpus[2].intena = 1`: its own values for its own thread. Hart 1 is in its scheduler,
+      and if its scan reaches slot 1 now it spins on `sh`'s `p->lock` until hart 0's
+      scheduler releases it below.
+
+  - title: "The scheduler inherits intena 1 and erases it (line 456)"
+    file: kernel/proc.c
+    lines: 444-464
+    focus: 453-456
+    state:
+      hart: 0
+      mode: S
+      proc: "none (hart 0's scheduler; c->proc still points at sh)"
+      intr: "off"
+      satp: kernel
+      locks: ["sh's p->lock"]
+      irq: {noff: 1, intena: 0, note: "line 456 has just changed intena from 1 (sh's value) to 0"}
+      stack: [main, scheduler]
+      sp: {"on": scheduler, switched: "`ld sp, 8(a1)` in [[swtch]] ([[kernel/swtch.S:26]])", detail: "sp = 0x80008810, hart 0's slice of stack0"}
+    note: |
+      `swtch` returns into the scheduler at `0x80001df0`. gdb, before and after line 456
+      (`sw zero,172(a5)` at `0x80001df8`):
+
+      | | noff | intena | SIE |
+      |---|---|---|---|
+      | after `swtch` | 1 | **1** (left by `sh`) | 0 |
+      | after line 456 | 1 | **0** | 0 |
+
+      `cpus[0]` is a per-hart structure, so the scheduler inherits whatever the last thread
+      left there. Here that is `sh`'s 1. The scheduler's own truth is different: its
+      interrupts are off on purpose (line 442). Without line 456, the `release` at line 463
+      would see `noff` 0 and `intena` 1 and execute `csrsi`, turning interrupts on in the
+      middle of the scan. The later `acquire`s in that same pass would then record `intena = 1`,
+      and a new process picked later in that pass would carry the wrong 1 into [[forkret]]
+      (compare step 18). Lines 441–442 reset SIE before the next pass, so the damage lasts
+      one pass at a time.
+
+      So there are **two** safeguards, one for each direction:
+
+      - line 456 protects the scheduler from the process's `intena`;
+      - [[sched]]'s save and restore protects each process from the scheduler's `intena`.
+
+  - title: The scheduler releases sh's lock with SIE staying off
+    file: kernel/proc.c
+    lines: 444-464
+    focus: 463
+    state:
+      hart: 0
+      mode: S
+      proc: "none (hart 0's scheduler)"
+      intr: "off"
+      satp: kernel
+      locks: []
+      irq: 0
+      stack: [main, scheduler]
+      sp: {"on": scheduler, detail: "sp = 0x80008810"}
+    note: |
+      `c->proc = 0`, then `release(&p->lock)` on `sh`'s lock. `sh` is now `SLEEPING` (state
+      2 in our trace). The release's `pop_off` takes `noff` from 1 to 0, finds `intena == 0`,
+      and skips the `csrsi`. SIE stays 0.
+
+      One lock was acquired by `sh`'s thread in [[sleep]] and released by the scheduler's
+      thread. `holding()` accepted it because the lock records the *hart*, `cpus[0]`, not the
+      thread ([[concept:locks#holding]]).
+
+      The scan goes on through the remaining 62 slots (2 to 63). Each `acquire` in the scan is
+      an outermost `push_off` made with SIE off, so each one records `intena = 0`. Slot 3,
+      pid 4, is `RUNNING` (on hart 2). Nothing else is `RUNNABLE`. `found` is already 1 (line
+      461, because `sh` ran in this pass), so this pass skips `wfi`; the next pass finds
+      nothing and reaches it.
+    others: |
+      As soon as `sh`'s lock is free, any hart may take it: a `wakeup(&cons.r)` from a
+      keystroke on any hart would now find `SLEEPING` and make `sh` `RUNNABLE`. That is
+      exactly the moment the hand-off was designed for: `sh`'s registers are saved, and no
+      hart is on its stack.
+
+  - title: One instruction with interrupts on, then wfi
+    file: kernel/proc.c
+    lines: 428-470
+    focus: 442
+    state:
+      hart: 0
+      mode: S
+      proc: "none (hart 0's scheduler)"
+      intr: "off"
+      satp: kernel
+      locks: []
+      irq: 0
+      stack: [main, scheduler]
+      sp: {"on": scheduler, detail: "sp = 0x80008810"}
+    note: |
+      The loop goes round. In this build the instructions are laid out
+      as:
+
+      ```text
+      0x80001e08  wfi                  only if found == 0
+      0x80001e0c  csrsi sstatus,2      line 441: sstatus 0x200000020 -> 0x200000022
+      0x80001e10  csrci sstatus,2      line 442: back to 0x200000020
+      ```
+
+      gdb saw the next pass: SIE 0, then 1 for exactly one instruction, then 0, then the scan,
+      then `wfi`. `wfi` waits for an interrupt to become *pending*; it does not need SIE on,
+      and with SIE off nothing is taken while it waits. When it returns, the `csrsi` opens the
+      window and a pending interrupt is taken right there.
+
+      Why off around `wfi`? If interrupts were on, a device interrupt could be handled
+      between the scan and the `wfi` and make a process `RUNNABLE`; the hart would then sleep
+      until the *next* interrupt with work waiting. Why on at all? So that, with every process
+      asleep, the interrupt that wakes one of them can be taken. And note `noff` here: 0.
+      This window is where the [[concept:locks#invariant|invariant]] is easiest to see: SIE is
+      only ever 1 when `noff` is 0.
+
+  - title: "A tick lands in the window: tickslock at noff 1, intena 0"
+    file: kernel/trap.c
+    lines: 166-180
+    focus: 169-173
+    state:
+      hart: 0
+      mode: S
+      proc: "none (hart 0's scheduler)"
+      intr: "off"
+      satp: kernel
+      locks: [tickslock]
+      irq: {noff: 1, intena: 0}
+      stack: [main, scheduler, kernelvec, kerneltrap, devintr, clockintr]
+      sp: {"on": scheduler, detail: "a 256-byte kernelvec frame on top: sp = 0x800086e0 in kerneltrap"}
+    note: |
+      The `wfi` returned, the `csrsi` at `0x80001e0c` ran, and the timer interrupt was taken
+      before the next instruction: [[kerneltrap]] reads `sepc = 0x80001e10`, `scause =
+      0x8000000000000005` (supervisor timer), `sstatus = 0x200000120`. That `sstatus` now has
+      SPP set (`0x100`, came from S-mode) and SPIE set (`0x20`, SIE was 1 when the trap hit).
+      [[kernelvec]]'s `addi sp,sp,-256` pushed its frame onto the **scheduler stack**: there
+      is no separate interrupt stack.
+
+      At `clockintr`'s `acquire(&tickslock)` gdb shows `noff = 0`, `intena = 0` (stale), SIE
+      0. The `push_off` reads an `sstatus` whose SIE is 0, so it records **intena 0** and
+      `noff` becomes 1. Hart 0 is the only hart that counts time: `ticks` goes from 12 to 13,
+      and [[wakeup]] scans all 64 `p->lock`s at `noff` 2.
+
+      Two facts about interrupt context, both visible here:
+
+      - It always starts at `noff == 0`. It has to: SIE can only be 1 when `noff` is 0. In a
+        separate run of `grind` (about a minute of wall-clock time, slowed by gdb) with a
+        breakpoint on `kerneltrap`, gdb counted **43,104** kernel-mode traps on the three
+        harts, and none of those whose `noff` it could read had `noff ≠ 0` (one read
+        failed). Most hit idle schedulers; 2,103 interrupted a process and 929 were timer
+        ticks. In the tour's own run, all 310 kernel traps checked were at `noff` 0 too.
+      - Everything a handler takes records `intena = 0`, so its releases never turn
+        interrupts on inside the handler.
+
+      `myproc()` is 0 here, so there is no `yield`. `kernelvec`'s `sret` returns to
+      `0x80001e10` with SIE restored from SPIE, and the `csrci` turns it off again.
+    others: |
+      Of those 43,104 traps, 40,920 arrived at `0x80001e10`, the instruction after this
+      `csrsi`, and 1,953 at `0x80000c50`, the instruction after [[pop_off]]'s `csrsi`. An
+      interrupt that becomes pending while a hart has SIE off simply waits, and it is taken
+      the instant SIE comes back on. That is the [[concept:locks#invariant|invariant]] doing
+      its job: no hart ever takes an interrupt in the middle of a critical section.
+
+  - title: The scheduler picks pid 4 and records intena 0
+    file: kernel/proc.c
+    lines: 444-464
+    focus: 446-453
+    state:
+      hart: 0
+      mode: S
+      proc: "none (hart 0's scheduler; about to run pid 4)"
+      intr: "off"
+      satp: kernel
+      locks: ["pid 4's p->lock"]
+      irq: {noff: 1, intena: 0}
+      stack: [main, scheduler]
+      sp: {"on": scheduler, detail: "sp = 0x80008810"}
+    note: |
+      The next scan finds slot 3 `RUNNABLE`. Pid 4 had just been preempted on **hart 2**: at
+      hart 2's own tick, a timer interrupt hit pid 4 in kernel code, and `kerneltrap` called
+      [[yield]]. Our breakpoint on `sched` recorded that suspension: path `kerneltrap →
+      yield → sched`, saved `s3 = 0`.
+
+      Hart 0's `acquire(&p->lock)` for pid 4: `push_off` at `noff` 0 with SIE 0, so
+      `cpus[0].intena = 0`, `noff = 1`. gdb confirms `noff 1`, `intena 0`. Line 451 sets
+      `RUNNING`, line 452 `c->proc`, line 453 calls `swtch`.
+
+      Remember this 0. Whenever the scheduler switches to *any* process, `cpus[i].intena` is
+      0, because the scheduler's own `acquire` just wrote it with interrupts off. That is the
+      value every resumed thread would see if [[sched]] did not restore its own.
+    others: |
+      Pid 4 last ran on hart 2 and is about to run on hart 0, on the same kernel stack
+      `KSTACK(3)`. Hart 2's scheduler released pid 4's lock only after `swtch` had finished
+      saving pid 4's registers; until then hart 0's `acquire` would have spun. The `p->lock`
+      hand-off is what makes this migration safe ([[tour:13]]).
+
+  - title: "Pid 4 resumes in sched: s3 = 0 restores intena 0"
+    file: kernel/proc.c
+    lines: 479-508
+    focus: 495-496
+    state:
+      hart: 0
+      mode: S
+      proc: "sh (pid 4, about to become grind)"
+      intr: "off"
+      satp: kernel
+      locks: ["pid 4's p->lock"]
+      irq: {noff: 1, intena: 0}
+      stack: [usertrap, syscall, sys_exec, kexec, namei, namex, dirlookup, readi, brelse, releasesleep, release, pop_off, kernelvec, kerneltrap, yield, sched]
+      sp: {"on": kernel, switched: "`ld sp, 8(a1)` in [[swtch]] ([[kernel/swtch.S:26]])", detail: "KSTACK(3), sp = 0x3fffff7880"}
+    note: |
+      `swtch` loads pid 4's context and returns to `0x80001e9c`, after the `swtch` call in
+      [[sched]]. gdb: `s3 = 0`, `cpus[0].intena = 0` before line 496, and 0 after
+      `sw s3,172(s2)` (`0x80001ea4`).
+
+      Here are the values side by side:
+
+      | | `cpus[0].intena` on arrival | saved in `s3` | correct value |
+      |---|---|---|---|
+      | `sh` (slept in a system call) | — | **1** | 1 |
+      | pid 4 (preempted in `kerneltrap`) | **0** (scheduler's `acquire`) | **0** | 0 |
+
+      For pid 4 the restore writes 0 over 0. Pid 4 does not depend on line 496: without it,
+      pid 4 would get the scheduler's 0, which is right, thanks to line 456 (and the
+      `intr_off` at line 442). A thread that yielded from a trap is protected by either
+      safeguard. The thread that
+      line 496 really rescues is `sh`. When `sh` resumes, it will find the scheduler's 0 in
+      `cpus[i].intena`. Without the restore, `sleep`'s `release` would leave SIE off, and the
+      rest of `sh`'s `read` (and every later `acquire`, which would re-record 0) would run with
+      interrupts off until the return to user mode.
+
+      For pid 4 to inherit a wrong **1**, *both* safeguards would have to be missing: no line
+      456 (so `sh`'s 1 survives and the rest of that scan runs with SIE on, its `acquire`s
+      recording 1) and no line 496, *and* pid 4 would have to be picked in that same scan
+      pass. In this run it was not: pid 4 was picked two passes later, after lines 441–442
+      had turned SIE off again. Had it been, the next step would turn interrupts on inside a
+      trap handler.
+    others: |
+      Hart 2 is back in its scheduler, `cpus[2].noff` 0 or 1 as it scans. Pid 4's stack holds
+      two kinds of frames: the system-call frames from `usertrap` down to `pop_off`, then a
+      `kernelvec` frame where the timer hit, then the `kerneltrap → yield → sched` frames.
+      [[tour:47]] draws such a stack.
+
+  - title: yield's release leaves SIE off; kerneltrap restores sstatus
+    file: kernel/trap.c
+    lines: 134-164
+    focus: 156-163
+    state:
+      hart: 0
+      mode: S
+      proc: "grind-to-be (pid 4)"
+      intr: "off"
+      satp: kernel
+      locks: []
+      irq: 0
+      stack: [usertrap, syscall, sys_exec, kexec, namei, namex, dirlookup, readi, brelse, releasesleep, release, pop_off, kernelvec, kerneltrap]
+      sp: {"on": kernel, detail: "KSTACK(3), sp = 0x3fffff78d0 in kerneltrap"}
+    note: |
+      [[yield]] ends with `release(&p->lock)`. `pop_off`: `noff` 1 → 0, `intena` 0, no
+      `csrsi`. gdb at the end of that `pop_off`: `sstatus = 0x200000020`, SIE **0**.
+
+      Back in [[kerneltrap]], lines 162–163 put back the trap registers it saved on entry
+      on hart 2. They survived the switch on pid 4's kernel stack, in the saved-register slots
+      of `yield`'s and `sched`'s frames, and were reloaded into `s2` and `s1` on the way back:
+
+      ```text
+      0x80002708  csrw sepc,s2       sepc    = 0x80000c50
+      0x8000270c  csrw sstatus,s1    sstatus = 0x200000120   (SPP=1, SPIE=1, SIE=0)
+      ```
+
+      Why must SIE still be 0 here? (Reasoned from the code, not observed.) An interrupt taken
+      before line 162 would be harmless: lines 162–163 rewrite both registers afterwards. After
+      `csrw sstatus,s1`, SIE is 0 again from the saved value. The one exposed point is the
+      boundary between the two `csrw`s: an interrupt there would set `sepc` to `0x8000270c`
+      itself, and `kernelvec`'s `sret` would later jump back into the middle of `kerneltrap`
+      with its frame already popped. The comment at lines 160–161 shows the authors knew
+      `yield` may let traps happen; `intena = 0` keeps that last boundary closed.
+
+  - title: "sret: pid 4 continues on hart 0, right after a csrsi"
+    file: kernel/kernelvec.S
+    lines: 38-64
+    focus: 61-64
+    state:
+      hart: 0
+      mode: S
+      proc: "grind-to-be (pid 4)"
+      intr: "off"
+      satp: kernel
+      locks: []
+      irq: 0
+      stack: [usertrap, syscall, sys_exec, kexec, namei, namex, dirlookup, readi, brelse, releasesleep, release, pop_off, kernelvec]
+      sp: {"on": kernel, detail: "KSTACK(3); after addi sp,sp,256 the kernelvec frame is gone: sp = 0x3fffff7a00"}
+    note: |
+      `kernelvec` restores the caller-saved registers and executes `sret` (`0x800055fc`), with
+      `sepc = 0x80000c50`. `sret` sets the mode from SPP (S), sets SIE from SPIE (1), and
+      jumps to `sepc`. gdb after the `sret`: `pc = 0x80000c50`, `sstatus = 0x200000022`,
+      SIE **1**, `noff` 0.
+
+      `0x80000c50` is the instruction right after `pop_off`'s `csrsi`. gdb's backtrace from
+      there: `pop_off ← release ← releasesleep ← brelse ← readi ← dirlookup ← namex ← namei
+      ← kexec ← sys_exec`. So on hart 2, pid 4 was releasing a buffer's sleep-lock while
+      looking up `grind`; the `release` of the sleep-lock's inner spinlock re-enabled
+      interrupts; the pending tick was taken on the very next instruction; and pid 4 now
+      resumes that instruction on **hart 0**, with SIE on, exactly as if nothing had happened.
+
+      Interrupts came back on only here, by `sret`, at `noff` 0, in the code that had them on
+      before the trap. That is the whole contract: `intena` 0 kept the handler closed, and
+      SPIE carried the "they were on" fact across the trap instead.
+
+  - title: "forkret: the first release leaves SIE off"
+    file: kernel/proc.c
+    lines: 510-543
+    focus: 517-520
+    state:
+      hart: 0
+      mode: S
+      proc: grind (pid 7)
+      intr: "off"
+      satp: kernel
+      locks: ["pid 7's p->lock"]
+      irq: {noff: 1, intena: 0}
+      stack: [forkret]
+      sp: {"on": kernel, switched: "`ld sp, 8(a1)` in [[swtch]] from hart 0's scheduler", detail: "KSTACK(5), empty except forkret's frame: sp = 0x3fffff3fd0"}
+    note: |
+      Tick 14. `grind` has forked; hart 0's scheduler picks the child, pid 7 in slot 5, and
+      its first `swtch` lands in [[forkret]] on an empty kernel stack ([[tour:13]]). gdb at
+      entry: `noff = 1`, `intena = 0`, `sstatus = 0x200000020`.
+
+      There is no `sched` frame to restore anything: pid 7 has never run. The `intena` it
+      sees is simply the one the scheduler's `acquire` recorded, 0. `myproc()` takes `noff`
+      to 2 and back. Then line 520's `release`: `noff` 1 → 0, `intena` 0, no `csrsi`. gdb
+      after it: SIE **0**, `noff` 0.
+
+      That is the right answer. `forkret` is about to call [[prepare_return]], which turns
+      interrupts off anyway (line 108 of `trap.c`) before changing `stvec`; `sret` in
+      [[userret]] will turn them on in user mode through SPIE. If line 456 were missing,
+      this is the release that would act on a leftover 1: interrupts would come on for the
+      few instructions before `prepare_return` turns them off. Mostly harmless here; the real
+      damage would have been done earlier, in the scheduler's scan.
+    others: |
+      At this moment hart 1 runs `grind` pid 6 in the kernel with `cpus[1].noff = 2`,
+      `intena = 1` (a system call), and hart 2 is in its scheduler with `intena = 0`. Three
+      harts, three different `intena`s, each correct for the thread it belongs to.
+
+  - title: "Tick 17: a timer lands in pid 7's kernel code at noff 0"
+    file: kernel/trap.c
+    lines: 134-164
+    focus: 137-149
+    state:
+      hart: 0
+      mode: S
+      proc: grind (pid 7)
+      intr: "off"
+      satp: kernel
+      locks: []
+      irq: {noff: 0, note: "the stale intena is 1, left by pid 7's system call"}
+      stack: [kernelvec, kerneltrap]
+      sp: {"on": kernel, detail: "KSTACK(5), kernelvec frame on top: sp = 0x3fffff3e10"}
+    note: |
+      Three ticks later pid 7 is in a system call. The timer fires on hart 0 and
+      [[kerneltrap]] reads `sepc = 0x80000c50` (once again the instruction after
+      `pop_off`'s `csrsi`), `sstatus = 0x200000120`, `scause = 0x8000000000000005`. gdb at
+      entry: `noff = 0`, SIE 0, and a **stale `intena = 1`**, written by the last outermost
+      `push_off` of pid 7's system call, when SIE was on.
+
+      `kerneltrap` checks SPP (it came from S-mode) and checks that SIE is off (the hardware
+      cleared it). The stale 1 does no harm, because nothing reads `intena` until a
+      `pop_off` reaches `noff` 0, and the next `push_off` at `noff` 0 will overwrite it.
+
+      We did not stop on the instructions before the trap, so we cannot say which `release`
+      pid 7 was in. What we can say is what the invariant guarantees: the trap arrived at
+      `noff` 0, so pid 7 held no spinlock when it was interrupted.
+
+  - title: "clockintr: intena 0, then noff 2 inside wakeup"
+    file: kernel/trap.c
+    lines: 166-180
+    focus: 170-173
+    state:
+      hart: 0
+      mode: S
+      proc: grind (pid 7)
+      intr: "off"
+      satp: kernel
+      locks: [tickslock, "init's p->lock (the first of 64)"]
+      irq: {noff: 2, intena: 0}
+      stack: [kernelvec, kerneltrap, devintr, clockintr, wakeup]
+      sp: {"on": kernel, detail: "KSTACK(5), sp = 0x3fffff3d80 in wakeup's acquire"}
+    note: |
+      `acquire(&tickslock)` (the lock named `time`, at `0x800157d0`). gdb at its `push_off`:
+
+      | | `a5` from `csrrci` | noff | intena |
+      |---|---|---|---|
+      | before | | 0 | 1 (stale) |
+      | after | `0x200000120` (SIE 0) | **1** | **0** |
+
+      The stale 1 is gone: an outermost `push_off` in a handler records the handler's truth.
+      `ticks` goes from 17 to 18 and [[wakeup]] walks all 64 slots, each `acquire` taking
+      `noff` to 2 and each `release` back to 1, `intena` 0 throughout. gdb saw `init`
+      (pid 1), `sh` (pid 2) and `grind` pid 5 `SLEEPING` among them.
+
+      This is the pair the whole mechanism exists for. [[sys_pause]] holds `tickslock` in
+      process context. If a timer interrupt could arrive on the same hart while it does,
+      `clockintr` would spin on `tickslock` forever, since its holder cannot run until the
+      handler returns. `push_off` in `sys_pause`'s `acquire` makes that impossible. The evidence: none of the
+      2,103 measured traps that interrupted process code, nor the 310 checked in this run,
+      arrived at `noff` above 0.
+
+      The `release(&tickslock)`: `noff` 1 → 0, `intena` 0, SIE stays off.
+    others: |
+      `tickslock` is a global, so another hart's `sys_pause` could hold it now. Then hart 0
+      spins here, in interrupt context, with SIE off; that is fine, because the holder is on
+      another hart and will finish. Only *same-hart* waiting is a deadlock.
+
+  - title: "yield and sched: s3 = 0, the state pid 4 was frozen in"
+    file: kernel/proc.c
+    lines: 479-508
+    focus: 503-506
+    state:
+      hart: 0
+      mode: S
+      proc: grind (pid 7)
+      intr: "off"
+      satp: kernel
+      locks: ["pid 7's p->lock"]
+      irq: {noff: 1, intena: 0}
+      stack: [kernelvec, kerneltrap, yield, sched]
+      sp: {"on": kernel, detail: "KSTACK(5), sp = 0x3fffff3dc0 at the swtch call"}
+    note: |
+      `myproc()` is pid 7, so `kerneltrap` calls [[yield]]. Its `acquire(&p->lock)` (lock at
+      `0x800104d8`) is another outermost `push_off` with SIE 0: `noff` 1, `intena` 0. In
+      [[sched]], `noff` is exactly 1, SIE is 0, and `lw s3,172(a5)` loads **0**. gdb at the
+      `swtch` call: `s3 = 0`.
+
+      This is precisely the state pid 4 was in on hart 2 before step 15: suspended in
+      `sched` under `kerneltrap`, with a saved `intena` of 0 and saved `sepc`/`sstatus` in
+      `kerneltrap`'s `s2`/`s1`. When pid 7 resumes, on whatever hart, steps 15–17 will replay
+      for it: restore 0, release with SIE off, `csrw sepc`, `csrw sstatus`, `sret`, SIE on.
+
+      Compare the two suspensions on hart 0 in this tour:
+
+      | | how it got to `sched` | `s3` | after it resumes, `release` does |
+      |---|---|---|---|
+      | `sh` | system call, [[sleep]] | 1 | `csrsi`: SIE on, system call continues |
+      | pid 7 | timer in kernel, [[yield]] | 0 | nothing: SIE stays off until `sret` |
+
+  - title: "noff and intena at every step"
+    file: kernel/proc.c
+    lines: 444-464
+    focus: 453-456
+    state:
+      hart: 0
+      mode: S
+      proc: "none (hart 0's scheduler, after pid 7's swtch)"
+      intr: "off"
+      satp: kernel
+      locks: ["pid 7's p->lock"]
+      irq: {noff: 1, intena: 0, note: "line 456 sets intena to 0; pid 7 left 0 here anyway"}
+      stack: [main, scheduler]
+      sp: {"on": scheduler, detail: "sp = 0x80008810"}
+    note: |
+      Hart 0's values, from gdb, step by step:
+
+      | Step | Where | SIE | noff | intena |
+      |---|---|---|---|---|
+      | 1 | `usertrap` line 66 | 0 → **1** | 0 | (0, stale) |
+      | 2 | `myproc` in `syscall` | 0 | 1 | **1** |
+      | 3 | `acquire(&cons.lock)` | 0 | 1 | 1 |
+      | 4 | `myproc` inside it | 0 | **2** | 1 |
+      | 5 | `sleep_prepare` | 0 | 2 | 1 |
+      | 6 | `release(&cons.lock)` | **1** | 0 | (1) |
+      | 7 | `sleep`'s `acquire` | 0 | 1 | 1 (rewritten) |
+      | 8–9 | `sched`, `s3 = 1` | 0 | 1 | 1 |
+      | 10 | scheduler line 456 | 0 | 1 | 1 → **0** |
+      | 11 | release `sh`'s lock | 0 | 0 | (0) |
+      | 12 | lines 441–442 | 1 for one instruction | 0 | (0) |
+      | 13 | `clockintr`, `tickslock` | 0 | 1 | 0 |
+      | 14 | `acquire` pid 4's lock | 0 | 1 | 0 |
+      | 15 | `sched` restores `s3 = 0` | 0 | 1 | 0 |
+      | 16 | `yield`'s release | 0 | 0 | (0) |
+      | 17 | `sret` | **1** | 0 | (0) |
+      | 18 | `forkret` release | 0 | 1 → 0 | 0 |
+      | 19 | tick in pid 7 | 0 | 0 | (1, stale) |
+      | 20 | `clockintr`, `wakeup` | 0 | 1, 2 | 0 |
+      | 21 | `yield`, `sched`, `s3 = 0` | 0 | 1 | 0 |
+
+      Read the SIE column: it is 1 only on rows where `noff` is 0, and it was only ever turned
+      on by four instructions: `usertrap`'s `csrsi`, `pop_off`'s `csrsi` at `noff` 0 with
+      `intena` 1, the scheduler's `csrsi`, and `sret`. Read the `intena` column: it changes
+      only at an outermost `push_off`, at line 456, and at line 496. And read the two `s3`
+      values: 1 for a thread that went to sleep with interrupts on, 0 for one that was
+      preempted in a handler. The hart's field is a scratch copy; the thread's truth travels in
+      its saved registers ([[concept:locks#sched-intena]]).
+locks:
+  - lock: cons.lock
+    where: "[[consoleread]] (step 3), released before `sleep` (step 6)"
+    protects: "The console input buffer `cons.buf`, `cons.r`, `cons.w`; also taken by [[consoleintr]], so it must never be held with SIE on"
+  - lock: "sh's p->lock"
+    where: "[[killed]], [[sleep_prepare]], [[sleep]] (acquired by `sh`); released by hart 0's [[scheduler]] (step 11)"
+    protects: "`sh`'s `chan` and `state`; held across `swtch` as the hand-off"
+  - lock: "pid 4's p->lock"
+    where: "hart 0's [[scheduler]] (step 14); released by [[yield]] (step 16)"
+    protects: "Pid 4's `state`, so only one hart can start it after it moved from hart 2"
+  - lock: "pid 7's p->lock"
+    where: "hart 0's [[scheduler]] → released in [[forkret]] (step 18); [[yield]] in step 21 → released by the scheduler"
+    protects: "Pid 7's `state` across both of its switches on hart 0"
+  - lock: tickslock
+    where: "[[clockintr]] on hart 0 only, in interrupt context (steps 13 and 20)"
+    protects: "`ticks`; shared with [[sys_pause]] and [[sys_uptime]] in process context, which is why it may never be held with SIE on"
+  - lock: "every p->lock, in turn"
+    where: "[[wakeup]] inside `clockintr`, at noff 2"
+    protects: "Each process's `chan` and `state`"
+  - lock: "(no lock) cpus[i].noff and cpus[i].intena"
+    where: "[[push_off]], [[pop_off]], [[sched]], [[scheduler]] line 456"
+    protects: "Per-hart fields: only the owning hart touches them, always with SIE off, so no lock is needed"
+  - lock: "(not a lock) myproc's push_off"
+    where: "[[myproc]], everywhere (steps 2, 4, 7, 8, 18)"
+    protects: "Nothing shared: it keeps the thread on one hart while it reads `c->proc`, and raises noff by one"
+quiz:
+  - q: "In step 4 the nested `push_off` saw an old SIE of 0. Why must it not write that 0 into `intena`, and what would the user notice if it did?"
+    a: "`intena` must describe the state before the *outermost* `push_off`, which was 1. If the nested call stored 0, the final `release(&cons.lock)` in step 6 would skip the `csrsi`, and `sh` would continue its system call, and every later outermost `push_off` would re-record 0, with interrupts off until it returned to user mode. Timer preemption and device interrupts on that hart would be delayed for the rest of the system call."
+  - q: "Steps 9 and 21 both end in a call to `swtch` from `sched`, with `noff = 1`. Why does `s3` differ, and where does each value come from?"
+    a: "`s3` is loaded from `cpus[0].intena`, which the last outermost `push_off` wrote. In step 9 the value came from `sleep`'s `acquire` (step 7), run in a system call with SIE on, so 1. In step 21 it was `yield`'s `acquire`, run inside `kerneltrap` with SIE off, so 0."
+  - q: "Remove only line 496 (sched's restore). Which of this tour's three threads (`sh`, pid 4, pid 7) behave differently, and how?"
+    a: "Of the suspensions shown, only `sh`'s. Every thread resumes with the 0 the scheduler's `acquire` recorded. That is correct for pid 4 and pid 7 in the suspensions shown here, which saved 0 anyway; but any thread that sleeps in a system call is affected like `sh` (pid 4 and pid 7 also do, later in this run, with `s3 = 1`). `sh` saved 1; it would resume with 0, `sleep`'s `release` would leave SIE off, and the rest of `sh`'s `read` would run with interrupts off."
+  - q: "Remove both line 456 and line 496. Trace what happens in steps 10–16 with the values you saw."
+    a: "In step 10 `cpus[0].intena` stays 1 (`sh`'s). The `release` in step 11 then executes `csrsi`, and the rest of *that* scan runs with SIE on, each `acquire` recording 1; a process picked later in that same pass would get 1. Pid 4 is not: lines 441–442 turn SIE off before the next pass, so its `acquire` in step 14 still records 0. Had pid 4 been RUNNABLE further along that first pass, then with no restore its `release` in `yield` would turn SIE on inside `kerneltrap`, and an interrupt between `csrw sepc` and `csrw sstatus` would leave `sepc` pointing into `kerneltrap`, and `kernelvec`'s `sret` would jump there with the frame already popped."
+  - q: "gdb counted 43,104 kernel-mode traps and found none at `noff > 0`, and most of them at `0x80001e10` or `0x80000c50`. Explain both facts."
+    a: "An *interrupt* can be taken in S-mode only while SIE is 1 (a kernel exception would panic), and SIE is 1 only when `noff` is 0 (every `push_off` clears it first; only `pop_off` at `noff` 0, `usertrap`'s `intr_on`, the scheduler's `intr_on` and `sret` set it). An interrupt that becomes pending while SIE is off waits, so it is delivered on the first instruction after SIE comes back on: right after the scheduler's `csrsi` (`0x80001e10`) or `pop_off`'s `csrsi` (`0x80000c50`)."
+  - q: "Why does `forkret` need no saved `intena`, and why is 0 the right value for it?"
+    a: "A new process has no `sched` frame to restore from; it inherits whatever the scheduler's `acquire` recorded, which is always 0 because the scheduler acquires with SIE off. 0 is right because `forkret` goes straight to `prepare_return`, which turns interrupts off before changing `stvec`, and `sret` turns them on in user mode through SPIE."

@@ -1,0 +1,1718 @@
+published: true
+title: Per-CPU free lists in kalloc
+area: Concurrency
+stars: 3
+branch: ext/18-percpu-kalloc
+prerequisites: {tours: [11, 15, 18, 26, 27, 50], concepts: [locks, stacks]}
+summary: |
+  In this tree every page of physical memory is handed out from one list, `kmem.freelist`,
+  under one spinlock, `kmem.lock`. Every [[kalloc]] and every [[kfree]] on every
+  [[g:hart]] takes that lock, even when the three harts are working on entirely different
+  pages for entirely different processes. With three processes growing and shrinking their
+  memory at the same time, one acquisition in sixteen finds the lock already held and spins.
+
+  In this lab you give each CPU its own free list and its own lock. A CPU frees onto its own
+  list and allocates from it, so in the common case no two harts ever touch the same lock.
+  The idea is simple; the details are a short course in what "per-CPU" really means. How
+  does code know which CPU it is on, and for how long is that answer true? What does a CPU
+  do when its own list is empty, and what new locking between harts does that bring back?
+  You will answer these questions yourself, then break the answers on purpose and record
+  what happens, one of them with gdb.
+
+  The reference solution is five small commits. On three harts it cuts the contended
+  acquisitions of the allocator's locks during a stress test from about 47,000 to under 10,
+  and you will see where memory ends up when nobody puts it back where it came from.
+learn:
+  - "What `cpuid()` really returns, and what can make that answer stale before the code has finished using it."
+  - "How to keep a CPU number valid in a function that may be called with interrupts on, with interrupts off, or with other spinlocks held, and what noff and intena look like in the allocator from a system call, a page fault and [[kwait]]."
+  - "Whether data that is per-CPU still needs a lock, and what a stale CPU number actually costs: measured on a real run."
+  - "What new [[g:lock-order]] question appears when one CPU must take pages from another, and what a violation looks like, recorded with gdb."
+  - "How much to take from another CPU, and from whom: what different choices cost in lock traffic and in lock hold time."
+  - "Where free memory ends up when nothing sends it back, and what that does to the meaning of a [[kalloc]] that returns 0."
+  - "How to measure lock contention (failed `amoswap` attempts per lock name) and why timings under QEMU must be read with care."
+spec: |
+  **Behaviour.** The allocator keeps one free list per possible CPU (`NCPU` = 8), each with
+  its own spinlock, named `kmem0` to `kmem7` so that a contention counter can tell them
+  apart.
+
+  - [[kfree]] puts the page on the list of the CPU it runs on.
+  - [[kalloc]] takes a page from the list of the CPU it runs on. If that list is empty, it
+    takes pages from another CPU's list ("steals"); it returns 0 only after it has tried
+    every list.
+  - At boot, [[kinit]] runs on hart 0, so all free pages start on hart 0's list.
+  - Ctrl-P on the console prints, after the process list, how many free pages each list
+    holds:
+
+    ```text
+    free pages: kmem0 32435 kmem1 73 kmem2 37 kmem3 0 kmem4 0 kmem5 0 kmem6 0 kmem7 0
+    ```
+
+  **Constraints.** No two harts may ever deadlock in the allocator, whatever they are
+  doing. The CPU number must not go stale while the code uses it. Nothing outside
+  `kalloc.c` (and the one Ctrl-P line in [[procdump]]) changes: every caller of [[kalloc]]
+  and [[kfree]] keeps working as it is. **`usertests -q` must print `ALL TESTS PASSED` on 3
+  harts.**
+
+  **The test program**, `kalloctest`, prints one line per check (and four lines of
+  information):
+
+  ```text
+  $ kalloctest
+  kalloctest: churn: 3 processes x 2000 rounds x 64 pages, 15 ticks
+  kalloctest: churn: OK
+  kalloctest: one process got 32472 free pages, 32472 at start
+  kalloctest: gather: OK
+  kalloctest: exhaust: 3 processes got 32378 of 32472 free pages
+  kalloctest: exhaust: OK
+  kalloctest: free pages 32472 before, 32472 after
+  kalloctest: no leaks: OK
+  kalloctest: ALL OK
+  ```
+
+  - **churn**: three processes (one per hart) each grow by 64 pages with `sbrk`, write and
+    check every page, and shrink again, 2,000 times: 768,000 page allocations and frees, all
+    at the same time. The tick count is information, not a check.
+  - **gather**: afterwards the free pages are spread over several lists; one process must
+    still be able to allocate every one of them.
+  - **exhaust**: three processes allocate page by page until nothing is left, all at once,
+    and hold on until all three have run out. Between them they must get nearly everything
+    (their own page tables come out of the same memory). This is where stealing harts
+    collide.
+  - **no leaks**: the number of free pages at the end equals the number at the start.
+
+  `kalloctest` passes on the original allocator too. This lab changes how fast the allocator
+  is under contention, not what it does; the effect is in the measurements, not in the
+  test's verdict. What `kalloctest` cannot see (which list a page is on, how often a lock
+  was contended) you check with Ctrl-P and with the contention counter of milestone 5.
+think:
+  - title: Why is one free list a bottleneck?
+    q: |
+      Three harts each run a process that grows its memory by 64 pages and shrinks it again,
+      over and over. The three processes never share a page. Do the three harts ever wait
+      for each other inside the allocator? Where, and why? Then: what would you change so
+      that, most of the time, they do not?
+    hints:
+      - "Read [[kalloc]] and [[kfree]] in [[kernel/kalloc.c]]. What does every call do first, whichever page it is about?"
+      - "A lock protects data, not pages: `kmem.lock` protects the one list head `kmem.freelist`, and every allocation and every free changes it. Contention comes from sharing a lock, not from sharing a page."
+      - "Split the data so that the common case touches data nobody else touches: one list, with its own lock, per CPU. Each CPU frees onto and allocates from its own."
+    answer: |
+      Yes. Every [[kalloc]] and every [[kfree]] acquires `kmem.lock`
+      ([[kernel/kalloc.c:59]], [[kernel/kalloc.c:73]]) to pop or push one page on the single
+      list. The three harts work on different pages, but they all change the same list head,
+      so they all need the same lock. When two want it at once, one spins in [[acquire]]'s
+      `amoswap` loop with interrupts off, doing nothing useful ([[concept:locks#amoswap]]).
+
+      Measured (with a counter of failed `amoswap` attempts per lock, described in the
+      measure section): during a run of three such processes (2,000 rounds of 64 pages
+      each), `kmem.lock` was acquired 768,134 times, and 43,429 to 49,770 of those
+      acquisitions (three runs) found it held.
+
+      The cure is to stop sharing the data. Give each CPU its own list and its own lock; a CPU
+      frees onto its own list and allocates from it. As long as a process allocates and frees
+      on the same hart, no other hart touches that lock, and an uncontended acquire costs one
+      `amoswap` that succeeds at once. The questions that follow are what makes this harder
+      than it sounds: knowing which CPU you are on, what a CPU does when its own list is
+      empty, and what locking between lists that introduces.
+    checks:
+      - id: lab18-01
+        level: 1
+        type: choice
+        q: |
+          On the original kernel, three harts run three processes that allocate and free
+          pages at the same time. The processes never share a page. Which statement is right?
+        options:
+          - text: "Every kalloc and kfree on every hart takes the same kmem.lock, so the harts wait for each other even though their pages are different."
+            correct: true
+            why: |
+              Right. The lock protects the single list head, and every allocation or free
+              changes that head.
+          - text: "The harts only wait for each other when two of them want the same page."
+            why: |
+              You may have thought a lock protects the page being handed out. It protects the
+              list `kmem.freelist`; every call changes the head of that list, whatever page is
+              involved.
+          - text: "Only kalloc takes the lock; kfree can push without it."
+            why: |
+              You may have thought freeing is harmless. Pushing is a read of the head and a
+              write of the head; two unlocked pushes, or a push racing a pop, lose pages. That
+              is the interleaving at the top of [[concept:locks#why]]. [[kfree]] takes the
+              lock at [[kernel/kalloc.c:59]].
+          - text: "They never wait: interrupts are off while kmem.lock is held, so no other hart can run."
+            why: |
+              You may have thought SIE is global. Turning interrupts off affects only this
+              hart; the other two keep running and spin when they reach the same lock
+              ([[concept:locks#sie]]).
+        explain: |
+          Contention is about sharing a lock, and a lock is shared by everyone who touches the
+          data it protects. Here that is one list head for all of RAM. See [[tour:27]] for the
+          allocator and [[concept:locks#lock-kmem]] for the lock.
+      - id: lab18-02
+        level: 2
+        type: number
+        q: |
+          Each of three processes does 2,000 rounds of `sbrk(64 pages)`, writes the pages,
+          then `sbrk(-64 pages)`. How many times do these rounds acquire `kmem.lock` in the
+          original kernel, counting only the 64 data pages per round (not page-table pages)?
+        answer: 768000
+        wrong:
+          384000: |
+            You may have counted only the allocations. `sbrk(-n)` frees every page through
+            [[uvmdealloc]] → [[uvmunmap]] → [[kfree]], and every [[kfree]] takes the lock too.
+          12000: |
+            You may have counted one acquisition per `sbrk` call. [[uvmalloc]] calls
+            [[kalloc]] once per page, and each call takes the lock separately.
+          6000: |
+            You may have counted one acquisition per round. Each round allocates 64 pages and
+            frees 64 pages, each with its own acquire.
+        why_wrong: "3 processes × 2,000 rounds × 64 pages × 2 (one kalloc and one kfree per page)."
+        explain: |
+          3 × 2,000 × 64 × 2 = 768,000. The recorder counted 768,134 acquisitions during that
+          run on the original kernel; the extra 134 come from `fork`, `exec`, `exit` and
+          page-table pages. One lock round trip per page per direction is the price of a shared list.
+  - title: Which CPU am I on, and for how long is that true?
+    q: |
+      Per-CPU lists mean [[kfree]] and [[kalloc]] must ask "which CPU is this?". Find how the
+      kernel answers that question. Then: a process in a system call on hart 1 gets the
+      answer 1, and a few instructions later uses it to pick a list. What could make the
+      answer wrong by then? What must be true in between, and how do you make it true in a
+      function that may be called with spinlocks already held, or with interrupts already
+      off?
+    hints:
+      - "Read [[cpuid]] and the comment above it ([[kernel/proc.c:61]]), [[kernel/start.c:46]], and what [[kerneltrap]] does after a timer interrupt ([[kernel/trap.c:157]]). Also read the comment at [[kernel/kernelvec.S:44]]."
+      - "`tp` belongs to the hart, not to the thread: [[swtch]] does not save it. A thread that is switched out by a timer interrupt can resume on another hart, where `tp` holds another number. Nothing can switch a kernel thread out while interrupts are off on its hart, and nothing in the allocator sleeps."
+      - "Turn interrupts off before asking and keep them off until you are done with the list; use the nesting-aware pair that [[acquire]] itself uses, because the caller may already hold locks (and then interrupts must stay off afterwards)."
+    answer: |
+      [[cpuid]] reads `tp`. [[start]] puts each hart's `mhartid` into its `tp` at boot
+      ([[kernel/start.c:47]]-[[kernel/start.c:48]]), [[uservec]] reloads it from the
+      trapframe on every entry from user space, and nothing changes it while the hart runs
+      kernel code ([[userret]] loads the user's `tp` only on the way out). So `tp` names the
+      hart that is executing the instruction that reads it.
+
+      The answer goes stale if the thread moves. In this kernel a kernel thread moves to
+      another hart only by giving up the CPU and being picked up later by another hart's
+      [[scheduler]]: by sleeping, or by a timer interrupt that makes [[kerneltrap]] call
+      [[yield]] ([[kernel/trap.c:157]]-[[kernel/trap.c:158]]). [[swtch]] saves only `ra`,
+      `sp` and `s0`-`s11`; `tp` stays with the hart, which is exactly why [[kernelvec]] does
+      not restore it ([[kernel/kernelvec.S:44]]). After the switch, `cpuid()` would return the
+      new hart's number, but a local variable `id` read before still holds the old one.
+
+      The allocator never sleeps, so the only danger is an interrupt. With interrupts off on
+      this hart, no timer interrupt can be taken, no yield happens, and `id` stays true until
+      interrupts come back on. The reference brackets the whole use of `id` with
+      [[push_off]] ... [[pop_off]]:
+
+      ```c
+      push_off();
+      id = cpuid();
+      acquire(&kmem[id].lock);
+      ...
+      release(&kmem[id].lock);
+      pop_off();
+      ```
+
+      Why not `intr_off()`/`intr_on()`? Because the allocator is called with locks held:
+      [[kfree]] in [[kwait]] with `wait_lock` and a child's `p->lock`, [[kalloc]] in
+      [[allocproc]] and [[kfork]] with the new child's `p->lock`. A plain `intr_on()` at the end would turn interrupts on inside those
+      critical sections, the very thing [[pop_off]] panics about
+      ([[concept:locks#invariant]]). And a page fault runs the allocator with interrupts
+      already off; they must stay off afterwards. [[push_off]] counts and remembers
+      (`noff`, `intena`) exactly for this ([[concept:locks#noff]]).
+
+      Notice that the acquire inside does a [[push_off]] of its own; the outer one is not
+      redundant, because it covers the instructions *before* the acquire, where `id` is read
+      and used to choose which lock to take.
+    checks:
+      - id: lab18-03
+        level: 2
+        type: choice
+        q: |
+          A system call on hart 1, with interrupts on, executes `id = cpuid();` and two
+          instructions later uses `id`. Which event can make `id` wrong in between?
+        options:
+          - text: "A timer interrupt: kerneltrap calls yield, and the thread later resumes on hart 2."
+            correct: true
+            why: |
+              Right. The thread continues where it left off, on whichever hart picked it up;
+              `tp` now says 2, but `id` still says 1.
+          - text: "Another hart writes hart 1's tp register."
+            why: |
+              You may have thought `tp` is shared memory. It is a register; each hart has its
+              own, and no hart can write another's.
+          - text: "A UART interrupt that is handled on hart 1 and returns."
+            why: |
+              You may have thought any interrupt can move the thread. Only a timer interrupt
+              makes [[kerneltrap]] yield ([[kernel/trap.c:157]]); a device interrupt is
+              handled and the thread resumes on the same hart, with the same `tp`.
+          - text: "A page fault in the kernel code."
+            why: |
+              Kernel code and data are mapped for good in the kernel page table; the kernel
+              does not take page faults on them. And a fault would not move the thread to
+              another hart either.
+        explain: |
+          Migration needs a context switch, and inside the allocator the only way to get one is
+          a timer interrupt followed by [[yield]]. Interrupts off closes that door. See
+          [[tour:11]] for the timer tick that leads to a switch and [[concept:stacks]] for why
+          `tp` is not part of a thread's saved state.
+      - id: lab18-04
+        level: 2
+        type: tf
+        q: |
+          True or false: in [[kfree]], `intr_off(); id = cpuid(); ... intr_on();` would do the
+          job as well as `push_off(); id = cpuid(); ... pop_off();`.
+        answer: false
+        why_tf: |
+          You may have thought the two pairs differ only in name. The plain pair forgets what
+          the state was before.
+        reasons:
+          - text: "kfree is called with spinlocks held (in kwait, wait_lock and a child's p->lock); intr_on would enable interrupts inside their critical sections."
+            correct: true
+            why: |
+              Right. [[pop_off]] turns interrupts back on only when the outermost level ends
+              and only if they were on before it began.
+          - text: "intr_off does not turn interrupts off on RISC-V; only push_off does."
+            why: |
+              [[intr_off]] clears `sstatus.SIE` as surely as [[push_off]] does. The difference
+              is the counting, not the clearing.
+          - text: "cpuid() itself calls push_off, so a second one is needed to balance it."
+            why: |
+              [[cpuid]] sets up a stack frame and does one `mv a0, tp`; it touches no
+              interrupt state at all.
+        explain: |
+          Code that may run inside other code's critical sections must restore the interrupt
+          state it found, not force one. That is what `noff` and `intena` are for
+          ([[concept:locks#intena]]).
+  - title: Where do pages start, and what does a CPU with an empty list do?
+    q: |
+      [[kinit]] runs once, on one hart, before the other harts start. Where do the free pages
+      end up? Could you spread them over the CPUs instead, and how many CPUs would you spread
+      them over? Then: hart 2 calls [[kalloc]] and its list is empty, but other lists are not.
+      What should happen? And when should [[kalloc]] finally give up and return 0?
+    hints:
+      - "Read [[main]]: which hart calls [[kinit]] ([[kernel/main.c:13]], [[kernel/main.c:19]]), and when do the others start? Look at `NCPU` in [[kernel/param.h:2]] and at the `-smp` option the lab runs with."
+      - "[[freerange]] gives every page to [[kfree]]. A [[kalloc]] that fails while other lists plainly hold pages would make `fork` and `sbrk` fail with plenty of memory left. (How exact \"plainly\" can be on three harts is question 8.)"
+      - "Shape: decide where the pages go at boot without new code if you can, and decide what condition must hold before [[kalloc]] may give up."
+    answer: |
+      [[main]] calls [[kinit]] on hart 0 only ([[kernel/main.c:13]]); harts 1 and 2 are still
+      spinning on `started`. [[freerange]] calls [[kfree]] for every page, and [[kfree]] puts
+      each one on the list of the CPU it runs on: all 32,735 free pages start on `kmem0`
+      (Ctrl-P right after boot shows `kmem0 32483 kmem1 62 kmem2 0`: the first process,
+      running on hart 1, has already taken pages from hart 0).
+
+      Spreading at boot is possible but not obviously better. The kernel is compiled for
+      `NCPU` = 8 and does not know that QEMU started 3 harts; spreading over 8 lists would put
+      five eighths of memory on lists no hart allocates from, so taking pages from other lists
+      is needed anyway. With stealing in place, starting everything on one list costs a few
+      early steals and nothing else.
+
+      So an empty CPU **steals**: it walks the other CPUs' lists and takes pages from the
+      first that has any. The reference starts the walk at its neighbour, `(id + 1) %
+      NCPU`, and wraps around, so different harts look at different victims first (more on
+      that in question 6). [[kalloc]] returns 0 only after it found its own list and all
+      seven others empty: on an exhausted machine every failed allocation costs 8 lock
+      acquisitions instead of 1.
+    checks:
+      - id: lab18-05
+        level: 2
+        type: number
+        q: |
+          Memory is exhausted: all eight lists are empty. A process on hart 2 calls [[kalloc]]
+          in the reference design (`NCPU` = 8, 3 harts running). How many kmem lock
+          acquisitions does this one failing call make?
+        answer: 8
+        wrong:
+          3: |
+            You may have counted only the lists of harts that exist. The kernel does not know
+            that only 3 harts run; it tries all `NCPU` = 8 lists, five of which are never used
+            by anyone.
+          1: |
+            That is the original kernel: one list, one lock. Here the own list is only the
+            first of eight tries.
+          7: |
+            You may have counted only the other CPUs' lists. The own list is tried first, with
+            its own acquire.
+        why_wrong: "One acquisition for the CPU's own list, then one for each of the other NCPU - 1 lists."
+        explain: |
+          1 + 7 = 8. That is the price of "return 0 only when everything is empty". It matters
+          only on an exhausted machine, and it is one reason `kalloctest exhaust` makes harts
+          collide on the locks.
+  - title: Does a per-CPU list need a lock?
+    q: |
+      With the CPU number pinned down, a CPU's own list is touched by that CPU's [[kalloc]] and
+      [[kfree]], with interrupts off. Is a lock still needed for it? Think about who else could
+      ever touch it: interrupt handlers on the same hart, other harts. And suppose, despite
+      everything, a thread used a stale CPU number: with a lock per list, what exactly would go
+      wrong? Without one?
+    hints:
+      - "Look at [[cpus]]: `noff` and `intena` are per-CPU data that has no lock at all ([[concept:locks#unlocked]]). What makes that safe, and does it hold for a free list?"
+      - "Search the interrupt handlers ([[devintr]] and what it calls) for [[kalloc]] and [[kfree]]. Then remember what a CPU with an empty list does."
+      - "Shape: list everyone who can touch one list; if anyone besides its own CPU is on that list, the list needs a lock. Then ask what a stale CPU number does to each list under that rule."
+    answer: |
+      Per-CPU data can go without a lock only if *nothing but its own CPU* ever touches it, and
+      that CPU touches it with interrupts off (so its own interrupt handlers cannot interleave).
+      `cpus[i].noff` is like that. A free list is not, for the reason of the previous
+      question: a CPU whose list is empty takes pages from other CPUs' lists. So each list is
+      shared after all, and keeps a spinlock. (Interrupt handlers are not the reason:
+      no handler in this kernel allocates or frees pages.)
+
+      The lock also decides what a stale CPU number costs. With a lock per list, a thread
+      that used `id` = 1 while really on hart 2 would lock `kmem1` and push onto list 1: the
+      page lands on another CPU's list, which is a loss of locality and nothing else, because
+      every access to list 1 is still made under list 1's lock. Clinic 1 removes the
+      interrupt bracket and measures this: 0 such events in about three million list
+      operations, 3 with the window artificially widened, and every test passed.
+
+      Without a lock, the same stale `id` would be a real race: two harts pushing and popping
+      on one list with no lock between them is the interleaving of [[concept:locks#why]],
+      with pages handed out twice or lost.
+    checks:
+      - id: lab18-06
+        level: 2
+        type: multi
+        q: |
+          In the reference design, which of these can access hart 1's list `kmem[1]`?
+        options:
+          - text: "kalloc running on hart 1"
+            correct: true
+            why: "Its own list is the first one it tries."
+          - text: "kfree running on hart 1"
+            correct: true
+            why: "Pages freed on hart 1 go on list 1."
+          - text: "kalloc running on hart 0 or hart 2, when its own list is empty"
+            correct: true
+            why: "Stealing: an empty CPU takes pages from the others' lists, under their locks."
+          - text: "an interrupt handler on hart 1"
+            why: |
+              You may have assumed interrupt handlers allocate memory. No handler reached from
+              [[devintr]] calls [[kalloc]] or [[kfree]]; and while hart 1 holds `kmem1`, its
+              interrupts are off anyway.
+          - text: "kfree on hart 2, in a thread that read cpuid() on hart 1 and then moved to hart 2"
+            why: |
+              That needs a context switch between `cpuid()` and the list operation. In the
+              reference, interrupts are off for that whole stretch, so the thread cannot move.
+              (Clinic 1 removes that protection.)
+        explain: |
+          The list is per-CPU for the common case and shared for stealing. That second use is
+          why each list has a lock; the first is why the lock is almost never contended.
+  - title: Stealing, and the order of locks
+    q: |
+      Hart 1 holds `kmem1`, has just found its own list empty, and wants pages from `kmem2`.
+      The natural code takes `kmem2`'s lock now, moves some pages, and releases both. What
+      can happen on three harts if hart 2, at the same moment, holds `kmem2`, finds it
+      empty, and walks towards `kmem1`? Write the interleaving. Then find a rule that makes it
+      impossible, and say which rule you prefer and what it costs.
+    hints:
+      - "Two locks of the same kind, taken in an order that depends on which CPU you are: look at [[concept:locks#order]] and [[tour:18]] for what a cycle in the lock-order graph means."
+      - "A deadlock needs a hart that holds one lock while it waits for another. Either never wait for a second kmem lock while holding one, or make every hart that needs two take them in the same global order (by CPU number)."
+      - "Shape: choose one of the two rules from hint 2 and check every path of your stealing code against it, including the moment the stolen pages are added to your own list."
+    answer: |
+      They deadlock:
+
+      | time | hart 1 | hart 2 |
+      |---|---|---|
+      | 1 | holds `kmem1`, own list empty | holds `kmem2`, own list empty |
+      | 2 | `acquire(&kmem2)`: spins | tries `kmem3` .. `kmem7`, `kmem0`: all empty |
+      | 3 | spins | `acquire(&kmem1)`: spins |
+      | 4 | spins forever, interrupts off | spins forever, interrupts off |
+
+      Each holds the lock the other needs, both with interrupts off, so not even a timer
+      interrupt gets through on those two harts. Clinic 2 builds exactly this and records it
+      with gdb on the second `kalloctest`: hart 0 holding `kmem0` and spinning on `kmem2`,
+      hart 2 holding `kmem2` and spinning on `kmem0`. With three harts a three-way cycle is
+      possible too (0 waits for 1, 1 for 2, 2 for 0).
+
+      Two rules avoid it:
+
+      - **Never hold two kmem locks at once** (the reference). [[kalloc]] releases its own
+        lock before it calls `steal`; `steal` cuts up to 64 pages off the victim's list under
+        the victim's lock, releases it, and then takes its own lock to put the extra pages
+        on its own list. No hart ever waits for a kmem lock while holding one, so no cycle
+        can form. The cost: for a moment the stolen batch is on no list at all (it is
+        reachable only from `steal`'s local variables), so another hart scanning for pages
+        can miss it (question 8).
+      - **A global order**: when two kmem locks are needed, take the lower-numbered one
+        first. A hart stealing from a higher-numbered CPU may keep its own lock; one stealing
+        from a lower-numbered CPU must release its own first and retake it after. The batch
+        is never in transit, but the code is longer and the rule is easy to get wrong.
+
+      The deadlock is not caught by [[holding]]: each hart holds a *different* lock. Nothing
+      in xv6 detects a cycle between two harts ([[concept:locks#panics]]); lab 21 builds a
+      checker for exactly this kind of cycle.
+    checks:
+      - id: lab18-07
+        level: 3
+        type: state
+        q: |
+          In the deadlock above (clinic 2's broken kernel), hart 0 is in a system call
+          (`sbrk`) inside [[kalloc]], holding `kmem0`, spinning in [[acquire]] for `kmem2`.
+          [[kalloc]] did a [[push_off]] before it took `kmem0`. Fill in the hart's state.
+        state:
+          mode: S
+          stack: kernel
+          sie: "off"
+          noff: 3
+          intena: 1
+        why:
+          noff: |
+            Count the levels: [[kalloc]]'s own [[push_off]] (1), `kmem0` held (2), and the
+            [[acquire]] of `kmem2` does its [[push_off]] *before* it spins (3). gdb recorded
+            `noff 3` on both stuck harts.
+          intena: |
+            The outermost [[push_off]] ran in a system call after [[usertrap]]'s `intr_on`
+            ([[kernel/trap.c:66]]), so it recorded SIE = 1.
+          sie: |
+            Any held spinlock means interrupts are off on this hart. That is why the deadlock
+            is total: not even the timer can interrupt the spinning harts.
+          stack: |
+            A system call runs on the process's kernel stack: `usertrap → syscall → sys_sbrk →
+            growproc → uvmalloc → kalloc → steal → acquire`.
+          mode: "The kernel runs in supervisor mode."
+        why_wrong: Track each push_off from usertrap's intr_on to the spinning acquire.
+        explain: |
+          Recorded with gdb in clinic 2: `cpus[0]: noff 3 intena 1 proc kalloctest pid 16` and
+          `cpus[2]: noff 3 intena 1 proc kalloctest pid 14`. The intena of 1 means that if the
+          locks were ever released, interrupts would come back on; they never are.
+      - id: lab18-08
+        level: 2
+        type: choice
+        q: |
+          What makes the reference steal deadlock-free?
+        options:
+          - text: "No hart ever waits for a kmem lock while holding another kmem lock."
+            correct: true
+            why: |
+              Right. A deadlock needs someone who holds one lock and waits for another; the
+              reference releases each kmem lock before taking the next.
+          - text: "Interrupts are off while it steals."
+            why: |
+              You may have thought interrupts off stops other harts. SIE is per hart; the other
+              harts keep running and can still wait for locks. Interrupts off is about `cpuid`
+              and about this hart's own handlers.
+          - text: "It takes the locks in increasing CPU order."
+            why: |
+              That is the other possible rule, and the reference does not use it: hart 2
+              tries `kmem3`, ..., `kmem7`, then `kmem0`, then `kmem1`. It never needs an
+              order because it never holds two.
+          - text: "A victim's list is never empty when steal locks it."
+            why: |
+              Lists are empty all the time on a busy machine; `steal` handles that with
+              `n == 0` and moves on. Emptiness has nothing to do with deadlock.
+        explain: |
+          Rule 2 of [[concept:locks#rules]] (acquire in a global order) has a simpler special
+          case: if you never hold two locks of a class at once, there is no order to get
+          wrong.
+  - title: How much to steal, and from whom?
+    q: |
+      When a CPU's list is empty, how many pages should it take from its victim: one, a fixed
+      batch, or half of the victim's list? Count what each choice costs in lock acquisitions
+      on another CPU's list, and how long each holds the victim's lock. And from whom: if every
+      hart scanned starting at list 0, who would pay?
+    hints:
+      - "At boot every free page is on `kmem0`. Count the lock acquisitions a process on hart 2 makes for each page it allocates, if it takes one page per steal: its own list, then `kmem3` to `kmem7`, then `kmem0`."
+      - "Taking `n` pages costs one trip through the victim's lock but a walk of `n` list nodes while holding it. A walk of half of a 32,000-page list holds the victim's lock for 16,000 pointer loads."
+      - "Shape: pick a batch size that bounds the walk under the victim's lock, decide where the extra pages go so that the next allocations are local, and choose a scan order in which the harts do not all start with the same victim."
+    answer: |
+      **One page at a time** keeps the victim's lock for the shortest time, but a CPU with an
+      empty list then pays a remote steal for *every* allocation. A process on hart 2 right
+      after boot pays 7 lock acquisitions per page (its own, `kmem3` to `kmem7`, then
+      `kmem0`). Clinic 3 measures it: with one-page stealing, `usertests -q` makes 1.63 to
+      1.78 million kmem acquisitions, 623,000 to 779,000 of them on another CPU's list,
+      against about 1.0 million and 8,000 to 12,000 with a batch of 64.
+
+      **A fixed batch** (the reference, 64 pages) pays one scan per 64 pages and holds the
+      victim's lock for a walk of at most 64 nodes. The 63 extra pages go on the stealer's
+      own list, so its next 63 allocations are local.
+
+      **Half of the victim's list** evens out two lists in one go, but the walk is as long as
+      half the list (16,000 nodes right after boot), all of it under the victim's lock while
+      the victim itself may want to allocate. Keeping a count per list would tell you where
+      half is, but not avoid the walk.
+
+      **Whom to rob.** If every hart scanned from list 0, list 0 would be every hart's first
+      victim and every early steal would contend there. Starting at `(id + 1) % NCPU` gives each
+      hart a different first victim (hart 0 tries `kmem1`, hart 1 `kmem2`, hart 2 `kmem3`).
+      It is not perfectly fair either: with 3 harts and `NCPU` = 8, hart 1 and hart 2 pass five
+      lists that are always empty before reaching `kmem0`, and hart 0's first victim is always
+      hart 1. A fairer scheme would remember the last victim, or rob the longest list (which
+      needs counts). Neither is needed for correctness, and none of them changes the rule that
+      makes stealing deadlock-free.
+    checks:
+      - id: lab18-09
+        level: 2
+        type: number
+        q: |
+          Right after boot all free pages are on `kmem0`. A process on hart 2 allocates pages
+          one after another with a kernel that steals **one page at a time** (scan order:
+          own list, then `(id + i) % 8` for i = 1..7). How many kmem lock acquisitions does
+          each successful [[kalloc]] make?
+        answer: 7
+        wrong:
+          2: |
+            You may have skipped the lists of CPUs that do not exist. Hart 2 scans `kmem3`,
+            `kmem4`, `kmem5`, `kmem6` and `kmem7` (all empty, all locked and unlocked) before
+            it reaches `kmem0`.
+          8: |
+            You may have counted all eight lists. The scan stops at `kmem0`, the first list
+            with a page; `kmem1` is never reached.
+          1: |
+            That would be true if the page came from hart 2's own list. It is empty, so every
+            page is stolen.
+        why_wrong: "Own list (1) + kmem3..kmem7 (5) + kmem0 (1)."
+        explain: |
+          1 + 5 + 1 = 7 acquisitions per page, 6 of them of other CPUs' locks. With a batch of
+          64 the same scan happens once per 64 pages.
+  - title: noff and intena inside the allocator
+    q: |
+      The allocator now does its own [[push_off]] before taking a list lock. Predict noff and
+      intena at the moment a list lock is held, for three callers: `sbrk` growing memory
+      (a system call), [[vmfault]] filling a lazily allocated page (a page fault), and [[kwait]]
+      freeing a zombie child. Which is the deepest, and is that deeper than anything in the
+      original kernel?
+    hints:
+      - "Where does [[usertrap]] turn interrupts on ([[kernel/trap.c:66]]), and for which kind of trap? A page fault takes the branch at [[kernel/trap.c:71]]."
+      - "intena is the SIE value when noff last went from 0 to 1. Every spinlock held by the caller is one level, kalloc's or kfree's own push_off is one, the list lock is one."
+      - "Shape: for each caller, list the spinlocks it already holds and whether SIE was on when the first of them (or the allocator's own push_off) was taken; then add the allocator's two levels."
+    answer: |
+      Recorded with gdb on the reference branch, at the instruction right after the list lock
+      was acquired:
+
+      | caller | locks held | noff | intena | SIE |
+      |---|---|---|---|---|
+      | `sbrk` → [[growproc]] → [[uvmalloc]] → [[kalloc]] (the shell's child, pid 3, hart 2) | `kmem2` | 2 | 1 | 0 |
+      | [[usertrap]] → [[vmfault]] → [[kalloc]] (`usertests lazy_alloc`, pid 5, hart 2) | `kmem2` | 2 | 0 | 0 |
+      | [[kfork]] → [[allocproc]] → [[kalloc]] (the shell, pid 2, hart 2) | the child's `p->lock`, `kmem2` | 3 | 1 | 0 |
+      | [[kwait]] → [[freeproc]] → ... → [[kfree]] (the shell reaping `echo`, hart 2) | `wait_lock`, `echo`'s `p->lock`, `kmem2` | **4** | 1 | 0 |
+
+      In a system call, interrupts were turned on at [[kernel/trap.c:66]], so the outermost
+      [[push_off]] records intena 1 and the final [[pop_off]] turns them back on. A page
+      fault never turns them on: [[kalloc]]'s [[push_off]] is the outermost level, records
+      intena 0, and its [[pop_off]] leaves interrupts off, as the rest of [[usertrap]]
+      expects. In [[kwait]], [[kfree]]'s [[push_off]] is the third level and does not touch
+      intena at all.
+
+      The original kernel's deepest nesting was noff 3, on this same [[kwait]] path
+      ([[concept:locks#nesting]]). That page and [[tour:51]] describe the original tree; on
+      this branch the answer is 4. (By the code, [[kwait]] → [[copyout]] → [[vmfault]] →
+      [[kalloc]] would also reach 4 on a lazily allocated page; it was not seen in the
+      recorded runs.) The extra [[push_off]] makes it 4. That is harmless (noff
+      is an `int`), but it is a real change to a measured property of the kernel, and the
+      kind of thing worth checking when you add a level of nesting to a function everyone
+      calls.
+    checks:
+      - id: lab18-10
+        level: 2
+        type: state
+        q: |
+          A process touches a page it reserved with `sbrklazy`. The store faults, [[usertrap]]
+          calls [[vmfault]], which calls [[kalloc]]. Fill in the hart's state just after
+          [[kalloc]] has acquired its own list's lock.
+        code: kernel/trap.c:69-79@71-75
+        state:
+          mode: S
+          stack: kernel
+          satp: kernel
+          sie: "off"
+          noff: 2
+          intena: 0
+        why:
+          noff: |
+            Two levels: [[kalloc]]'s own [[push_off]] and the list lock's [[acquire]]. The
+            fault itself holds no lock.
+          intena: |
+            You may have assumed every trap turns interrupts on. Only the system-call branch
+            does ([[kernel/trap.c:66]]); for a page fault SIE is still 0 from the trap entry,
+            so the outermost [[push_off]] records 0. gdb recorded intena 0 here.
+          sie: "A held spinlock means interrupts are off on this hart."
+          satp: "The trap switched to the kernel page table in [[uservec]]."
+          stack: "A trap from user space runs on the process's kernel stack."
+          mode: "The kernel runs in supervisor mode."
+        why_wrong: Follow the fault path from uservec through usertrap (no intr_on) to kalloc.
+        explain: |
+          Recorded on the reference branch during `usertests lazy_alloc` (pid 5, hart 2):
+          noff 2, intena 0, SIE 0, stack `usertrap → vmfault → kalloc`. When [[kalloc]]
+          returns, its [[pop_off]] brings noff to 0 and, because intena is 0, leaves interrupts
+          off.
+      - id: lab18-11
+        level: 3
+        type: state
+        q: |
+          The shell waits for `echo`, finds it a `ZOMBIE`, and [[freeproc]] frees its pages.
+          Fill in the state just after [[kfree]] has acquired its list lock, for one of those
+          pages.
+        code: kernel/proc.c:380-401@396-399
+        state:
+          mode: S
+          sie: "off"
+          noff: 4
+          intena: 1
+        why:
+          noff: |
+            Count the levels: `wait_lock` (1), the zombie's `p->lock` (2), [[kfree]]'s own
+            [[push_off]] (3), the list lock (4). The original kernel reaches 3 here; the
+            per-CPU [[kfree]]'s [[push_off]] adds one.
+          intena: |
+            The outermost level is `acquire(&wait_lock)` in a system call, after
+            [[usertrap]]'s `intr_on`: intena 1. Inner levels never change it.
+          sie: "Three spinlocks are held; interrupts are off."
+          mode: "The kernel runs in supervisor mode."
+        why_wrong: Start at kwait's acquire(&wait_lock) and add one level per acquire and push_off.
+        explain: |
+          gdb recorded noff 4, intena 1, SIE 0 on hart 2 for the shell (pid 2) reaping `echo`,
+          stack `kwait → freeproc → proc_freepagetable → uvmfree → uvmunmap → kfree`. The
+          original kernel's deepest measured nesting was 3, on this same path.
+  - title: Where does memory end up?
+    q: |
+      Nothing in the design ever sends a page back to the CPU it came from. After a while,
+      where are the free pages? Can [[kalloc]] now return 0 while a free page exists
+      somewhere? Look for two different ways. Does either matter?
+    hints:
+      - "Run Ctrl-P after a few programs. Which hart freed the pages of the last big process?"
+      - "A failing [[kalloc]] looks at the lists one at a time, each under its own lock, never all at once. And in the reference `steal`, between releasing the victim's lock and taking its own, the stolen pages are in a local variable only."
+      - "Yes in both cases: a page freed onto a list that was already scanned, or a batch in transit. The failure is not wrong in any way the callers can detect (they already handle 0), but it is no longer an exact statement about all of memory."
+    answer: |
+      **Memory follows the last big free.** A page goes on the list of the hart that freed it,
+      whichever hart allocated it. A process that held most of memory and exits (or shrinks)
+      on hart 2 leaves most of memory on `kmem2`. Ctrl-P on the reference branch after one
+      `kalloctest`: `kmem0 0 kmem1 0 kmem2 32545`; after `usertests -q` and another
+      `kalloctest`: `kmem0 32545 kmem1 0 kmem2 0`; after `usertests -q` in another run (a
+      measurement copy of the branch): `kmem0 19980 kmem2 12560`. Imbalance costs nothing until a hart's list runs dry; then
+      it steals 64 pages at a time from the rich list, which is the steady state the
+      measurements show (3,000 to 12,000 remote acquisitions per million).
+
+      **A spurious 0.** The original [[kalloc]] decided "no memory" under one lock, so the
+      answer was exact at that instant. The per-CPU [[kalloc]] scans eight lists one after
+      another; a page freed onto list 0 just after the scan passed list 0 is not seen.
+      Worse, the reference's own rule (never hold two kmem locks) means a stolen batch of up
+      to 63 pages sits in `steal`'s local variables between the release of the victim's lock
+      and the acquire of its own; a scan in that window finds it on no list. Both windows are
+      a few instructions long, with interrupts off. Callers of [[kalloc]] already treat 0 as
+      "fail the operation", and a nearly exhausted machine is already a place where an
+      allocation may fail, so nothing breaks; `kalloctest exhaust` gets within about 95
+      pages of all memory either way (`32378 of 32472` on this branch, `32378 of 32472` on
+      the original). But it is a semantic change worth knowing about: "returned 0" no longer
+      means "there was no free page at that moment".
+    checks:
+      - id: lab18-12
+        level: 3
+        type: tf
+        q: |
+          True or false: with the reference per-CPU allocator, if [[kalloc]] returns 0, then at
+          some instant during the call there was no free page on any list.
+        answer: false
+        why_tf: |
+          You may have carried over the guarantee of the single-list allocator, which decides
+          under one lock. The per-CPU [[kalloc]] never holds all the lists at once.
+        reasons:
+          - text: "The lists are checked one at a time, and a stolen batch can be on no list while another hart scans; a page can be free the whole time and never seen."
+            correct: true
+            why: |
+              Right. A page freed onto a list after the scan passed it, or a batch in transit
+              in another hart's `steal`, is free but invisible to this scan.
+          - text: "kalloc returns 0 when its own list is empty, without looking at the others."
+            why: |
+              The reference tries every list before giving up ([[kalloc]] calls `steal`,
+              which scans the other seven). A version that did not would fail at boot on
+              harts 1 and 2.
+          - text: "Interrupts are on during the scan, so a timer interrupt can move the thread."
+            why: |
+              The whole scan runs between [[push_off]] and [[pop_off]], interrupts off. The
+              windows here are caused by other harts, not by this one moving.
+        explain: |
+          Splitting one lock into many trades an exact global answer for speed. Here the trade
+          is harmless because a 0 from [[kalloc]] was already "the operation fails", and the
+          window is a few instructions; in other data structures (counters, statistics) it can
+          matter more.
+build: |
+  **Start.**
+
+  ```text
+  git checkout -b my-percpu 06aad25
+  ```
+
+  Add the test program first: `user/kalloctest.c` with the four checks of the spec, and
+  `$U/_kalloctest\` in `UPROGS` in the `Makefile`. It passes on the unmodified kernel; run it
+  anyway, so that you know its output and its tick count before you change anything.
+
+  **Milestones, in an order that keeps the system bootable after each one.**
+
+  1. **An array of lists, all CPUs still using list 0.** Turn `kmem` into `struct kmem
+     kmem[NCPU]`, give each lock a name of its own (`kmem0` ... `kmem7`, stored in the
+     struct so that the name outlives [[kinit]]), initialize every lock in [[kinit]], and
+     make [[kalloc]] and [[kfree]] use `kmem[0]`. Nothing changes in behaviour. Test:
+     `kalloctest`, `usertests -q`.
+  2. **Free onto, and allocate from, this CPU's list.** [[push_off]], `id = cpuid()`, use
+     `kmem[id]`, [[pop_off]]. In [[kalloc]], if the own list is empty, try the other lists
+     one at a time and take one page from the first that has any. Hold one kmem lock at a
+     time. Test: boot (if harts 1 and 2 cannot allocate, `init` or `sh` fails at once),
+     `kalloctest`, `usertests -q`.
+  3. **Steal a batch.** Take up to 64 pages from a victim, keep one, and put the rest on your
+     own list, taking your own lock only after releasing the victim's. Test: `kalloctest`
+     (watch the `exhaust` line: three harts stealing at once), `usertests -q`, `kalloctest`
+     again.
+  4. **Make the distribution visible.** A page count per list, updated under the list's lock,
+     and a line printed from [[procdump]] (Ctrl-P) without taking any lock. Type Ctrl-P after
+     boot, after `kalloctest`, and after `usertests -q`, and explain what you see.
+  5. **Measure contention** (in a scratch copy, not on your branch). In [[acquire]], count
+     the failed `amoswap` attempts of each acquisition; keep per-hart tables keyed by
+     `lk->name` (a shared table would need a lock of its own and would become the most
+     contended lock in the kernel); print them on Ctrl-P and reset. Measure the original
+     kernel and yours with the same workload.
+
+  **Debugging advice.** Start QEMU with `make qemu-gdb`, which waits for gdb on the port it
+  prints, so breakpoints set before the first `continue` catch boot; for later events, and to
+  inspect a hang, let it run and interrupt gdb (Ctrl-C).
+
+  - **A hang** in `kalloctest` (no output, no prompt) is almost always a deadlock between
+    kmem locks. Attach gdb and run `info threads` and `thread apply all bt`: look for harts
+    in [[acquire]] called from your allocator. Then print each lock:
+    `p kmem[0].lock` shows `locked` and `cpu`; `(cpu - &cpus[0])` (128-byte entries) is the
+    holder's hart. Clinic 2 shows a complete session.
+  - **Ctrl-P** takes no kmem or proc lock (only `cons.lock` and the printing lock
+    `pr.lock`), so it works while harts are stuck on kmem locks, as long as the hart that
+    takes the UART interrupt is not one of them.
+  - The Ctrl-P counts add up exactly only on an idle machine: a batch in transit (up to 63
+    pages) is on no list for a moment.
+  - Count before you guess: on an idle machine the page counts on Ctrl-P must add up to the number `countfree`
+    reports plus the pages held by running processes. A count that drifts means a path that
+    moves pages without updating it (the steal is the usual suspect).
+  - Timings under QEMU are noisy and depend on code layout (see the measure section). Trust
+    lock counts more than tick counts.
+clinic:
+  - bug: cpuid() read with interrupts on
+    change: |
+      The [[push_off]]/[[pop_off]] bracket is left out of both [[kfree]] and [[kalloc]], so the
+      CPU number is read while a timer interrupt can still move the thread:
+
+      ```diff
+      -  push_off();
+         id = cpuid();
+         acquire(&kmem[id].lock);
+         ...
+         release(&kmem[id].lock);
+      -  pop_off();
+      ```
+
+      To see what happens, the experiment also counts every list operation done on a list
+      other than the current hart's: right after each `acquire(&kmem[id].lock)` (where
+      interrupts are off), `if (id != cpuid()) kmoved++`, printed as `moved` on Ctrl-P. A
+      second copy widens the window with a 200-iteration delay loop between `cpuid()` and
+      the acquire, to make a migration in it likely enough to observe.
+    symptom: |
+      # as written (no delay): kalloctest, Ctrl-P, usertests -q, kalloctest, Ctrl-P
+      [...]
+      kalloctest: ALL OK
+      [...]
+      free pages: kmem0 32545 kmem1 0 kmem2 0 kmem3 0 kmem4 0 kmem5 0 kmem6 0 kmem7 0 moved 0
+      [...]
+      ALL TESTS PASSED
+      [...]
+      kalloctest: ALL OK
+      [...]
+      free pages: kmem0 21213 kmem1 0 kmem2 11332 kmem3 0 kmem4 0 kmem5 0 kmem6 0 kmem7 0 moved 0
+
+      # with the window widened by a delay loop, same commands:
+      [...]
+      kalloctest: ALL OK
+      [...]
+      free pages: kmem0 0 kmem1 0 kmem2 32545 kmem3 0 kmem4 0 kmem5 0 kmem6 0 kmem7 0 moved 1
+      [...]
+      ALL TESTS PASSED
+      [...]
+      kalloctest: ALL OK
+      [...]
+      free pages: kmem0 32545 kmem1 0 kmem2 0 kmem3 0 kmem4 0 kmem5 0 kmem6 0 kmem7 0 moved 3
+    why: |
+      Nothing breaks, and that is the finding. For a migration to matter, a timer interrupt
+      has to arrive in the few instructions between `cpuid()` and the [[acquire]] (which
+      turns interrupts off), [[kerneltrap]] has to [[yield]], and another hart has to pick the
+      thread up. In about three million list operations (two `kalloctest` runs and
+      `usertests -q`) that happened 0 times as written, in the window the counter watches,
+      and 3 times with that window artificially widened by a 200-iteration delay loop (a
+      second run of the same experiment counted 4). The counter does not see a second window: in this
+      variant's [[kalloc]], interrupts are also on from the release of the own lock through
+      `steal`, including between the victim's release and the own acquire. A migration
+      there is just as harmless (the batch goes onto the stale CPU's list, under that
+      list's lock), but it was not counted.
+
+      And when it does happen, the damage is limited by the lock. The thread holds `id` = 1
+      but runs on hart 2; it locks `kmem1`, pushes or pops under `kmem1`'s lock, and unlocks
+      it. The list stays consistent, because every access to it is still made under its own
+      lock. The page has merely gone onto, or come from, the "wrong" CPU's list: a loss of
+      locality, which the next steal evens out. All tests passed on both copies.
+
+      So why does the reference bother? Because "it only costs locality" is true only thanks
+      to the per-list lock, and only for this data structure. The same stale `id` in code
+      that relies on "only my CPU touches this" (per-CPU data without a lock, like `cpus[i]`'s
+      `noff` and `intena`, or a per-CPU cache that a later version might make lock-free) is a
+      real race, and one rare enough that no test would catch it. The comment above
+      [[cpuid]] ([[kernel/proc.c:61]]) states the rule; keeping it is cheap, and a bug that
+      no test catches is not one you want to debug.
+  - bug: Stealing while holding your own lock
+    change: |
+      [[kalloc]] keeps its own list's lock while it steals, and `steal` puts the whole batch
+      on the own list directly (its lock is already held):
+
+      ```diff
+         acquire(&kmem[id].lock);
+         r = kmem[id].freelist;
+      +  if (r == 0)
+      +    r = steal(id);
+         if (r) {
+           kmem[id].freelist = r->next;
+           kmem[id].nfree--;
+         }
+         release(&kmem[id].lock);
+      -  if (r == 0)
+      -    r = steal(id);
+      ```
+
+      (and in `steal`, the `acquire(&kmem[id].lock)`/`release` around the push are removed).
+      It is the natural first version: it even avoids the "batch in transit" window.
+    symptom: |
+      $ kalloctest
+      kalloctest: churn: 3 processes x 2000 rounds x 64 pages, 36 ticks
+      kalloctest: churn: OK
+      kalloctest: one process got 32472 free pages, 32472 at start
+      kalloctest: gather: OK
+      kalloctest: exhaust: 3 processes got 32378 of 32472 free pages
+      kalloctest: exhaust: OK
+      kalloctest: free pages 32472 before, 32472 after
+      kalloctest: no leaks: OK
+      kalloctest: ALL OK
+      $ kalloctest
+      kalloctest: churn: 3 processes x 2000 rounds x 64 pages, 36 ticks
+      kalloctest: churn: OK
+      kalloctest: one process got 32472 free pages, 32472 at start
+      kalloctest: gather: OK
+      [... nothing more; after 120 s gdb was attached:]
+      [...]
+
+        Id   Target Id                    Frame
+      * 1    Thread 1.1 (CPU#0 [running]) acquire (lk=lk@entry=0x8000f9f0 <kmem+96>) at kernel/spinlock.c:37
+        2    Thread 1.2 (CPU#1 [halted ]) s_sstatus (x=2) at kernel/riscv.h:67
+        3    Thread 1.3 (CPU#2 [running]) acquire (lk=lk@entry=0x8000f990 <kmem>) at kernel/spinlock.c:37
+
+      Thread 3 (Thread 1.3 (CPU#2 [running])):
+      #0  acquire (lk=lk@entry=0x8000f990 <kmem>) at kernel/spinlock.c:37
+      #1  0x0000000080000c3a in steal (id=<optimized out>) at kernel/kalloc.c:98
+      #2  kalloc () at kernel/kalloc.c:134
+      #3  0x00000000800014fc in uvmalloc (pagetable=0x87f38000, oldsz=46358528, newsz=46362624, xperm=xperm@entry=4) at kernel/vm.c:228
+      #4  0x0000000080001e4c in growproc (n=4096) at kernel/proc.c:246
+      #5  0x0000000080002bfc in sys_sbrk () at kernel/sysproc.c:51
+      #6  0x0000000080002b02 in syscall () at kernel/syscall.c:146
+      #7  0x0000000080002888 in usertrap () at kernel/trap.c:68
+      #8  0x0000003ffffff09c in ?? ()
+
+      Thread 2 (Thread 1.2 (CPU#1 [halted ])):
+      #0  s_sstatus (x=2) at kernel/riscv.h:67
+      #1  intr_on () at kernel/riscv.h:312
+      #2  scheduler () at kernel/proc.c:441
+      #3  0x00000000800010b4 in main () at kernel/main.c:44
+
+      Thread 1 (Thread 1.1 (CPU#0 [running])):
+      #0  acquire (lk=lk@entry=0x8000f9f0 <kmem+96>) at kernel/spinlock.c:37
+      #1  0x0000000080000c3a in steal (id=<optimized out>) at kernel/kalloc.c:98
+      #2  kalloc () at kernel/kalloc.c:134
+      #3  0x00000000800014fc in uvmalloc (pagetable=0x80cf8000, oldsz=43352064, newsz=43356160, xperm=xperm@entry=4) at kernel/vm.c:228
+      #4  0x0000000080001e4c in growproc (n=4096) at kernel/proc.c:246
+      #5  0x0000000080002bfc in sys_sbrk () at kernel/sysproc.c:51
+      #6  0x0000000080002b02 in syscall () at kernel/syscall.c:146
+      #7  0x0000000080002888 in usertrap () at kernel/trap.c:68
+      #8  0x0000003ffffff09c in ?? ()
+      kmem[0] kmem0 locked=1 held by hart 0 nfree=0 freelist=0x0
+      kmem[1] kmem1 locked=0 held by - nfree=0 freelist=0x0
+      kmem[2] kmem2 locked=1 held by hart 2 nfree=0 freelist=0x0
+      kmem[3] kmem3 locked=0 held by - nfree=0 freelist=0x0
+      [...]
+      cpus[0]: noff 3 intena 1 proc kalloctest pid 16
+      cpus[1]: noff 0 intena 0 proc none
+      cpus[2]: noff 3 intena 1 proc kalloctest pid 14
+      slot  0 pid   1 SLEEPING init
+      slot  1 pid   2 SLEEPING sh
+      slot  2 pid  10 SLEEPING kalloctest
+      slot  3 pid  14 RUNNING  kalloctest
+      slot  4 pid  15 SLEEPING kalloctest
+      slot  5 pid  16 RUNNING  kalloctest
+    why: |
+      The first `kalloctest` passed, including `exhaust`; the second hung in `exhaust`, the
+      phase where all three harts run out of pages at the same moment. gdb shows the cycle
+      directly. In this build `struct kmem` is 48 bytes and `kmem` is at `0x8000f990`, so
+      `kmem+96` is `kmem[2]`:
+
+      - hart 0 (pid 16) holds `kmem0` (its own, empty) and spins in [[acquire]] for `kmem2`.
+        Its scan order is `kmem1` (empty, taken and released), then `kmem2`.
+      - hart 2 (pid 14) holds `kmem2` (its own, empty) and spins for `kmem0`. Its scan order
+        is `kmem3` to `kmem7` (empty), then `kmem0`.
+
+      Each holds what the other wants. Both have noff 3 (kalloc's [[push_off]], the own lock,
+      and the spinning acquire's [[push_off]]), so both have interrupts off: no timer
+      interrupt, no yield, forever. Every list is empty anyway; they deadlock while fighting
+      over nothing.
+
+      Hart 1 is not stuck: it sits in its idle [[scheduler]] loop (`intr_on` at
+      [[kernel/proc.c:441]] is where gdb caught it). The third child, pid 15, is `SLEEPING`:
+      for an `exhaust` child that means it already ran out of memory, wrote its byte to the
+      parent and is waiting in `read` for the parent's go. The parent (pid 10) sleeps waiting
+      for the other two, which never come. And the clock stops: only hart 0 advances `ticks`
+      ([[kernel/trap.c:170]] runs on `cpuid() == 0` only), and hart 0 no longer takes
+      interrupts.
+
+      Another run of the same broken kernel hung on the *first* `kalloctest`, with
+      all three harts caught: hart 1 holding `kmem1` and spinning on `kmem2`, hart 2 holding
+      `kmem2` and spinning on `kmem1`, and hart 0, holding `kmem0`, queued behind them
+      spinning on `kmem1`. All three had noff 3 and intena 1, and `ticks` was frozen.
+
+      Why did the first run pass? The two harts must each have taken their own lock and found
+      their own list empty before the other released, which needs both lists to run dry within
+      a few instructions of each other. Most of the time one hart wins and the other's next
+      steal finds pages; it took two runs here (one in the other run). A design whose correctness depends on that kind
+      of luck is wrong, and the fix is the rule from question 5: release your own lock before
+      you take anyone else's.
+  - bug: Stealing one page at a time
+    change: |
+      The batch size is 1, so every allocation by a CPU with an empty list is a remote steal:
+
+      ```diff
+      -#define STEAL 64 // most pages taken from another CPU's list at once
+      +#define STEAL 1  // most pages taken from another CPU's list at once
+      ```
+
+      (Commit 3 of the reference behaves like this too, before commit 4 adds batches; its own
+      scan differs slightly, and its measured numbers are not the ones below.)
+      Measured with the contention counter of the measure section, three boots, each running
+      `kchurn` (the churn phase of `kalloctest` alone), `kalloctest` and `usertests -q`.
+    symptom: |
+      # STEAL 1, boot 1: the contention counter's Ctrl-P after usertests -q (trimmed)
+      LS kmem0 acq 530711 contended 0 spins 0 maxspins 0
+      LS kmem1 acq 372287 contended 0 spins 0 maxspins 0
+      LS kmem2 acq 313524 contended 0 spins 0 maxspins 0
+      LS kmem3 acq 82048 contended 0 spins 0 maxspins 0
+      [...]
+      LS kmem7 acq 82048 contended 0 spins 0 maxspins 0
+      LSH hart 2 kmem2 acq 264176 contended 0 spins 0
+      LSH hart 2 kmem3 acq 74173 contended 0 spins 0
+      [...]
+      LSH hart 2 kmem0 acq 74173 contended 0 spins 0
+      LSH hart 2 kmem1 acq 44189 contended 0 spins 0
+
+      # summary of all such dumps: kmem* acquisitions per workload, all eight lists added up
+      # (3 boots each)
+      #                    total acquisitions      of another CPU's list   contended
+      # STEAL 1
+      kchurn               769,456 - 770,396       1,322 - 2,262           14 - 50
+      kalloctest           1,216,305 - 1,375,459   188,311 - 347,465       870 - 1,418
+      usertests -q         1,626,762 - 1,783,300   622,936 - 779,474       0
+      # STEAL 64 (the reference)
+      kchurn               768,159 - 768,163       20 - 25                 2 - 5
+      kalloctest           1,032,020 - 1,036,044   3,220 - 6,423           243 - 249
+      usertests -q         1,014,352 - 1,018,373   8,367 - 11,819          0
+
+      # every test passed in all six boots
+    why: |
+      Correct, and wasteful. With one-page stealing a CPU whose list is empty stays empty:
+      every page it allocates is taken from another CPU's list, through a scan that locks
+      every empty list on the way. `usertests` shows it most: it counts free pages at the
+      start and the end by allocating *all* of memory in one process (`countfree`), and when
+      that process runs on a hart whose list is empty, every one of the ~32,000 pages costs a
+      scan of up to seven locks. `usertests -q` makes 60-75% more kmem acquisitions, and 38-44%
+      of all of them are of other CPUs' locks, against about 1% with batches.
+
+      The per-hart lines show the scan itself: during `usertests -q`, hart 2 locked each of
+      `kmem3` to `kmem7`, lists no hart ever owns, 74,173 times, every time on its way to
+      `kmem0`, and `kmem0` itself 74,173 times: one scan per page it tried to steal.
+
+      Contention is not the problem here (one-page steals hold the victim's lock for a few
+      instructions, so they rarely collide); traffic is. On QEMU the extra acquisitions cost
+      little time, because QEMU does not model the cost of moving a cache line between cores.
+      On real hardware every acquisition of another CPU's lock moves that lock's cache line,
+      and the lock's whole point (keep each CPU on its own cache lines) is lost exactly for the
+      CPUs that are short of memory.
+
+      Note what batches cost in return. In `kalloctest`, the reference has fewer contended
+      acquisitions than the one-page version (243-249 against 870-1,418 in the same
+      measurement) but more spins (154,412-195,470 against 19,240-31,107), about 640-790 spins
+      per contended acquisition. A plausible reading (our inference, not separated by the data)
+      is that a stealer holds the victim's lock for a walk of up to 64 nodes. But spin counts
+      on QEMU also include a vCPU's host thread being descheduled while it holds a lock: the
+      original kernel's few-instruction critical section reached 3,034 spins in one run.
+      That is the trade question 6 asks about, and why it should be timed on real hardware.
+  - bug: Only the first lock is initialized
+    change: |
+      [[kinit]] keeps its original shape and initializes only list 0:
+
+      ```diff
+      -  for (int i = 0; i < NCPU; i++) {
+      -    safestrcpy(kmem[i].name, "kmem0", sizeof(kmem[i].name));
+      -    kmem[i].name[4] += i;
+      -    initlock(&kmem[i].lock, kmem[i].name);
+      -  }
+      +  safestrcpy(kmem[0].name, "kmem0", sizeof(kmem[0].name));
+      +  initlock(&kmem[0].lock, kmem[0].name);
+      ```
+    symptom: |
+      # the branch with this change: kalloctest, Ctrl-P, usertests -q, kalloctest, Ctrl-P
+      [...]
+      kalloctest: ALL OK
+      [...]
+      free pages: kmem0 32545  0  0  0  0  0  0  0
+      [...]
+      ALL TESTS PASSED
+      [...]
+      kalloctest: ALL OK
+      [...]
+      free pages: kmem0 32545  0  0  0  0  0  0  0
+
+      # gdb, breakpoint on userinit (after kinit):
+      $1 = {locked = 0, name = 0x8000f9b4 <kmem+36> "kmem0", cpu = 0x0}
+      $2 = {locked = 0, name = 0x0, cpu = 0x0}
+      $3 = "\000\000\000\000\000\000\000"
+      $4 = {lock = {locked = 0, name = 0x0, cpu = 0x0}, freelist = 0x0, nfree = 0, name = "\000\000\000\000\000\000\000"}
+
+      # the same change with the contention counter, after one kalloctest (Ctrl-P, trimmed):
+      LS kmem0 acq 362563 contended 172 spins 136346 maxspins 2527
+      LS time acq 49904 contended 0 spins 0 maxspins 0
+      LS cons acq 97500 contended 2 spins 2790 maxspins 1972
+      LS pipe acq 558091 contended 88 spins 36378 maxspins 1479
+      # (the reference over a kalloctest interval: time 65, cons 24, pipe 18 acquisitions)
+    why: |
+      The locks work anyway. `kmem` is a global array in `.bss`, which xv6 never clears
+      itself: it relies on QEMU's loader, which fills the part of the kernel's segment beyond
+      the file's contents with zeros, on memory that starts out zero. A zeroed spinlock is
+      `locked = 0, cpu = 0`: an unlocked lock. [[acquire]], [[release]] and [[holding]] never
+      read the name. So every test passes, and gdb shows the only difference: `name = 0x0`
+      for locks 1 to 7, and the Ctrl-P line prints empty names (`kmem0 32545  0  0 ...`).
+
+      Two things make this a real bug anyway. First, the program works only because the
+      lock lives in zero-filled memory and is never reused: the same struct allocated with
+      [[kalloc]] (which fills pages with junk bytes, `5`) or reset after use would start out
+      `locked` = `0x05050505`, and the first [[acquire]] would spin forever.
+
+      Second, everything that relies on the name breaks, quietly. The contention counter keys
+      its per-hart tables by `lk->name` and treats a null name as "empty slot". The
+      acquisitions of `kmem1` and `kmem2` went into such a slot, which the next new lock name
+      on that hart then took over, counts and all: after one `kalloctest`, the report credits
+      `pipe` with 558,091 acquisitions, `cons` with 97,500 and `time` (`tickslock`) with 49,904
+      (the reference over a `kalloctest` interval: 18, 24 and 65), and `kmem1` and `kmem2` do
+      not appear at all. A measurement that
+      silently gives the wrong lock the credit is worse than no measurement; and lock names
+      exist exactly for this kind of tool (the lab names the locks distinctly *so that*
+      contention can be measured per list).
+reveal:
+  - title: "The test: three harts allocating at once"
+    commit: 1
+    file: user/kalloctest.c
+    lines: 38-79
+    focus: 40-55
+    diff: true
+    state:
+      hart: any
+      mode: U
+      proc: kalloctest (one of three children)
+      intr: "on"
+      satp: user
+      locks: []
+      stack: [main, churntest, churn]
+      sp: {"on": user}
+    note: |
+      The first commit adds the test, and it passes on the unmodified kernel: this lab
+      changes speed, not behaviour.
+
+      `churn` is the workload. Each of three children (one per hart, though the scheduler
+      decides where each actually runs) grows by 64 pages with `sbrk`, writes a value into
+      every page, checks them all, and shrinks again, 2,000 times. Each round costs the
+      kernel 64 [[kalloc]] calls in [[uvmalloc]] and 64 [[kfree]] calls in [[uvmunmap]]:
+      768,000 allocator calls in all, from three harts at once, for pages no two processes
+      ever share.
+
+      `sbrk` here is the eager kind ([[user:sbrk]] passes `SBRK_EAGER`), so the pages are
+      allocated inside the system call, with interrupts on before the allocator's own locks
+      turn them off. The writes check that each page really belongs to this process: a page
+      handed out twice would show another process's value.
+
+      `churntest` prints the tick count as information. It is not a check: on QEMU it says
+      more about the emulator than about the allocator (see the measure section).
+  - title: What a single process must still be able to do
+    commit: 1
+    file: user/kalloctest.c
+    lines: 81-152
+    focus: 125-147
+    state:
+      hart: any
+      mode: U
+      proc: kalloctest (the parent)
+      intr: "on"
+      satp: user
+      locks: []
+      stack: [main]
+      sp: {"on": user}
+    note: |
+      The other three checks are about properties that per-CPU lists could break.
+
+      - **gather** (line 135): after `churn`, the freed pages are wherever the three children
+        freed them. `countfree` allocates page after page in one process until `sbrk`
+        fails; it must get exactly as many pages as at the start. An allocator that looks
+        only at its own CPU's list would stop early.
+      - **exhaust** (lines 84-123): three children allocate one page at a time until `sbrk`
+        fails, *at the same time*, and hold on to their pages (they block in `read` on the
+        `go` pipe) until all three have failed. Between them they must get nearly all of
+        memory: each child's own page tables, about one page per 512 heap pages, come out of
+        the same pool, which is why the check allows 256 pages of slack. In practice they got
+        32,378 of 32,472. This phase is where all three harts' lists run dry together, and
+        where clinic 2's deadlock appeared.
+      - **no leaks**: free pages at the end equal free pages at the start.
+
+      Everything the test checks is visible from user space. Which list a page is on, and how
+      often a lock was contended, are not; for those you use Ctrl-P (commit 5) and a
+      contention counter.
+  - title: One list and one named lock per CPU
+    commit: 2
+    file: kernel/kalloc.c
+    lines: 17-48
+    focus: 21-39
+    diff: true
+    state:
+      hart: 0
+      mode: S
+      proc: none (boot)
+      intr: "off"
+      satp: bare
+      locks: []
+      irq: 0
+      stack: [main, kinit]
+      sp:
+        "on": boot
+        detail: "hart 0's slice of `stack0`; paging is still off"
+    note: |
+      The data structure first, with no change in behaviour: `kmem` becomes an array of
+      `NCPU` (8) structures, each a lock and a list head. In this commit [[kalloc]] and
+      [[kfree]] still use `kmem[0]` only (lines 67-71 and 82-86), so the system behaves exactly
+      as before.
+
+      Each lock gets its own name, and the name is stored *in the struct* (`name[8]`).
+      [[initlock]] keeps only a pointer to the name ([[kernel/spinlock.c:14]]); a name built in
+      a local array would be gone when [[kinit]] returns. `"kmem0"` is copied and its digit
+      bumped by `i`, giving `kmem0` to `kmem7`. Nothing in the lock code reads the name; it
+      exists for people and tools, here the contention counter that tells `kmem0` from
+      `kmem1`. (Clinic 4 forgets this loop.)
+
+      [[kinit]] runs on hart 0 only ([[kernel/main.c:19]]), with interrupts off and paging
+      off, before harts 1 and 2 leave their wait on `started`: the locks are initialized
+      before anyone can use them, and no lock is needed to do it.
+    others: |
+      Harts 1 and 2 are spinning in [[main]] on `started` ([[kernel/main.c:35]]), which hart 0
+      sets only after [[userinit]]. Nobody else can touch the allocator yet.
+  - title: kfree puts the page on this CPU's list
+    commit: 3
+    file: kernel/kalloc.c
+    lines: 52-80
+    focus: 70-79
+    diff: true
+    state:
+      hart: 2
+      mode: S
+      proc: sh (pid 2)
+      intr: "off"
+      satp: kernel
+      locks: [kmem2]
+      irq: {noff: 2, intena: 1, note: "kmem2 plus kfree's own push_off"}
+      stack: [usertrap, syscall, sys_exec, kexec, proc_freepagetable, uvmfree, uvmunmap, kfree]
+      sp: {"on": kernel, detail: "pid 2's kernel stack, `0x3fffffb000`-`0x3fffffc000`"}
+    note: |
+      Now the lists become per-CPU. [[kfree]] reads the CPU number and pushes the page on that
+      CPU's list, under that list's lock.
+
+      The recorded moment (gdb on the finished branch, whose [[kfree]] is this one plus a
+      counter): the shell, pid 2, has just finished `exec("sh")` on hart 2 and [[kexec]] is
+      freeing the old image's pages. Each goes on `kmem2`. noff is 2: [[kfree]]'s own
+      [[push_off]] and the list lock. intena is 1: this is a system call, interrupts were on
+      when the outer [[push_off]] ran, and the final [[pop_off]] will turn them back on.
+
+      The [[push_off]] on line 73 comes *before* `cpuid()` and the [[pop_off]] on line 79
+      after the release. Between them no timer interrupt can be taken on this hart, so the
+      thread cannot be moved, and `id` names the hart it is running on for as long as it is
+      used. The [[acquire]] on line 75 would turn interrupts off as well, but too late: `id`
+      was read, and the lock chosen, before it.
+    others: |
+      Hart 0 and hart 1 can free and allocate at the same moment on `kmem0` and `kmem1`
+      without touching `kmem2`'s lock at all. The only way another hart reaches `kmem2` is by
+      taking pages from it (line 95's loop, in [[kalloc]]), and then it takes `kmem2`'s lock
+      like everyone else.
+  - title: Why cpuid() needs interrupts off
+    commit: 3
+    file: kernel/proc.c
+    lines: 58-90
+    focus: 61-69
+    state:
+      hart: 2
+      mode: S
+      proc: sh (pid 2)
+      intr: "off"
+      satp: kernel
+      locks: []
+      irq: {noff: 1, intena: 1, note: "the level is kfree's own push_off, taken just before cpuid()"}
+      stack: [usertrap, syscall, sys_exec, kexec, proc_freepagetable, uvmfree, uvmunmap, kfree, cpuid]
+      sp: {"on": kernel}
+    note: |
+      [[cpuid]] does one real thing, `mv a0, tp`: read `tp`. [[start]] put the hart's `mhartid` there
+      ([[kernel/start.c:47]]-[[kernel/start.c:48]]), [[uservec]] reloads it from the trapframe
+      on every entry from user space ([[kernel/trampoline.S:79]]), and the kernel never
+      changes it. So `tp` is always the number of the hart executing the read.
+
+      The comment on lines 61-63 is the rule this lab lives by. A thread can move to another
+      hart only by giving up the CPU: [[sleep]], or a timer interrupt that makes
+      [[kerneltrap]] call [[yield]] ([[kernel/trap.c:157]]). [[swtch]] does not save `tp`; it
+      belongs to the hart, which is why [[kernelvec]] deliberately does not restore it
+      ([[kernel/kernelvec.S:44]]: "in case we moved CPUs"). A thread resumed on hart 1 reads
+      `tp` = 1 from then on, but any `id` it read on hart 2 still says 2.
+
+      The allocator never sleeps, so turning interrupts off is enough. [[mycpu]] has the same
+      requirement (line 72) and [[myproc]] shows the pattern in miniature: [[push_off]],
+      read, [[pop_off]] (lines 85-88).
+    others: |
+      What the bracket prevents, on three harts:
+
+      | time | hart 2 | hart 1 |
+      |---|---|---|
+      | 1 | `id = cpuid()` → 2 | running something else |
+      | 2 | timer interrupt → [[yield]] | |
+      | 3 | (sh is RUNNABLE) | [[scheduler]] picks sh |
+      | 4 | | `acquire(&kmem[2].lock)` with `id` = 2 |
+
+      With the per-list lock, step 4 is still correct: the page goes on `kmem2` under `kmem2`'s
+      lock, merely not on hart 1's own list (clinic 1 measured how often this happens without
+      the bracket: almost never). Without a per-list lock it would be a race on `kmem2`.
+  - title: kfree inside kwait, at noff 4
+    commit: 3
+    file: kernel/kalloc.c
+    lines: 52-80
+    focus: 73-79
+    state:
+      hart: 2
+      mode: S
+      proc: sh (pid 2)
+      intr: "off"
+      satp: kernel
+      locks: [wait_lock, "echo's p->lock (pid 3)", kmem2]
+      irq: {noff: 4, intena: 1, note: "three locks plus kfree's own push_off"}
+      stack: [usertrap, syscall, sys_wait, kwait, freeproc, proc_freepagetable, uvmfree, uvmunmap, kfree]
+      sp: {"on": kernel, detail: "pid 2's kernel stack"}
+    note: |
+      The same [[kfree]], called from a much deeper place. The shell (pid 2) has waited for
+      `echo hi` (pid 3) and found it a `ZOMBIE`. [[kwait]] holds `wait_lock` and the child's
+      `p->lock` ([[kernel/proc.c:376]], [[kernel/proc.c:384]]) and calls [[freeproc]]
+      ([[kernel/proc.c:398]]), which frees the trapframe and every page of the child's address
+      space through [[kfree]].
+
+      gdb recorded noff 4 here, on hart 2: `wait_lock` (1), echo's `p->lock` (2), [[kfree]]'s
+      [[push_off]] (3), `kmem2` (4). intena is 1, recorded by the outermost level, the
+      `acquire(&wait_lock)` in a system call; the inner levels leave it alone. When [[kfree]]
+      returns, its [[pop_off]] brings noff back to 2, and interrupts stay off because noff is
+      not 0.
+
+      In the original kernel this path is the deepest one measured, at noff 3
+      ([[concept:locks#nesting]]). The new [[push_off]] adds a level to every path through
+      the allocator. That is harmless (noff is an `int`, and [[sched]] only cares that it is
+      exactly 1 at a switch), but it is the kind of change to a kernel-wide property that is
+      worth noticing: here it is also why [[pop_off]] and not `intr_on` is the only correct
+      way out.
+    others: |
+      The pages of `echo` go onto `kmem2` because the *shell* happens to run on hart 2, even if
+      `echo` allocated them on hart 0. Pages follow the freeing hart, not the allocating one;
+      the last reveal step and question 8 come back to what that does to the distribution of
+      memory.
+  - title: kalloc tries its own list, then the others, one lock at a time
+    commit: 3
+    file: kernel/kalloc.c
+    lines: 82-108
+    focus: 88-103
+    diff: true
+    state:
+      hart: 1
+      mode: S
+      proc: "pid 1 (the first process, before exec names it init)"
+      intr: "off"
+      satp: kernel
+      locks: [kmem0]
+      irq: {noff: 2, intena: 0, note: "kmem0 plus kalloc's own push_off"}
+      stack: [forkret, kexec, proc_pagetable, uvmcreate, kalloc]
+      sp: {"on": kernel, detail: "pid 1's kernel stack, `0x3fffffd000`-`0x3fffffe000`"}
+    note: |
+      [[kalloc]] scans the lists starting with its own (`i` = 0) and takes one page from the
+      first list that has one. Each list is locked, examined and unlocked before the next is
+      locked: no hart ever holds two kmem locks, so two harts scanning each other's lists
+      cannot deadlock (question 5).
+
+      The first allocation on hart 1 in a recorded boot shows why the scan is needed at all.
+      The first process (pid 1) was picked by hart 1's scheduler and in [[forkret]] calls
+      [[kexec]] for `/init`, which needs a page table. `kmem1` is empty: every free page is on
+      `kmem0`, where [[kinit]] put them. Hart 1 scans `kmem2` to `kmem7` (all empty) and
+      takes its page from `kmem0` at `i` = 7. (Recorded on the finished branch, where the
+      same scan happens in `steal`; gdb showed `kmem0` held, noff 2, intena 0.)
+
+      intena is 0 because [[forkret]] runs with interrupts off: it releases the `p->lock` the
+      scheduler acquired with interrupts off ([[kernel/proc.c:520]]), and nothing has turned
+      them on since. So this [[kalloc]]'s [[pop_off]] will leave them off.
+
+      This commit is complete and correct, and it passes `usertests -q`. It is also slow in a
+      way the next commit fixes: a CPU with an empty list stays empty, and pays a scan of
+      several locks for *every* page (clinic 3 measures it).
+    others: |
+      Hart 0 may be allocating from `kmem0` at the same moment, for example in [[kfork]]. It
+      takes `kmem0`'s lock for its own list; hart 1 takes the same lock for a remote one. The
+      two serialize on `kmem0` for a few instructions, which is the cross-hart contention the
+      next commit makes rare.
+  - title: A page fault versus a system call
+    commit: 3
+    file: kernel/kalloc.c
+    lines: 82-108
+    focus: 95-101
+    state:
+      hart: 2
+      mode: S
+      proc: usertests (pid 5)
+      intr: "off"
+      satp: kernel
+      locks: [kmem2]
+      irq: {noff: 2, intena: 0, note: "kmem2 plus kalloc's own push_off"}
+      stack: [usertrap, vmfault, kalloc]
+      sp: {"on": kernel, detail: "pid 5's kernel stack, `0x3fffff7000`-`0x3fffff8000`"}
+    note: |
+      The same lines, entered from a page fault. In `usertests lazy_alloc` (pid 5 in the
+      recorded run, on hart 2) the process touches memory it reserved with `sbrklazy`;
+      [[usertrap]] sends the store fault to [[vmfault]] ([[kernel/trap.c:71]]), which calls
+      [[kalloc]] ([[kernel/vm.c:469]]).
+
+      gdb recorded noff 2 and **intena 0** with `kmem2` held. Compare the system call in the
+      fourth step (intena 1). The difference is [[usertrap]]: it turns interrupts on only for
+      a system call ([[kernel/trap.c:66]]); for a fault, SIE is still 0 from the trap entry.
+      So in a fault, [[kalloc]]'s [[push_off]] is the outermost level and records 0, and its
+      [[pop_off]] at line 103 leaves interrupts off, as the rest of the fault handling
+      expects. In a system call the same [[pop_off]] turns them back on.
+
+      This is the reason the allocator must use the counting pair: it cannot know whether its
+      caller had interrupts on, and it must leave them exactly as it found them.
+  - title: "steal: cut a batch off the victim's list"
+    commit: 4
+    file: kernel/kalloc.c
+    lines: 84-118
+    focus: 94-105
+    diff: true
+    state:
+      hart: 1
+      mode: S
+      proc: sh (pid 4)
+      intr: "off"
+      satp: kernel
+      locks: [kmem0]
+      irq: {noff: 2, intena: 1, note: "kmem0 plus kalloc's own push_off"}
+      stack: [usertrap, syscall, sys_sbrk, growproc, uvmalloc, kalloc, steal]
+      sp: {"on": kernel, detail: "pid 4's kernel stack, `0x3fffff9000`-`0x3fffffa000`"}
+    note: |
+      Commit 4 moves the scan of other lists into `steal` and makes it take up to `STEAL` (64)
+      pages. Under the victim's lock only: walk at most 63 `next` pointers to find the last
+      page of the batch, and make the page after it the victim's new head. That is one lock
+      round trip and a walk of at most 64 nodes, whatever the length of the victim's list.
+
+      The recorded moment: you typed `kalloctest` at the shell; the shell's child (pid 4,
+      still running `sh`'s code before its `exec`) grows its heap with `sbrk` on hart 1.
+      `kmem1` is empty, so [[kalloc]] calls `steal(1)`, which finds `kmem2` to `kmem7` empty
+      and cuts 64 pages off `kmem0` (`i` = 7). gdb: `kmem0` held, noff 2 ([[kalloc]]'s
+      [[push_off]] and `kmem0`), intena 1 (a system call).
+
+      The scan order `(id + i) % NCPU` gives each hart a different first victim: hart 0 looks
+      at `kmem1` first, hart 1 at `kmem2`, hart 2 at `kmem3`. With 3 harts and `NCPU` 8, harts
+      1 and 2 pass several lists that are always empty before they reach `kmem0`; that costs
+      a few lock round trips per steal, once per 64 pages.
+    others: |
+      While hart 1 walks, hart 0 may want `kmem0` for its own allocation. It spins for at most
+      64 pointer loads. This is the one place the reference holds a lock longer than before,
+      and, we infer, part of why the reference's `kalloctest` shows a few hundred contended acquisitions,
+      mostly in `exhaust` where all three harts steal at once (measure section).
+  - title: "steal: keep one page, give the rest to your own list"
+    commit: 4
+    file: kernel/kalloc.c
+    lines: 84-118
+    focus: 105-115
+    state:
+      hart: 1
+      mode: S
+      proc: sh (pid 4)
+      intr: "off"
+      satp: kernel
+      locks: [kmem1]
+      irq: {noff: 2, intena: 1, note: "kmem1 plus kalloc's own push_off"}
+      stack: [usertrap, syscall, sys_sbrk, growproc, uvmalloc, kalloc, steal]
+      sp: {"on": kernel}
+    note: |
+      The victim's lock is released on line 105 **before** this CPU's own lock is taken on
+      line 110. That ordering is the whole deadlock argument: no hart ever waits for a kmem
+      lock while holding another, so no cycle of waiting harts can form. (Clinic 2 takes the
+      own lock first and deadlocks on the second `kalloctest`.)
+
+      Then the batch is spliced in front of the own list: `last->next` points at the old head,
+      and the head becomes `first->next`. The first page is kept for the caller; the other 63
+      are now on `kmem1`, and the next 63 allocations on hart 1 are local.
+
+      Between line 105 and line 110 the batch is on *no* list: it is reachable only from
+      `first` and `last`. Interrupts are off, so the window is a few instructions; but another
+      hart that scans all lists in that window will not see these 63 pages (question 8). With
+      the opposite rule (take two locks in CPU order) the batch would never be in transit, at
+      the price of more complicated code.
+  - title: kalloc, final shape
+    commit: 4
+    file: kernel/kalloc.c
+    lines: 120-143
+    focus: 129-138
+    diff: true
+    state:
+      hart: 1
+      mode: S
+      proc: sh (pid 4)
+      intr: "off"
+      satp: kernel
+      locks: [kmem1]
+      irq: {noff: 2, intena: 1, note: "kmem1 plus kalloc's own push_off"}
+      stack: [usertrap, syscall, sys_sbrk, growproc, uvmalloc, kalloc]
+      sp: {"on": kernel}
+    note: |
+      [[kalloc]] now does the common case in five lines: [[push_off]], `cpuid()`, pop a page
+      from the own list under the own lock, release. Only if that list was empty does it call
+      `steal`, and by then it holds no kmem lock. [[pop_off]] comes last, so `id` is valid
+      for `steal` too.
+
+      The recorded moment is the shell's child on hart 1 again, a few allocations after the
+      steal: its own list now has pages, and this allocation is purely local. gdb: `kmem1`
+      held, noff 2, intena 1.
+
+      Compare with the original [[kalloc]] ([[kernel/kalloc.c:69]]): one lock, always the same
+      one. Here, in the common case, also one lock, but each hart's own, which no other hart
+      touches unless it is stealing. In the measured `kchurn` workload that brings the
+      contended acquisitions from 43,429-49,770 to 2-5 (measure section).
+    others: |
+      The deadlock this shape avoids, as recorded in clinic 2 (where the own lock was still
+      held during `steal`):
+
+      | time | hart 0 (pid 16) | hart 2 (pid 14) |
+      |---|---|---|
+      | 1 | holds `kmem0`, empty | holds `kmem2`, empty |
+      | 2 | `kmem1`: empty, released | `kmem3`..`kmem7`: empty |
+      | 3 | `acquire(&kmem2)`: spins | `acquire(&kmem0)`: spins |
+
+      With the reference shape, at step 1 both have already released their own locks, so
+      step 3 cannot block either of them for longer than a 64-node walk.
+  - title: A count per list, kept under the list's lock
+    commit: 5
+    file: kernel/kalloc.c
+    lines: 120-161
+    focus: 151-161
+    diff: true
+    state:
+      hart: 1
+      mode: S
+      proc: none (hart 1's scheduler was idle)
+      intr: "off"
+      satp: kernel
+      locks: [cons.lock]
+      irq: {noff: 1, intena: 0}
+      stack: [scheduler, kernelvec, kerneltrap, devintr, uartintr, consoleintr, procdump, kmemdump]
+      sp: {"on": scheduler, detail: "hart 1's slice of `stack0`, with a `kernelvec` frame on top"}
+    note: |
+      The last commit makes the distribution of memory visible. Each list gets `nfree`, kept
+      exact by updating it in the same critical sections that change the list: `++` in
+      [[kfree]], `--` in [[kalloc]], `-= n` on the victim and `+= n - 1` on the stealer in
+      `steal`.
+
+      `kmemdump` prints the eight counts and takes **no** lock, following [[procdump]]'s rule
+      ([[kernel/proc.c:675]]): Ctrl-P must work on a machine that is stuck, and a machine
+      stuck on a kmem lock (clinic 2) is exactly the one you want to look at. The price is
+      that a count may be a moment old; an `int` read is a single `lw`, so it is never torn.
+
+      The recorded moment: Ctrl-P after `echo hi`. The UART interrupt was taken on hart 1
+      while it was idle in its [[scheduler]], so [[kernelvec]] pushed its frame on the
+      scheduler stack; [[consoleintr]] holds `cons.lock` (noff 1, intena 0: an interrupt
+      handler) and calls [[procdump]], which calls `kmemdump`. Output:
+      `free pages: kmem0 32435 kmem1 73 kmem2 37 kmem3 0 kmem4 0 kmem5 0 kmem6 0 kmem7 0`.
+      Harts 1 and 2 have stolen a little from hart 0 and are living on it.
+  - title: procdump prints the counts
+    commit: 5
+    file: kernel/proc.c
+    lines: 673-704
+    focus: 703
+    diff: true
+    state:
+      hart: 1
+      mode: S
+      proc: none (hart 1's scheduler was idle)
+      intr: "off"
+      satp: kernel
+      locks: [cons.lock]
+      irq: {noff: 1, intena: 0}
+      stack: [scheduler, kernelvec, kerneltrap, devintr, uartintr, consoleintr, procdump]
+      sp: {"on": scheduler}
+    note: |
+      One line in [[procdump]], after the process list. It is the only change outside
+      `kalloc.c` (apart from the prototype in `defs.h`), and it changes nothing for the rest of
+      the kernel.
+
+      This is the tool for the last think question. Type Ctrl-P after `kalloctest`, after
+      `usertests -q`, after a big program exits: the free pages are on whichever list the last
+      big free went to (`kmem0 0 kmem1 0 kmem2 32545` after one `kalloctest` in a recorded
+      run; `kmem0 32545 kmem1 0 kmem2 0` after the next). Nothing moves them back; stealing
+      in batches of 64 is what keeps that imbalance cheap.
+  - title: What changed, and what it cost
+    commit: 5
+    file: kernel/kalloc.c
+    lines: 124-149
+    focus: 133-144
+    state:
+      hart: any
+      mode: S
+      proc: any
+      intr: "off"
+      satp: kernel
+      locks: ["kmem<this hart>"]
+      irq: {noff: 2, intena: 1, note: "in a system call; the caller may hold more locks (noff 3 in fork, 4 in kwait) and a page fault has intena 0"}
+      stack: [kalloc]
+      sp: {"on": kernel}
+    note: |
+      The whole change is about 90 changed lines in `kalloc.c`, plus one line in [[procdump]]. The rest of the kernel did not
+      notice: every caller of [[kalloc]] and [[kfree]] is unchanged, and `usertests -q` passes
+      at every commit.
+
+      What it bought, measured with a counter of failed `amoswap` attempts per lock (measure
+      section): during three processes churning memory on three harts, contended acquisitions
+      of the allocator's locks fell from 43,429-49,770 to 2-5 out of about 768,000, and the
+      spins from 617,603-683,545 to 2,211-15,351. What it cost: a [[push_off]] level on every
+      allocator call (noff 4 in [[kwait]]), a scan of eight locks for every failed allocation,
+      a short window in which a stolen batch is on no list, and memory that piles up on the
+      hart that freed it.
+
+      And the lesson of the clinics: the one rule that matters for correctness is the lock
+      order (never hold two kmem locks), and breaking it passed one full `kalloctest` before
+      it deadlocked. The rule that the CPU number must not go stale cost nothing visible when
+      broken, thanks to the per-list locks; it is kept because without those locks it would be
+      a race rare enough that no test would catch it.
+verify: |
+  On the branch (`ext/18-percpu-kalloc`, 5 commits), built with the project toolchain and
+  run on 3 harts (`-smp 3 -m 128M`), with Ctrl-P after boot and after the first test:
+
+  ```text
+  free pages: kmem0 32483 kmem1 62 kmem2 0 kmem3 0 kmem4 0 kmem5 0 kmem6 0 kmem7 0
+  kalloctest
+  kalloctest: churn: 3 processes x 2000 rounds x 64 pages, 15 ticks
+  kalloctest: churn: OK
+  kalloctest: one process got 32472 free pages, 32472 at start
+  kalloctest: gather: OK
+  kalloctest: exhaust: 3 processes got 32378 of 32472 free pages
+  kalloctest: exhaust: OK
+  kalloctest: free pages 32472 before, 32472 after
+  kalloctest: no leaks: OK
+  kalloctest: ALL OK
+  [...]
+  free pages: kmem0 0 kmem1 0 kmem2 32545 kmem3 0 kmem4 0 kmem5 0 kmem6 0 kmem7 0
+  usertests -q
+  usertests starting
+  test copyin: OK
+  test copyout: OK
+  [...]
+  test kernmem: usertrap(): unexpected scause 0xd pid=6483
+  [...]
+  ALL TESTS PASSED
+  $ kalloctest
+  kalloctest: churn: 3 processes x 2000 rounds x 64 pages, 16 ticks
+  kalloctest: churn: OK
+  kalloctest: one process got 32472 free pages, 32472 at start
+  kalloctest: gather: OK
+  kalloctest: exhaust: 3 processes got 32379 of 32472 free pages
+  kalloctest: exhaust: OK
+  kalloctest: free pages 32472 before, 32472 after
+  kalloctest: no leaks: OK
+  kalloctest: ALL OK
+  ```
+
+  The `usertrap()` lines inside `usertests` are the expected kills of tests that touch
+  memory they must not (`kernmem`, `nowrite`, ...), as on the original kernel. `usertests -q`
+  passing shows that everything that used the allocator still works, including the tests
+  that exhaust memory (`sbrkfail`, `sbrkmuch`) and the free-page count that `usertests`
+  compares at the end; `kalloctest` before and after it shows that no pages leaked
+  (32,472 both times, the same number the original kernel reports). Every commit was built
+  and passed `kalloctest` and `usertests -q` on 3 harts.
+
+  The Ctrl-P lines are checked by eye: right after boot the first process (on hart 1) has
+  already taken a batch from hart 0's list; after `kalloctest` all free memory sits on the
+  list of the hart whose final `countfree` freed it.
+measure: |
+  **How it was measured.** A scratch copy of each kernel (never the branch) counted, in
+  [[acquire]], the failed `amoswap` attempts ("spins") before each acquisition succeeded, in
+  per-hart tables keyed by the lock's name (per-hart, so that the counter itself adds no
+  lock), and printed and reset them on Ctrl-P. Three boots per kernel, 3 harts each; between
+  Ctrl-Ps: `kchurn` (the churn phase of `kalloctest` on its own: 3 processes × 2,000 rounds
+  × 64 pages), then `kalloctest`, then `usertests -q`. "Remote" means an acquisition of
+  another hart's list; "contended" means at least one failed `amoswap`. Ranges are over the
+  three boots.
+
+  | workload | kernel | kmem acquisitions | contended | spins | remote |
+  |---|---|---|---|---|---|
+  | `kchurn` | original (one `kmem`) | 768,134 | **43,429-49,770** | 617,603-683,545 | — |
+  | `kchurn` | per-CPU, `STEAL` 64 | 768,159-768,163 | **2-5** | 2,211-15,351 | 20-25 |
+  | `kalloctest` | original | 1,028,002 | 42,574-51,664 | 661,559-718,654 | — |
+  | `kalloctest` | per-CPU | 1,032,020-1,036,044 | 243-249 | 154,412-195,470 | 3,220-6,423 |
+  | `usertests -q` | original | 1,003,854 | 30-33 | 455-488 | — |
+  | `usertests -q` | per-CPU | 1,014,352-1,018,373 | 0 | 0 | 8,367-11,819 |
+
+  - **The point of the lab**: under concurrent allocation (`kchurn`), contention on the
+    allocator drops by four orders of magnitude, from about one acquisition in sixteen to a
+    handful in 768,000. The few that remain are steals.
+  - **Where per-CPU lists still contend**: `kalloctest`'s `exhaust` phase, where all three
+    lists run dry together and every hart steals. Fewer collisions than the original (about
+    245 against about 47,000) but more spins per collision (about 640-790 on average, against
+    about 14 in the original). Our inference is that a stealer holds the victim's lock for a
+    walk of up to 64 nodes; the data does not separate that from host scheduling, since the
+    largest single waits are QEMU vCPU threads descheduled by the host (the original's
+    few-instruction section once reached 3,034 spins, and the reference's `kchurn` 11,827).
+  - **`usertests -q`** runs one test at a time, so even the original lock is rarely contended
+    (about 30 times in a million). The per-CPU version removes even those, at the price of
+    about 1% remote acquisitions.
+  - One-page stealing (clinic 3) has 3-10 times more contended acquisitions than the
+    reference (870-1,418 against 243-249 in `kalloctest`, 14-50 against 2-5 in `kchurn`)
+    but far fewer spins, and 1.6-1.8 million acquisitions in `usertests -q`, 38-44% of them
+    remote.
+
+  **Where the memory went** (Ctrl-P on the branch): after boot `kmem0 32483 kmem1 62 kmem2
+  0`; after one `kalloctest` `kmem0 0 kmem1 0 kmem2 32545`; after `usertests -q` in one boot
+  of the measurement copy `kmem0 19980 kmem2 12560`. Free memory sits wherever it was last freed.
+
+  **Time, with a warning.** On QEMU the per-CPU allocator is not measurably faster: the
+  churn phase took 15-22 ticks (1.5-2.2 s) on both kernels (one run of the original took 35). QEMU emulates the harts on host
+  threads but does not model what makes contention expensive on real hardware (moving a
+  lock's cache line between cores), and a spinning hart costs only host CPU time. The tick
+  counts also depend on things that have nothing to do with the allocator: in one
+  instrumented build, `memset`'s three-instruction loop happened to straddle a page boundary
+  (`0x80000ffa`-`0x80001000`), and every `kalloctest` churn took 307-389 ticks in that build,
+  about twenty times longer, although its allocator code was correct and uncontended. A
+  control rebuilt that tree twice and ran both at the same time: unchanged, 376,
+  377 and 406 ticks; with only `memset` moved off the page boundary
+  (`__attribute__((aligned(32)))` on `memset`), 35, 39 and 42 ticks. Why a page-straddling
+  loop is so slow is our inference, not something we measured: QEMU translates guest code
+  in blocks, and a loop split across two guest pages appears to take a slower path from
+  block to block on every iteration. The measurements above use `-falign-functions=64` for
+  all kernels. Plain builds of the same commits gave anywhere from 15 to 45 ticks depending
+  on what else the computer was doing (your times will differ), which is one more reason to trust counts over ticks. Count events (acquisitions, spins) to judge a locking change on QEMU; time it
+  on real hardware.
+further: |
+  - **Rebalancing.** Give pages back: when a list holds far more than its share, a `kfree`
+    could push the page to the poorest list instead. Measure whether the remote traffic of
+    `usertests` goes down, and what the extra decision costs on every free.
+  - **Avoid false sharing.** `struct kmem` is 48 bytes, so neighbouring CPUs' entries share
+    64-byte cache lines. In this build `kmem` is at `0x8000f990`, so `kmem[1]`'s line
+    (`0x8000f9c0`-`0x8000f9ff`) also holds the first 16 bytes of `kmem[2]`, including its
+    lock word: hart 2 acquiring its own lock disturbs the line hart 1 needs for its own. Pad each entry to a cache line (`__attribute__((aligned(64)))`) and explain why
+    this matters on real hardware and not at all on QEMU.
+  - **A lock-free fast path.** Each CPU's own pops and pushes happen with interrupts off; only
+    stealing needs the lock. Design a scheme where the owner's fast path takes no lock (for
+    example, stealers request pages and the owner hands them over), and argue it correct on
+    three harts. It teaches exactly what clinic 1 could not show: what a stale CPU number
+    does when there is no lock to save you.
+  - **Per-CPU everything.** Apply the same idea to `bcache` (lab 19 hashes it instead) or to
+    the process table scan in [[scheduler]], and compare which data really is per-CPU.
+  - **Steal half, with counts.** Use `nfree` to steal half of the richest list, and measure the
+    walk length against the number of steals.

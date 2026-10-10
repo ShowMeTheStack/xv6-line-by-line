@@ -1,0 +1,784 @@
+title: Logging and crash recovery
+summary: begin_op, log_write and end_op, group commit, the single header write that commits a transaction, and how the next boot redoes it.
+questions:
+  - id: log-01
+    level: 1
+    type: choice
+    q: |
+      [[balloc]] has just set a bit in the bitmap buffer and calls [[log_write]] on it.
+      What has happened on the disk by the time `log_write` returns?
+    code: kernel/log.c:223-244
+    options:
+      - text: Nothing. log_write only records the block number in the in-memory header and pins the buffer; the disk is written later, by the commit.
+        correct: true
+        why: |
+          `log_write` takes `log.lock`, puts `b->blockno` in `log.lh.block[]` (if it is not
+          there already) and calls [[bpin]]. There is no `bwrite` anywhere in it. The changed
+          bytes live only in the cached buffer until [[commit]] runs.
+      - text: The block has been copied into the next free log block on disk.
+        why: |
+          You may have thought the log is appended to as changes happen. In this kernel
+          nothing touches the log area until [[write_log]], which runs inside [[commit]] after
+          the last [[end_op]]. `log_write` does no I/O at all.
+      - text: The block has been written to its home location, and its number added to the log so recovery can undo it.
+        why: |
+          You may have thought of an undo log. xv6's log is a *redo* log: no home block is
+          written before its transaction commits, so recovery only ever copies forward and
+          never has to undo anything.
+      - text: The log header on disk now lists the block, so the change is already committed.
+        why: |
+          You may have confused the in-memory header `log.lh` with the header block on disk.
+          `log_write` changes only `log.lh`; the disk header is written by [[write_head]],
+          and only during the commit.
+    explain: |
+      The rule inside a transaction is "record, don't write": the buffer cache holds the new
+      contents, `log.lh` holds the list of changed block numbers, and the pin keeps the
+      buffer in memory. All disk writes happen later, in [[commit]] ([[tour:31]]).
+
+  - id: log-02
+    level: 1
+    type: line
+    q: |
+      In [[commit]], click the line whose disk write is the moment the transaction becomes
+      durable: if the power fails before this write completes, the transaction never
+      happened; after it, the next boot will finish it.
+    code: kernel/log.c:202-212
+    answer: 207
+    lines:
+      206: |
+        You may have thought that copying the blocks into the log commits them. After
+        [[write_log]] the disk header still says `n = 0`, so recovery ignores those log
+        blocks: a crash here loses the transaction cleanly.
+      208: |
+        You may have thought the transaction counts only once the home blocks are written.
+        By then it is already committed: if the power fails during [[install_trans]], the
+        next boot sees `n > 0` in the header and installs everything again.
+      210: |
+        This second [[write_head]] writes `n = 0`. It *erases* the transaction from the log
+        after everything is home; it does not commit anything.
+      209: |
+        Setting `log.lh.n = 0` only changes memory. Nothing about durability is decided by a
+        memory write.
+    why_wrong: Ask for each line what the disk header says just before and just after it.
+    explain: |
+      Line 207's [[write_head]] writes the header block with the real `n` and the list of
+      block numbers. Before it, the disk header says `n = 0` and the home blocks are
+      untouched; after it, [[recover_from_log]] will install every logged block. One block
+      write decides between the two worlds ([[tour:32]]).
+
+  - id: log-03
+    level: 1
+    type: order
+    q: |
+      The last [[end_op]] of a group commits it. Put these events in the order they
+      happen.
+    code: kernel/log.c:152-212
+    items:
+      - text: "`end_op` sets `log.committing = 1` under `log.lock`, then releases the lock"
+        why: The flag must be set before the lock is dropped, so no new transaction slips in before the commit starts.
+      - text: "`write_log`: copy each logged block from the cache into the log area"
+        why: The log blocks must hold the new data before any header claims they do.
+      - text: "`write_head`: write the header with `n` and the block list (the commit point)"
+        why: The header may only name log blocks that are already on disk, so it comes after write_log.
+      - text: "`install_trans(0)`: copy each block to its home location and unpin it"
+        why: Home blocks may be overwritten only once the transaction is committed, so installation follows the header write.
+      - text: "`write_head` again, with `n = 0`: erase the transaction"
+        why: The log can be erased only after every block is home; erasing earlier would lose committed changes in a crash.
+      - text: "`end_op` clears `committing`, increments `ncommit`, and wakes sleepers on `&log`"
+        why: Other transactions may use the log again only after it has been erased on disk.
+    why_wrong: Each step must make the disk safe for the next one; ask what a crash between two steps would leave behind.
+    explain: |
+      Flag up, log blocks, header (commit), home blocks, header cleared, flag down. Every
+      disk write is synchronous, so each step is complete before the next starts. The order
+      guarantees that at every instant a crash leaves either the old state or a committed
+      log that recovery can replay ([[commit]], [[tour:31]]).
+
+  - id: log-04
+    level: 1
+    type: number
+    q: |
+      The log is empty (`log.lh.n = 0`) and no commit is running. Processes keep calling
+      [[begin_op]] and none of them has reached [[end_op]] yet. How many of them are
+      admitted before the next one has to sleep?
+    code: kernel/log.c:127-150@138
+    answer: 3
+    wrong:
+      2: |
+        You may have read the test as `>=`. It is `>`: the third newcomer computes
+        `0 + (2 + 1) * 10 = 30`, and 30 is not greater than [[LOGBLOCKS]] = 30, so it gets in.
+      30: |
+        You may have confused blocks with transactions. The log holds 30 blocks, but
+        [[begin_op]] reserves [[MAXOPBLOCKS]] = 10 of them for every running transaction.
+      4: |
+        The fourth newcomer computes `0 + (3 + 1) * 10 = 40 > 30`, so it sleeps until a
+        commit frees the log.
+    why_wrong: Plug `lh.n = 0` and the current `outstanding` into the test on line 138 for each newcomer in turn.
+    explain: |
+      Each running transaction might still log up to [[MAXOPBLOCKS]] = 10 blocks, so
+      [[begin_op]] reserves 10 per transaction. With [[LOGBLOCKS]] = 30, three fit exactly into
+      an empty log. The reservation is pessimistic, but running out of log space mid-transaction
+      would have no recovery: [[log_write]] would panic ([[tour:31]]).
+
+  - id: log-05
+    level: 2
+    type: order
+    q: |
+      The machine crashed with a committed transaction still in the log. Put the steps of
+      the next boot's file-system start-up in order.
+    items:
+      - text: "[[fsinit]] reads the superblock (block 1) and checks its magic number"
+        why: Nothing else can be found on disk until the superblock says where the log and inodes are.
+      - text: "[[read_head]] copies `n` and the block list from the header block into `log.lh`"
+        why: Recovery needs the list of home block numbers before it can copy anything.
+      - text: "[[install_trans]]`(1)` copies each log block to its home block, printing `recovering tail …`"
+        why: Installing uses the list that read_head just loaded.
+      - text: "[[write_head]] writes `n = 0`, clearing the log"
+        why: The log is cleared only after every block is home, so a crash during recovery simply repeats it.
+      - text: "[[ireclaim]] scans the inodes for orphans (allocated, `nlink == 0`) and frees them"
+        why: ireclaim reads inode blocks, which may be stale until recovery has installed them, and it runs its own transactions, which need an empty log.
+    why_wrong: The log must be replayed and cleared before anything reads inode blocks or starts a new transaction.
+    explain: |
+      [[fsinit]] calls [[initlog]] (which runs [[recover_from_log]]: read the header, install,
+      clear) and only then [[ireclaim]]. The order matters: before recovery, inode blocks on
+      disk may still be the old versions ([[tour:32]]).
+
+  - id: log-06
+    level: 1
+    type: choice
+    q: |
+      Inside one transaction, [[writei]] changes block 1006 and calls [[log_write]]; a moment
+      later the same transaction changes block 1006 again and calls `log_write` a second time.
+      What does the second call do?
+    code: kernel/log.c:223-244@234-242
+    options:
+      - text: It finds 1006 already in log.lh.block[], adds nothing, and does not pin the buffer again.
+        correct: true
+        why: |
+          The loop on lines 234-237 stops at the existing entry, so `i < log.lh.n`, line 238
+          rewrites the same number, and the `if` on line 239 is false: no new slot, no second
+          [[bpin]]. This is **absorption**.
+      - text: It adds a second entry for 1006, so the commit writes both versions in order.
+        why: |
+          You may have thought the log keeps a history of changes. It keeps block *numbers*;
+          the commit copies whatever the cached buffer holds at commit time, which already
+          includes both changes.
+      - text: It panics, because a block may be logged only once per transaction.
+        why: |
+          You may have confused this with the panics on lines 229-232. Those fire when the log
+          is full or when no transaction is open, not on a repeated block.
+      - text: It writes the first version to disk immediately to make room for the second.
+        why: |
+          You may have thought the buffer can hold only one pending version. There is only one
+          version: the cached buffer, modified in place. `log_write` never writes to disk.
+    explain: |
+      The log records which blocks changed, not how. Because the buffer cache keeps one copy
+      of each block, every change to block 1006, by this process or any other in the same
+      group, is in that one buffer, and one log slot carries all of them ([[tour:31]]).
+
+  - id: log-07
+    level: 1
+    type: choice
+    q: |
+      Three processes are inside transactions (`log.outstanding = 3`). They call
+      [[end_op]] one after another. Which call runs [[commit]]?
+    code: kernel/log.c:152-184@160-165
+    options:
+      - text: The third one, the call that brings outstanding to 0; it commits all three processes' changes together.
+        correct: true
+        why: |
+          Only the `end_op` that sees `outstanding == 0` sets `do_commit` and `committing`.
+          That one call does the disk work for the whole group: this is **group commit**.
+      - text: Each of them commits its own changes, one after another.
+        why: |
+          You may have expected one commit per system call. The three transactions share one
+          `log.lh` and the same cached buffers (often the same bitmap and inode blocks), so
+          their changes cannot be separated; they commit together.
+      - text: The first one, since its transaction finished first.
+        why: |
+          You may have thought a finished transaction can commit at once. Its buffers may
+          also contain half-done changes of the other two; committing now would put those
+          partial changes on disk. The first `end_op` only decrements `outstanding` and
+          calls [[wakeup]].
+      - text: None of them; a kernel thread commits the log in the background every few ticks.
+        why: |
+          You may know file systems with a periodic flush daemon. xv6 has no such thread:
+          the commit runs on the kernel stack of whichever system call ends last.
+    explain: |
+      `end_op` decrements `outstanding`; if it reaches 0 this call commits, otherwise it
+      wakes anyone waiting for log space and returns. So the last one out pays for everyone,
+      and the earlier ones return before their data is on disk ([[end_op]], [[tour:31]]).
+
+  - id: log-08
+    level: 1
+    type: match
+    q: |
+      `echo hi > f` is creating `f` (blocks 34, 47 and 33 are logged). Match each moment of
+      power failure with what the disk shows after the next boot.
+    pairs:
+      - left: during [[write_log]]
+        right: no f; the half-written log blocks are ignored
+        why: The header on disk still says n = 0, so recovery installs nothing and the home blocks were never touched.
+      - left: just after the first [[write_head]] completes
+        right: "f exists: recovery copies all three blocks home"
+        why: The header now says n = 3 with the block list, and the home blocks are still old, so recovery installs them.
+      - left: during [[install_trans]], after block 34 but before 47 reached home
+        right: "f exists: recovery installs all three again, including 34 a second time"
+        why: The header still says n = 3. Rewriting 34 with the same contents is harmless; the redo log is idempotent.
+      - left: after the second `write_head` (n = 0) completes
+        right: f exists and recovery has nothing to do
+        why: Everything is already home and the header says n = 0, so recover_from_log installs no blocks.
+    explain: |
+      The single header write splits time into "before: nothing happened" and "after:
+      recovery will finish it". No moment leaves `f` half-created, for example an inode
+      marked used with no directory entry naming it ([[tour:32]]).
+
+  - id: log-09
+    level: 2
+    type: choice
+    q: |
+      Why does [[log_write]] call [[bpin]] when it adds a new block to the transaction?
+    code: kernel/log.c:223-244@239-242
+    options:
+      - text: The changed bytes exist only in that cached buffer; the pin keeps refcnt above 0 so bget cannot recycle the buffer for another block before the commit.
+        correct: true
+        why: |
+          [[bget]] only recycles buffers with `refcnt == 0`. Without the pin, the caller's
+          [[brelse]] would drop `refcnt` to 0, the buffer could be reused for another block,
+          and the change would be lost: [[write_log]] would `bread` the old contents back from
+          disk.
+      - text: To keep other processes from reading or modifying the block until the transaction commits.
+        why: |
+          You may have thought a pin is a lock. It only raises `refcnt`. Other processes can
+          still `bread` the block and change it (that is how absorption combines several
+          processes' changes); the buffer's sleep-lock serializes them one access at a time.
+      - text: To tell the disk driver to write the buffer at the next commit.
+        why: |
+          You may have thought the pin marks the buffer dirty for the driver. The commit
+          finds the blocks through `log.lh.block[]`, not through any flag in the buffer.
+      - text: Because bwrite panics if it is called on a buffer whose refcnt is 0.
+        why: |
+          You may have mixed up two checks. [[bwrite]] checks that the caller holds the
+          buffer's *sleep-lock* (`holdingsleep`), not the reference count.
+    explain: |
+      `log_write` replaces `bwrite`: the change is deliberately left only in memory until
+      the commit. The pin is what keeps "only in memory" safe; [[install_trans]] drops it with
+      [[bunpin]] once the block is home ([[tour:31]]).
+
+  - id: log-10
+    level: 2
+    type: choice
+    q: |
+      [[end_op]] releases `log.lock` *before* calling [[commit]] (line 172, then 177). What
+      would happen if it called `commit()` while still holding `log.lock`?
+    code: kernel/log.c:152-184@172-177
+    options:
+      - text: The kernel would panic with "sched locks" at the first disk operation that waits (a bread miss or the first bwrite), because commit sleeps waiting for the disk while a spinlock is held.
+        correct: true
+        why: |
+          Every [[bwrite]] (and every `bread` that misses) goes through [[virtio_disk_rw]],
+          which sleeps until the disk interrupt. [[sched]] requires `noff == 1` (only
+          `p->lock`); with `log.lock` held as well it would be 2, and `sched` panics.
+      - text: Nothing bad; it would only make the commit a little slower.
+        why: |
+          You may have thought holding a spinlock longer is merely inefficient. In this
+          kernel, sleeping while holding any spinlock other than `p->lock` is an error that
+          [[sched]] checks for and turns into a panic.
+      - text: Other harts' begin_op would spin forever, but the committing process would finish normally.
+        why: |
+          You may have pictured the cost only on the other harts. The committing process
+          itself cannot finish: its first disk wait calls [[sched]] with two spinlocks held,
+          and that panics before anyone else is even involved.
+      - text: Disk interrupts would be lost, because log.lock blocks the disk interrupt handler.
+        why: |
+          You may have thought the disk handler takes `log.lock`. It takes
+          `disk.vdisk_lock` and the `p->lock`s in [[wakeup]], never `log.lock`.
+    explain: |
+      The commit must sleep, so it cannot hold a spinlock. Instead, the `committing` flag,
+      set under `log.lock`, keeps new transactions out while the commit runs unlocked
+      ([[concept:locks#rules]], [[tour:31]]).
+
+  - id: log-11
+    level: 2
+    type: number
+    q: |
+      One transaction is running (`log.outstanding = 1`, `log.committing = 0`). A second
+      process calls [[begin_op]]. What is the **largest** value of `log.lh.n` for which it is
+      admitted without sleeping?
+    code: kernel/log.c:127-150@138
+    answer: 10
+    wrong:
+      20: |
+        You may have forgotten that the newcomer reserves space too. The test uses
+        `outstanding + 1`: `20 + 2 * 10 = 40 > 30`.
+      9: |
+        You may have read the test as `>=`. With `lh.n = 10` it computes `10 + 20 = 30`,
+        which is not greater than 30, so the newcomer is admitted.
+      0: |
+        You may have thought a newcomer must wait whenever anything is already logged. The
+        test leaves room as long as `lh.n + 20 <= 30`.
+    why_wrong: Solve `lh.n + (1 + 1) * 10 <= 30` for the largest `lh.n`.
+    explain: |
+      `lh.n` blocks are already used, and each of the two transactions (the running one and
+      the newcomer) may still add up to [[MAXOPBLOCKS]] = 10. So `lh.n` may be at most
+      30 - 20 = 10. The reservation double-counts (the running transaction's already-logged
+      blocks are in `lh.n` *and* in its 10), so the bound overestimates: safe, at the cost
+      of sometimes making a newcomer wait unnecessarily.
+
+  - id: log-12
+    level: 3
+    type: number
+    q: |
+      A process writes 2000 bytes at offset 0 to an empty regular file (no data blocks yet).
+      The log was empty and no other transaction runs. The [[filewrite]] chunk is one
+      transaction. How many **distinct blocks** are in `log.lh.block[]` when [[end_op]]
+      commits?
+    answer: 4
+    wrong:
+      7: |
+        You may have counted [[log_write]] calls. There are 7 (bitmap, zeroed block 0, data
+        block 0, bitmap again, zeroed block 1, data block 1, inode block), but repeats are
+        absorbed: the bitmap and each data block are logged once.
+      3: |
+        You may have forgotten [[iupdate]] at the end of [[writei]], which logs the block
+        holding the file's inode (new size and `addrs[]`).
+      5: |
+        You may have counted two bitmap blocks. This file system has one bitmap block
+        (2000 blocks, 8192 bits per block), so both allocations change the same block.
+    why_wrong: Follow writei through bmap, balloc and the zeroing of each new block, then iupdate; count each block number once.
+    explain: |
+      2000 bytes cover file blocks 0 and 1. For each, [[balloc]] logs the bitmap and zeroes
+      the new block (logging it), then `writei` logs the data into that same block. Finally
+      [[iupdate]] logs the inode block. Distinct: bitmap, two data blocks, inode block = 4
+      ([[tour:31]] shows this exact sequence traced: 46, 1006, 1006, 46, 1007, 1007, 34).
+
+  - id: log-13
+    level: 2
+    type: multi
+    q: |
+      Which of these situations make [[begin_op]] put the caller to sleep?
+    code: kernel/log.c:127-150
+    options:
+      - text: "`log.committing` is 1"
+        correct: true
+        why: A commit is writing the log area; a new transaction's blocks must not mix into it, so line 133 sends the caller to sleep.
+      - text: "`log.lh.n + (log.outstanding + 1) * MAXOPBLOCKS` is greater than `LOGBLOCKS`"
+        correct: true
+        why: There might not be room for this transaction's worst case, so line 138 makes it wait for a commit to empty the log.
+      - text: "`log.outstanding` is greater than 0"
+        why: |
+          You may have thought transactions run one at a time. Up to three can be
+          outstanding at once in an empty log; that is what makes group commit possible.
+      - text: "`log.lh.n` is greater than 0"
+        why: |
+          You may have thought any logged block blocks newcomers. With `lh.n = 4` and
+          `outstanding = 1`, the test gives `4 + 20 = 24 <= 30`: admitted.
+      - text: Another process holds the inode lock of the file this process will write
+        why: |
+          You may have mixed up the order. [[begin_op]] never looks at inodes; [[filewrite]]
+          calls it *before* [[ilock]], so a process waiting for the inode lock is already
+          inside its transaction.
+    explain: |
+      Exactly two reasons to wait: a commit in progress, or not enough guaranteed room.
+      Both are re-checked in a loop after every wakeup, because a wakeup on `&log` only
+      means "something changed" ([[tour:31]]).
+
+  - id: log-14
+    level: 1
+    type: tf
+    q: |
+      True or false: in this kernel, once a `write()` to a regular file has returned to
+      user space, its data is on the disk.
+    answer: false
+    why_tf: |
+      You may have assumed every system call commits before returning. Only the [[end_op]]
+      that brings `outstanding` to 0 commits; the others return while their changes are
+      still only in pinned cache buffers.
+    reasons:
+      - text: Its end_op may not have been the last one out; the group commit then happens later, in another process's end_op.
+        correct: true
+        why: |
+          With other transactions still running, `end_op` just decrements `outstanding` and
+          returns. A crash before the group commits loses this write (cleanly).
+          [[sys_sync]] exists to wait for that commit.
+      - text: The data stays in the buffer cache until the buffer is evicted, which can take minutes.
+        why: |
+          You may be thinking of a write-back cache that flushes on eviction. Logged buffers
+          are pinned and cannot be evicted; they reach disk only through the commit, which
+          happens as soon as `outstanding` drops to 0.
+      - text: write() never touches the disk; only sync() writes file data.
+        why: |
+          You may have overgeneralized. A write that runs alone is committed by its own
+          `end_op` before it returns. `sync` only waits for a commit; it does not do one.
+    explain: |
+      Group commit trades durability for fewer disk writes: early finishers return at memory
+      speed, and the last one out commits for everyone. A program that needs its data on disk
+      calls `sync` ([[sys_sync]], [[tour:31]]).
+
+  - id: log-15
+    level: 2
+    type: choice
+    q: |
+      [[install_trans]] calls [[bunpin]] only when `recovering == 0`. Why does it skip the
+      unpin during crash recovery?
+    code: kernel/log.c:66-85@80-81
+    options:
+      - text: The pins were taken by log_write in the previous boot; in this boot's fresh buffer cache nobody pinned these buffers, so unpinning would push refcnt below its true value.
+        correct: true
+        why: |
+          `bpin`/`bunpin` must pair up within one boot's cache. After a reboot, the cache
+          starts empty; each buffer here has only the references `bread` gave it, which the
+          `brelse` calls drop. An extra `bunpin` could let a buffer that is still in use be
+          recycled.
+      - text: Because during recovery the blocks are written with bwrite, which unpins automatically.
+        why: |
+          You may have thought `bwrite` changes reference counts. It only checks the
+          sleep-lock and calls [[virtio_disk_rw]]; `refcnt` is touched only by `bget`,
+          `brelse`, `bpin` and `bunpin`.
+      - text: To keep the recovered blocks in the cache permanently for faster booting.
+        why: |
+          You may have read "skip unpin" as "keep pinned". These buffers were never pinned in
+          this boot, so there is nothing to keep; after `brelse` their `refcnt` is 0 and they
+          can be recycled like any other.
+      - text: Because bunpin takes bcache.lock, which cannot be acquired before the scheduler starts.
+        why: |
+          You may have thought recovery runs before processes exist. It runs in pid 1, in
+          [[forkret]], and `bread`/`brelse` take `bcache.lock` throughout it anyway.
+    explain: |
+      The same function serves two callers. In a normal commit it undoes the pin each
+      [[log_write]] took; in recovery there were no pins, because the logging happened in a
+      previous life of the machine ([[tour:32]]).
+
+  - id: log-16
+    level: 3
+    type: multi
+    q: |
+      At the end of a commit, [[end_op]] calls `wakeup(&log)` (line 181). Which of these
+      sleeping processes can it wake?
+    options:
+      - text: A process in begin_op that found log.committing set
+        correct: true
+        why: "[[begin_op]] line 134 registers on `&log` before sleeping."
+      - text: A process in begin_op that found too little room in the log
+        correct: true
+        why: Line 140 uses the same channel, `&log`; after the commit the log is empty and it will be admitted.
+      - text: A process in sys_sync waiting for ncommit to advance
+        correct: true
+        why: "[[sys_sync]] sleeps on `&log` (line 253) and re-checks `ncommit` each time it wakes."
+      - text: A process waiting in bread for a buffer that the committing process holds
+        why: |
+          You may have thought every file-system wait is on the log. That process sleeps
+          in [[acquiresleep]] on the buffer's sleep-lock (channel `lk`), and is woken by
+          [[releasesleep]] when the buffer is released.
+      - text: A process in virtio_disk_rw waiting for its own read to complete
+        why: |
+          You may have connected the disk with the log. A disk request sleeps on its buffer
+          `b` and is woken by [[virtio_disk_intr]], not by the log.
+      - text: An earlier end_op caller of the same group, waiting for its data to reach the disk
+        why: |
+          You may have thought the other members of the group wait for the commit. They
+          don't: a non-last [[end_op]] returns immediately, and no code in it sleeps.
+    explain: |
+      Three code paths sleep on `&log`: the two waits in [[begin_op]] and the wait in
+      [[sys_sync]]. All three re-check their condition in a loop, because one wakeup wakes
+      all of them and only some can proceed ([[tour:31]]).
+
+  - id: log-17
+    level: 2
+    type: choice
+    q: |
+      Crash recovery runs from [[forkret]] in the first process (pid 1), not from [[kernel:main]].
+      Why?
+    code: kernel/proc.c:512-536@522-528
+    options:
+      - text: Recovery reads and writes the disk, and every disk operation sleeps; sleeping needs a process, and main runs on a boot stack with no process.
+        correct: true
+        why: |
+          [[virtio_disk_rw]] calls `sleep` until the disk interrupt. [[kernel:sleep]] marks the
+          *current process* `SLEEPING` and switches away from it. In `main` there is no
+          current process to put to sleep, as the comment on lines 525-527 says.
+      - text: Because main runs in machine mode, which cannot access the virtio disk.
+        why: |
+          You may have mixed up the boot stages. Only `start` runs in M-mode; `main` runs in
+          supervisor mode (it turns paging on itself, in [[kvminithart]]), and S-mode
+          drives the virtio disk without trouble.
+      - text: So that recovery runs on every hart in parallel and finishes faster.
+        why: |
+          You may have thought each hart runs forkret. `forkret` is entered by every new
+          process, but the `first` flag makes only pid 1's first run call [[fsinit]], once.
+      - text: Because the log can only be read after /init has been loaded.
+        why: |
+          It is the other way round: [[kexec]] of `/init` reads the disk, so it must come
+          *after* recovery. That is why `fsinit` is called before `kexec` in `forkret`.
+    explain: |
+      Disk I/O blocks, and only a process can block. pid 1 is the first process, and its
+      first `forkret` runs before any program can look at the file system, so recovery
+      always finishes before anyone reads a possibly half-installed disk ([[tour:32]]).
+
+  - id: log-18
+    level: 2
+    type: multi
+    q: |
+      Which of these run inside a transaction ([[begin_op]] ... [[end_op]]) in this kernel?
+    options:
+      - text: close() of the last descriptor of a regular file
+        correct: true
+        why: "[[fileclose]] wraps `iput` in begin_op/end_op: if the file was unlinked, the final iput truncates and frees it."
+      - text: chdir()
+        correct: true
+        why: "[[sys_chdir]] does a lookup and `iput`s the old current directory, which might be its last reference."
+      - text: exit()
+        correct: true
+        why: "[[kexit]] calls `iput(p->cwd)` inside begin_op/end_op for the same reason."
+      - text: exec()
+        correct: true
+        why: "[[kexec]] looks up and reads the program inside a transaction, because `namei` and the final `iunlockput` can drop references."
+      - text: read() on a regular file
+        why: |
+          You may have thought every file operation needs one. [[fileread]] only locks the
+          inode and calls [[readi]]; it takes no reference it could drop, writes nothing,
+          and needs no transaction.
+      - text: close() of the last descriptor of a pipe
+        why: |
+          You may have thought every close is a transaction. For `FD_PIPE`, [[fileclose]]
+          calls [[pipeclose]], which only touches memory; the transaction is taken only for
+          inodes and devices.
+    explain: |
+      The rule is "every [[iput]] must be inside a transaction" (the comment above `iput`),
+      because any `iput` might be the one that frees an unlinked inode and writes the
+      bitmap and inode blocks. Many of these transactions end up logging nothing, and then
+      [[commit]] does no I/O.
+
+  - id: log-19
+    level: 2
+    type: bits
+    q: |
+      After a crash, gdb shows the first 16 bytes of block 2 (the log header,
+      `struct logheader`, little-endian 32-bit ints) as
+      `03 00 00 00 22 00 00 00 2f 00 00 00 21 00 00 00`. `sb.logstart` is 2. Decode it.
+    value: "03000000 22000000 2f000000 21000000"
+    fields:
+      - label: "`n`"
+        options: ["0", "3", "34", "0x03000000"]
+        answer: "3"
+        why: "The first int is `n`. Little-endian: bytes 03 00 00 00 mean 3. Reading it as 0x03000000 is the big-endian mistake."
+      - label: "`block[0]`, the home of the first logged block"
+        options: ["34", "22", "3", "47"]
+        answer: "34"
+        why: "0x22 = 34 in decimal. 22 is the hex digits read as decimal."
+      - label: Which log block holds the new contents for home block 47 (0x2f)?
+        options: ["block 4", "block 3", "block 5", "block 47"]
+        answer: "block 4"
+        why: "47 is `block[1]`, so tail = 1, and the log block is `log.start + tail + 1` = 2 + 1 + 1 = 4. Block 3 holds tail 0."
+      - label: Was this transaction committed before the crash?
+        options: ["yes", "no"]
+        answer: "yes"
+        why: "The only write that puts n > 0 on disk is commit's first write_head, the commit point. A crash before it leaves n = 0."
+      - label: What does the next boot do?
+        options: ["copy log blocks 3, 4, 5 to 34, 47, 33, then write n = 0", "ignore the log, since the home blocks may be half-written", "undo blocks 34, 47, 33 from the log"]
+        answer: "copy log blocks 3, 4, 5 to 34, 47, 33, then write n = 0"
+        why: "[[recover_from_log]] redoes a committed transaction; there is nothing to undo, because home blocks are written only after the commit."
+    explain: |
+      `n = 3`, blocks 34, 47, 33 (0x21): the creation of a file (its inode block, the root
+      directory's data block, the root inode's block). Log block `tail` lives at
+      `log.start + tail + 1` because block `log.start` itself is the header ([[read_head]],
+      [[install_trans]], [[tour:32]]).
+
+  - id: log-20
+    level: 2
+    type: line
+    q: |
+      While a commit is running, `log.lock` is not held. Click the line in [[end_op]] that
+      keeps new transactions from starting during the commit.
+    code: kernel/log.c:152-184
+    answer: 165
+    lines:
+      160: |
+        Decrementing `outstanding` records that this transaction is over. By itself it would
+        let new transactions in, not keep them out.
+      163: |
+        This line decides that *this* call will commit, but deciding is not enough: other
+        processes check a shared flag, which is set on the next lines.
+      164: |
+        `do_commit` is a local variable. Other processes in [[begin_op]] cannot see it.
+      172: |
+        Releasing the lock is what makes the protection necessary. What protects the commit
+        after this point is the flag set before it.
+      179: |
+        This clears the flag after the commit, letting transactions in again.
+    why_wrong: Look for the shared state that begin_op tests on its first check.
+    explain: |
+      `log.committing = 1` (line 165) is set under `log.lock`, and [[begin_op]] sleeps while
+      it is set (line 133). With `outstanding` at 0 and no newcomer admitted, nobody can call
+      [[log_write]], so [[commit]] can read `log.lh` without the lock. A flag guarded by a
+      spinlock does the job of a lock that may be held across sleeps ([[tour:31]]).
+
+  - id: log-21
+    level: 3
+    type: state
+    q: |
+      The machine is booting after a crash. pid 1 is in [[install_trans]] during recovery,
+      executing line 78 (the `memmove` from the log block's buffer to the home block's
+      buffer). Both buffers are held. What is the state of the hart running it?
+    code: kernel/log.c:66-85@78
+    state:
+      mode: S
+      stack: kernel
+      satp: kernel
+      sie: "off"
+      noff: 0
+      intena: "-"
+    why:
+      sie: |
+        You may have expected interrupts on, since no spinlock is held. But pid 1 reached
+        [[forkret]] from the [[kernel:scheduler]], which turned interrupts off before acquiring
+        `p->lock`, so the saved intena is 0 and `release` leaves them off. Nothing on the
+        way through [[fsinit]] turns them on: every pop_off there finds intena 0, and pid 1
+        has never been through [[usertrap]]. So recovery runs with SIE off.
+      noff: |
+        The two buffers are held through their *sleep-locks*, which are not push_off levels.
+        `bcache.lock` and the sleep-locks' inner `lk->lk` were released before `bread`
+        returned.
+      stack: |
+        This is pid 1's own kernel stack: the scheduler's [[swtch]] loaded `p->context.sp`,
+        which [[allocproc]] set to the top of pid 1's kernel stack page. The boot stack
+        became hart 0's scheduler stack.
+      intena: |
+        With noff 0 there is no outstanding push_off, so intena means nothing here.
+      satp: |
+        Kernel code always runs on the kernel page table; pid 1 has not even been to user
+        space yet.
+      mode: |
+        Kernel code here runs in supervisor mode; only `start` ran in machine mode.
+    why_wrong: Trace pid 1 from the scheduler's acquire of p->lock, through forkret's release, into fsinit; track SIE and noff.
+    explain: |
+      S-mode, pid 1's kernel stack, kernel page table, no spinlock held, and interrupts
+      off: SIE was off when the scheduler took `p->lock`, so the scheduler's intena of
+      0, consumed by [[forkret]]'s `release`, left them off. Pid 1 cannot be preempted during recovery; disk interrupts are
+      taken by harts in their scheduler loop while pid 1 sleeps ([[tour:32]],
+      [[concept:locks#intena]]).
+
+  - id: log-22
+    level: 3
+    type: choice
+    q: |
+      [[commit]] reads `log.lh.n` and `log.lh.block[]` without holding `log.lock`, although
+      [[log_write]] changes them under that lock. Why is this not a race?
+    code: kernel/log.c:202-212
+    options:
+      - text: "committing is 1 and outstanding is 0: begin_op admits nobody, so no process can be inside a transaction to call log_write."
+        correct: true
+        why: |
+          `log_write` is only legal inside a transaction (it panics if `outstanding < 1`).
+          The last `end_op` set `committing` with `outstanding == 0` under the lock, and
+          [[begin_op]] sleeps while `committing` is set, so no writer of `lh` can exist until
+          the commit is over.
+      - text: Because log.lh is only ever changed by the committing process itself.
+        why: |
+          You may have thought each process has its own header. `log.lh` is one shared
+          structure; every process's [[log_write]] adds to it.
+      - text: Because commit runs with interrupts disabled, so no other code can run.
+        why: |
+          You may have thought interrupts off stops other harts. SIE affects only this hart,
+          and in a normal system-call commit interrupts are on anyway: `commit` holds no
+          spinlock and sleeps on every disk write.
+      - text: It is a race, but harmless, because absorption hides duplicate entries.
+        why: |
+          You may have accepted the race too quickly. A `log_write` during `write_log`
+          could add a block after its turn in the loop, which would then be missing from the
+          header or the log. The code excludes it; it does not tolerate it.
+    explain: |
+      This is a common pattern: a spinlock protects a flag, and the flag protects a long
+      operation that sleeps. Here the flag is `committing` and the operation is the whole
+      four-stage commit ([[tour:31]]).
+
+  - id: log-23
+    level: 3
+    type: choice
+    q: |
+      Suppose [[commit]] omitted line 210 (it still sets `log.lh.n = 0` in memory, but no
+      longer writes the empty header). The disk header would keep saying `n = 3: 34, 47, 33`
+      after this commit. What could go wrong?
+    code: kernel/log.c:202-212@209-210
+    options:
+      - text: The next commit's write_log overwrites log blocks 3, 4, 5 with new, uncommitted data; a crash then makes recovery copy that data into blocks 34, 47 and 33.
+        correct: true
+        why: |
+          Recovery trusts the header. If it still lists 34, 47, 33 while log blocks 3-5 hold
+          another transaction's contents, a crash before that transaction's own
+          [[write_head]] installs uncommitted data, and into the wrong blocks.
+      - text: Nothing; replaying an old transaction is harmless because the redo log is idempotent.
+        why: |
+          You may have overextended idempotence. Replaying the *same* log contents is
+          harmless. The danger is that the log blocks are reused for different data while the
+          stale header still points at them.
+      - text: The next boot would panic in read_head because n is not 0.
+        why: |
+          You may have thought a non-zero header is an error. [[read_head]] accepts any `n`;
+          a non-zero `n` is the normal sign of a committed transaction to recover.
+      - text: begin_op would refuse all new transactions, because it reads n from the disk header.
+        why: |
+          You may have confused the two headers. [[begin_op]] uses the in-memory `log.lh.n`,
+          which is 0; it never reads block 2.
+    explain: |
+      The second header write ends the transaction's life on disk. It must happen after all
+      home blocks are written and before the log area is reused, so that the disk header
+      only ever describes log blocks that belong to it ([[tour:32]]).
+
+  - id: log-24
+    level: 3
+    type: choice
+    q: |
+      A process calls `sync()` while `log.committing = 0`, `log.outstanding = 2` and
+      `log.ncommit = 5`. When does [[sys_sync]] return?
+    code: kernel/log.c:246-261
+    options:
+      - text: After ncommit reaches 6, that is, once outstanding has dropped to 0 and the commit including the two running transactions has finished.
+        correct: true
+        why: |
+          It records `n = ncommit + 1 = 6` and sleeps on `&log` until `ncommit >= 6`. The
+          next increment happens at the end of the next commit, which can only start when
+          `outstanding` reaches 0; that commit includes both running transactions (and any
+          admitted meanwhile).
+      - text: Immediately, since no commit is in progress.
+        why: |
+          You may have read the test as checking only `committing`. It is
+          `committing || outstanding > 0`; with two transactions open, their changes (and
+          those of calls that already returned) are not on disk yet.
+      - text: After sync itself commits the log by calling commit().
+        why: |
+          You may have thought `sync` forces a commit. It cannot: committing with
+          transactions still running would write half-done changes. It only waits for the
+          commit that the last [[end_op]] will do.
+      - text: Once the two running transactions call end_op, even before any disk write.
+        why: |
+          The last `end_op` *starts* the commit; `ncommit` is incremented only after
+          [[commit]] has written and erased the log (line 180). sync waits for that.
+    explain: |
+      sync's promise is "every write that returned before I was called is now durable".
+      If nothing is open or committing, that is already true (every commit happens when
+      `outstanding` hits 0). Otherwise it waits for one more commit to complete
+      ([[tour:31]]).
+
+  - id: log-25
+    level: 2
+    type: number
+    q: |
+      A commit finds `log.lh.n = 4`. How many disk **writes** does [[commit]] issue in
+      total? (Count writes only, not reads.)
+    code: kernel/log.c:186-212
+    answer: 10
+    wrong:
+      8: |
+        You may have counted only the block copies (4 to the log, 4 home). The header is
+        written twice as well: once to commit, once to erase.
+      9: |
+        You may have counted only one header write. [[write_head]] runs at line 207 (commit)
+        and again at line 210 (erase).
+      5: |
+        You may have thought the blocks are written once, plus the header. Each block is
+        written twice: into the log by [[write_log]], then home by [[install_trans]].
+    why_wrong: Count the bwrite calls in write_log, write_head, install_trans and the second write_head.
+    explain: |
+      4 log blocks + 1 header + 4 home blocks + 1 header = 10, each one synchronous.
+      Without the log the same change would take 4 writes; the extra cost buys atomicity.
+      Absorption and group commit reduce `n` itself ([[tour:31]]).

@@ -1,0 +1,266 @@
+summary: |
+  The implementation of the [[g:spinlock]], the lock that every other piece of
+  synchronization in xv6 is built on. It has three jobs, and each one is a classic source of
+  bugs:
+
+  1. **Mutual exclusion.** Only one CPU at a time may hold a lock. [[acquire]] uses an
+     atomic swap instruction so that two CPUs can never both see the lock as free.
+  2. **Memory ordering.** Reads and writes of the protected data must stay inside the
+     [[g:critical-section]]; neither the compiler nor the hardware may move them before the
+     acquire or after the release. The `__atomic` built-ins add the needed
+     [[g:memory-barrier|barriers]].
+  3. **No interrupts while holding a lock.** If an interrupt handler on the same CPU tried
+     to take a lock the interrupted code holds, the CPU would [[g:deadlock]]. So a CPU keeps
+     interrupts off while it holds any spinlock, using the nesting counter in [[push_off]]
+     and [[pop_off]] ([[g:interrupts-and-locks]]).
+
+  The compiler output quoted below comes from `kernel/kernel.asm` of this build.
+
+  **Read before:** [[kernel/spinlock.h]]. **Read next:** [[kernel/sleeplock.c]], and
+  [[sched]] in [[kernel/proc.c]] for how a lock is carried across a [[g:context-switch]].
+
+blocks:
+  - lines: 1-9
+    title: Headers
+    note: |
+      [[kernel/spinlock.h]] defines the lock itself. [[kernel/proc.h]] is needed for
+      `struct cpu`, whose `noff` and `intena` fields [[push_off]] and [[pop_off]] use, and
+      [[kernel/riscv.h]] for the functions that read and change the interrupt-enable bit.
+
+  - lines: 11-17
+    title: "initlock(): make a lock, free"
+    note: |
+      Every spinlock is initialized once, before any CPU can use it: [[procinit]] for the
+      process-table locks, [[kinit]] for the free-page list, and so on. No atomics are needed
+      here, because at that point nobody else can see the lock yet.
+
+  - lines: 19-24
+    title: "acquire(): first, interrupts off"
+    note: |
+      The first thing [[acquire]] does is turn interrupts off on this CPU, through
+      [[push_off]], and it keeps them off until the matching [[release]].
+
+      The reason is the comment's "to avoid deadlock". Suppose a system call running on hart 0
+      holds `tickslock` in [[sys_pause]] and a timer interrupt arrives (hart 0 is the one
+      that counts ticks). The handler,
+      [[clockintr]], wants `tickslock` too. It would spin forever: the lock's holder is the
+      very code the interrupt paused, and it cannot continue until the handler returns. With
+      interrupts off, the interrupt stays pending and is taken right after the lock is
+      released. See [[g:interrupts-and-locks]], and [[concept:locks#invariant]] for why
+      this means an interrupt handler never interrupts a critical section on its own hart.
+
+      Interrupts must go off *before* the lock is taken: if they were turned off after the
+      swap, an interrupt could still arrive in between. They also have to be off for
+      [[holding]] and [[mycpu]] on the next lines to be reliable.
+
+  - lines: 25-26
+    title: Catch a CPU re-acquiring its own lock
+    note: |
+      If this CPU already holds `lk`, the loop below would spin forever waiting for itself.
+      [[holding]] detects that case and [[panic]]s with the message `acquire`, which is far
+      easier to debug than a frozen machine.
+
+  - lines: 28-38
+    title: Spin until the atomic swap finds the lock free
+    note: |
+      The heart of the lock. `__atomic_exchange_n(&lk->locked, 1, ...)` writes 1 into
+      `locked` and returns the value that was there before, as one indivisible operation
+      ([[g:atomic]]):
+
+      - old value 0: the lock was free, and this CPU's write of 1 has taken it. Exit the loop.
+      - old value 1: another CPU holds it. Writing 1 over 1 changed nothing; try again.
+
+      Why not `while (lk->locked) ; lk->locked = 1;`? Because two CPUs could both read 0
+      before either writes 1, and both would enter the critical section: a
+      [[g:race-condition]]. The swap makes "test" and "set" one step.
+
+      The source comment shows the code it expects, and the build matches it
+      (`kernel/kernel.asm`, slightly trimmed):
+
+      ```
+      li      a4,1
+      mv      a5,a4
+      amoswap.w.aq  a5,a5,(s1)    # a5 = old lk->locked; lk->locked = 1
+      sext.w  a5,a5
+      bnez    a5,<back to mv>
+      ```
+
+      [[g:insn:amoswap|amoswap.w]] is the RISC-V atomic swap; `s1` holds `lk`, whose first
+      field is `locked`. The `.aq` (acquire) bit, produced by `__ATOMIC_ACQUIRE`, is the
+      [[g:memory-barrier]] the comment describes: no load or store that comes after it in
+      this hart's program can be seen by other harts before the swap. The compiler is
+      likewise forbidden to move memory accesses above it. Without that, a read of protected
+      data could be satisfied before the lock was actually held.
+
+      Notice that *every* iteration is an atomic write, even while the lock is plainly held:
+      a plain swap loop, not the "test-and-test-and-set" loop that spins on ordinary loads
+      first. On real multi-core hardware that makes waiting harts fight over the lock's cache
+      line. See [[concept:locks#amoswap]].
+
+  - lines: 40-42
+    title: Record the owner
+    note: |
+      Once the lock is held, store which CPU holds it. Only [[holding]] reads this (and you,
+      in a debugger). It is written after the swap, so whenever `lk->cpu` names this CPU, this
+      CPU really does hold the lock. There is a short moment where `locked` is 1 and `cpu` is
+      still 0; [[holding]] then answers "not mine", which is the truth.
+
+  - lines: 44-49
+    title: "release(): check the caller is the holder"
+    note: |
+      Releasing a lock you do not hold is always a bug (it would let a second CPU into a
+      critical section someone else is in), so [[release]] [[panic]]s with `release`
+      instead.
+
+  - lines: 51
+    title: Forget the owner before freeing the lock
+    note: |
+      `lk->cpu` must be cleared *before* `locked` becomes 0. In the other order, another CPU
+      could take the lock and set `cpu` to itself in between, and this line would then
+      overwrite the new owner with 0, making [[holding]] wrong for that CPU.
+
+  - lines: 53-73
+    title: Free the lock with a release store
+    note: |
+      `__atomic_store_n(&lk->locked, 0, __ATOMIC_RELEASE)` frees the lock. The long
+      comment gives two reasons not to write `lk->locked = 0;`:
+
+      - **One store.** An atomic store is guaranteed to be indivisible (on RISC-V, one `sw`), so
+        no CPU can ever see a half-written value. (For an aligned 32-bit `uint`, GCC would in
+        practice also emit one store; the atomic makes it a guarantee.)
+      - **Ordering.** The release ordering puts a [[g:memory-barrier]] in front of the
+        store. The build matches the comment exactly:
+
+        ```
+        fence   rw,w
+        sw      zero,0(s1)
+        ```
+
+        [[g:insn:fence|fence rw,w]] means: every load (`r`) and store (`w`) before the
+        fence is ordered before every store after it. So all writes made inside the
+        critical section are visible to other harts before they can see `locked == 0`, and
+        all reads inside it have completed. Otherwise the next holder could read data this
+        CPU had not finished writing. See [[concept:locks#fence]].
+
+      The comment on lines 64–65 repeats "the" across the line break; it is only a typo.
+
+  - lines: 75-76
+    title: Interrupts back on, if they were on before
+    note: |
+      [[pop_off]] undoes the [[push_off]] from [[acquire]]. It only turns interrupts back on
+      if this was the outermost lock and interrupts were on when that lock was taken.
+
+  - lines: 78-86
+    title: "holding(): does this CPU hold the lock?"
+    note: |
+      True only if the lock is held *and* the holder recorded in `lk->cpu` is this CPU.
+      [[acquire]] and [[release]] use it for their sanity checks, and [[sched]] uses it to
+      insist that the caller holds `p->lock`.
+
+      Reading two fields without any atomics is safe here. If this CPU holds the lock, no
+      other CPU changes the value of either field (waiting CPUs do write 1 over 1), so both reads are stable. If it does not, `lk->cpu` is
+      0 or some other CPU, never this one, because this CPU always clears `cpu` before
+      giving a lock up (line 51).
+
+      "Interrupts must be off" because of [[mycpu]]: with interrupts on, a timer interrupt
+      could move this process to another CPU between reading `tp` and the comparison, and
+      the answer would be about the wrong CPU. All callers of [[holding]] in xv6 have
+      interrupts off.
+
+      Because `lk->cpu` names a hart rather than a process, a lock can be acquired by one
+      thread and released by another on the same hart. xv6 relies on this for `p->lock`,
+      which the [[scheduler]] acquires and the process releases after [[swtch]]
+      ([[concept:locks#handoff]]).
+
+  - lines: 88-90
+    title: Matched interrupt disabling
+    note: |
+      [[intr_off]] and [[intr_on]] are plain switches. Locks nest (for example
+      [[kexit]] holds `wait_lock` and then takes `p->lock`), and releasing the inner lock
+      must not turn interrupts back on while the outer one is still held. So these two
+      functions count: each CPU's `struct cpu` has `noff`, the number of unmatched
+      [[push_off]] calls, and `intena`, whether interrupts were on before the first one. See
+      [[g:interrupts-and-locks]] and [[concept:locks#noff]]. Besides [[acquire]] and
+      [[release]], [[myproc]] and [[uartputc_sync]] call the pair directly.
+
+  - lines: 92-103
+    title: "push_off(): interrupts off, remember if they were on"
+    note: |
+      [[rc_sstatus]] reads [[g:csr:sstatus|sstatus]] and clears its `SIE` bit (bit 1,
+      the global supervisor interrupt enable) in one instruction; the build has
+      `csrrci a5,sstatus,2` ([[g:insn:csrrc|csrrci]]). `flags` receives the value *before*
+      the clear, so `old` is 1 if interrupts were on and 0 if they were already off. (`!!x`
+      turns any non-zero value into 1.)
+
+      Only the outermost `push_off` (when `noff` is 0) records `old` in `intena`. Inner
+      calls find interrupts already off, and recording that would lose the fact that they
+      were on originally. Then the depth goes up by one.
+
+      The comment on lines 95–96 gives the other reason interrupts must be off first:
+      [[mycpu]] is only meaningful if the process cannot be moved to another CPU while it
+      uses the result. [[concept:locks#trace]] follows `SIE`, `noff` and `intena` through a
+      three-level nesting step by step.
+
+  - lines: 105-116
+    title: "pop_off(): undo one push_off"
+    note: |
+      Two sanity checks, then the decrement:
+
+      - Interrupts must still be off. If they are on, someone enabled them inside a
+        critical section, which defeats the whole scheme, so xv6 panics with
+        `pop_off - interruptible`.
+      - `noff` must be at least 1; otherwise there are more pops than pushes.
+
+      Interrupts come back on only when the count reaches 0 *and* `intena` says they were on
+      before the outermost [[push_off]]. Code that runs with interrupts already off (an
+      interrupt handler, or the [[scheduler]]) takes and releases locks without
+      accidentally enabling them.
+
+      `intena` belongs to the kernel thread, not the hart: while a process is switched out,
+      other threads overwrite it. [[sched]] therefore saves it across [[swtch]] and restores
+      it, and the [[scheduler]] sets it to 0 after each switch back
+      ([[concept:locks#sched-intena]]).
+
+lines:
+  14: |
+    The debugging name; usually a string literal such as `"proc"`.
+  15: |
+    Start out free.
+  16: |
+    No owner.
+  24: |
+    Interrupts off on this CPU, with nesting; see the block note.
+  37: |
+    Atomically set `locked` to 1 and test the old value; loop until it was 0. Compiles to
+    an `amoswap.w.aq` loop.
+  38: |
+    The empty loop body: keep swapping until the lock is ours.
+  41: |
+    Remember that this CPU holds the lock, for [[holding]].
+  73: |
+    Store 0 into `locked` after a `fence rw,w`: from this moment another CPU's
+    [[acquire]] can succeed.
+  84: |
+    Held, and held by this CPU. The `&&` evaluates left to right and stops early, so
+    [[mycpu]] is only called if the lock is held at all.
+  97: |
+    Read `sstatus` and clear `SIE` in one `csrrci`; `flags` is the old value.
+  98: |
+    `old` = 1 if interrupts were enabled before this call, else 0.
+  100: |
+    Outermost push_off on this CPU?
+  101: |
+    Then remember the original interrupt state.
+  102: |
+    One more level of nesting.
+  108: |
+    Safe to call [[mycpu]] once here: interrupts are off (the caller did a [[push_off]]).
+  109: |
+    [[intr_get]] reads the `SIE` bit of [[g:csr:sstatus|sstatus]].
+  113: |
+    One level less.
+  114: |
+    Outermost level gone, and interrupts were on before it: turn them back on.
+  115: |
+    [[intr_on]] sets `SIE` (`csrsi sstatus,2`). If an interrupt arrived while the lock
+    was held, it is taken right here.

@@ -1,0 +1,140 @@
+summary: |
+  `logstress` keeps the file system's [[g:write-ahead-log]] busy. For every file name on
+  its command line it starts one child process, and all children append 2000-byte chunks
+  to their own files at the same time. Each chunk is one file-system operation (one
+  [[kernel:begin_op]] … [[kernel:end_op]]); overlapping operations are committed together
+  as one [[g:transaction]], so the log is always busy with several at once.
+
+  Its main use is the crash test in [[test-xv6.py]] ([[test-xv6.py:131]]), added with this
+  program in commit `fe989da` ("Checkpoint WIP: a crash test", August 2025): run
+  `logstress f0 f1 f2 f3 f4 f5`, kill QEMU after two seconds, boot again, and check that
+  the kernel printed `recovering tail …` lines, meaning that [[kernel:initlog]] found a
+  committed transaction in the log and replayed it ([[kernel/log.c:74]]). Whether the
+  kill lands in a commit depends on timing, so the script retries up to 20 times; when it
+  does, the next boot replays about a dozen blocks.
+
+  **Two bugs**, both checked at this commit:
+
+  - `buf` holds 500 bytes, but the program fills and writes 2000 (see line 31).
+  - Each child tries to write 250 × 2000 = 500,000 bytes, but the largest xv6 file is
+    [[MAXFILE]] × [[BSIZE]] = 268 × 1024 = 274,432 bytes. Run to completion, every child
+    fails (line 33). The crash test never runs long enough to notice.
+
+  **Read before:** [[kernel/log.c]] and [[kernel:filewrite]]. **Read next:**
+  [[test-xv6.py]].
+
+blocks:
+  - lines: 1-11
+    title: Headers, purpose and the data buffer
+    note: |
+      The comment states the purpose: several processes, each writing to its own file, so
+      their file-system operations overlap in the log. `buf` is a global, so it lives in the
+      program's [[g:bss]] and starts out as zeros. `BUFSZ` (500) is the size that the
+      constant `SZ` below should have matched; it no longer does.
+
+  - lines: 13-17
+    title: "main(): sizes of the test"
+    note: |
+      Each child does `N` = 250 writes of `SZ` = 2000 bytes. Using an `enum` is a common
+      C way to declare integer constants with a scope, without the preprocessor.
+
+      Commit `52efd73` (August 2025, the commit that added [[user/forphan.c]] and
+      [[user/dorphan.c]]) changed these from `N = 1000, SZ = 500` to the current values
+      but did not change `BUFSZ`. That edit created the overflow described at line 31.
+      The total per file was 500,000 bytes before and after, already more than a file can
+      hold.
+
+      2000 bytes is chosen to fit in one operation: [[kernel:filewrite]] splits a write
+      into pieces of at most `((MAXOPBLOCKS-1-1-2)/2) * BSIZE` = 3 × 1024 = 3072 bytes
+      ([[kernel/file.c:153]]), so each 2000-byte `write` is exactly one
+      [[kernel:begin_op]] … [[kernel:end_op]] pair.
+
+  - lines: 19-24
+    title: One child per file name
+    note: |
+      The parent loops over the arguments (`argv[1]` onward) and forks once for each. A
+      failed `fork` ends the whole program with [[g:exit-status]] 1.
+
+  - lines: 25-40
+    title: "Child: append 250 chunks to its own file"
+    note: |
+      Each child creates (or opens) its file, fills the buffer with one digit (`'1'` for
+      the first argument, `'2'` for the second, and so on) and writes it 250 times. Each
+      `write` runs [[kernel:sys_write]] → [[kernel:filewrite]]: [[kernel:begin_op]],
+      [[kernel:writei]] (which allocates new blocks with [[kernel:balloc]] and records
+      each changed block with [[kernel:log_write]]), then [[kernel:end_op]]. A chunk
+      changes two or three data blocks, the file's inode block, always the
+      [[g:free-bitmap]] block (each 2000-byte append needs at least one new block), and, once the file passes 12 blocks, its
+      [[g:indirect-block]].
+
+      With several children, this is what stresses the log ([[kernel/log.c]]):
+
+      - [[kernel:begin_op]] admits a new operation only if the log has room for it in the
+        worst case: `log.lh.n + (outstanding+1) * MAXOPBLOCKS <= LOGBLOCKS`. With an empty
+        log that is 3 operations at once (3 × 10 = 30 blocks); the rest sleep.
+      - The operations that are admitted share one transaction. The last one to call
+        [[kernel:end_op]] runs [[kernel:commit]] for all of them (group commit), while new
+        callers wait because `log.committing` is set.
+      - Blocks that several operations change (the bitmap block, an inode block holding
+        several of the new files' inodes) are logged once ("absorption" in
+        [[kernel:log_write]]).
+
+      Failure would look like a kernel [[kernel:panic]] such as `too big a transaction`
+      or `log_write outside of trans`, a hang (a process asleep in `begin_op` that is
+      never woken), or, after a crash, a file system that recovery leaves inconsistent.
+      Inside the child, `i` is reused as the write counter; that is harmless because the
+      child exits at the end of this block and never returns to the outer loop.
+
+  - lines: 41-48
+    title: "Parent: wait for every child"
+    note: |
+      The parent waits once per child and stops at the first non-zero status, exiting
+      with that status. The remaining children carry on; when the parent exits, they are
+      handed to `init` ([[kernel:reparent]]), which reaps them. If every child succeeds,
+      `main` returns 0, which [[user:start]] passes to `exit`.
+
+      Because of the bug at line 33, a complete run always ends with the parent exiting
+      with status 1.
+
+lines:
+  9: |
+    The intended buffer size. It no longer matches `SZ` (2000) below.
+  11: |
+    The 500-byte buffer, in the bss segment.
+  17: |
+    250 writes of 2000 bytes per child: 500,000 bytes per file, more than the 274,432
+    bytes an xv6 file can hold.
+  20: |
+    One child per file name.
+  26: |
+    Create the file (or open an existing one, without truncating it) for reading and
+    writing.
+  31: |
+    Fills 2000 bytes starting at `buf`, which has room for 500: a buffer overflow. It does
+    not crash, by luck of the memory layout. In the build at this commit
+    (`user/logstress.sym`) `buf` is at `0x1010` and ends at `0x1204`; the next variable
+    is `base` at `0x1208`, the 16-byte list head of the user [[user:malloc]]
+    ([[user/umalloc.c]]), and after it the bss ends at `0x1218`. The memset runs on to
+    `0x17e0`, overwriting `base` and then unused bytes. They are still mapped, because
+    [[kernel:kexec]] allocates whole 4096-byte pages and the page `0x1000`–`0x1fff` is
+    entirely the program's; the [[g:guard-page]] starts at `0x2000`. The child never
+    calls `malloc`, so the damaged `base` is never used. A larger overflow, or a
+    different layout, would corrupt real data or fault.
+  32: |
+    `i` is reused as the write counter, which is safe only because this child exits
+    without returning to the outer loop.
+  33: |
+    Write one 2000-byte chunk (also reading 1500 bytes past the end of `buf`; they hold
+    the same digit, set by line 31). Any short count is a failure.
+
+    This check does fire on a full run. The 137th write ends at byte 274,000; the 138th
+    would end at 276,000, past the 274,432-byte limit, so [[kernel:writei]] refuses it
+    ([[kernel/fs.c:551]]) and `write` returns -1: the child prints `write failed -1`
+    and exits with status 1. With four or more files the disk runs out first: the image
+    has only 1953 data blocks, many already used by the programs on it, so
+    [[kernel:balloc]] prints `balloc: out of blocks` and those writes also return -1.
+    Both happen in QEMU at this commit.
+  43: |
+    Collect one child's exit status.
+  45: |
+    Report the first failure as this program's own exit status.

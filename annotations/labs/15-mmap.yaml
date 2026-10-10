@@ -1,0 +1,1950 @@
+published: true
+title: mmap and munmap of files
+area: Memory
+stars: 5
+branch: ext/15-mmap
+prerequisites: {tours: [20, 21, 22, 25, 26, 28, 31, 33, 36, 39], concepts: [stacks, locks]}
+summary: |
+  In this tree a process reaches a file's bytes only through `read` and `write`: the kernel
+  copies them between the [[g:buffer-cache]] and a buffer the program owns. In this lab you
+  add `mmap`, which puts part of a file *into the address space*: the program reads the file
+  by loading from memory and changes it by storing to memory. `munmap` takes the mapping
+  away again. Pages are read from the file only when they are first touched, and a shared
+  mapping's changes go back to the file when it is unmapped.
+
+  The system call is two lines in a man page; the kernel work touches almost every part of
+  this tree. Where in the address space does a mapping go, when a heap already grows into
+  the same empty space? How does a [[g:page-fault]] know which file and which bytes a
+  missing page stands for? Which pages were changed, and who noticed: the hardware, the
+  kernel, or neither? Writing a page back to a file is a file-system operation: what does
+  that require, and how much may one page cost? What do [[kfork]], [[kexit]] and [[kexec]],
+  which knew nothing about mappings, now get wrong? And the fault handler now reads a file:
+  what happens when the fault comes from inside a system call that already holds locks,
+  perhaps the lock of the very file being mapped? The think section asks these questions in
+  the order a designer meets them.
+
+  The reference solution is ten small commits. With it, touching 1 page of a 3-page mapping
+  costs exactly 1 page of memory, and unmapping a 64-page mapping in which one page was
+  changed writes one page back, not 64.
+learn:
+  - "What a kernel must remember about a mapping so that a page fault, possibly much later, can build the missing page byte for byte, and why that record has to hold a counted reference to an open file."
+  - "How to fit a new region into an address space that already has a growing heap, and why the functions that copy and free address spaces in this tree do not see it."
+  - "How a RISC-V PTE records that a page has been written, who sets that bit, and which writes into user memory do not set it."
+  - "What it takes to write memory back into a file: which locks, which transaction, how many log blocks, and which bytes must never be written."
+  - "How fork, exit and exec each have to learn about a new kind of per-process state, and what each one does wrong when it does not."
+  - "Which kernel paths can reach a fault handler that sleeps and takes an inode's sleep-lock, and three different ways it fails when the path already holds a lock."
+spec: |
+  **Behaviour.** Two new system calls, in `user/user.h`:
+
+  ```c
+  void *mmap(void *addr, uint64 len, int prot, int flags, int fd, uint64 off);
+  int munmap(void *addr, uint64 len);
+  ```
+
+  - `addr` must be 0: the kernel chooses where the mapping goes and returns its address, or
+    `MAP_FAILED` (`(void *)-1`). `len` is rounded up to whole pages; `off` must be a
+    multiple of the page size.
+  - `prot` is `PROT_READ` or `PROT_READ | PROT_WRITE`. `flags` is `MAP_SHARED` (stores go
+    to the file) or `MAP_PRIVATE` (stores stay in this process). The constants live in
+    `kernel/fcntl.h`.
+  - `fd` must be a file or a directory opened for reading (not a pipe, not a device): the
+    reference accepts anything backed by an inode, and a directory's raw entries can be
+    mapped read-only or private. A shared writable mapping of a file opened read-only must
+    fail (and `open` never gives a writable descriptor for a directory).
+  - The mapping stays valid after `close(fd)`, and keeps an unlinked file readable.
+  - A page is read from the file when it is first touched, by the program or by the kernel on
+    its behalf. Bytes past the end of the file read as 0; no page is allocated by `mmap`.
+  - A store to a `PROT_READ` mapping kills the process, as a store to program text does.
+  - `munmap(addr, len)` removes a whole mapping, or a part of it that starts at its start or
+    ends at its end (unmapping a hole in the middle fails). Changed pages of a shared mapping
+    are written back to the file. Pages of a private mapping never are. A mapping never
+    makes its file longer.
+  - `exit` and `exec` unmap everything, writing back as `munmap` does. A child created by
+    `fork` has its parent's mappings.
+  - Each process may have up to 16 mappings (`NVMA`).
+
+  **What must not change.**
+
+  - The heap still grows with `sbrk` (eager and lazy), and never into a mapping.
+  - System calls must work with their user buffers inside a mapping, including a mapping of
+    the very file being read or written (the test uses pipes, files and `wait`).
+  - No leak of memory, files or inodes; no kernel panic or hang.
+  - **`usertests -q` must print `ALL TESTS PASSED` on 3 harts.**
+
+  **The test program**, `mmaptest`, prints one line per check (`mmaptest NAME` runs one):
+
+  ```text
+  $ mmaptest
+  mmaptest: read: touching 1 of 3 mapped pages took 1 free pages
+  usertrap(): unexpected scause 0xd pid=4
+              sepc=0x1e stval=0x3fffffb000
+  mmaptest: read: OK
+  mmaptest: shared: OK
+  usertrap(): unexpected scause 0xf pid=5
+              sepc=0xa stval=0x3fffffc000
+  mmaptest: private: OK
+  usertrap(): unexpected scause 0xd pid=6
+              sepc=0x1e stval=0x3fffffa000
+  usertrap(): unexpected scause 0xd pid=7
+              sepc=0x1e stval=0x3fffffd000
+  mmaptest: partial: OK
+  mmaptest: fork: OK
+  mmaptest: exit: OK
+  mmaptest: many: OK
+  mmaptest: locked: OK
+  mmaptest: self: OK
+  mmaptest: stress: OK
+  mmaptest: ALL OK
+  ```
+
+  The `usertrap()` lines are expected: each is a child the test starts on purpose to touch
+  an address it must not touch, and the test checks that the child was killed.
+
+  - **read**: a 2.5-page file mapped read-only and private, then closed; touching one page
+    must cost exactly one free page; every byte must match the file, and the bytes past its
+    end must be 0. After `munmap`, a child that loads from the address must be killed.
+  - **shared**: stores through a shared writable mapping must be in the file after
+    `munmap`, except one made past the end of the file (in its last page), which must not
+    reach it; the file's size must not change; the page never touched must be unchanged.
+  - **private**: a shared writable mapping of a read-only file must fail; a private one must
+    work and never reach the file; a store to a read-only mapping must kill the process;
+    `read` into a read-only mapping must fail; a pipe must not be mappable.
+  - **partial**: a hole in the middle must be refused; the first and the last page unmapped
+    on their own; the rest keeps its contents; everything written reaches the file.
+  - **fork**: a child stores into a page its parent never touched and exits without
+    `munmap`; the parent then sees the store through its own mapping.
+  - **exit**: a child's stores reach the file when it exits, and when it calls `exec`.
+  - **many**: 16 mappings work and a 17th fails; 300 rounds of open, map, close, unmap leave
+    the number of free pages unchanged and never run out of files; a mapping keeps an
+    unlinked file readable.
+  - **locked**: `write` to a pipe from an unloaded mapped page, `read` from the pipe into
+    another, `wait(&status)` into a third; what the kernel wrote must reach the file.
+  - **self**: `read` of a file into an unloaded page of a mapping of the same file, and
+    `write` to the file from another one.
+  - **stress**: three processes, 30 rounds each, map one 12-page file shared, check that
+    every page is uniform, fill their own 4 pages, unmap; the file must end with each
+    process's last values, and no page may leak.
+think:
+  - title: What does mmap have to remember?
+    q: |
+      `mmap` maps no page. The first touch of a page might come seconds later, from user code
+      or from inside a system call. At that moment the kernel must build the page exactly:
+      which file, which bytes of it, which PTE bits. What does `mmap` have to record, and
+      where? The program may `close(fd)` right after `mmap`, or even `unlink` the file. What
+      keeps the file usable, and what kind of reference is the right one to keep?
+    hints:
+      - "Look at what [[sys_read]] needs to read a file: an entry in `p->ofile[]`, a `struct file` ([[kernel/file.h:1]]) with its own reference count, and the inode it points to. Then look at what [[sys_close]] does to them, and at [[iput]] ([[kernel/fs.c:350]])."
+      - "A pointer is only safe while you hold a counted reference to what it points to. The file descriptor number is not a reference at all: after `close` the slot can hold another file. And the open mode (read-only, read-write) lives in the `struct file`, not in the inode."
+      - "A small fixed table in `struct proc`, one entry per mapping: where it starts, how long it is, its protection and sharing mode, the offset in the file, and a counted reference to the open file, taken the way `dup` takes one."
+    answer: |
+      For each mapping the kernel needs: the first address and the length (to find the
+      mapping that contains a faulting address), the protection (`PTE_W` or not), the sharing
+      mode (whether changes go back), the offset in the file of the first byte, and the file.
+      The reference keeps these in `struct vma` (for "virtual memory area", the name Linux
+      uses), an array `p->vma[NVMA]` in `struct proc` with `NVMA` 16. A slot with `len` 0 is
+      free.
+
+      The file must be a counted reference, and the right one is a reference to the open file,
+      `struct file`, taken with [[filedup]]: the same thing `dup(fd)` does. It keeps the file
+      descriptor's `struct file` alive after `close(fd)`, and through it the inode after
+      `unlink` (the `struct file` holds the inode's reference until [[fileclose]] drops it).
+      Keeping the `struct file` rather than only the inode also keeps the open mode, which
+      `mmap` checks: a shared writable mapping needs `f->writable`, and every mapping needs
+      `f->readable`, because its pages are read from the file.
+
+      Keeping the descriptor number instead would be wrong in two ways: `close(fd)` would
+      leave the mapping with nothing, and a later `open` reusing that number would make the
+      mapping read *another* file.
+
+      The table needs no lock, for the same reason as `p->ofile`: only the process itself
+      changes it (in its own `mmap`, `munmap`, `exec` and `exit`), and [[kfork]] reads the
+      parent's while the parent is busy in `fork`. xv6 processes have one thread.
+    checks:
+      - id: lab15-01
+        level: 1
+        type: multi
+        q: |
+          A page of a mapping is first touched long after `mmap` returned. Which of these must
+          `mmap` have recorded so that the fault can build the page?
+        options:
+          - text: "the first address and the length of the mapping"
+            correct: true
+            why: "The fault has an address; the kernel must find which mapping, if any, contains it."
+          - text: "the offset in the file where the mapping starts"
+            correct: true
+            why: "The page at `start + k * 4096` holds the file's bytes from `off + k * 4096`."
+          - text: "the protection and the sharing mode"
+            correct: true
+            why: "Protection gives the PTE bits and decides whether a store is allowed; the mode decides whether changes go back to the file."
+          - text: "a counted reference to the open file"
+            correct: true
+            why: "Without a reference the file could be closed and its `struct file` reused for another file before the fault."
+          - text: "the file descriptor number"
+            why: |
+              You may have thought the descriptor names the file. It names a slot in
+              `p->ofile[]`; after `close(fd)` the slot is empty or holds another file.
+          - text: "the physical address of each page"
+            why: |
+              You may have thought `mmap` allocates the pages. It allocates none; the page
+              table records the physical page once a fault has loaded it.
+        explain: |
+          These five values are `struct vma` in the reference. The file reference is a
+          `struct file *` taken with [[filedup]], like `dup`; see [[g:open-file]] and
+          [[g:reference-count]].
+      - id: lab15-02
+        level: 2
+        type: tf
+        q: |
+          True or false: a program that calls `close(fd)` right after `mmap(..., fd, 0)` can
+          no longer use the mapping.
+        answer: false
+        why_tf: |
+          You may have thought the mapping uses the descriptor. It holds its own reference to
+          the `struct file`, so `close` only drops the descriptor's reference.
+        reasons:
+          - text: "The mapping took its own counted reference to the open file, so the file stays open until the mapping goes."
+            correct: true
+            why: "Right. `mmaptest read` closes the descriptor before touching any page, and every byte is still there."
+          - text: "close() is refused while a mapping uses the file."
+            why: |
+              Nothing in this kernel looks for mappings in [[sys_close]]; it never fails for an
+              open descriptor.
+          - text: "The pages were read at mmap time, so the file is no longer needed."
+            why: |
+              No page is read at `mmap` time. Every page the program has not touched is still
+              only in the file.
+        explain: |
+          `close(fd)` removes one reference: the descriptor's. [[fileclose]] frees the
+          `struct file` (and drops the inode) only when the count reaches 0, which for a
+          mapped file is when the last mapping of it goes.
+  - title: Where does a mapping go?
+    q: |
+      Look at a user address space in this tree ([[kernel/memlayout.h:54]]): program text and
+      data at 0, the guard page and the stack, then the heap growing up with `sbrk` toward
+      `TRAPFRAME`. Where will you put a mapping? What stops the heap from growing into it
+      later, eagerly or lazily, and what stops a mapping from landing on the heap? And which
+      functions that walk or copy an address space will see mapped pages, and which will not?
+    hints:
+      - "Read [[growproc]] ([[kernel/proc.c:243]]) and [[sys_sbrk]]'s lazy branch ([[kernel/sysproc.c:60]]): what limit do they check? Then read [[uvmcopy]], [[uvmfree]] and [[vmfault]]: which range of addresses does each consider?"
+      - "Both regions want to grow: the heap upward from `p->sz`, mappings wherever there is room. Whatever you choose, the heap's limit must move with the mappings, and a mapping must never start below `p->sz`. Almost everything in this tree that walks or checks an address space works on `[0, p->sz)`."
+      - "Put mappings at the top, just below `TRAPFRAME`, each new one below those already there (or in a gap that fits). The heap's limit becomes the lowest mapping instead of `TRAPFRAME`."
+    answer: |
+      The reference puts mappings at the top of the address space and grows them downward:
+      `vmaplace` looks for the highest free range below `TRAPFRAME` that is long enough,
+      skipping down past any mapping in the way, and refuses to go below `PGROUNDUP(p->sz)`.
+      The first 3-page mapping in `mmaptest` lands at `0x3fffffb000`: `TRAPFRAME`
+      (`0x3fffffe000`) minus 3 pages. The heap and the mappings grow toward each other from the
+      two ends of 256 GiB of address space.
+
+      The heap had one limit, `TRAPFRAME`, in [[growproc]] and in [[sys_sbrk]]'s lazy branch.
+      Both now use `vmabottom(p)`, the lowest mapped address (or `TRAPFRAME` with no
+      mappings). Without that, an eager `sbrk` that starts just below a mapping (after lazy
+      growth brought the heap there: one `sbrk` takes an `int`, far less than the 256 GiB gap)
+      would call [[mappages]] on a loaded page and panic with `mappages: remap`, and lazy
+      growth itself would stretch `p->sz` over
+      the mapping, so that code walking `[0, sz)` ([[uvmcopy]] in `fork`, [[uvmdealloc]] when
+      the heap shrinks) would copy or free the mapping's pages as if they were heap.
+
+      Keeping mappings above `p->sz` has a consequence the rest of the lab depends on.
+      [[uvmcopy]] copies `[0, sz)`, [[uvmfree]] frees `[0, sz)`, and [[vmfault]] refuses any
+      address at or above `psz` ([[kernel/vm.c:463]]). None of them sees a mapped page. That
+      is convenient for the fault path (it can ask "is this in a mapping?" before the `psz`
+      test), and a trap for `exit`, `exec` and `fork`, which question 5 returns to. One more
+      function bounds by `p->sz`: [[fetchaddr]] ([[kernel/syscall.c:15]]), so `exec` with its
+      `argv` pointer array inside a mapping fails (a run printed `exec failed`), while
+      path strings inside a mapping work, since [[fetchstr]] goes through [[copyinstr]].
+
+      (An alternative is a fixed region, say from 128 GiB up. It works as well; it only moves
+      the fence. Linux places mappings top-down below the stack, much as this design does.)
+    checks:
+      - id: lab15-03
+        level: 2
+        type: number
+        q: |
+          `mmaptest read` maps 3 pages when the process has no other mapping. `TRAPFRAME` is
+          `0x3fffffe000` in this tree. At what address does the reference place the mapping?
+        answer: "0x3fffffb000"
+        wrong:
+          "0x3fffffe000": |
+            That is `TRAPFRAME` itself, the trapframe's page. The mapping must *end* at
+            `TRAPFRAME`, so it starts 3 pages below it.
+          "0x3fffffd000": |
+            You may have subtracted one page. The mapping is 3 pages long, so it starts
+            `0x3000` below `TRAPFRAME`.
+          "0x7000": |
+            That is `p->sz` in this run, where the heap ends. Placing the mapping there would
+            leave the heap no room to grow; the reference starts at the top.
+        why_wrong: "The mapping occupies [start, start + 3 pages) and its end is TRAPFRAME."
+        explain: |
+          `0x3fffffe000 - 0x3000 = 0x3fffffb000`. The child killed in `mmaptest read` faulted
+          at exactly `stval=0x3fffffb000`: it touched the first page after `munmap`.
+      - id: lab15-04
+        level: 2
+        type: choice
+        q: |
+          A kernel has the mapping table and `mmap`, but [[growproc]] and [[sys_sbrk]] still
+          check against `TRAPFRAME`. A process maps a file and touches the mapping's first
+          page, grows its heap *lazily* (`sbrklazy`, many calls) to one page below the mapping,
+          then calls the eager `sbrk(8192)`. What happens?
+        options:
+          - text: "panic: mappages: remap"
+            correct: true
+            why: |
+              [[uvmalloc]] maps a fresh page at every address up to the new size, and
+              [[mappages]] panics when it finds the loaded page's valid PTE.
+          - text: "sbrk returns -1"
+            why: |
+              That is what the reference does. Here nothing compares the new size with the
+              mapping.
+          - text: "The mapped page is silently replaced by a zero page"
+            why: |
+              [[mappages]] does not overwrite a valid PTE; it panics. (A *lazy* `sbrk` would
+              touch no page at all: it only raises `p->sz`, and the damage comes later, from
+              code that walks `[0, sz)`.)
+          - text: "Nothing: the heap and the mapping share the page"
+            why: |
+              One virtual address has one PTE. Two owners for one address is exactly what the
+              limit prevents.
+        explain: |
+          The limit is a fence between two regions that grow toward each other. A build of the
+          branch with the old `TRAPFRAME` limit ran exactly this: the heap
+          went from `0x7000` to `0x3fffffc000` by lazy steps, and the eager `sbrk` of two pages
+          printed `panic: mappages: remap` ([[kernel/vm.c:167]]). A single eager `sbrk` from
+          a small heap cannot get there: its argument is an `int`, and memory runs out long
+          before 256 GiB.
+  - title: What happens on the first touch?
+    q: |
+      A program loads from a page of a mapping that has not been touched. What does the hart
+      report, which code in this tree sees it first, and what must change there so that the
+      page comes from the file and the lazy heap keeps working? What must the new page
+      contain, byte by byte, when the mapping extends past the end of the file? Which PTE bits
+      does it get? And what must happen to a *store* to a read-only mapping, or to a page that
+      is already loaded?
+    hints:
+      - "Follow `scause` 13 and 15 through [[usertrap]] ([[kernel/trap.c:71]]) into [[vmfault]] ([[kernel/vm.c:458]]). Note its first test, its `read` argument, and who else calls it: [[copyout]], [[copyin]] and [[copyinstr]] ([[kernel/vm.c:357]])."
+      - "A mapped address is above `p->sz`, so the existing first test rejects it. [[kalloc]] fills a page with junk ([[kernel/kalloc.c:80]]); [[readi]] returns fewer bytes than asked at the end of the file, and nothing at all past it. A RISC-V PTE with `W` but without `R` is reserved."
+      - "Give mapped addresses their own path in the fault handler, taken before anything that would reject them. On that path, decide which faults to refuse, and build the page so that every byte the file does not supply is defined."
+    answer: |
+      A load from an unmapped page raises a load page fault (`scause` 13), a store a store page
+      fault (15); [[usertrap]] sends both to [[vmfault]], with `read` 1 for a load. The kernel's
+      own copies reach [[vmfault]] the same way, from [[copyout]] (`read` 0) and [[copyin]]
+      (`read` 1). So [[vmfault]] is the single place to teach, and the reference adds one test
+      at its top: if the page table is the process's own and `vmalookup` finds a mapping that
+      contains the address, the fault belongs to `mmapfault`. The existing `va >= psz` test
+      would have rejected it, since mappings lie above `p->sz`. Everything below that line is
+      the lazy heap, unchanged.
+
+      `mmapfault` then:
+
+      - refuses a store (`read` 0) to a mapping without `PROT_WRITE`: [[vmfault]] returns 0
+        and [[usertrap]] kills the process (`mmaptest private`: `scause 0xf`);
+      - refuses a page that is already mapped: a fault on a mapped page is about permissions,
+        and mapping it again would panic in [[mappages]];
+      - allocates a page and **zeroes it**, then, with the inode locked, reads
+        `min(4096, size - off)` bytes from file offset `off = v->off + (va - v->start)`, if
+        `off` is inside the file. The rest of the page stays zero: the tail of a last page
+        that the file only partly fills, and whole pages past the end of the file;
+      - maps it with `PTE_R | PTE_U`, plus `PTE_W` for a writable mapping. (`PROT_WRITE` alone
+        is refused by `mmap`, because a PTE with `W` and no `R` is reserved in RISC-V.)
+
+      gdb read the PTE of a page of a writable shared mapping when it was unmapped:
+      `0x21fc94d7`, flags `0xd7` = `V|R|W|U|A|D`. `A` and `D` were set by the hart when the
+      program used the page; the next question is about `D`.
+
+      The page is read with the inode's [[g:sleeplock]] held and may wait for the disk: in the
+      three-process stress run gdb stopped in [[virtio_disk_rw]]'s wait below `mmapfault` on
+      all three harts (50 times before the recorder stopped counting). A fault from user code holds no lock, so that is legal; question 6 is about
+      the faults that do not come from user code.
+    checks:
+      - id: lab15-05
+        level: 2
+        type: choice
+        q: |
+          `mmaptest private` maps a file `PROT_READ`, `MAP_SHARED`, and a child stores one
+          byte into it. The page is not loaded yet. What happens, on the reference branch?
+        options:
+          - text: "usertrap() prints scause 0xf and the child is killed"
+            correct: true
+            why: |
+              The store faults with 15; `mmapfault` refuses a store to a read-only mapping,
+              [[vmfault]] returns 0, and [[usertrap]] kills the child.
+          - text: "The page is loaded, and the store faults again: scause 0xf, killed"
+            why: |
+              You may have thought the page is loaded first and the permission checked by the
+              hardware afterwards. That would also end in a kill, but the reference refuses
+              before allocating anything: the first test in `mmapfault` looks at `read`.
+          - text: "The store succeeds but never reaches the file"
+            why: |
+              That is `MAP_PRIVATE` with `PROT_WRITE`. Without `PROT_WRITE` there is no way to
+              store into the mapping at all.
+          - text: "scause 0xd, because the page is not loaded"
+            why: |
+              You may have thought a missing page always reports a load fault. The cause
+              depends on the access, not on the page: a store reports 15.
+        explain: |
+          The recorded run: `usertrap(): unexpected scause 0xf pid=5`, `sepc=0xa
+          stval=0x3fffffc000`. The test then checks that the child's exit status is -1.
+      - id: lab15-06
+        level: 2
+        type: number
+        q: |
+          A file is 2 pages and 1000 bytes long (9192 bytes) and is mapped with `len` 3 pages
+          at offset 0. When page 2 of the mapping is loaded, how many bytes does `mmapfault`
+          read from the file?
+        answer: 1000
+        wrong:
+          4096: |
+            You may have thought a page is always read whole. [[readi]] would return only
+            1000 bytes anyway, and treating that short read as an error would kill the
+            program for a legal access.
+          0: |
+            You may have thought the last, partial page is not part of the file. Its first
+            1000 bytes are; only the rest must be zero.
+          3096: |
+            That is the number of bytes that stay zero (4096 - 1000), not the number read.
+        why_wrong: "The page starts at file offset 8192; the file has 9192 - 8192 bytes from there."
+        explain: |
+          `n = min(4096, size - off)` with `off` = `0x2000`. The remaining 3096 bytes of the page
+          are zero because the page was zeroed *before* the read. `mmaptest read` checks every
+          one of the 12288 bytes.
+  - title: Which pages go back to the file, and how?
+    q: |
+      When a shared writable mapping is unmapped, its changes must reach the file. Which pages
+      must be written: all loaded ones, or only some? How does the kernel know which? Remember
+      that the kernel itself also writes into user pages (a `read` into a mapped buffer). How do
+      you write one page into a file safely: which locks, which transaction, how many log blocks?
+      And which bytes of the page must never be written?
+    hints:
+      - "Read the PTE format in the RISC-V privileged specification: bits 6 and 7, `A` and `D`. Then look at how [[copyout]] writes ([[kernel/vm.c:370]]): through which address? Then [[writei]] ([[kernel/fs.c:544]]) and [[log_write]] ([[kernel/log.c:231]])."
+      - "The hart sets `D` in the PTE it used for a store. A write through the kernel's [[g:direct-map]] uses the kernel's PTE, not the user's. Every [[writei]] must be inside [[begin_op]]/[[end_op]], and a transaction may log at most `MAXOPBLOCKS` blocks ([[kernel/param.h:9]]). [[writei]] past the end of the file makes the file longer."
+      - "Decide page by page from something the PTE records; remember the kernel's own writes; size one transaction for one page, and decide which bytes of it belong to the file."
+    answer: |
+      **Which pages: the dirty ones.** A RISC-V PTE has an `A` (accessed, bit 6) and a `D`
+      (dirty, bit 7) bit. On QEMU the hart sets them itself in the PTE it used: `A` on any
+      access, `D` on a store. (The specification also allows hardware that instead raises a
+      page fault and leaves the update to the kernel; this tree, whose [[mappages]] never sets
+      `A` or `D`, already relies on the first kind.) So at unmap time the reference walks the
+      range and writes back each loaded page whose PTE has `D`. A page that was only read has
+      `D` clear and is skipped.
+
+      **The kernel's own writes.** [[copyout]] writes into a user page through the kernel's
+      [[g:direct-map]] (`memmove` to `pa0`), using the kernel's PTE. The user PTE's `D` stays
+      clear, and a `read()` into a shared mapping would be lost at `munmap`. So [[copyout]]
+      sets `D` itself after its `PTE_W` check. gdb saw such a page in `mmaptest locked`: after
+      a `read` from a pipe into page 1 the PTE was `0x21fcc497`, flags `0x97` =
+      `V|R|W|U|D`: `D` from [[copyout]], and no `A`, because user code never touched that page.
+      Without the line, `mmaptest locked` and `self` print `FAIL (file contents)` (a kernel
+      built that way, run once).
+
+      **Why not write back every loaded page?** It is slower, and with several processes it is
+      wrong. Each process has its own copy of a page (this design has no shared page cache).
+      If process A loaded a page that B later changed and wrote back, A's unmap would write its
+      stale copy over B's change. Clinic 6 does this and `mmaptest stress` fails.
+
+      **How to write.** `vmawrite` does [[begin_op]], [[ilock]], [[writei]] from the physical
+      page (a kernel address, `user_src` 0), [[iunlock]], [[end_op]]. [[writei]] calls
+      [[log_write]], which panics outside a transaction (clinic 1). One page per transaction
+      is small enough: the reference writes only bytes inside the file, so no block is
+      allocated; 4 data blocks plus the inode block that [[writei]]'s [[iupdate]] writes, 5
+      log blocks, within `MAXOPBLOCKS` (10). [[filewrite]] uses a smaller chunk (3 blocks,
+      [[kernel/file.c:153]]) because a write that grows a file also allocates blocks and
+      updates the bitmap and the indirect block.
+
+      **Which bytes never.** Only `min(4096, size - off)` bytes, and nothing for a page wholly
+      past the end of the file. Writing the whole page would make the file longer, with the
+      zeros (or whatever the program stored there) past its old end (clinic 2).
+
+      A `MAP_PRIVATE` mapping, or a shared read-only one, is never written back.
+    checks:
+      - id: lab15-07
+        level: 2
+        type: bits
+        q: |
+          gdb read this PTE in `mmaptest locked`, when page 1 of a shared writable mapping was
+          unmapped. Before that the program had called `read` from a pipe into the page, and
+          had never touched it from user code. Decode the flags.
+        value: "0x21fcc497"
+        fields:
+          - label: "W (bit 2)"
+            options: ["0", "1"]
+            answer: "1"
+            why: "0x97 has bit 2 (0x4) set: the mapping is writable, so copyout accepted it."
+          - label: "U (bit 4)"
+            options: ["0", "1"]
+            answer: "1"
+            why: "0x10 is set: every page of a user mapping has PTE_U."
+          - label: "A (bit 6)"
+            options: ["0", "1"]
+            answer: "0"
+            why: "You may have expected A, since the page was written. It was written by the kernel through its direct map; the hart sets A only in the PTE it uses, and no user instruction used this one."
+          - label: "D (bit 7)"
+            options: ["0", "1"]
+            answer: "1"
+            why: "You may have thought only the hardware sets D. The reference's copyout sets it, precisely because the hardware did not."
+        explain: |
+          `0x97` = `V` (1) + `R` (2) + `W` (4) + `U` (0x10) + `D` (0x80). Because `D` is set, the
+          unmap wrote the page back, and the test found the pipe's 8 bytes in the file. See
+          [[g:pte]].
+      - id: lab15-08
+        level: 3
+        type: number
+        q: |
+          `vmawrite` writes one page of a mapping back, inside a file whose size is a multiple of
+          the page size and with blocks of 1024 bytes. How many blocks does that transaction log?
+        answer: 5
+        wrong:
+          4: |
+            You may have counted only the data blocks. [[writei]] ends with [[iupdate]], which
+            logs the block holding the inode, even when the size did not change.
+          10: |
+            That is `MAXOPBLOCKS`, what [[begin_op]] *reserves* for every transaction, not what
+            this one writes.
+          7: |
+            You may have added a bitmap block and an indirect block. Nothing is allocated: every
+            block lies inside the file and already exists.
+        why_wrong: "Count the blocks log_write is called on: the data blocks the page covers, and the inode."
+        explain: |
+          4 data blocks + 1 inode block = 5 ≤ `MAXOPBLOCKS`. [[begin_op]] still reserves 10 per
+          transaction against `LOGBLOCKS` (30), so at most three write-backs can be in progress:
+          in the stress run gdb caught [[begin_op]] putting write-backs to sleep for log space on
+          all three harts (50 times before the recorder stopped counting).
+  - title: What do fork, exit and exec now get wrong?
+    q: |
+      Three functions in this tree make, copy or destroy whole address spaces, and none of them
+      knows about mappings: [[kfork]], [[kexit]] (with [[freeproc]] in the parent's `wait`)
+      and [[kexec]]. For each one: what goes wrong if you leave it as it is, and what is the
+      simplest correct change? For `fork`, decide what the child should see in a mapped page
+      that the parent changed and has not yet written back.
+    hints:
+      - "Read [[uvmfree]] and [[freewalk]] ([[kernel/vm.c:276]]), and where [[kexec]] frees the old image ([[kernel/exec.c:138]]). Then [[kfork]]'s handling of `p->ofile` ([[kernel/proc.c:285]])."
+      - "Mapped pages lie above `p->sz` (question 2). Whatever frees a page table must first remove every leaf in it. Each copy of a file reference must be counted. Changes reach the file only at unmap time."
+      - "Unmap all mappings (with write-back) in `exit`, and in `exec` once the new image is committed. In `fork`, copy the table, take one more file reference per mapping, and copy no page: the child loads pages from the file."
+    answer: |
+      **exit.** [[freeproc]], run by the parent in [[kwait]], frees the user page table with
+      [[uvmfree]], which unmaps `[0, sz)` and then calls [[freewalk]]. [[freewalk]] panics with
+      `freewalk: leaf` on any valid leaf it still finds, and mapped pages are such leaves. A
+      kernel built without the exit change printed `panic: freewalk: leaf` in `mmaptest fork`,
+      on the parent's hart, inside `wait`. The reference unmaps every mapping at the top of
+      [[kexit]], with write-back: that is what makes "exit writes back" true, and it drops the
+      file references. The dying process can still sleep there (write-back takes the log and the
+      inode lock); nothing is locked yet.
+
+      **exec.** The same [[freewalk]] problem for the old page table ([[kernel/exec.c:138]]),
+      and the same rule as POSIX: a new program starts with no mappings. The reference unmaps
+      after the commit point, from the *old* page table: a failed `exec` returns to a program
+      whose mappings are intact.
+
+      **fork.** The child must have the mappings, or its first touch of one falls through to
+      the heap code, which rejects an address above `sz`, and the child is killed (clinic 3).
+      The reference copies the table and calls [[filedup]] for each mapping, as [[kfork]] does
+      for `p->ofile`. No page is copied: [[uvmcopy]] copies `[0, sz)`, and the child loads each
+      mapped page from the file when it touches it.
+
+      That simple choice has a cost you should state. A change the parent made to a mapped page
+      and has not written back is not in the child's copy, which comes from the file. For a
+      private mapping, the child does not inherit the parent's private changes, which POSIX
+      says it should. For a shared mapping, each process sees the other's stores only if it
+      loads the page after the other's write-back, and if both store into the same page, the
+      last unmap overwrites the other's changes to that page (a run showed exactly
+      that: child `C` at byte 0, parent `P` at byte 1, parent unmapped first, file `C.`). Copying the parent's loaded pages in [[kfork]] would fix the
+      private case; sharing the physical pages (and counting references to them, as in lab 11)
+      would be needed for the shared case. `mmaptest fork` checks only what this design
+      promises: a store the child made reaches the file at its exit, and the parent, loading
+      the page after that, sees it.
+    checks:
+      - id: lab15-09
+        level: 2
+        type: choice
+        q: |
+          A kernel is complete except that [[kexit]] does not unmap the process's mappings. In
+          `mmaptest fork` the child loads and changes page 1 of a mapping, then exits. What
+          happens?
+        options:
+          - text: "panic: freewalk: leaf, in the parent's wait"
+            correct: true
+            why: |
+              The parent's [[kwait]] frees the zombie with [[freeproc]]; [[uvmfree]] removes
+              `[0, sz)` only, and [[freewalk]] finds the mapped page's leaf.
+          - text: "panic: freewalk: leaf, in the child's exit"
+            why: |
+              You may have thought exit frees the page table. It cannot free the memory it is
+              running on; the parent does that later, in `wait` ([[freeproc]]).
+          - text: "The page leaks, but nothing else happens"
+            why: |
+              It would leak if [[freewalk]] skipped leaves. It does not; it panics on them,
+              precisely to catch this.
+          - text: "The child's store is written back by freeproc"
+            why: |
+              [[freeproc]] knows nothing of files and runs holding spinlocks, where writing a
+              file (which sleeps) is not allowed.
+        explain: |
+          The recorded panic: `panic: freewalk: leaf`, with the backtrace `freewalk ← freewalk
+          ← freewalk ← uvmfree ← proc_freepagetable ← freeproc ← kwait ← sys_wait`, on hart 2
+          with `noff` 2 (`wait_lock` and the child's `p->lock`).
+      - id: lab15-10
+        level: 3
+        type: tf
+        q: |
+          True or false: on the reference branch, if a parent stores into page 0 of a shared
+          mapping and then forks, the child reading page 0 sees the parent's store.
+        answer: false
+        why_tf: |
+          You may have thought fork copies mapped pages, or shares them. It copies neither: the
+          child loads page 0 from the file, and the parent's store reaches the file only when
+          the parent unmaps.
+        reasons:
+          - text: "The child's page comes from the file, and the parent's store is still only in the parent's page."
+            correct: true
+            why: "Right. That is the cost of the simple fork, stated in the answer above."
+          - text: "uvmcopy copied the parent's page into the child."
+            why: |
+              [[uvmcopy]] copies `[0, sz)`; mapped pages lie above `sz`.
+          - text: "The store is written back to the file at fork time."
+            why: |
+              Nothing writes back at fork. Only unmapping (by munmap, exit or exec) does.
+        explain: |
+          `mmaptest fork` makes the parent store into page 0 before the fork, and checks
+          nothing about the child's view of page 0: the design does not promise it.
+  - title: Where can a load run, and what may it hold?
+    q: |
+      Loading a mapped page takes the file's inode lock (a sleep-lock) and may wait for the
+      disk. Which paths can reach the load? List them, and for each, which locks the thread
+      already holds at that moment. What goes wrong on each path that holds a lock, and what will
+      you do about it? Think in particular about a `read` from a file into a mapping of that
+      same file.
+    hints:
+      - "Start from every caller of [[vmfault]]: [[usertrap]], and [[copyout]], [[copyin]] and [[copyinstr]]. For the three copy functions, find all their callers, and for each caller what it holds at the moment of the copy. Do not forget the callers that reach them through [[either_copyout]] and [[either_copyin]]."
+      - "[[sched]] panics if a process gives up the CPU holding a spinlock other than its own `p->lock`. [[wakeup]] acquires *every* process's `p->lock` ([[kernel/proc.c:581]]), and releasing any sleep-lock calls it. [[acquiresleep]] does not check who holds the lock."
+      - "Make sure no copy made under a lock ever needs a load: before a system call takes any lock, load the mapped pages of its user buffer. Ask who could unmap such a page again before the copy happens."
+    answer: |
+      The paths, with what gdb or the code shows held at the load:
+
+      | path | interrupts | locks held when the load starts | what a load there does |
+      |---|---|---|---|
+      | user code → [[usertrap]] → [[vmfault]] | off | none | fine (may sleep) |
+      | [[argstr]] → [[copyinstr]] (a path name) | on | none (in [[sys_mkdir]], [[sys_mknod]], [[sys_chdir]] a transaction is open, which is not a lock; a load writes nothing to the log) | fine |
+      | [[pipewrite]] → [[copyin]], [[piperead]] → [[copyout]] | off | `pi->lock` | sleeps under a spinlock whenever the load must sleep (a cache miss, or a sleep-lock held by another process): `panic: sched locks` |
+      | [[consoleread]] → [[copyout]] | off | `cons.lock` | the same |
+      | [[kwait]] → [[copyout]] of the status | off | `wait_lock`, the child's `p->lock` | `panic: acquire`, every time |
+      | [[fileread]] → [[readi]] → [[copyout]] | on | the file's inode lock, a buffer's lock (sleep-locks) | hangs forever if the file is the mapped one |
+      | [[filewrite]] → [[writei]] → [[copyin]] | on | a transaction, the inode lock, a buffer's lock | the same |
+
+      Three different failures, all observed on a kernel without the fix (clinic 5):
+
+      - **`panic: acquire` in `wait`.** The load reads the page with [[readi]], which releases
+        each buffer with [[brelse]] → [[releasesleep]] → [[wakeup]]. [[wakeup]] acquires every
+        process's `p->lock`, including the zombie child's, which [[kwait]] already holds on this
+        hart. This happens whether or not the disk is touched, so it fails every time.
+      - **`panic: sched locks` in a pipe.** Only when the load has to sleep: a cache miss, or
+        the inode's (or a buffer's) sleep-lock held by another process. Then [[sleep]] adds
+        `p->lock` to `pi->lock` and [[sched]] sees `noff` 2. With the blocks cached and nobody
+        else using the file, nothing sleeps and the bug hides. (A version of the test with a
+        larger file panicked with `sched locks` on its first run; no backtrace was recorded
+        for it.)
+      - **A hang in `read` of the mapped file.** [[fileread]] holds the file's inode lock while
+        [[readi]] copies into the user buffer; the copy needs the page; `mmapfault` calls
+        [[ilock]] on the same inode, and [[acquiresleep]] waits for the holder, which is the
+        process itself. No message, and `kill` cannot end it.
+
+      **The fix: load before you lock.** [[sys_read]], [[sys_write]] and [[sys_wait]] call
+      `vmaprefault` before they take any lock. It loads every unloaded page of the user buffer
+      that lies in a mapping, holding nothing. A loaded page stays loaded for the rest of the
+      call: only this process can unmap it, and it is busy in this call (one thread per
+      process). Lab 12 met the same problem with pages of the program and solved it the same
+      way. Lab 12 also had to make [[usertrap]] read `scause` and `stval` once, before the
+      fault handler could sleep; this branch does not, so if a load fails after sleeping
+      (only when [[mappages]] runs out of memory after the read), the `usertrap()` kill message
+      may print another trap's registers from whichever hart the process resumed on. Only the
+      message is affected, not the kill (reasoned from the code, not observed).
+
+      The other copies hold no lock: [[filestat]] unlocks the inode before its [[copyout]],
+      [[sys_pipe]]'s copy and [[argstr]] hold nothing, and [[kexec]] copies only into the new
+      page table, which has no mappings. Lazy heap pages need no prefault: allocating one takes
+      only [[kalloc]]'s spinlock and never sleeps.
+    checks:
+      - id: lab15-11
+        level: 3
+        type: state
+        q: |
+          Without the prefault, `mmaptest locked` calls `wait` with the status in an unloaded
+          mapped page. [[kwait]]'s [[copyout]] loads the page; [[readi]] releases a buffer, and
+          [[wakeup]] is about to acquire the zombie child's `p->lock`. Fill in the hart's state at
+          that moment, as gdb recorded it at the resulting panic.
+        code: kernel/proc.c:576-584
+        state:
+          mode: S
+          stack: kernel
+          satp: kernel
+          sie: "off"
+          noff: 4
+          intena: 1
+        why:
+          noff: |
+            Count the spinlocks: `wait_lock` and the child's `p->lock` from [[kwait]], the
+            buffer sleep-lock's inner `lk` held by [[releasesleep]], and the [[push_off]] at the
+            start of this very [[acquire]], before it checks [[holding]].
+          intena: |
+            `wait` is a system call: [[usertrap]] turned interrupts on before [[kwait]]'s first
+            acquire, so that acquire recorded intena 1.
+          sie: "Spinlocks are held, so interrupts are off on this hart."
+          stack: "A system call runs on the process's kernel stack: usertrap → syscall → sys_wait → kwait → copyout → vmfault → mmapfault → readi → brelse → releasesleep → wakeup → acquire."
+          satp: "uservec switched to the kernel page table before usertrap ran."
+        why_wrong: Count every spinlock held at that point, including the inner spinlock of the sleep-lock being released, and remember that acquire pushes before it checks.
+        explain: |
+          gdb at `panic("acquire")`: hart 0, `noff 4 intena 1`, pid 3, the lock
+          `proc+3000`, which is the child's. [[holding]] finds it held by this hart and
+          [[acquire]] panics. Five boots of that kernel panicked the same way.
+      - id: lab15-12
+        level: 2
+        type: choice
+        q: |
+          Without the prefault, `mmaptest self` reads its file into an unloaded page of a mapping
+          of the same file. What does the console show?
+        options:
+          - text: "Nothing more: mmaptest never finishes, and the prompt never comes back."
+            correct: true
+            why: |
+              The process sleeps in [[acquiresleep]] on its own file's inode lock, which it
+              holds itself, forever.
+          - text: "panic: acquire"
+            why: |
+              That needs a *spinlock* taken twice on one hart. A sleep-lock records a pid, and
+              [[acquiresleep]] never checks it; it sleeps.
+          - text: "panic: sched locks"
+            why: |
+              Only sleep-locks and no spinlock are held: [[acquiresleep]] releases its inner
+              spinlock before [[sleep]], so [[sched]] sees `noff` 1.
+          - text: "mmaptest: self: FAIL"
+            why: |
+              Nothing makes the `read` fail. It never returns.
+        explain: |
+          gdb, attached to the hung kernel, found the three harts idle and `mmaptest` (pid 3)
+          SLEEPING on `itable+312`, the lock of inode 25, whose `pid` field was 3. Its kernel
+          stack: `sys_read → fileread → readi → either_copyout → copyout → vmfault → mmapfault
+          → ilock → acquiresleep → sleep`.
+  - title: How do you know it works, and that nothing leaks?
+    q: |
+      Many of this lab's bugs leave the kernel running: a page goes to the wrong place, a file
+      reference is never dropped, an update is lost when two processes write. What can a user
+      program check, and how can it make such a bug visible? In particular, if `munmap` forgot
+      to drop the mapping's file reference, what would a user program notice, and after how
+      long?
+    hints:
+      - "There are `NFILE` (100) `struct file`s in the whole system ([[kernel/param.h:4]]); [[filealloc]] fails when none is free. The file's inode keeps its blocks while any reference remains."
+      - "A leak that is small per operation becomes visible when the operation is repeated more times than the resource has slots. A lost update between processes needs several processes, several pages, and a final value that only the right interleaving of write-backs can produce."
+      - "Repeat open, mmap, close, munmap more than `NFILE` times and require `open` to keep working; count free pages before and after; let three processes rewrite their own pages of one file many times and check the final contents."
+    answer: |
+      The test makes each kind of bug visible by repetition or by contents:
+
+      - **File references.** `mmaptest many` runs 300 rounds of open, mmap, close, munmap. A
+        `munmap` that forgot [[fileclose]] keeps every round's `struct file` alive; after
+        about 100 rounds [[filealloc]] has none left and `open` fails. And the damage is
+        system-wide: on such a kernel the next command could not even create a file, and `ls`
+        printed `ls: cannot open .` (clinic 4).
+      - **Pages.** The same test counts free pages before and after (the way `usertests`
+        does), so a page that `munmap` forgot to free shows up as a difference.
+      - **Write-back.** `shared`, `partial`, `fork`, `exit`, `locked` and `self` check the
+        file's bytes with `read`, including bytes that must *not* have changed and the file's
+        size.
+      - **Lost updates.** `stress` runs three processes for 30 rounds each. Each maps the
+        whole 12-page file shared, checks that every page is uniform (a page must never be
+        half written), fills its own 4 pages with a round number, and unmaps. The file must end
+        with each process's last round. A write-back of clean pages makes a process write its
+        stale copy of the others' pages over their newer data, and the final contents are
+        wrong (clinic 6).
+
+      What a user program cannot check by itself, and the lab measured instead: that the
+      processes really ran at once on different harts (gdb saw loads and write-backs of the
+      stress run on all three harts), and how much a write-back costs (the measure section).
+    checks:
+      - id: lab15-13
+        level: 2
+        type: choice
+        q: |
+          A kernel's `munmap` frees the pages and clears the mapping but never calls
+          [[fileclose]]. You run `mmaptest many`, then `mmaptest`, then `ls`. What do you see?
+        options:
+          - text: "many: FAIL (open failed: files leak); then mmaptest cannot create its first file; ls: cannot open ."
+            correct: true
+            why: |
+              Each round leaks one `struct file`; once all 100 are in use, every `open` in
+              the system fails, for every process.
+          - text: "many: FAIL (pages leak), and everything else works"
+            why: |
+              You may have thought the leak is of memory. The pages are freed by [[uvmunmap]];
+              the leak is of open files, which are a system-wide table.
+          - text: "Only mmaptest is affected; ls works"
+            why: |
+              The file table, `ftable`, is shared by all processes. A leaked entry is lost for
+              everyone until reboot.
+          - text: "panic: fileclose"
+            why: |
+              That panic is for a reference dropped too often. Here one is never dropped, and
+              nothing checks for that.
+        explain: |
+          Clinic 4 is this run. The leaked references also keep each file's inode, and with it
+          its blocks, alive: an unlinked file mapped once would never be freed.
+build: |
+  **Start.**
+
+  ```text
+  git checkout -b my-15 06aad25
+  ```
+
+  Add the system calls first, with nothing behind them: numbers in `kernel/syscall.h`, entries
+  in `kernel/syscall.c` and `user/usys.pl`, prototypes in `user/user.h`, the `PROT_` and
+  `MAP_` constants in `kernel/fcntl.h`. A new file `kernel/mmap.c` (add `$K/mmap.o` to `OBJS`
+  in the `Makefile`) keeps the mapping code in one place. Then write `user/mmaptest.c` from
+  the spec's list of checks and add `$U/_mmaptest\` to `UPROGS`. Every check fails at first;
+  that is the test working.
+
+  **Milestones, in an order that keeps the system bootable after each one.** `usertests` never
+  calls `mmap`, so `usertests -q` must pass after every milestone.
+
+  1. **The table.** `struct vma` and `p->vma[NVMA]` in `kernel/proc.h`. Test: it boots.
+  2. **mmap records.** Check the arguments, find a free slot and a place, take a reference
+     to the file, record. Test: `mmap` returns an address near the top (print it).
+  3. **The fence.** [[growproc]] and [[sys_sbrk]] stop at the lowest mapping. Test:
+     `usertests -q` (its `sbrk` tests).
+  4. **Load on fault.** The test at the top of [[vmfault]], and the loader. Test: the first
+     check of `mmaptest read`. Until milestone 6, a process that exits with a loaded mapped
+     page panics the kernel with `freewalk: leaf` (question 5), so expect that when the test
+     exits.
+  5. **munmap**, whole and at either end, without write-back. Test: `mmaptest read`, then
+     `partial`.
+  6. **exit and exec unmap everything.** Test: `mmaptest read`, `private`.
+  7. **Write-back.** The `D` test, the transaction, the size limit, and [[copyout]] setting
+     `D`. Test: `shared`, `partial`, `exit`.
+  8. **fork.** Test: `fork`.
+  9. **Load before you lock.** Test: `locked`, `self`, then the whole of `mmaptest` and
+     `usertests -q`, and `mmaptest` once more.
+
+  **Debugging advice.** Start QEMU with `make qemu-gdb` and attach gdb on the port it prints;
+  mapping code runs only when your test runs, so let the system boot, set your breakpoints,
+  then run the test.
+
+  - Print every load while you build it: `printk("mmap load pid %d va %p off %d\n", p->pid,
+    va, off)`, and every write-back. The first lines of `mmaptest read` should be one load at
+    the page it touches, and none for the pages it never touches.
+  - `panic: freewalk: leaf` means a mapped page was still in a page table being freed: look at
+    `kexit` and `kexec`.
+  - `panic: mappages: remap`: something mapped a page over a loaded one (the heap fence, or a
+    missing `ismapped` test).
+  - `panic: acquire` or `panic: sched locks` with `copyout` or `copyin` in the backtrace:
+    a load under a lock (question 6). Break on `panic` and run `bt`.
+  - A hang with idle harts: attach gdb, list `proc[]` with `state` and `chan`, and compare a
+    sleeping process's `chan` with the address of the mapped file's inode lock
+    (`p->vma[i].f->ip->lock`). To see the sleeping process's kernel stack, set `$sp`, `$s0`
+    and `$pc` from its `p->context` on a halted hart and run `bt`.
+  - To check a PTE, walk the page table in gdb from `p->pagetable` (three levels of 512
+    entries, index bits 38-30, 29-21, 20-12 of the address) and print the leaf: look at
+    bits 6 and 7.
+clinic:
+  - bug: The write-back runs outside a transaction
+    change: |
+      `vmawrite` locks the inode and calls [[writei]], but nobody opened a transaction: it
+      looks like a plain write of kernel memory into a file.
+
+      ```diff
+      -  begin_op();
+         ilock(ip);
+         if (off < ip->size) {
+           [...]
+           writei(ip, 0, pa, off, n);
+         }
+         iunlock(ip);
+      -  end_op();
+      ```
+    symptom: |
+      xv6 kernel is booting
+
+      hart 1 starting
+      hart 2 starting
+      init: starting sh
+      $ mmaptest shared
+      panic: log_write outside of trans
+
+      # the same boot, gdb breakpoint on panic:
+      #0  panic (s=s@entry=0x80008548 "log_write outside of trans") at kernel/printk.c:139
+      #1  0x0000000080003f5a in log_write (b=b@entry=0x800274a8 <bcache+27824>) at kernel/log.c:232
+      #2  0x00000000800037e8 in writei (ip=ip@entry=0x80029000 <itable+296>, user_src=user_src@entry=0, src=2280804352, off=off@entry=0, n=4096) at kernel/fs.c:566
+      #3  0x0000000080005028 in vmawrite (v=0x80011708 <proc+2344>, va=274877886464, pa=2280804352) at kernel/mmap.c:207
+      #4  vmaunmap (pagetable=0x87f24000, v=0x80011708 <proc+2344>, addr=addr@entry=274877886464, len=len@entry=12288) at kernel/mmap.c:228
+      #5  0x0000000080005184 in sys_munmap () at kernel/mmap.c:276
+      #6  0x0000000080002944 in syscall () at kernel/syscall.c:150
+      #7  0x00000000800026ca in usertrap () at kernel/trap.c:68
+      #8  0x0000003ffffff09c in ?? ()
+        Id   Target Id                    Frame
+      * 1    Thread 1.1 (CPU#0 [running]) panic (s=s@entry=0x80008548 "log_write outside of trans") at kernel/printk.c:139
+        2    Thread 1.2 (CPU#1 [halted ]) s_sstatus (x=2) at kernel/riscv.h:67
+        3    Thread 1.3 (CPU#2 [halted ]) s_sstatus (x=2) at kernel/riscv.h:67
+      hart 0 noff 1 intena 1 pid 3 name mmaptest
+    why: |
+      The very first write-back fails. `mmaptest shared` stored into page 0 of the mapping
+      (`va` 274877886464 = `0x3fffffb000`) and unmapped it. [[writei]] copies the page into the
+      file's first block in the [[g:buffer-cache]] and calls [[log_write]] to record that the
+      block must reach the disk through the log. [[log_write]] takes `log.lock` (the `noff` 1
+      gdb shows) and checks that some transaction is open, `log.outstanding >= 1`
+      ([[kernel/log.c:231]]); none is, so it panics.
+
+      The check exists because the log can only promise "all or nothing" for writes it knows
+      belong to a transaction: [[end_op]] commits when the last outstanding operation ends
+      ([[tour:31]]). A block changed outside any transaction could be committed half-way
+      through someone else's, or never. Any kernel path that changes the file system, even one
+      that starts from memory rather than from a system call's arguments, has to bracket the
+      change with [[begin_op]] and [[end_op]], and they must come *before* [[ilock]], the order
+      [[filewrite]] uses ([[kernel/file.c:160]]).
+
+      The other two harts are idle in the scheduler (`halted`): nobody else was in the middle
+      of anything when the first write-back panicked.
+  - bug: The whole page is written back
+    change: |
+      `vmawrite` keeps the "inside the file" test for the start of the page but always writes
+      4096 bytes:
+
+      ```diff
+         if (off < ip->size) {
+           n = PGSIZE;
+      -    if (ip->size - off < PGSIZE)
+      -      n = ip->size - off;
+           writei(ip, 0, pa, off, n);
+         }
+      ```
+    symptom: |
+      $ mmaptest
+      mmaptest: read: touching 1 of 3 mapped pages took 1 free pages
+      usertrap(): unexpected scause 0xd pid=4
+                  sepc=0x1e stval=0x3fffffb000
+      mmaptest: read: OK
+      mmaptest: shared: FAIL (the file changed size)
+      mmaptest: shared: FAIL (page 2 not written back)
+      usertrap(): unexpected scause 0xf pid=5
+                  sepc=0xa stval=0x3fffffc000
+      mmaptest: private: OK
+      [...]
+      mmaptest: self: OK
+      mmaptest: stress: OK
+      mmaptest: SOME FAILED
+    why: |
+      `mmaptest shared` maps a file of 8292 bytes (2 pages and 100 bytes) with a 3-page
+      mapping, and stores into page 2 twice: `X` at offset 50, inside the file, and `Y` at
+      offset 3000, past its end. Page 2 starts at file offset 8192, inside the file, so it is
+      written; with `n` 4096, [[writei]] writes through offset 12287 and, since that is past
+      `ip->size`, sets the size to 12288 ([[kernel/fs.c:570]]). The file grew by 3996 bytes:
+      zeros, and the `Y`. Hence the first `FAIL`. The second follows from it: the test reads
+      page 2 back expecting exactly 100 bytes, and got 4096.
+
+      Every other check passes, because every other *shared writable* mapping is of a file
+      that is a whole number of pages (`read`'s 2.5-page file is mapped private, so nothing is
+      written back), and for those the bug changes nothing. A mapping that ends in the middle of its file's last
+      page is the only case that shows it, which is why the test has one.
+
+      Two rules are behind the reference's version. A mapping never changes the size of its
+      file (on Linux too: stores past the end of the file in the last page are dropped). And
+      writing past the end would also need block allocation, which the transaction size
+      chosen in question 4 does not allow for: each new block costs a bitmap block too.
+  - bug: fork does not give the child the mappings
+    change: |
+      [[kfork]] copies the open files and the current directory, as before, and nothing else:
+
+      ```diff
+         np->cwd = idup(p->cwd);
+
+      -  memmove(np->vma, p->vma, sizeof(p->vma));
+      -  for (i = 0; i < NVMA; i++)
+      -    if (np->vma[i].len != 0)
+      -      filedup(np->vma[i].f);
+      ```
+    symptom: |
+      $ mmaptest
+      [...]
+      mmaptest: partial: OK
+      usertrap(): unexpected scause 0xd pid=8
+                  sepc=0x116 stval=0x3fffffd000
+      mmaptest: fork: FAIL (child)
+      mmaptest: fork: FAIL (the child's store did not reach the file)
+      mmaptest: fork: FAIL (file)
+      mmaptest: exit: OK
+      mmaptest: many: OK
+      mmaptest: locked: OK
+      mmaptest: self: OK
+      mmaptest: stress: OK
+      mmaptest: SOME FAILED
+    why: |
+      The child (pid 8) loads from page 1 of the mapping, `0x3fffffd000`. Its page table has
+      no PTE there ([[uvmcopy]] copied `[0, sz)` only) and its `p->vma` is empty: the slot's
+      previous owner cleared it at exit. So [[vmfault]] finds no mapping, falls through to the
+      heap code, sees `va >= psz`, and returns 0. [[usertrap]] prints the load fault (`scause`
+      13) and kills the child, whose exit status is -1: `FAIL (child)`. The other two failures
+      follow: the child never stored `C`, so neither the parent's mapping nor the file has it.
+
+      Other children in `mmaptest` survive this bug because they do not use a mapping they
+      inherited: the `exit` children map the file themselves, the `locked` child only exits,
+      the `stress` children each map the file after `fork`. (`private`'s child does store into
+      an inherited read-only mapping, but it is meant to be killed on either kernel: the same
+      `scause 0xf` line for `stval=0x3fffffc000` appears in this run, so that check cannot
+      tell the difference.) A child that uses its parent's
+      mapping is the only case that shows it, and the symptom points straight at the cause:
+      a fault at a mapped address, in a process that never called `munmap`.
+  - bug: munmap forgets the file reference
+    change: |
+      When the last page of a mapping goes, the record is cleared but the file is not closed:
+
+      ```diff
+         v->len -= len;
+      -  if (v->len == 0) {
+      -    fileclose(v->f);
+      +  if (v->len == 0)
+           v->f = 0;
+      -  }
+      ```
+    symptom: |
+      xv6 kernel is booting
+
+      hart 1 starting
+      hart 2 starting
+      init: starting sh
+      $ mmaptest many
+      mmaptest: many: FAIL (open failed: files leak)
+      $ mmaptest
+      mmaptest: cannot create mm.read
+      $ ls
+      ls: cannot open .
+      $
+    why: |
+      Each mapping took a reference with [[filedup]] that is now never dropped. In `mmaptest
+      many`, every round opens the file (a new `struct file` from [[filealloc]]), maps it
+      (reference count 2), closes it (1) and unmaps it (still 1, forever). There are `NFILE`
+      = 100 `struct file`s for the whole system ([[kernel/param.h:4]]); after about a hundred
+      rounds [[filealloc]] finds none free, `open` fails, and the test says so.
+
+      The leak is not confined to the process. When `mmaptest many` exits, its mappings are
+      gone but the leaked `struct file`s stay allocated, because nothing points to them any
+      more and nothing will ever close them. The next `mmaptest` cannot create its first
+      file, and `ls` cannot even open the current directory. Only a reboot recovers.
+
+      Each leaked `struct file` also holds a reference to its inode ([[iput]] is never
+      called), so an unlinked file that was mapped once would keep its blocks until reboot.
+      This is why a test should repeat an operation more times than the resource it uses has
+      slots: one leaked reference per call is invisible in a test that calls once.
+  - bug: No prefault before read, write and wait
+    change: |
+      [[sys_read]], [[sys_write]] and [[sys_wait]] go straight to the code that copies; a
+      missing mapped page is loaded wherever the copy happens to find it:
+
+      ```diff
+         if (argfd(0, 0, &f) < 0)
+           return -1;
+      -  // load the buffer's mapped pages now: fileread holds locks while
+      -  // it copies, and loading a mapped page needs to sleep.
+      -  if (n > 0 && vmaprefault(myproc(), p, n) < 0)
+      -    return -1;
+         return fileread(f, p, n);
+      ```
+
+      (and the same in [[sys_write]], one line in [[sys_wait]].)
+    symptom: |
+      xv6 kernel is booting
+
+      hart 2 starting
+      hart 1 starting
+      init: starting sh
+      $ mmaptest locked
+      panic: acquire
+
+      # the same boot, gdb breakpoint on panic:
+      #0  panic (s=s@entry=0x80008048 "acquire") at kernel/printk.c:139
+      #1  0x0000000080000c28 in acquire (lk=lk@entry=0x80011998 <proc+3000>) at kernel/spinlock.c:26
+      #2  0x0000000080002008 in wakeup (chan=chan@entry=0x80022230 <bcache+6712>) at kernel/proc.c:592
+      #3  0x0000000080004092 in releasesleep (lk=lk@entry=0x80022230 <bcache+6712>) at kernel/sleeplock.c:42
+      #4  0x0000000080002d22 in brelse (b=b@entry=0x80022220 <bcache+6696>) at kernel/bio.c:122
+      #5  0x00000000800036da in readi (ip=ip@entry=0x80029000 <itable+296>, user_dst=user_dst@entry=0, dst=dst@entry=2280845312, off=off@entry=8192, n=n@entry=4096) at kernel/fs.c:531
+      #6  0x0000000080004cd8 in mmapfault (p=p@entry=0x800115b0 <proc+2000>, v=0x80011708 <proc+2344>, va=va@entry=274877894656, read=read@entry=0) at kernel/mmap.c:97
+      #7  0x000000008000151a in vmfault (pagetable=pagetable@entry=0x87f24000, psz=psz@entry=28672, va=va@entry=274877894656, read=read@entry=0) at kernel/vm.c:471
+      #8  0x00000000800015d0 in copyout (pagetable=0x87f24000, psz=28672, dstva=dstva@entry=274877894656, src=src@entry=0x800119c4 <proc+3044> "\a", len=len@entry=4) at kernel/vm.c:357
+      #9  0x0000000080002250 in kwait (addr=274877894656) at kernel/proc.c:402
+      #10 0x00000000800029d6 in sys_wait () at kernel/sysproc.c:37
+      #11 0x0000000080002944 in syscall () at kernel/syscall.c:150
+      #12 0x00000000800026ca in usertrap () at kernel/trap.c:68
+      #13 0x0000003ffffff09c in ?? ()
+        Id   Target Id                    Frame
+      * 1    Thread 1.1 (CPU#0 [running]) panic (s=s@entry=0x80008048 "acquire") at kernel/printk.c:139
+        2    Thread 1.2 (CPU#1 [halted ]) s_sstatus (x=2) at kernel/riscv.h:67
+        3    Thread 1.3 (CPU#2 [halted ]) s_sstatus (x=2) at kernel/riscv.h:67
+      hart 0 noff 4 intena 1 pid 3 name mmaptest
+
+      # another boot of the same kernel: `mmaptest self`, which never returns
+      $ mmaptest self
+      # (nothing more; after 60 seconds gdb was attached to the hung kernel)
+      === harts
+        Id   Target Id                    Frame
+      * 1    Thread 1.1 (CPU#0 [halted ]) s_sstatus (x=2) at kernel/riscv.h:67
+        2    Thread 1.2 (CPU#1 [halted ]) s_sstatus (x=2) at kernel/riscv.h:67
+        3    Thread 1.3 (CPU#2 [halted ]) s_sstatus (x=2) at kernel/riscv.h:67
+      === processes
+      proc[0] pid 1 SLEEPING init chan 0x80010de0 <proc>
+      proc[1] pid 2 SLEEPING sh chan 0x800111c8 <proc+1000>
+      proc[2] pid 3 SLEEPING mmaptest chan 0x80029010 <itable+312>
+        vma[0] start 0x3fffffb000 len 0x3000 inode 25 lock.locked 1 lock.pid 3 &lock 0x80029010 <itable+312>
+      [...]
+        kernel stack of pid 3 (from p->context):
+      #0  r_tp () at kernel/riscv.h:344
+      #1  cpuid () at kernel/proc.c:67
+      #2  mycpu () at kernel/proc.c:76
+      #3  sched () at kernel/proc.c:507
+      #4  0x0000000080001fba in sleep () at kernel/proc.c:580
+      #5  0x0000000080004044 in acquiresleep (lk=lk@entry=0x80029010 <itable+312>) at kernel/sleeplock.c:28
+      #6  0x00000000800032ac in ilock (ip=ip@entry=0x80029000 <itable+296>) at kernel/fs.c:303
+      #7  0x0000000080004ca4 in mmapfault (p=0x800109b0 <pid_lock>, p@entry=0x800115b0 <proc+2000>, v=0x80011708 <proc+2344>, va=1, va@entry=274877890560, read=read@entry=0) at kernel/mmap.c:92
+      #8  0x000000008000151a in vmfault (pagetable=pagetable@entry=0x87f24000, psz=28672, psz@entry=0, va=va@entry=274877890560, read=read@entry=0) at kernel/vm.c:471
+      #9  0x00000000800015d0 in copyout (pagetable=0x87f24000, psz=0, dstva=dstva@entry=274877890560, src=src@entry=0x80027500 <bcache+27912> "", len=len@entry=1024) at kernel/vm.c:357
+      #10 0x000000008000232a in either_copyout (user_dst=user_dst@entry=1, dst=dst@entry=274877890560, src=src@entry=0x80027500 <bcache+27912>, len=len@entry=1024) at kernel/proc.c:662
+      #11 0x00000000800036d0 in readi (ip=0x80029000 <itable+296>, user_dst=user_dst@entry=1, dst=dst@entry=274877890560, off=0, n=n@entry=4096) at kernel/fs.c:526
+      #12 0x0000000080004326 in fileread (f=0x8002ab30 <ftable+104>, addr=274877890560, n=4096) at kernel/file.c:122
+      #13 0x0000000080005422 in sys_read () at kernel/sysfile.c:81
+      #14 0x0000000080002944 in syscall () at kernel/syscall.c:150
+      #15 0x00000000800026ca in usertrap () at kernel/trap.c:68
+      #16 0x0000003ffffff09c in ?? ()
+    why: |
+      One missing rule, "load before you lock", and two different failures.
+
+      **`mmaptest locked`: `panic: acquire`.** The pipe write and read worked: the file had
+      just been written, its blocks were in the [[g:buffer-cache]], and loading those two pages
+      never slept. Then `wait(&status)` with `status` in page 2 of the mapping (`va`
+      274877894656 = `0x3fffffd000`). [[kwait]] has found the zombie child and holds
+      `wait_lock` and the child's `p->lock` (`proc+3000`; the parent is `proc+2000`) while it
+      copies the status out ([[kernel/proc.c:390]]). The copy loads the page; [[readi]] reads
+      the block and releases its buffer with [[brelse]], which releases the buffer's
+      sleep-lock, and [[releasesleep]] calls [[wakeup]] in case anyone waits for that buffer.
+      [[wakeup]] acquires *every* process's `p->lock` in turn ([[kernel/proc.c:581]]),
+      including the child's, already held on this hart: [[acquire]]'s [[holding]] check panics.
+      `noff` 4: `wait_lock`, the child's `p->lock`, the buffer sleep-lock's own spinlock held by
+      [[releasesleep]], and this [[acquire]]'s [[push_off]]. This one does not depend on the
+      cache: any load, cached or not, releases a buffer. Five boots, five identical panics.
+
+      The pipe paths are still wrong, only quieter: [[pipewrite]] and [[piperead]] hold
+      `pi->lock`, which [[wakeup]] does not need, so they fail only when the load has to sleep
+      (a cache miss, or the file's inode or a buffer locked by another process: three readers
+      hammering a one-page file produced `panic: sched locks` on a pipe write);
+      then [[sleep]] adds `p->lock` and [[sched]] sees `noff` 2: `panic: sched
+      locks`. A version of this test with a larger file panicked with `sched
+      locks` on this kernel (no backtrace was recorded for that run).
+
+      **`mmaptest self`: a process waiting for itself.** `read` of the mapped file into page 1
+      of its own mapping (`va` 274877890560 = `0x3fffffc000`). [[fileread]] locks inode 25
+      ([[kernel/file.c:121]]) and [[readi]] copies the first block out with
+      [[either_copyout]]. The copy needs the page; `mmapfault` calls [[ilock]] on the mapping's
+      file, inode 25 again, and [[acquiresleep]] sleeps until the holder releases it. The
+      holder is pid 3 itself (`lock.pid 3`), and pid 3's `chan` is that lock's address. It will
+      sleep forever: no panic, no message, the harts idle, `kill` useless. A `write` to the file
+      from its own mapping would hang the same way inside [[filewrite]].
+
+      (Some argument values in the hung backtrace, like `va=1` or `psz=0`, are stale registers
+      in this optimized build; the `@entry` values are the real ones. The stack was read by
+      loading the sleeping process's saved `sp`, `s0` and `ra` into a halted hart, which is why
+      its top frames are `sched` and `mycpu`.)
+
+      The reference's three call sites remove all of these at once: the pages are loaded before
+      any lock is taken, so the copies under locks never load.
+  - bug: Every loaded page is written back, clean or not
+    change: |
+      The `D` test is dropped, as if writing a clean page back were merely wasted work:
+
+      ```diff
+            pte = walk(pagetable, a, 0);
+      -     if (pte && (*pte & PTE_V) && (*pte & PTE_D))
+      +     if (pte && (*pte & PTE_V))
+              vmawrite(v, a, PTE2PA(*pte)); // written since it was loaded
+      ```
+    symptom: |
+      $ mmaptest
+      [...]
+      mmaptest: locked: OK
+      mmaptest: self: OK
+      mmaptest: stress: FAIL (file contents)
+      mmaptest: SOME FAILED
+      $ mmaptest stress
+      mmaptest: stress: FAIL (file contents)
+      $ mmaptest stress
+      mmaptest: stress: FAIL (file contents)
+      $ mmaptest stress
+      mmaptest: stress: FAIL (file contents)
+      $ mmaptest stress
+      mmaptest: stress: FAIL (file contents)
+      $ mmaptest stress
+      mmaptest: stress: OK
+
+      # another boot: a copy of this kernel that prints how many pages each large munmap
+      # wrote back, running a scratch benchmark (not on the branch): 10 rounds of map 64
+      # pages, read every page, store into one, munmap
+      $ mmapbench
+      munmap: 64 pages written back
+      [...]
+      munmap: 64 pages written back
+      mmapbench: 10 rounds of: map 64 pages, read all, write 1, munmap: 60 ticks
+      $ mmapbench
+      [...]
+      mmapbench: 10 rounds of: map 64 pages, read all, write 1, munmap: 100 ticks
+      $ mmapbench
+      [...]
+      mmapbench: 10 rounds of: map 64 pages, read all, write 1, munmap: 53 ticks
+
+      # the same instrumentation on the reference branch, another boot:
+      $ mmapbench
+      munmap: 1 pages written back
+      [...]
+      mmapbench: 10 rounds of: map 64 pages, read all, write 1, munmap: 8 ticks
+      [...]
+      mmapbench: 10 rounds of: map 64 pages, read all, write 1, munmap: 8 ticks
+      [...]
+      mmapbench: 10 rounds of: map 64 pages, read all, write 1, munmap: 7 ticks
+    why: |
+      This looks like a performance bug, and it is one: 64 pages written back per `munmap`
+      instead of 1, and the benchmark took 53 to 100 ticks instead of 7 or 8 (a tick is 1,000,000 timer cycles,
+      [[kernel/trap.c:179]], 0.1 s on QEMU). Every page costs a transaction: [[begin_op]],
+      5 blocks into the log (4 data blocks and the inode), the commit, the install. All other checks pass, since writing an
+      unchanged page back changes nothing in the file, as long as only one process maps it.
+
+      `stress` is where it is wrong. Each of three processes maps all 12 pages, reads them all
+      (so all 12 are loaded, each a private copy of the file as it was *at load time*), changes
+      its own 4, and unmaps. Suppose A loads page 5, B's page, while it holds round 10's value;
+      B then writes round 11 into page 5 and unmaps, writing it back; A unmaps a moment later
+      and writes back its stale copy of page 5: round 10 again. B's update is lost. Whether the
+      final file is right depends on the order of the last write-backs, so the test failed 5
+      times out of 6 here, and passed 10 times out of 10 on the reference.
+
+      With the `D` test, a process writes back only pages it stored into, and in `stress` no two
+      processes store into the same page. Two processes that do store into the same page of a
+      shared mapping still overwrite each other at page granularity, because each has its own
+      copy. Removing that would need one physical page per file page, shared by every mapping:
+      a page cache (see "further").
+reveal:
+  - title: A record per mapping
+    commit: 1
+    file: kernel/proc.h
+    lines: 79-115
+    focus: 81-89
+    diff: true
+    state:
+      hart: any
+      proc: "(a definition: used by mmap, munmap, the fault path, fork, exit and exec)"
+      locks: []
+    note: |
+      The story of this tour was recorded with gdb on the finished branch, three harts:
+      `mmaptest shared` maps a file and changes it, `fork` hands a mapping to a child, `locked`
+      and `self` call `read`, `write` and `wait` with buffers inside a mapping, and `stress`
+      runs three processes against one file. Each step says which run its state comes from.
+
+      Commit 1 adds the record that question 1 designed. `struct vma` (Linux's name, "virtual
+      memory area") holds where the mapping starts and how long it is, `prot` and `flags`, the
+      file's offset of `start`, and `f`, a counted reference to the open file. `struct proc`
+      gets a fixed array of `NVMA` (16, in `param.h`) of them; a slot with `len` 0 is free.
+      Each one is 40 bytes, so every `struct proc` grows by 640 bytes: gdb printed
+      `sizeof(struct proc)` = 1000 in this build, which is why the third process slot shows up
+      as `proc+2000` in the backtraces below.
+
+      The array sits below the comment "these are private to the process, so p->lock need not
+      be held", and that is where it belongs: only the process itself changes its mappings,
+      and [[kfork]] reads the parent's while the parent is inside `fork`. That is also why the
+      fault path, later, reads the table with no lock at all.
+  - title: "mmap: check everything first"
+    commit: 2
+    file: kernel/mmap.c
+    lines: 53-102
+    focus: 65-84
+    diff: true
+    state:
+      hart: 0
+      mode: S
+      proc: mmaptest (pid 3)
+      intr: "on"
+      satp: kernel
+      locks: []
+      irq: 0
+      stack: [usertrap, syscall, sys_mmap]
+      sp: {"on": kernel, detail: "pid 3's kernel stack, `sp` = `0x3fffff9f60`"}
+    note: |
+      `sys_mmap` fetches six arguments, the most any system call in this tree takes: `a0`
+      to `a5` are all the argument registers [[argraw]] knows. Then it refuses, in order:
+
+      - an `addr` other than 0 (the kernel chooses), a zero or absurd `len`, an `off` that is
+        not a page boundary, and an `off + len` that wraps around;
+      - any `prot` but read or read-write (`W` without `R` is reserved in a RISC-V PTE);
+      - any `flags` but exactly one of shared and private;
+      - a bad descriptor, a pipe or device (pages are read from an inode), or a file not
+        opened for reading;
+      - a shared writable mapping of a file opened read-only (line 83): its stores would end
+        up in a file the process may not write. `mmaptest private` checks this one.
+
+      This is `mmaptest shared` (pid 3), on hart 0, in a system call: interrupts on, nothing
+      held. gdb recorded the state at line 95, after all the checks; nothing on the way there
+      takes a lock.
+  - title: "mmap: find room at the top, take a reference"
+    commit: 2
+    file: kernel/mmap.c
+    lines: 31-101
+    focus: 86-101
+    state:
+      hart: 0
+      mode: S
+      proc: mmaptest (pid 3)
+      intr: "on"
+      satp: kernel
+      locks: []
+      irq: 0
+      stack: [usertrap, syscall, sys_mmap]
+      sp: {"on": kernel}
+    note: |
+      A free slot, then a place: `vmaplace` (lines 34-51) starts with `end` at `TRAPFRAME`,
+      tries `[end - len, end)`, and whenever an existing mapping overlaps it, moves `end` down
+      to that mapping's start and tries again. Each retry lowers `end`, so the loop ends, at
+      the first gap that fits or at the heap, which it never crosses (line 41).
+
+      gdb at line 95: `start` = `0x3fffffb000`, `len` = `0x3000`, `p->sz` = `0x7000`, file
+      inode 25 with `f->ref` 1. The mapping ends exactly at `TRAPFRAME` (`0x3fffffe000`), and
+      between it and the top of the heap lie about 256 GiB of empty address space.
+
+      Line 99 takes the reference: [[filedup]] makes `f->ref` 2, one for the descriptor and one
+      for the mapping, under `ftable.lock` for a moment (`noff` 1 inside [[filedup]]). The test
+      closes the descriptor right after `mmap` returns; the mapping keeps the file open. Nothing
+      else happens: no page is allocated, no PTE is written, no byte is read. `mmap` costs the
+      same for 1 page as for 1000.
+  - title: The heap stops at the lowest mapping
+    commit: 3
+    file: kernel/proc.c
+    lines: 233-254
+    focus: 241-251
+    diff: true
+    state:
+      hart: any
+      mode: S
+      proc: "a process growing its heap"
+      intr: "on"
+      satp: kernel
+      locks: []
+      irq: 0
+      stack: [usertrap, syscall, sys_sbrk, growproc]
+      sp: {"on": kernel}
+    note: |
+      The heap had one fence, `TRAPFRAME`. Now it has `vmabottom(p)`: the lowest address of
+      any mapping, or `TRAPFRAME` if there is none. [[growproc]] (eager `sbrk`) checks it here,
+      and [[sys_sbrk]]'s lazy branch checks the same in `sysproc.c`. Without the fence, an eager
+      `sbrk` that starts just below a mapping (after lazy growth brought the heap there) would
+      run [[uvmalloc]] over it and [[mappages]] would panic on a loaded page (`mappages:
+      remap`, reproduced on such a build); lazy growth would raise `p->sz` past mapped addresses, which
+      would confuse every function that walks `[0, sz)`.
+
+      With no mappings `vmabottom` returns `TRAPFRAME`, so every `sbrk` behaves exactly as
+      before, which is why `usertests` cannot tell this commit apart from the original.
+
+      (No breakpoint was set here; the state is the ordinary one for a system call.)
+  - title: "vmfault: is it in a mapping?"
+    commit: 4
+    file: kernel/vm.c
+    lines: 454-485
+    focus: 462-471
+    diff: true
+    state:
+      hart: 0
+      mode: S
+      proc: mmaptest (pid 3)
+      intr: "off"
+      satp: kernel
+      locks: []
+      irq: 0
+      stack: [usertrap, vmfault]
+      sp:
+        "on": kernel
+        switched: "`ld sp, 8(a0)` in [[uservec]] ([[kernel/trampoline.S:76]]), after the store page fault"
+        detail: "`sp` = `0x3fffff9f40` in `mmapfault`"
+    note: |
+      `mmaptest shared` closed the file and executed `strcpy(m + 10, "hello")`: a store to
+      `0x3fffffb00a`, in a page with no PTE. The hart raised a store page fault (`scause` 15),
+      [[usertrap]] called [[vmfault]] with `read` 0, and here is the one new test: the page
+      table is the process's own, and `vmalookup` finds a mapping containing the address, so
+      the fault belongs to `mmapfault`.
+
+      The test must come before line 470. A mapped address is far above `psz` (`p->sz`,
+      `0x7000` here), and the old first line would reject it. Below line 470 nothing changed:
+      the lazy heap works as before. The comparison with `p->pagetable` keeps [[kexec]]'s
+      copies into a brand-new page table away from the old image's mappings.
+
+      Interrupts are off, as on every page fault: [[usertrap]] turns them on only for system
+      calls ([[kernel/trap.c:66]]). No lock is held. gdb recorded exactly that on hart 0:
+      `noff` 0, SIE 0.
+  - title: "mmapfault: refuse, then start from zeros"
+    commit: 4
+    file: kernel/mmap.c
+    lines: 67-112
+    focus: 82-90
+    diff: true
+    state:
+      hart: 0
+      mode: S
+      proc: mmaptest (pid 3)
+      intr: "off"
+      satp: kernel
+      locks: []
+      irq: 0
+      stack: [usertrap, vmfault, mmapfault]
+      sp: {"on": kernel, detail: "`sp` = `0x3fffff9f40`"}
+    note: |
+      Two refusals first. A store (`read` 0) to a mapping without `PROT_WRITE` returns 0, and
+      [[usertrap]] kills the process: that is `mmaptest private`'s `scause 0xf` line. And a
+      fault on a page that is already mapped is about permissions, not about a missing page;
+      mapping it again would make [[mappages]] panic with `remap`.
+
+      Then a page from [[kalloc]], zeroed at once. [[kalloc]] fills pages with `0x05`
+      ([[kernel/kalloc.c:80]]), and any byte the file does not supply must read as 0: the end
+      of a last page that the file only partly fills, and whole pages past the end of the file.
+      Zeroing first and reading over it gives both for free.
+
+      gdb at line 92 for this fault: `va` = `0x3fffffb000`, `read` 0, `off` 0, inode 25 with
+      `size` `0x2064` (8292 bytes: two pages and 100 bytes) and `ref` 1. The inode's reference
+      is the `struct file`'s; the file's own `ref` is 1 too, the mapping's, because the test
+      has closed its descriptor.
+  - title: "mmapfault: read the file's part, under the inode lock"
+    commit: 4
+    file: kernel/mmap.c
+    lines: 84-112
+    focus: 91-111
+    state:
+      hart: 0
+      mode: S
+      proc: mmaptest (pid 3)
+      intr: "off"
+      satp: kernel
+      locks: ["the mapped file's inode lock (sleep-lock)"]
+      irq: 0
+      stack: [usertrap, vmfault, mmapfault]
+      sp: {"on": kernel}
+    note: |
+      The page's file offset is `v->off` plus how far `va` is into the mapping. If that is
+      inside the file, [[readi]] copies `min(4096, size - off)` bytes into the front of the page,
+      with the inode locked: [[ilock]] is a [[g:sleeplock]], `ip->size` is only stable under
+      it, and [[readi]] may wait for the disk in [[bread]]. Past the end of the file there is
+      nothing to read, and the zero page is the answer.
+
+      Then the PTE: `PTE_R | PTE_U`, and `PTE_W` for a writable mapping. When `munmap` later
+      read this PTE it was `0x21fc94d7`: flags `0xd7` = `V|R|W|U|A|D`. `A` and `D` were set by
+      the hart when the retried `strcpy` used the page; the write-back steps rely on `D`.
+
+      gdb at line 93: the lock is held, `lock.pid` 3, interrupts still off, `noff` 0: the
+      sleep-lock is not a spinlock and is not counted. Sleeping here is legal: [[sched]] wants
+      exactly `noff` 1 (`p->lock`) and interrupts off. In this run the blocks were cached (the
+      test had just written the file); in the stress run, whose loads often missed the cache,
+      gdb caught loads asleep in [[virtio_disk_rw]] on all three harts, with `noff` 1
+      (`disk.vdisk_lock`) and `intena` 0, as a fault from user mode should show.
+    others: |
+      While a load waits for the disk, its hart runs the scheduler and the process may resume
+      anywhere. Another process mapping the same file can fault at the same moment; it waits
+      for this inode lock in [[acquiresleep]], then reads its own private copy of the page.
+      Nothing else here is shared: the page and the PTE belong to this process alone.
+  - title: "munmap: free the pages, shrink the record"
+    commit: 5
+    file: kernel/mmap.c
+    lines: 165-207
+    focus: 170-183
+    diff: true
+    state:
+      hart: 0
+      mode: S
+      proc: mmaptest (pid 3)
+      intr: "on"
+      satp: kernel
+      locks: []
+      irq: 0
+      stack: [usertrap, syscall, sys_munmap, vmaunmap]
+      sp: {"on": kernel, detail: "`sp` = `0x3fffff9f20` in `vmaunmap`"}
+    note: |
+      `sys_munmap` (lines 188-207) accepts a range that is the whole mapping, or a part
+      of it starting at its start or ending at its end. A hole in the middle would leave two
+      pieces, which need two records; the reference refuses it (`mmaptest partial` checks the
+      refusal) rather than splitting.
+
+      `vmaunmap` frees the loaded pages with [[uvmunmap]], which skips the pages that were
+      never touched ([[kernel/vm.c:205]]): an unmapped range with holes in it frees cleanly.
+      Then the record shrinks. Removing a part at the start moves `start` *and* `off`, so that
+      the remaining pages still find their own bytes in the file. When nothing is left,
+      [[fileclose]] drops the mapping's reference; if it was the last, the file is closed, and
+      an unlinked file is freed inside [[fileclose]]'s own transaction. Clinic 4 forgets this
+      line.
+
+      No TLB flush is needed here, though pages were just freed: this process will return to
+      user mode through [[userret]], which runs `sfence.vma` after loading `satp`
+      ([[kernel/trampoline.S:112]]), and any other hart that still caches a translation of
+      this process flushes the same way before it runs user code again. Until then no user
+      code runs with this page table. (The `sbrk` that shrinks the heap relies on the same
+      argument.)
+
+      The state is from the finished branch's `munmap` in `mmaptest shared`, recorded at the
+      first line of the write-back loop that commit 7 adds above line 173.
+  - title: exit unmaps everything first
+    commit: 6
+    file: kernel/proc.c
+    lines: 322-350
+    focus: 330-343
+    diff: true
+    state:
+      hart: 2
+      mode: S
+      proc: mmaptest (pid 5, a child)
+      intr: "on"
+      satp: kernel
+      locks: []
+      irq: 0
+      stack: [usertrap, syscall, sys_exit, kexit]
+      sp: {"on": kernel, detail: "pid 5's kernel stack, `sp` = `0x3fffff7f70`"}
+    note: |
+      Mapped pages lie above `p->sz`. The parent's [[kwait]] frees this process's page table
+      later with [[freeproc]] → [[uvmfree]], which unmaps `[0, sz)` and then calls
+      [[freewalk]]; [[freewalk]] panics on any valid leaf it finds ([[kernel/vm.c:276]]). So
+      [[kexit]] removes every mapping before anything else, while the process can still sleep
+      (the write-back of commit 7 will need to) and holds nothing. A copy of the finished branch
+      without this call panicked with `freewalk: leaf` in `mmaptest fork`, inside the parent's
+      `wait` on hart 2, with `noff` 2 (`wait_lock` and the child's `p->lock`).
+
+      gdb stopped here in `mmaptest fork`'s child, pid 5, on hart 2: its `p->vma[0]` still had
+      `len` `0x2000` at `0x3fffffc000`, the mapping it inherited (commit 8) and used.
+
+      Unmapping also drops the mappings' file references, so an exiting process leaks no
+      `struct file` through its mappings, exactly as the loop below closes `p->ofile`.
+  - title: exec unmaps the old image's mappings, after the point of no return
+    commit: 6
+    file: kernel/exec.c
+    lines: 120-150
+    focus: 132-139
+    diff: true
+    state:
+      hart: 2
+      mode: S
+      proc: mmaptest (pid 11, about to become the new program)
+      intr: "on"
+      satp: kernel
+      locks: []
+      irq: 0
+      stack: [usertrap, syscall, sys_exec, kexec]
+      sp: {"on": kernel, detail: "`sp` = `0x3fffff7b30` in `vmaunmap`"}
+    note: |
+      [[proc_freepagetable]] on line 139 frees the old page table with the same [[uvmfree]]
+      and [[freewalk]], so [[kexec]] has the same problem as exit, and the same answer as
+      POSIX: a new program starts with no mappings.
+
+      The call sits after the commit (lines 133-137), not before. Up to line 132 `exec` can
+      still fail, and a failed `exec` must return to the old program with its mappings intact.
+      After line 134 the process runs on the new page table, so `vmaunmapall` is given the old
+      one explicitly: the write-back reads the old pages through their PTEs there.
+
+      gdb recorded this in `mmaptest exit`'s second child (pid 11), which stored into page 1
+      of a shared mapping and called `exec`: here the unmap found that page's PTE
+      `0x21fcb0d7`, dirty, and wrote it back, starting on hart 2 and finishing (the
+      [[fileclose]] of the mapping) on hart 0. The new program never knew.
+  - title: A PTE bit the hardware sets
+    commit: 7
+    file: kernel/mmap.c
+    lines: 189-218
+    focus: 196-207
+    diff: true
+    state:
+      hart: 0
+      mode: S
+      proc: mmaptest (pid 3)
+      intr: "on"
+      satp: kernel
+      locks: []
+      irq: 0
+      stack: [usertrap, syscall, sys_munmap, vmaunmap]
+      sp: {"on": kernel, detail: "`sp` = `0x3fffff9f20`"}
+    note: |
+      Commit 7 makes unmapping write back. For a shared, writable mapping, the loop walks every
+      page of the range: a page that is loaded *and* has `D` in its PTE goes back to the file,
+      before [[uvmunmap]] frees it. `PTE_D` (bit 7) and `PTE_A` (bit 6) are new names in
+      `riscv.h`; the hardware has always had them.
+
+      gdb at line 204, `mmaptest shared` unmapping its 3 pages:
+
+      | page | PTE | flags | written back? |
+      |---|---|---|---|
+      | `0x3fffffb000` | `0x21fc94d7` | `V R W U A D` | yes (the `strcpy`) |
+      | `0x3fffffc000` | `0` | never loaded | no |
+      | `0x3fffffd000` | `0x21fc98d7` | `V R W U A D` | yes (the `X` and `Y`) |
+
+      In `mmaptest fork`, the parent's page 1, loaded after the child exited and only read, had
+      PTE `0x21fc8c57`: flags `0x57` = `V R W U A`, accessed but not dirty, and it was not
+      written. Private mappings and read-only ones skip the loop entirely.
+
+      Why not write every loaded page? Clinic 6 tries it: 64 pages written per `munmap` instead
+      of 1, and in `stress` a process writes its stale copy of another process's page over the
+      newer one.
+  - title: "vmawrite: one page, one transaction, never past the end"
+    commit: 7
+    file: kernel/mmap.c
+    lines: 164-188
+    focus: 172-186
+    state:
+      hart: 0
+      mode: S
+      proc: mmaptest (pid 3)
+      intr: "on"
+      satp: kernel
+      locks: ["the mapped file's inode lock (sleep-lock)"]
+      irq: 0
+      stack: [usertrap, syscall, sys_munmap, vmaunmap, vmawrite]
+      sp: {"on": kernel}
+    note: |
+      [[begin_op]] first, then [[ilock]]: the order [[filewrite]] uses, and the lock order of
+      the file system (a transaction is entered before any inode lock is taken). [[writei]]
+      copies from `pa`, the page's physical address, which the kernel can use directly through
+      its [[g:direct-map]] (`user_src` 0). Clinic 1 leaves out the transaction and gets `panic:
+      log_write outside of trans` on the first write-back.
+
+      Only `min(4096, size - off)` bytes, and nothing for a page past the end: a mapping never
+      makes its file longer (clinic 2 writes the whole page and the file grows). Since nothing
+      past the end is written, nothing is allocated, and one page costs 4 data blocks plus the
+      inode block that [[writei]]'s [[iupdate]] logs: 5, within `MAXOPBLOCKS`.
+
+      gdb at line 179: `va` `0x3fffffb000`, `pa` `0x87f25000`, `off` 0, inode 25 locked by pid
+      3, `size` 8292. In the frames, `vmawrite` is inlined into `vmaunmap` in this build (gdb
+      shows both at one address); the state's `stack` lists it as the C code does.
+    others: |
+      [[begin_op]] reserves `MAXOPBLOCKS` (10) blocks per transaction, against `LOGBLOCKS`
+      (30) in the log, so at most three can be open at once. In the stress run, three
+      processes unmapping 4 dirty pages each, gdb caught [[begin_op]] putting write-backs to
+      sleep for log space on all three harts, and to sleep while a commit was in progress. A
+      transaction that does write-back is an ordinary one: it commits with the others
+      ([[tour:31]]).
+  - title: The kernel's own writes set D by hand
+    commit: 7
+    file: kernel/vm.c
+    lines: 341-380
+    focus: 362-368
+    diff: true
+    state:
+      hart: 2
+      mode: S
+      proc: mmaptest (pid 6)
+      intr: "off"
+      satp: kernel
+      locks: [pi->lock]
+      irq: {noff: 1, intena: 1}
+      stack: [usertrap, syscall, sys_read, fileread, piperead, copyout]
+      sp: {"on": kernel}
+    note: |
+      [[copyout]] writes into a user page with `memmove` to `pa0`, the page's physical address,
+      through the kernel's [[g:direct-map]]. The hart uses the *kernel's* PTE for that store
+      and sets `D` there, if anywhere; the user PTE is untouched. A `read()` into a shared
+      mapping would put the file's (or the pipe's) bytes in the page and leave it "clean", and
+      `munmap` would throw them away. So [[copyout]] sets `PTE_D` itself, right after it has
+      checked `PTE_W`.
+
+      `mmaptest locked` reads 8 bytes from a pipe into page 1 of a shared mapping: this line,
+      called from [[piperead]] with `pi->lock` held. At `munmap` gdb read that page's PTE:
+      `0x21fcc497`, flags `0x97` = `V R W U D`, `D` from this line and no `A` at all, since no
+      user instruction ever used the page. A kernel without this line printed `locked: FAIL
+      (file contents)` and `self: FAIL (file contents)`.
+
+      (No breakpoint was set at this line in the pipe case; the state is reasoned: [[piperead]]
+      holds `pi->lock`, taken in a system call after interrupts were turned on, hence `noff`
+      1, `intena` 1. Hart 2 is where gdb saw this process's prefault for the same `read`, in
+      commit 9's code.)
+  - title: The child gets the mappings, not the pages
+    commit: 8
+    file: kernel/proc.c
+    lines: 284-313
+    focus: 290-296
+    diff: true
+    state:
+      hart: 2
+      mode: S
+      proc: mmaptest (pid 4)
+      intr: "off"
+      satp: kernel
+      locks: ["np->lock (the child's, pid 5)"]
+      irq: {noff: 1, intena: 1}
+      stack: [usertrap, syscall, sys_fork, kfork]
+      sp: {"on": kernel}
+    note: |
+      [[kfork]] copies the whole table and takes one more file reference for each mapping in
+      use, exactly as it does for `p->ofile` above. No page is copied: [[uvmcopy]] copied
+      `[0, sz)`, and the child will load each mapped page from the file when it first touches
+      it. Clinic 3 removes these lines; the child's first touch of the mapping falls through
+      to the heap code and kills it.
+
+      gdb at line 296 in `mmaptest fork`: parent pid 4 on hart 2, child pid 5, the mapping at
+      `0x3fffffc000`, `f->ref` 1 before this [[filedup]] (the parent had closed its
+      descriptor), 2 after. [[kfork]] still holds the child's `np->lock` here (from
+      [[allocproc]] until line 302): `noff` 1, `intena` 1, interrupts off. Inside [[filedup]],
+      `ftable.lock` nests under it for a few instructions: the `p->lock` → `ftable` edge that
+      [[kfork]]'s `p->ofile` loop already creates ([[concept:locks#order]]).
+
+      What the child does *not* get: the parent stored `P` into page 0 before forking and has
+      not written it back. The child's page 0 will come from the file, without the `P`. That is
+      the cost of this simple design; question 5 discusses what fixing it would take.
+  - title: The child's store reaches the file at its exit
+    commit: 8
+    file: kernel/mmap.c
+    lines: 189-218
+    focus: 201-206
+    state:
+      hart: 2
+      mode: S
+      proc: mmaptest (pid 5, the child)
+      intr: "on"
+      satp: kernel
+      locks: []
+      irq: 0
+      stack: [usertrap, syscall, sys_exit, kexit, vmaunmapall, vmaunmap]
+      sp: {"on": kernel, detail: "`sp` = `0x3fffff7ee0`"}
+    note: |
+      The child (pid 5) read page 1 of the inherited mapping, which loaded it from the file on
+      hart 2, stored `C` into it, and called `exit` without `munmap`. [[kexit]] unmaps
+      everything (commit 6), and here the loop finds page 0 never loaded (PTE 0) and page 1
+      dirty (`0x21fd0cd7`), and writes page 1 back at file offset `0x1000` with inode 25 locked
+      by pid 5.
+
+      The write-back slept (log, inode lock, disk), and the child finished its unmap on hart 0:
+      gdb's next stop, the [[fileclose]] of the mapping, was on hart 0, with the file's `ref`
+      2 (the child's mapping and the parent's) about to become 1.
+
+      Then the parent (pid 4) returns from `wait` and loads page 1 through *its* mapping for
+      the first time: from the file, so it sees `C`. At its own `munmap` its page 0 (the `P`)
+      was dirty and was written; its page 1 was clean and was not. The file ends with both,
+      which is what `mmaptest fork` checks.
+    others: |
+      | order | hart 0 | hart 2 |
+      |---|---|---|
+      | 1 | | parent pid 4: [[kfork]], child pid 5 gets the mapping |
+      | 2 | | child pid 5: loads page 1 from the file, stores `C` |
+      | 3 | | child: `exit` → write-back of page 1 begins |
+      | 4 | child resumes after sleeping: [[fileclose]] of the mapping | |
+      | 5 | parent: back from `wait`, loads page 1 (`C`), `munmap` writes page 0 | |
+
+      (From the order of gdb's stops and the hart recorded at each.)
+  - title: Load before you lock
+    commit: 9
+    file: kernel/mmap.c
+    lines: 113-138
+    focus: 119-137
+    diff: true
+    state:
+      hart: 2
+      mode: S
+      proc: mmaptest (pid 6)
+      intr: "on"
+      satp: kernel
+      locks: []
+      irq: 0
+      stack: [usertrap, syscall, sys_wait, vmaprefault]
+      sp: {"on": kernel, detail: "`sp` = `0x3fffff9f40`"}
+    note: |
+      `vmaprefault(p, va, n)` intersects `[va, va+n)` with every mapping and loads each page in
+      the intersection that is not mapped yet, through the same `mmapfault`. It holds nothing
+      while it does, so the load may sleep on the disk and take the inode lock freely. If a
+      page cannot be loaded, the system call fails with -1 before it has done anything.
+
+      This is `mmaptest locked` (pid 6) calling `wait(&status)` with `status` in page 2 of a
+      shared mapping, `0x3fffffd000`. gdb stopped in this loop on hart 2 with interrupts on and
+      no lock; the load that followed locked inode 25 for pid 6 and returned. Moments later
+      [[kwait]], holding `wait_lock` and the child's `p->lock`, copied 7 into a page that was
+      there: no load, no [[wakeup]], no `panic: acquire` (clinic 5).
+
+      Why may the page not vanish between this loop and the copy? Only this process can unmap
+      its pages (`munmap`, `exit`, `exec`, `sbrk`), and this process is busy in this system
+      call; xv6 processes have one thread. Lab 12 relies on the same argument for pages of the
+      program.
+  - title: read, write and wait call it first
+    commit: 9
+    file: kernel/sysfile.c
+    lines: 68-102
+    focus: 77-83
+    diff: true
+    state:
+      hart: 1
+      mode: S
+      proc: mmaptest (pid 8)
+      intr: "on"
+      satp: kernel
+      locks: []
+      irq: 0
+      stack: [usertrap, syscall, sys_read]
+      sp: {"on": kernel}
+    note: |
+      [[sys_read]] and [[sys_write]] call the prefault after decoding their arguments and
+      before [[fileread]] or [[filewrite]], the last point at which the call holds no lock of
+      any kind. [[sys_wait]] does the same for the status word in `sysproc.c`. What each copy
+      would otherwise hold:
+
+      | the copy | locks held during it | without the prefault |
+      |---|---|---|
+      | [[piperead]], [[pipewrite]] | `pi->lock` | `panic: sched locks` whenever the load sleeps |
+      | [[consoleread]] | `cons.lock` | the same |
+      | [[kwait]] | `wait_lock`, child's `p->lock` | `panic: acquire`, every time |
+      | [[fileread]], [[filewrite]] | inode lock, buffer lock (sleep-locks) | hang, if it is the mapped file |
+
+      This is `mmaptest self` (pid 8) on hart 1, reading its file into page 1 of its own
+      mapping. The prefault locked inode 25, loaded the page and *unlocked* it; then
+      [[fileread]] locked inode 25 again and [[readi]] copied into a page that was present.
+      Clinic 5 without these lines: the same `read` sleeps forever on its own inode lock.
+  - title: Three processes, one file, three harts
+    commit: 10
+    file: user/mmaptest.c
+    lines: 544-576
+    focus: 556-574
+    diff: true
+    state:
+      hart: any
+      mode: U
+      proc: mmaptest (a stress child)
+      intr: "on"
+      satp: user
+      locks: []
+      stack: [main, stresstest, stresschild]
+      sp: {"on": user}
+    note: |
+      The last check. Three children each run 30 rounds: open, map all 12 pages shared, check
+      that every page is uniform (a page is written back in one [[writei]] under the inode lock,
+      and loaded in one [[readi]] under it, so no process may ever see half of a write-back),
+      fill its own 4 pages with `(c + 1) * 1000 + r`, unmap. The parent then reads the file and
+      expects every child's last round: 1029, 2029, 3029. It also counts free pages before and
+      after.
+
+      gdb on the stress run saw it spread over the machine: loads and write-backs on all three
+      harts, loads asleep on the disk, write-backs asleep in [[begin_op]] waiting for log
+      space, and processes moving between harts from one write-back to the next. The check passed 10 times out of 10 on the reference and failed 5 times out of 6 with
+      clinic 6's clean write-backs.
+
+      What the branch cost: ten commits, one new file of about 280 lines, a dozen lines in
+      `vm.c`, `proc.c`, `exec.c`, `sysproc.c` and `sysfile.c`. What it bought: a file in the
+      address space, read lazily (one page of memory per page touched) and written back only
+      where it changed. What it exposed: three structures that walk `[0, sz)` and never saw
+      the new region, a PTE bit the kernel's own writes do not set, and a fault handler that
+      sleeps on an inode lock, reachable from code that holds locks.
+    others: |
+      Eleven consecutive gdb stops from the stress run (children are pids 4, 5 and 6; "page"
+      is the file offset written back):
+
+      | order | hart 0 | hart 1 | hart 2 |
+      |---|---|---|---|
+      | 1 | | pid 6 writes back page `0x8000` | |
+      | 2 | | pid 6 writes back page `0x9000` | |
+      | 3 | pid 5 sleeps in [[begin_op]]: log space | | |
+      | 4 | pid 4 writes back page `0x3000` | | |
+      | 5 | | | pid 6 sleeps in [[begin_op]] |
+      | 6 | pid 5 sleeps in [[begin_op]] again | | |
+      | 7 | | | pid 6 writes back page `0xa000` |
+      | 8 | pid 6 sleeps in [[begin_op]] | | |
+      | 9 | pid 5 writes back page `0x6000` | | |
+      | 10 | | | pid 5 writes back page `0x7000` |
+      | 11 | | pid 6 writes back page `0xb000` | |
+
+      Pid 6 went from hart 1 to hart 2, to hart 0 and back to hart 1 within four of its pages;
+      pid 5 from hart 0 to hart 2. Each sleep in [[begin_op]] or on the disk gives the hart
+      away, and the process resumes wherever a hart is free. Every page here belongs to the
+      process writing it, which is why their order does not matter.
+verify: |
+  On the branch (`ext/15-mmap`, 10 commits), built with the project toolchain and run on 3
+  harts (`-smp 3 -m 128M`), one boot:
+
+  ```text
+  $ mmaptest
+  mmaptest: read: touching 1 of 3 mapped pages took 1 free pages
+  usertrap(): unexpected scause 0xd pid=4
+              sepc=0x1e stval=0x3fffffb000
+  mmaptest: read: OK
+  mmaptest: shared: OK
+  usertrap(): unexpected scause 0xf pid=5
+              sepc=0xa stval=0x3fffffc000
+  mmaptest: private: OK
+  usertrap(): unexpected scause 0xd pid=6
+              sepc=0x1e stval=0x3fffffa000
+  usertrap(): unexpected scause 0xd pid=7
+              sepc=0x1e stval=0x3fffffd000
+  mmaptest: partial: OK
+  mmaptest: fork: OK
+  mmaptest: exit: OK
+  mmaptest: many: OK
+  mmaptest: locked: OK
+  mmaptest: self: OK
+  mmaptest: stress: OK
+  mmaptest: ALL OK
+  $ usertests -q
+  usertests starting
+  test copyin: OK
+  test copyout: OK
+  [...]
+  test nowrite: usertrap(): unexpected scause 0xf pid=6576
+  [...]
+  ALL TESTS PASSED
+  $ mmaptest
+  mmaptest: read: touching 1 of 3 mapped pages took 1 free pages
+  usertrap(): unexpected scause 0xd pid=6662
+              sepc=0x1e stval=0x3fffffb000
+  mmaptest: read: OK
+  [...]
+  mmaptest: stress: OK
+  mmaptest: ALL OK
+  ```
+
+  The `usertrap()` lines in `mmaptest` are the expected kills: in `read` a child loads from the
+  mapping after `munmap` (`stval` is its first page); in `private` a child stores into a
+  read-only mapping (`scause 0xf`); in `partial` two children load from the first and the
+  last page after they were unmapped. A second boot printed the same, with the same pids.
+
+  `usertests -q` passing shows that what the original kernel did still works: the heap's
+  `sbrk` tests (eager, lazy, shrinking, running out of memory) see the same limit as before
+  when no mapping exists, `copyout` into text still fails, and no page is lost. Every commit
+  builds with `make kernel/kernel fs.img`, and `usertests -q` printed `ALL TESTS PASSED` on 3
+  harts at each of the 10 commits.
+
+  `mmaptest stress` alone, 10 times in a row on one boot: 10 times `OK`.
+measure: |
+  **Pages cost only when touched.** `mmaptest read` counts free pages around one touch of a
+  3-page mapping: `touching 1 of 3 mapped pages took 1 free pages`, on every run. `mmap`
+  itself allocates nothing, and no page-table page is needed either: the mapping lies in the
+  same 2 MiB as the trapframe, under a level-0 page table that exists from the start.
+
+  **Write back what changed.** A scratch benchmark (not on the branch) maps a 64-page file
+  shared, reads one byte from every page, stores one byte into page 0, and unmaps, 10 times;
+  a copy of each kernel printed how many pages each such `munmap` wrote back. Three runs each,
+  one boot each:
+
+  | kernel | pages written back per `munmap` | 10 rounds, ticks |
+  |---|---|---|
+  | reference (`D` bit) | 1 | 8, 8, 7 |
+  | clinic 6 (every loaded page) | 64 | 60, 100, 53 |
+
+  A tick is 1,000,000 timer cycles ([[kernel/trap.c:179]]), 0.1 s on QEMU's 10 MHz clock: about
+  0.8 s against 5 to 10 s for the same ten rounds. Each extra page is a transaction, five
+  blocks (4 data, 1 inode) copied into the log and back, and a disk write per block; the loads (64 per round)
+  are the same in both. (The second row varies a lot from run to run; that was not
+  investigated.)
+
+  **Correctness, measured.** `mmaptest stress`: 10 of 10 `OK` on the reference; 1 of 6 `OK`
+  with clean pages written back (5 `FAIL (file contents)`).
+
+  **Where loads and write-backs happen.** In the gdb runs of the finished branch, loads came
+  from user page faults (interrupts off, no locks) and from the three prefaults (interrupts on,
+  no locks), never from a copy made under a lock. Write-backs came from `munmap`, from
+  [[kexit]] and from [[kexec]]. In the stress run both happened on all three harts, loads slept
+  on the disk, and write-backs slept in [[begin_op]] for log space: with `MAXOPBLOCKS` 10
+  reserved per transaction and 30 log blocks, three write-backs fill the log's reservation
+  although each logs only 5 blocks.
+further: |
+  - **A page cache.** Make every mapping of a file page share one physical page, kept in a
+    per-inode table and reference-counted (lab 11's counts). Shared mappings become coherent
+    between processes, `fork` can share pages instead of reloading them, and `read` and
+    `write` could use the same pages. What lock protects the table, and what happens when the
+    file is truncated under a mapping?
+  - **Copy at fork.** Copy the parent's loaded mapped pages into the child (or share them
+    copy-on-write) so that a private mapping's changes are inherited, as POSIX requires. Which
+    function walks a range of addresses that is not `[0, sz)`?
+  - **msync and holes.** Add `msync(addr, len)` to write dirty pages back without unmapping
+    (clear `D` afterwards: what about the TLB?), and let `munmap` punch a hole by splitting a
+    record in two.
+  - **Make the latent bug fail every time.** A load under a pipe's lock only panics when the load
+    sleeps (a cache miss, or a sleep-lock held by someone else). A check at the top of `mmapfault`, `panic` if this hart's `noff` is not 0, turns the
+    whole class into a panic on every run. Why would it not catch the self-deadlock?
+  - **Evict clean file pages.** Under memory pressure a clean page of a mapping can be freed
+    and loaded again later from the file, with no swap space at all; a dirty shared one can be
+    written back first. What must the kernel know to choose, and what does the `A` bit offer?
+    (Lab 16 builds on this.)

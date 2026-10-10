@@ -1,0 +1,374 @@
+summary: |
+  The [[g:write-ahead-log]], which makes file system updates **crash-safe**.
+
+  Most file system operations change several blocks. Creating a file, for example, marks an
+  inode as used, writes the new inode, and adds an entry to a directory block. If the
+  machine lost power after some of those writes and not others, the disk would be
+  inconsistent: an inode marked used that no directory refers to, or a directory entry
+  pointing at a free inode. This file prevents that: each group of writes reaches the disk
+  completely or not at all.
+
+  The protocol:
+
+  1. A file system operation that may modify the disk brackets its work with [[begin_op]] and [[end_op]]. In
+     between, instead of writing modified blocks to disk, it calls [[log_write]], which
+     only records the block number and pins the buffer in the cache.
+  2. When the last concurrent operation calls [[end_op]], [[commit]] runs: it copies every
+     modified block into the log area of the disk ([[write_log]]), then writes the log
+     header with the count of blocks ([[write_head]]). **Writing the header is the commit
+     point.** Then it copies the blocks to their real locations ([[install_trans]]) and
+     clears the header.
+  3. At boot, [[recover_from_log]] checks the header. If it records a committed
+     [[g:transaction]], recovery copies the logged blocks to their real locations again.
+
+  The system call `sync` ([[sys_sync]]) is also here, because it only needs to wait for the
+  log.
+
+  **Read before:** [[kernel/bio.c]]. **Read next:** [[kernel/fs.c]], whose functions call
+  [[log_write]], and [[kernel/sysfile.c]], whose system calls call [[begin_op]] and
+  [[end_op]].
+
+blocks:
+  - lines: 1-8
+    title: Headers
+    note: |
+      The log works on buffers ([[kernel/buf.h]]), reads the superblock's layout fields
+      ([[kernel/fs.h]]), and uses a spinlock plus the sleep/wakeup functions declared in
+      [[kernel/defs.h]].
+
+  - lines: 10-31
+    title: The design, in the source's words
+    note: |
+      This comment is an accurate summary of the protocol. Two points deserve emphasis.
+
+      **Group commit.** A transaction is not one system call. Several file system calls can
+      run at the same time, and their changes all go into one transaction, which commits
+      when the last of them ends. Because the log only commits when no call is in progress,
+      a commit never contains half of a system call's changes.
+
+      **A redo log of whole blocks.** The log stores the *new* contents of each modified
+      block, never the old ones. Recovery can only finish a committed transaction (redo it),
+      never undo one, so nothing may reach a block's home location before the transaction
+      is committed. That is why the file system calls [[log_write]] instead of [[bwrite]].
+
+      "Log appends are synchronous" means that [[commit]] waits for each disk write to
+      finish before starting the next ([[bwrite]] returns only when the device reports
+      completion), so the order of writes on disk is the order in the code.
+
+  - lines: 33-38
+    title: The log header
+    note: |
+      The header records which blocks the log contains: `n` blocks, whose home block numbers
+      are `block[0]` … `block[n-1]`. The copy of block `block[i]` is stored in log block
+      `log.start + 1 + i`, right after the header block.
+
+      The same struct serves twice: as the layout of the header block on disk, and as the
+      in-memory list of blocks the current transaction has modified (`log.lh`).
+
+      With [[LOGBLOCKS]] = 30 it is 4 + 30 × 4 = 124 bytes, well within one 1024-byte block
+      (checked by [[initlog]]). On disk the log occupies 31 blocks, 2 to 32: [[mkfs:main|mkfs]]
+      sets `nlog` to `LOGBLOCKS + 1`.
+
+  - lines: 40-49
+    title: The log's in-memory state
+    note: |
+      One global [[log]] for the one disk. `lock` (a [[g:spinlock]]) protects `outstanding`,
+      `committing`, `ncommit` and the in-memory header `lh` while operations are running.
+
+      `outstanding` counts the file system calls between [[begin_op]] and [[end_op]].
+      `committing` is 1 while [[commit]] runs; new operations wait until it is 0.
+      `ncommit` counts finished commits, so that [[sys_sync]] can wait for "the next
+      commit". `start` and `dev` say where the log is on disk.
+
+  - lines: 51-52
+    title: Forward declarations
+    note: |
+      [[initlog]] and [[end_op]] call these `static` functions, which are defined further
+      down the file. The empty parentheses of `commit()` are an
+      [[g:old-style-decl|old-style declaration]].
+
+  - lines: 54-64
+    title: "initlog(): find the log and recover"
+    note: |
+      Called by [[fsinit]] ([[kernel/fs.c:47]]) right after the superblock has been read,
+      in the first process, before any file system call can run. It copies the log's
+      location from the [[g:superblock]] and then runs [[g:crash-recovery]].
+
+      The size check is a guard for anyone who raises [[LOGBLOCKS]]: the header must fit in
+      one block, or [[write_head]] would write beyond the buffer's `data`.
+
+  - lines: 66-85
+    title: "install_trans(): copy logged blocks to their home locations"
+    note: |
+      For each block in the header, read its copy from the log, copy the bytes into the
+      buffer for its home block, and write that buffer to disk.
+
+      It runs in two situations, told apart by `recovering`:
+
+      - **After a commit** (`recovering == 0`, from [[commit]]). The home block's buffer
+        is still in the cache, pinned by [[log_write]], and already holds the new data, so
+        the [[memmove]] copies identical bytes. The important part is [[bwrite]]. Afterward
+        [[bunpin]] drops the pin, so the buffer can be recycled.
+      - **During recovery** (`recovering == 1`, from [[recover_from_log]]). The cache holds
+        none of the logged blocks yet (only the superblock and the log header have been
+        read), so the copy from the log is what puts the new data in place. Nothing was
+        pinned, so there is nothing to unpin. Each block replayed is printed.
+
+      Running it twice for the same header has the same effect as running it once, which is
+      what makes a crash *during* installation or recovery harmless.
+
+  - lines: 87-99
+    title: "read_head(): load the header from disk"
+    note: |
+      Reads the log's header block (`log.start`) and copies the count and block numbers into
+      `log.lh`. The cast treats the buffer's raw bytes as a [[logheader]], the same layout
+      [[write_head]] wrote.
+
+  - lines: 101-116
+    title: "write_head(): the commit point"
+    note: |
+      Copies the in-memory header into the header block and writes it to disk, waiting until
+      the write completes.
+
+      This one write is what decides, after a crash, whether a transaction happened. Before
+      it, the header on disk says `n == 0` and recovery ignores the log. After it, the header
+      lists the logged blocks and recovery installs them all. The same function also
+      *clears* the log, by writing a header with `n == 0` once the blocks are installed.
+
+      The argument relies on the header write being all-or-nothing: after a crash, the disk
+      holds either the old header or the new one, never a mix. The bytes that matter (124 of
+      them, see lines 35–38) lie in the block's first 512-byte sector, and a disk is normally
+      assumed to write a single sector atomically. (Simplified: xv6 does not state or check
+      this assumption.)
+
+  - lines: 118-125
+    title: "recover_from_log(): finish a committed transaction"
+    note: |
+      Read the header; install whatever it lists (nothing, if `n` is 0); then write an empty
+      header, so that the log is clear before new transactions start.
+
+      If the system crashed after a commit but before (or during) installation, the home
+      locations get the new contents now. If it crashed before the commit point, `n` is 0
+      and the half-written log blocks are ignored. Either way the file system is left with
+      all of the last transaction's changes or none of them.
+
+  - lines: 127-150
+    title: "begin_op(): join the current transaction"
+    note: |
+      Called at the start of every file system operation that may write to the disk (for
+      example in [[sys_link]], [[kernel/sysfile.c:132]], and also by [[kexec]], by
+      [[kexit]] when it releases the current directory, and by [[ireclaim]]). Calls that
+      only read, like `read`, do not use the log. It waits in two cases, then registers the caller as one more
+      outstanding operation.
+
+      - **A commit is in progress.** Changes made now would mix with blocks being written
+        to the log, so the caller waits for the next transaction.
+      - **The log might overflow.** Each operation is assumed to write at most
+        [[MAXOPBLOCKS]] (10) distinct blocks. The check reserves that much for every
+        outstanding operation plus this one, on top of the `log.lh.n` blocks already
+        logged, and waits if the total would exceed [[LOGBLOCKS]] (30). With an empty log,
+        at most three operations can run at once. The estimate is conservative: blocks
+        already logged by the running operations are counted in both `lh.n` and their
+        reservation.
+
+      Both waits use [[g:sleep-wakeup]] on the channel `&log`: [[sleep_prepare]] while
+      `log.lock` is held, then release, then [[sleep]], so a wakeup between the release and
+      the sleep is not lost. [[end_op]] issues the wakeups. After waking, the loop checks
+      both conditions again.
+
+  - lines: 152-184
+    title: "end_op(): leave the transaction, and commit if last"
+    note: |
+      Called at the end of every operation that called [[begin_op]]. It decrements
+      `outstanding`; the panic checks that no commit is running, which [[begin_op]]
+      guarantees.
+
+      If this was the last outstanding operation, this process becomes the committer: it
+      sets `committing` (so new operations wait in [[begin_op]]) and, after releasing
+      `log.lock`, calls [[commit]]. The lock must be released first because [[commit]]
+      reads and writes the disk and so sleeps, and a process must not sleep holding a
+      spinlock. No lock is needed during the commit: with `committing` set and no
+      operations outstanding, nobody else changes `log.lh`.
+
+      When the commit is done, it clears `committing`, counts the commit and wakes everyone
+      waiting on `&log`: operations waiting in [[begin_op]] and callers of [[sys_sync]].
+
+      If other operations are still running, nothing is committed yet; this one's reserved
+      log space is released, so it wakes [[begin_op]] callers that may now fit. Note what
+      that means: when a file system call returns, its changes are committed only if it was
+      the last outstanding operation. Otherwise they are committed later, when the last one
+      ends.
+
+  - lines: 186-200
+    title: "write_log(): copy modified blocks into the log area"
+    note: |
+      For each block number in the header, take the modified block from the cache and write
+      a copy into the next log block on disk. The home block is still pinned in the cache,
+      so `bread(log.dev, log.lh.block[tail])` finds it there without reading the disk.
+      [[bread]] for the log block itself may read that block from disk first, though its old
+      contents are immediately overwritten.
+
+      Writing the log does not commit anything: until [[write_head]] writes the header, the
+      disk's header still says `n == 0`, so a crash here leaves these blocks ignored.
+
+      A sizing remark: [[NBUF]] equals [[LOGBLOCKS]] (both 30). If a transaction ever
+      logged 30 blocks, all 30 buffers would be pinned, and the [[bread]] of a log block
+      here would find no free buffer and panic in [[bget]]. xv6 relies on operations
+      writing far fewer blocks than their reservation allows.
+
+  - lines: 202-212
+    title: "commit(): the four steps"
+    note: |
+      The heart of the protocol, run with no operations outstanding:
+
+      1. [[write_log]]: the new block contents go to the log area. A crash now loses the
+         transaction, cleanly: nothing has reached a home location.
+      2. [[write_head]]: the header with `n` > 0 goes to disk. **The transaction is now
+         committed.** A crash from here on is repaired by recovery at the next boot.
+      3. [[install_trans]]: each block goes to its home location. A crash in the middle is
+         repaired by recovery, which redoes all of them.
+      4. `n = 0` and [[write_head]] again: the log is empty. Without this step, the header
+         on disk would still list the old transaction while the next transaction's
+         [[write_log]] overwrote the log blocks; a crash at that moment would make recovery
+         copy the *new, uncommitted* data to the *old* blocks' home locations. A crash
+         before this write only means recovery re-installs blocks that are already in
+         place.
+
+      The order matters at every step. Swapping steps 1 and 2 could commit a header that
+      points at log blocks that were never written; installing before the header is written
+      could leave half a transaction in place after a crash, with nothing in the log to
+      finish it. The order on disk equals the order in the code because every [[bwrite]]
+      waits for the device to report completion. (Simplified: xv6 assumes that a write the
+      device has reported complete will survive a crash.)
+
+  - lines: 214-244
+    title: "log_write(): record a modified block in the transaction"
+    note: |
+      The file system's replacement for [[bwrite]], used as the comment shows: modify the
+      buffer, call [[log_write]], then [[brelse]]. It writes nothing to disk. It records the
+      block number in `log.lh` and pins the buffer so it stays in the cache, with its
+      changes, until [[install_trans]] has written it home.
+
+      **Absorption.** If the block is already in the list (because this operation, or
+      another one in the same transaction, modified it earlier), nothing new is added. The
+      block is logged once, with its latest contents, no matter how many times it is
+      changed. This matters for blocks that many operations touch, such as the free bitmap
+      and inode blocks, and it keeps the log from filling up.
+
+      The two panics catch a transaction that has outgrown the log and a call made outside
+      [[begin_op]]/[[end_op]]. The first check comes before the absorption search, so it
+      would also fire for a block already in a full log; that is conservative, not wrong.
+
+  - lines: 246-261
+    title: "sys_sync(): wait until earlier changes are on disk"
+    note: |
+      The `sync` system call (user program [[user/sync.c]]). When a file system call
+      returns, its changes may not be committed yet, because the transaction it joined
+      commits only when the last concurrent operation ends ([[end_op]]). `sync` waits for
+      that commit.
+
+      If nothing is outstanding or committing, every finished operation's changes are
+      already on disk and it returns at once. Otherwise it waits for the next commit to
+      finish, by remembering the commit count it must reach and sleeping on `&log` until
+      [[end_op]] increments `ncommit` past it. That next commit includes every operation
+      currently in progress: a running commit has no outstanding operations, and a pending
+      one includes all operations outstanding now.
+
+      It returns 0, as the system-call convention expects from a call that cannot fail.
+
+lines:
+  36: |
+    Number of blocks in the transaction (on disk: 0 means "nothing committed").
+  37: |
+    Home block number of each logged block; log block `i + 1` holds its new contents.
+  41: |
+    Protects the fields below while operations run.
+  42: |
+    Block number of the log header on disk (2 in the default `fs.img`).
+  43: |
+    Number of operations between [[begin_op]] and [[end_op]].
+  44: |
+    1 while [[commit]] runs.
+  45: |
+    The disk the log lives on, always [[ROOTDEV]].
+  46: |
+    Number of completed commits; [[sys_sync]] waits for it to advance.
+  47: |
+    The in-memory header: the blocks the current transaction has modified.
+  57-58: |
+    The header must fit in one block.
+  61: |
+    The log starts at the block the superblock names: 2, for the `fs.img` [[mkfs:main|mkfs]]
+    builds.
+  63: |
+    Run [[g:crash-recovery]] before any file system call can use the disk.
+  76: |
+    The log block holding entry `tail`: one past the header block.
+  77: |
+    The home location of that block.
+  78: |
+    Copy the new contents into the home block's buffer.
+  79: |
+    Write the home block to disk and wait for completion.
+  80-81: |
+    Remove the pin that [[log_write]] added. Recovery pinned nothing, so it skips this.
+  92: |
+    View the block's bytes as a [[logheader]].
+  114: |
+    Write the header to disk. When this completes with `n` > 0, the transaction is
+    committed; with `n` = 0, the log is empty.
+  122: |
+    Install the committed transaction, if any (`log.lh.n` may be 0).
+  123-124: |
+    Mark the log empty, in memory and on disk.
+  133-137: |
+    A commit is running: wait for it to finish.
+  138: |
+    Would the blocks already logged plus a full reservation for every running operation
+    and this one exceed the log? Then wait.
+  145: |
+    Join the transaction. From here until [[end_op]], the caller's changes belong to it.
+  160: |
+    One fewer operation in progress.
+  163-165: |
+    The last one out commits. Setting `committing` under the lock keeps new operations
+    out until the commit is done.
+  170: |
+    Wake [[begin_op]] callers that were waiting for log space.
+  177: |
+    Commit, with no locks held, because it sleeps waiting for the disk.
+  179-181: |
+    Done: let waiting operations start and wake [[sys_sync]] callers.
+  193: |
+    The log block for entry `tail`.
+  194: |
+    The modified block, still in the cache because it is pinned.
+  196: |
+    Write the copy into the log on disk.
+  205: |
+    An empty transaction (for example a call that only read) needs no disk writes.
+  206: |
+    Step 1: write the modified blocks to the log.
+  207: |
+    Step 2: write the header. This is the commit point.
+  208: |
+    Step 3: copy the blocks to their home locations and unpin them.
+  209-210: |
+    Step 4: erase the transaction from the log on disk.
+  229-230: |
+    The transaction has filled the log. [[begin_op]]'s reservation should prevent this.
+  231-232: |
+    Every [[log_write]] must happen inside a [[begin_op]]/[[end_op]] pair.
+  234-237: |
+    Look for the block in the transaction already (absorption).
+  238: |
+    Record the block number. If it was found, this rewrites the same value; otherwise it
+    appends at position `n`.
+  239-242: |
+    A new block: pin its buffer and count it.
+  250: |
+    Is there a transaction that has not finished committing?
+  251: |
+    The commit count to wait for: the next commit to complete.
+  252-257: |
+    Sleep on `&log` until that commit has finished.

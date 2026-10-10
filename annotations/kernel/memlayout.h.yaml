@@ -1,0 +1,207 @@
+summary: |
+  The map of the machine. This header names the physical addresses where QEMU's `virt`
+  machine puts its devices and RAM, and the virtual addresses where xv6 places the pages
+  that every [[g:address-space]] shares. [[kvmmake]] reads it to build the kernel's
+  [[g:page-table]], device drivers read it to find their registers ([[g:mmio]]), and
+  [[kernel/trampoline.S]] reads it to find the trapframe.
+
+  **Physical memory** (what the bus sees, on QEMU with `-m 128M`):
+
+  ```
+  0x88000000  PHYSTOP   end of the RAM xv6 uses
+              ...       free pages, handed out by kalloc()
+              end       end of the kernel image (from kernel.ld)
+              ...       kernel data and bss
+              etext     end of the kernel code (page-aligned)
+              ...       kernel code; its last page is the trampoline
+  0x80000000  KERNBASE  start of RAM; entry.S is the first byte
+              ...       (nothing xv6 uses)
+  0x10001000  VIRTIO0   virtio disk registers
+  0x10000000  UART0     serial-port registers
+  0x0c000000  PLIC      interrupt controller
+  0x02000000  CLINT     core-local interruptor (not used by this xv6)
+  0x00001000            QEMU's boot ROM
+  ```
+
+  **Kernel virtual memory** ([[kernel_pagetable]]). Below `PHYSTOP` every mapping is the
+  [[g:direct-map]]: virtual address = physical address. Above it, only the top of the
+  39-bit space is used:
+
+  ```
+  0x4000000000  MAXVA       (one past the highest usable address)
+  0x3ffffff000  TRAMPOLINE  trampoline code             R X  -> physical page at trampoline
+  0x3fffffe000              unmapped (guard)
+  0x3fffffd000  KSTACK(0)   kernel stack of proc[0]     R W
+  0x3fffffc000              unmapped (guard)
+  0x3fffffb000  KSTACK(1)   kernel stack of proc[1]     R W
+                ...         64 stacks in all (NPROC), each with a guard page below it
+  0x3ffff7f000  KSTACK(63)
+                ...         unmapped
+  0x88000000    PHYSTOP
+                            free RAM                    R W   (direct map)
+  etext                     kernel data, bss            R W   (direct map)
+  0x80000000    KERNBASE    kernel code                 R X   (direct map)
+  0x10001000    VIRTIO0     one page                    R W   (direct map)
+  0x10000000    UART0       one page                    R W   (direct map)
+  0x0c000000    PLIC        64 MiB                      R W   (direct map)
+  ```
+
+  The [[g:user-memory-layout]] of each process is at the end of this file.
+
+  **Read before:** [[kernel/kernel.ld]]. **Read next:** [[kernel/vm.c]], which builds
+  these mappings.
+
+blocks:
+  - lines: 1-13
+    title: What QEMU's virt machine provides
+    note: |
+      This comment lists the physical address map of QEMU's `virt` board, as defined in
+      QEMU's source file `hw/riscv/virt.c`. Everything below `0x80000000` is devices (and
+      a small ROM); RAM starts at `0x80000000`.
+
+      One detail of the comment is loose. With `-bios none -kernel kernel/kernel` (see the
+      Makefile), it is QEMU itself that copies the kernel into RAM before any hart starts;
+      the few instructions in the boot ROM at `0x1000` then jump to `0x80000000`
+      ([[kernel/entry.S]]).
+
+  - lines: 15-18
+    title: How xv6 uses RAM
+    note: |
+      The kernel image occupies the bottom of RAM, from `0x80000000` up to [[end]], a
+      symbol the linker script defines ([[kernel/kernel.ld]]). Everything from `end`
+      (rounded up to a page boundary) to [[PHYSTOP]] is managed by the
+      [[g:page-allocator]], which [[kinit]] fills at boot.
+
+  - lines: 20-26
+    title: The UART and the disk
+    note: |
+      Physical addresses of two devices' registers, and the interrupt numbers they raise
+      at the [[g:plic|PLIC]]. [[kernel/uart.c]] reads and writes the UART's registers at
+      [[UART0]]; [[kernel/virtio_disk.c]] talks to the disk at [[VIRTIO0]]. Because
+      [[kvmmake]] maps both pages at the same virtual address, the drivers use these
+      numbers directly as pointers.
+
+      The IRQ numbers are how [[devintr]] tells the two devices apart when the PLIC
+      reports an interrupt. [[plicinit]] gives these two sources a nonzero priority, and
+      [[plicinithart]] sets their enable bits in each hart's supervisor context.
+
+  - lines: 28-30
+    title: The CLINT, unused
+    note: |
+      The CLINT ("core-local interruptor") holds the machine-mode timer and the
+      inter-processor interrupt registers. Nothing in this version of xv6 uses these
+      macros: timer interrupts come from the [[g:sstc|Sstc]] `stimecmp` register instead
+      ([[timerinit]]), and the kernel page table does not even map the CLINT. `CLINT(hart)`
+      computes the address of hart `hart`'s 4-byte software-interrupt (`msip`) register.
+
+  - lines: 32-38
+    title: The PLIC's registers
+    note: |
+      The [[g:plic|PLIC]] is one large block of registers starting at `0x0c000000`.
+      [[kernel/plic.c]] uses these addresses:
+
+      - [[PLIC_PRIORITY]]: one 4-byte priority per interrupt source, at `PLIC + 4 × irq`;
+        0 means "never deliver". (plic.c writes `PLIC + irq * 4` directly instead of using
+        this name.)
+      - [[PLIC_PENDING]]: one pending bit per source (not used by xv6).
+      - [[PLIC_SENABLE]]`(hart)`: the enable bits of this hart's *supervisor-mode*
+        context, one bit per source.
+      - [[PLIC_SPRIORITY]]`(hart)`: that context's priority threshold; only interrupts with
+        a higher priority are delivered. xv6 sets it to 0.
+      - [[PLIC_SCLAIM]]`(hart)`: reading it claims the highest-priority pending interrupt
+        (returns its IRQ number); writing the number back says it has been handled.
+
+      The PLIC numbers its "contexts" (a hart in one privilege mode) consecutively, and on
+      QEMU each hart has two: machine mode (`2 × hart`) and supervisor mode
+      (`2 × hart + 1`). Enable bits for context *c* are at `0x2000 + c × 0x80` and its
+      threshold at `0x200000 + c × 0x1000`, so for the supervisor context of hart *h* this
+      becomes `0x2080 + h × 0x100` and `0x201000 + h × 0x2000`, the numbers on lines 36–38.
+      The claim register is 4 bytes after the threshold.
+
+  - lines: 40-44
+    title: The RAM xv6 uses
+    note: |
+      RAM starts at [[KERNBASE]] = `0x80000000` (2 GiB). xv6 assumes exactly 128 MiB of it,
+      so [[PHYSTOP]] = `0x80000000 + 0x8000000` = `0x88000000`. This must agree with the
+      `-m 128M` option in the Makefile. xv6 does not ask the hardware how much RAM exists:
+      with less, boot crashes inside [[kinit]]: [[kfree]]'s junk fill writes to the
+      missing RAM, causing an access fault before any trap handler is installed. With
+      more, the extra is never used.
+
+  - lines: 46-48
+    title: The trampoline page, at the top
+    note: |
+      [[TRAMPOLINE]] is the highest page of the virtual address space:
+      [[MAXVA]] − 4096 = `0x3ffffff000`. The trampoline code ([[kernel/trampoline.S]]) is
+      mapped there in the kernel's page table ([[kvmmake]]) *and* in every process's page
+      table ([[proc_pagetable]]). The code switches [[g:csr:satp|satp]] between the two,
+      and the instruction after the switch must be at the same address in both, or the
+      hart would fetch it from somewhere else. See [[g:trampoline]].
+
+  - lines: 50-52
+    title: Kernel stacks, with guard pages
+    note: |
+      Each process slot *p* (0 to [[NPROC]] − 1) has a one-page kernel stack at virtual
+      address [[KSTACK]]`(p)` = `TRAMPOLINE − (p + 1) × 2 × 4096`, so stacks sit at every
+      other page going down from the trampoline: `0x3fffffd000`, `0x3fffffb000`, ...,
+      `0x3ffff7f000`. The pages in between are left unmapped. A kernel stack grows down,
+      so if one overflows, the next access hits the unmapped page below it and causes a
+      [[g:page-fault]] instead of quietly overwriting the neighbouring stack. That unmapped
+      page is a [[g:guard-page]]. (Simplified: the trap handler itself pushes registers on
+      the overflowed stack, so it faults repeatedly and writes into the next stack down
+      before [[kerneltrap]] panics. The guard page makes the bug loud, not clean.)
+
+      The physical pages for the stacks come from [[kalloc]] in [[proc_mapstacks]] and need
+      not be contiguous; only the virtual layout has gaps.
+
+  - lines: 54-63
+    title: The user address space and the trapframe
+    note: |
+      The comment lists a process's virtual memory from address 0 up:
+
+      ```
+      MAXVA       0x4000000000
+      TRAMPOLINE  0x3ffffff000  trampoline code  R X    (no U: user code cannot touch it)
+      TRAPFRAME   0x3fffffe000  p->trapframe     R W    (no U)
+                  ...           unmapped
+      p->sz                     heap, grown by sbrk          R W U
+                                user stack, USERSTACK pages  R W U
+                                guard page                   R W (U cleared)
+                                data and bss                 R W U
+      0                         text                         R X U
+      ```
+
+      [[TRAPFRAME]] is the page just below the trampoline. Each process's own
+      [[g:trapframe]] page (allocated in [[allocproc]]) is mapped there by
+      [[proc_pagetable]], so the trampoline code finds the current process's saved
+      registers at the same fixed address, whatever process is running. The stack has a
+      fixed size: the comment's "fixed-size stack" is [[USERSTACK]] pages. See
+      [[g:user-memory-layout]].
+
+      The kernel never lets the heap reach `TRAPFRAME`: [[growproc]] and [[sys_sbrk]]
+      refuse to grow a process past it.
+
+lines:
+  21: |
+    The UART's registers start at `0x10000000`. The `L` suffix makes the constant a
+    `long` (64 bits), so arithmetic on it is done in 64 bits.
+  22: |
+    The UART raises interrupt number 10 at the PLIC.
+  25: |
+    The first virtio device's registers start at `0x10001000`, one page above the UART.
+    QEMU's `virt` machine provides several virtio slots; the Makefile attaches the disk to
+    the first (`bus=virtio-mmio-bus.0`).
+  26: |
+    That virtio slot raises interrupt number 1 at the PLIC.
+  43: |
+    Physical address where RAM, and the kernel, begin.
+  44: |
+    One byte past the last byte of RAM xv6 uses: `0x88000000`.
+  48: |
+    `0x3ffffff000`, the last page below [[MAXVA]] (defined in [[kernel/riscv.h]]).
+  52: |
+    Virtual address of the kernel stack of process slot `p`. The `+ 1` skips the page
+    right below the trampoline, and the `× 2` leaves an unmapped page between stacks.
+  63: |
+    `0x3fffffe000`, one page below the trampoline. Only user page tables map it; in the
+    kernel page table this address is the unmapped page above `KSTACK(0)`.

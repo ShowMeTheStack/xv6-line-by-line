@@ -1,0 +1,644 @@
+title: Output to the console from three harts
+group: Devices and putting it all together
+prerequisites: [5, 17, 37]
+summary: |
+  There is one screen and three harts. When several programs print at once, whose bytes go
+  out first, and how finely can they be mixed? The answer in xv6 is precise, and it is
+  decided by locks: a [[g:sleeplock]] that writers take turns on, a [[g:spinlock]] for the
+  kernel's own messages, and two paths to the UART that ignore each other.
+
+  This tour watches a real run. You type `cat README & ; wc README` at a freshly booted
+  shell. `cat` prints the 2441-byte README with `write`s of 512 bytes; `wc` prints its
+  one-line result with `printf`, one byte per system call; the shell prints its prompt;
+  and you start typing again while all this is on the screen, so the kernel echoes your
+  keys from an interrupt handler. Here is what QEMU actually showed, around byte 512 of
+  README:
+
+  ```
+  The following people have made contribution48 336 2441 README
+  $ s: Russ Cox (context switching,
+  ```
+
+  `wc`'s line and the shell's prompt landed in the middle of a word of `cat`'s output.
+  By the end of the tour you will know exactly where such breaks can and cannot fall, why
+  kernel messages behave differently, and what changes when the kernel panics. The single
+  `write` path itself is [[tour:5]]; here we look at what happens when it is crowded.
+cast: |
+  The machine has three [[g:hart|harts]]. The shell (pid 2) forked pid 3 to run the
+  command list; pid 3 forked pid 4 for the background part, which forked pid 5 to run
+  `cat` and exited; pid 3 then ran `wc` itself. When the tour starts:
+
+  | Hart | What it is doing |
+  |---|---|
+  | 0 | Running `cat README` (pid 5), writing the file to the console 512 bytes at a time |
+  | 1 | Running `wc README` (pid 3), about to print its result |
+  | 2 | Idle in its [[kernel:scheduler]]; it will take your keystroke interrupts |
+
+  The shell (pid 2) is asleep in [[kernel:kwait]], waiting for pid 3 (`wc`). When `wc`
+  exits, the shell will print `$ `, a third writer.
+steps:
+  - title: wc prints its answer
+    file: user/wc.c
+    lines: 8-34
+    focus: 33
+    state:
+      hart: 1
+      mode: U
+      proc: wc (pid 3)
+      intr: on
+      satp: user
+      locks: []
+      stack: [main, wc]
+      sp: user
+    note: |
+      `wc` has counted README: 48 lines, 336 words, 2441 bytes. Line 33 prints
+      `"48 336 2441 README\n"`, 19 bytes, to file descriptor 1, the console.
+
+      `wc` inherited descriptor 1 from the shell, so it shares one [[g:open-file]] with
+      `cat`, the shell and `init`: the same `struct file`, the same console. Nothing in
+      `wc` knows that `cat` is printing at the same moment on hart 0, and nothing needs to.
+      Arbitrating the screen is the kernel's job.
+    others: |
+      On hart 0, `cat` is somewhere in its loop: reading 512 bytes of README, or writing
+      them. On hart 2, nothing yet. Both `cat` and `wc` will soon be inside
+      [[kernel:consolewrite]] at the same time, running the same code on the same device.
+
+  - title: printf makes one system call per byte
+    file: user/printf.c
+    lines: 51-66
+    focus: 59-66
+    state:
+      hart: 1
+      mode: U
+      proc: wc (pid 3)
+      intr: on
+      satp: user
+      locks: []
+      stack: [main, wc, printf, vprintf]
+      sp: user
+    note: |
+      xv6's user [[user:printf]] has no buffer. [[user:vprintf]] walks the format string and
+      sends every character through `putc`, which is `write(fd, &c, 1)`
+      ([[user/printf.c:12]]). Numbers go through `printint`, which also calls `putc` once per
+      digit.
+
+      So `wc`'s 19-byte line costs **19 `write` system calls**, each carrying one byte all
+      the way through [[tour:5]]'s path. That is slow, but the important consequence here
+      is different: to the kernel, `wc`'s line is not one request. It is 19 unrelated
+      one-byte requests, and the kernel is free to put other output between any two of them.
+
+      A real C library buffers `printf` output and hands the kernel a whole line at once,
+      which is one reason lines from different programs rarely break apart on Unix.
+
+  - title: cat writes 512 bytes at once
+    file: user/cat.c
+    lines: 7-22
+    focus: 12-13
+    state:
+      hart: 0
+      mode: U
+      proc: cat (pid 5)
+      intr: on
+      satp: user
+      locks: []
+      stack: [main, cat]
+      sp: user
+    note: |
+      [[user:cat]] does the opposite: one `read` of up to 512 bytes from README, then one
+      `write(1, buf, n)` of all of them. README is 2441 bytes, so `cat` makes five writes:
+      512, 512, 512, 512 and 393 bytes.
+
+      One `write` is one request to the kernel. Does that mean a 512-byte write reaches the
+      screen in one piece? No. The next step shows the kernel cutting it into smaller pieces
+      before it reaches the UART, and every cut is a place where someone else's bytes can
+      get in.
+
+  - title: consolewrite cuts every write into 32-byte batches
+    file: kernel/console.c
+    lines: 58-79
+    focus: 65-76
+    state:
+      hart: 0
+      mode: S
+      proc: cat (pid 5)
+      intr: on
+      satp: kernel
+      locks: []
+      irq: 0
+      stack: [usertrap, syscall, sys_write, filewrite, consolewrite]
+      sp: {"on": kernel, switched: "`ld sp, 8(a0)` in `uservec` ([[kernel/trampoline.S:76]]) when `cat` executed `ecall`", detail: "cat's kernel stack, with consolewrite's buf[32] in it"}
+    note: |
+      [[consolewrite]] has a 32-byte buffer on the kernel stack. For each batch it copies
+      up to 32 bytes from the user with [[either_copyin]] and hands them to [[uartwrite]].
+      `cat`'s 512-byte write becomes 16 calls of `uartwrite(buf, 32)`; the final 393-byte
+      write becomes 12 calls of 32 bytes and one of 9.
+
+      Why batches? The bytes must be copied out of user memory before the device can see
+      them, and a small fixed buffer on the kernel stack avoids allocating memory per
+      write. The cost is the granularity you will meet next: [[uartwrite]] holds its lock
+      for one batch, not for the whole `write`.
+
+      `wc`'s one-byte writes go through the same loop: one batch of 1 byte each.
+
+      "On the kernel stack" means `cat`'s own: the page of its process slot that `uservec`
+      pointed `sp` at when `cat` executed `ecall` ([[kernel/trampoline.S:76]];
+      [[concept:stacks#kernel]]). It now holds `usertrap`, `syscall`, `sys_write`,
+      `filewrite`, and `consolewrite`'s frame with `buf` in it. A kernel stack is one 4 KiB
+      page with an unmapped guard page below it.
+    others: |
+      `wc` on hart 1 may be in this very function right now, with its own `buf` on its own
+      kernel stack. Nothing here is shared, so no lock is needed. The sharing starts at the
+      UART.
+
+  - title: uartwrite holds tx_lock for one batch
+    file: kernel/uart.c
+    lines: 76-96
+    focus: 84-93
+    state:
+      hart: 0
+      mode: S
+      proc: cat (pid 5)
+      intr: on
+      satp: kernel
+      locks: [tx_lock (sleep-lock)]
+      irq: 0
+      stack: [usertrap, syscall, sys_write, filewrite, consolewrite, uartwrite]
+      sp: kernel
+    note: |
+      [[uartwrite]] took `tx_lock` on line 82 and now feeds the batch to the UART one byte
+      at a time: register on `tx_chan`, check `LSR`, write `THR` if the transmitter is idle,
+      otherwise sleep until the UART's transmit interrupt ([[tour:5]] has the details). On
+      QEMU the transmitter is nearly always ready, so in practice the 32 bytes go out in a
+      quick burst. (A kernel instrumented to record every lock saw `uartwrite` take
+      `tx_lock` 1,426 times across boot, `usertests` and several pipelines, and **never**
+      sleep holding it: the idle test on line 87 always succeeded,
+      [[concept:locks#lock-uart]].)
+
+      Look at the irq strip: `noff` is 0. `uartwrite` calls [[sleep_prepare]] on line 86
+      holding a sleep-lock and **no spinlock**, unlike the console and the pipe, which
+      register while holding the lock that guards their condition. Here the condition is a
+      device register, `LSR`, which no lock can guard; if the UART goes idle between the
+      check and [[sleep]], the interrupt's `wakeup(&tx_chan)` clears `p->chan` and `sleep`
+      returns at once ([[concept:locks#sleep-wakeup]]).
+
+      `tx_lock` is a [[g:sleeplock]] ([[tour:17]]). Its holder may sleep in the middle of a
+      batch, so it cannot be a spinlock. And interrupts stay **on** while it is held:
+      holding a sleep-lock does not disable them.
+
+      This lock is the reason a batch is never mixed with another *batch*: while `cat`
+      holds it, no other `uartwrite` can send a byte. It is released on line 95, after 32
+      bytes, and taken again for the next batch.
+    others: |
+      Suppose `wc` on hart 1 reaches [[uartwrite]] with its one byte, `4`, while `cat` holds
+      `tx_lock`. It cannot have the lock, so it will sleep in [[acquiresleep]] and give up
+      hart 1. A spinlock would have made it spin, with interrupts off, for the whole batch.
+
+  - title: wc waits for the lock, asleep
+    file: kernel/sleeplock.c
+    lines: 21-34
+    focus: 25-26
+    state:
+      hart: 1
+      mode: S
+      proc: wc (pid 3)
+      intr: off
+      satp: kernel
+      locks: ["tx_lock.lk (spinlock)"]
+      irq: {noff: 1, intena: 1, note: "`tx_lock.lk` only; [[sleep_prepare]] makes it 2 for a moment, and the release on line 27 brings it to 0, turning SIE back on before `sleep()`"}
+      stack: [usertrap, syscall, sys_write, filewrite, consolewrite, uartwrite, acquiresleep]
+      sp: kernel
+    note: |
+      Inside, a sleep-lock is a `locked` flag guarded by a small spinlock, `lk->lk`.
+      [[acquiresleep]] takes `tx_lock.lk` (so interrupts are off on hart 1 for these few
+      lines), finds `locked == 1` because `cat` holds the sleep-lock, registers on the
+      channel `lk` with [[sleep_prepare]], releases the spinlock, and calls [[sleep]] (line
+      28).
+
+      `wc` is now asleep, holding nothing. Hart 1 is free and goes back to its scheduler,
+      which finds nothing to run and waits in `wfi`.
+
+      The same register-then-release pattern as everywhere in this version of xv6
+      ([[g:sleep-wakeup]]) protects against a lost wakeup: if `cat` releases the lock on
+      hart 0 between line 27 and line 28, its [[wakeup]] clears `wc`'s `p->chan`, and
+      `sleep` returns immediately.
+
+      On the stacks: `sleep` → `sched` → `swtch` saves `wc`'s `sp` in its `p->context` and puts
+      hart 1 on its scheduler stack ([[kernel/swtch.S:26]]). `wc`'s frames stay on its kernel
+      stack, waiting:
+
+      ```text
+      wc's kernel stack
+        top ─► usertrap
+               syscall
+               sys_write
+               filewrite
+               consolewrite   buf[32] holds the byte "4"
+               uartwrite
+               acquiresleep
+               sleep
+               sched          ◄─ saved in wc's p->context.sp
+      ```
+
+      The byte `wc` wants to print is already copied into the kernel, in `consolewrite`'s `buf`
+      on that stack. It waits there, with the rest of the frames, until `wc` runs again.
+    others: |
+      `tx_lock.lk` is held only for a few instructions at a time, by [[acquiresleep]] and
+      [[releasesleep]] on any hart. If hart 0 is in `releasesleep` right now, hart 1 spins
+      here for a moment, interrupts off. That short spin, like the brief `p->lock`
+      acquisitions inside [[sleep_prepare]], [[sleep]] and [[wakeup]], is the only kind of
+      busy-waiting on the `write` path: a few instructions at a time. Nothing on this path
+      spins for the length of a batch.
+
+  - title: Two queues, two channels
+    file: kernel/uart.c
+    lines: 135-155
+    focus: 141-146
+    state:
+      hart: 2
+      mode: S
+      proc: none (scheduler)
+      intr: off
+      satp: kernel
+      locks: []
+      irq: 0
+      stack: [scheduler, kernelvec, kerneltrap, devintr, uartintr]
+      sp: {"on": scheduler, detail: "hart 2's slice of stack0, with a `kernelvec` frame on top"}
+    note: |
+      There are now two different kinds of waiting around the UART, on two different
+      [[g:sleep-wakeup|channels]]:
+
+      | Who | Waits for | Channel | Woken by |
+      |---|---|---|---|
+      | `wc` (and any other writer) | its turn | `&tx_lock` | [[releasesleep]] |
+      | `cat`, the holder, if the UART is busy | room in the transmitter | `&tx_chan` | [[uartintr]] |
+
+      At most one process can ever be waiting on `tx_chan`: only the holder of `tx_lock`
+      sends bytes. Everybody else waits one level up, on the lock.
+
+      If `cat` did have to wait for the transmitter (rare on QEMU, common on a real 38,400
+      baud line), the "transmitter empty" interrupt would arrive at any hart, here hart 2,
+      and [[uartintr]] would call `wakeup(&tx_chan)`. That wakeup walks the whole process
+      table but can only ever wake `cat`. (It may also clear a leftover
+      `p->chan == &tx_chan` from an earlier holder, because [[uartwrite]] does not
+      unregister after its last byte; that is harmless, since every sleep follows a fresh
+      [[sleep_prepare]].) `wc`, asleep on `&tx_lock`, is untouched: waking it would be
+      pointless, since `cat` still holds the lock.
+    others: |
+      Hart 2 holds no lock while it reads `ISR` and `LSR`: the UART registers are not
+      protected by any kernel lock. [[wakeup]] takes each `p->lock` in turn, which is what
+      makes it safe against `cat` registering on hart 0 at the same moment ([[tour:5]]
+      walks through that race).
+
+  - title: Release wakes every waiter, and the race is open
+    file: kernel/sleeplock.c
+    lines: 36-44
+    focus: 40-42
+    state:
+      hart: 0
+      mode: S
+      proc: cat (pid 5)
+      intr: off
+      satp: kernel
+      locks: ["tx_lock.lk (spinlock)"]
+      irq: {noff: 1, intena: 1, note: "`tx_lock.lk`; [[wakeup]] adds each `p->lock` in turn (2)"}
+      stack: [usertrap, syscall, sys_write, filewrite, consolewrite, uartwrite, releasesleep]
+      sp: kernel
+    note: |
+      `cat`'s batch is out. [[releasesleep]] clears `locked` and calls `wakeup(lk)`, which
+      makes `wc` `RUNNABLE`. It does not hand the lock to `wc`. There is no queue: every
+      waiter is woken, and whoever reaches [[acquiresleep]] first wins.
+
+      `cat` is already running. It returns to [[consolewrite]], copies the next 32 bytes,
+      and calls `uartwrite` again, all within microseconds. `wc` must first be picked up by
+      a scheduler. So `cat` often wins again, and `wc` goes back to sleep.
+
+      In our run, `wc`'s whole line and then the shell's `$ ` appeared at exactly byte 512 of
+      README, after `cat`'s first `write` ended and before its second began. The race above
+      may explain why `wc` got nothing in during that first write. But no `cat` byte appears
+      inside `wc`'s 19 writes or the prompt, so `cat` was probably not writing at all during
+      that time: perhaps `wc` only reached its `printf` then, or `cat` was held up in its
+      next `read`. This is an inference; we did not trace it. The break fell in the middle
+      of the word "contributions" because a byte count, not a word or a line, decides where
+      writes start and end.
+
+      Note also that `releasesleep`'s wakeup sends no signal to idle harts waiting in
+      `wfi`: a woken `wc` runs only when some scheduler next scans the table.
+    others: |
+      The order is a race, not a rule:
+
+      | Time | Hart 0 (cat) | Hart 1 / 2 (wc) |
+      |---|---|---|
+      | t1 | `releasesleep`: `locked = 0`, wakes `wc` | `wc` `RUNNABLE`, no hart has picked it up yet |
+      | t2 | copies the next 32 bytes, `acquiresleep`: free, takes it | a scheduler switches to `wc` |
+      | t3 | sends the batch | `acquiresleep`: `locked == 1`, sleeps again |
+      | … | finishes the 512-byte write, returns to user, calls `read` | |
+      | t4 | | woken by the last release, takes `tx_lock`, sends `4` |
+
+      Had `wc` won at t2, its byte would have appeared between two 32-byte pieces of the
+      same `cat` write. Both outcomes are correct; neither is guaranteed.
+
+  - title: You type, and the echo ignores tx_lock
+    file: kernel/uart.c
+    lines: 98-120
+    focus: 113-116
+    state:
+      hart: 2
+      mode: S
+      proc: none (scheduler)
+      intr: off
+      satp: kernel
+      locks: [cons.lock]
+      irq: {noff: 2, intena: 0, note: "`cons.lock` plus `uartputc_sync`'s own push_off (line 106); intena 0 because the first push_off happened inside the trap handler"}
+      stack: [scheduler, kernelvec, kerneltrap, devintr, uartintr, consoleintr, consputc, uartputc_sync]
+      sp: {"on": scheduler, detail: "hart 2's slice of stack0, with a `kernelvec` frame on top"}
+    note: |
+      While README scrolls by, you start typing your next command. Each key is an
+      interrupt, here on hart 2, and [[consoleintr]] echoes it through [[consputc]] and
+      [[uartputc_sync]] ([[tour:37]]).
+
+      `uartputc_sync` never touches `tx_lock`. It cannot: it runs in an interrupt handler,
+      with `cons.lock` held, where sleeping is forbidden, and a sleep-lock's waiter sleeps.
+      So it spins until `LSR` says the transmitter is ready and writes `THR`, whoever is in
+      the middle of a batch.
+
+      In a second run we typed a new command while `cat` was printing, and the screen
+      showed our keystrokes `cat README & ; w` in the middle of README's text. Echoes
+      interleave at **single-byte** granularity with everything except `procdump`'s listing
+      (both need `cons.lock`).
+    others: |
+      `cat`'s [[uartwrite]] on hart 0 and this echo on hart 2 both "check `LSR`, then write
+      `THR`", and the two steps are not atomic across harts: both may see the transmitter
+      ready and both write. With the FIFOs enabled ([[kernel/uart.c:68]]), "ready" means the
+      16-byte transmit FIFO is empty, so both bytes fit; the only uncertainty is their
+      order. At most one byte per hart can be squeezed in this way, far from 16.
+
+      At this moment (say `cat` is mid-batch and `wc` is still waiting for `tx_lock`) the three
+      harts are each on a different stack, each with its own `sp`:
+
+      ```text
+      hart 0: cat's kernel stack      usertrap … consolewrite (buf[32]), uartwrite  ◄─ sp
+      hart 1: its scheduler stack     start, main, scheduler, in wfi  ◄─ sp
+              (wc's frames wait on wc's kernel stack, asleep on &tx_lock)
+      hart 2: its scheduler stack     scheduler, kernelvec frame, kerneltrap, devintr,
+                                      uartintr, consoleintr, consputc, uartputc_sync  ◄─ sp
+      ```
+
+      Two of them are writing to the same UART at the same time, from two different stacks. The
+      stacks keep their *data* apart (each byte waits in its own frame); only the locks, and the
+      16550's FIFO, decide the *order* in which the bytes reach the wire.
+
+  - title: printk takes pr.lock for the whole call
+    file: kernel/printk.c
+    lines: 62-78
+    focus: 73-77
+    state:
+      hart: 2
+      mode: S
+      proc: none (scheduler)
+      intr: off
+      satp: kernel
+      locks: [cons.lock, pr.lock]
+      irq: {noff: 2, intena: 0, note: "`cons.lock` and `pr.lock`; inside each [[consputc]], `uartputc_sync`'s push_off makes 3, tying the deepest nesting in the kernel ([[concept:locks#nesting]])"}
+      stack: [scheduler, kernelvec, kerneltrap, devintr, uartintr, consoleintr, procdump, printk]
+      sp: {"on": scheduler, detail: "hart 2's slice of stack0, with a `kernelvec` frame on top"}
+    note: |
+      One of your keys is control-P. [[consoleintr]] calls [[procdump]], which prints with
+      [[printk]], the kernel's own `printf` ([[tour:37]]).
+
+      `printk` takes `pr.lock`, a [[g:spinlock]], for the whole call, and prints every
+      character with [[consputc]]. So two `printk` calls on different harts never mix: the
+      second waits, spinning, until the first has printed its last byte (until a panic
+      sets `panicking`). Kernel messages
+      are short and rare, so spinning is acceptable.
+
+      Count hart 2's levels on the irq strip: `cons.lock` (from [[consoleintr]]), `pr.lock`,
+      and, inside every [[consputc]], the [[push_off]] in [[uartputc_sync]]: `noff` 3, tying
+      the deepest nesting anywhere in xv6, reached in this way only when someone types
+      control-P ([[concept:locks#nesting]]). `intena` is 0 at every level, because the first
+      push_off happened inside the trap handler.
+
+      Why not use [[uartwrite]] and `tx_lock` like everyone else? Because `printk` must work
+      where sleeping is impossible: inside interrupt handlers (like this one), with
+      spinlocks held (here `cons.lock`), and early in boot before any process exists. Only
+      a spinning path works in all three.
+    others: |
+      `pr.lock` only orders `printk` against `printk`. It does nothing about `cat`'s
+      [[uartwrite]] on hart 0, which holds a different lock, nor about echoes, which hold
+      `cons.lock`. Hart 0 can push a byte of README between any two bytes of this process
+      listing.
+
+      Lock order here is `cons.lock` → `pr.lock`. `printk` itself never takes `cons.lock`,
+      so no code takes them in the opposite order.
+
+  - title: consputc goes straight to the UART
+    file: kernel/console.c
+    lines: 28-45
+    focus: 34-45
+    state:
+      hart: 2
+      mode: S
+      proc: none (scheduler)
+      intr: off
+      satp: kernel
+      locks: [cons.lock, pr.lock]
+      irq: {noff: 2, intena: 0, note: "inside [[uartputc_sync]] (lines 105-119) it is 3: `cons.lock`, `pr.lock`, and the push_off on line 106"}
+      stack: [scheduler, kernelvec, kerneltrap, devintr, uartintr, consoleintr, procdump, printk, consputc]
+      sp: {"on": scheduler, detail: "hart 2's slice of stack0, with a `kernelvec` frame on top"}
+    note: |
+      [[consputc]] is the bottom of both the echo and `printk`: one byte, straight to
+      [[uartputc_sync]], no buffer, no `tx_lock`. Its only special case is `BACKSPACE`, which
+      becomes `\b`, space, `\b` to erase a character on the screen.
+
+      There is a subtlety in "whole call". [[procdump]] prints each process with **two**
+      `printk` calls ([[kernel/proc.c:700]] and [[kernel/proc.c:701]]): the fields, then
+      `"\n"`. `pr.lock` is released in between, so another hart's `printk` could slip in
+      before the newline. `printk` protects calls, not lines. (Here hart 2 also holds
+      `cons.lock` throughout `procdump`, so echoes, at least, cannot get in.)
+    others: |
+      What can land between two bytes of this listing:
+
+      | Other writer | Can it interleave? | Why |
+      |---|---|---|
+      | another `printk` | only between calls | `pr.lock` |
+      | an echo | no, during `procdump` | the echo needs `cons.lock`, which hart 2 holds |
+      | `cat`'s `uartwrite` | yes, any byte | `tx_lock` and `pr.lock` are unrelated |
+
+  - title: The shell's prompt, and what wc's 19 writes really were
+    file: user/sh.c
+    lines: 134-143
+    focus: 137
+    state:
+      hart: 1
+      mode: U
+      proc: sh (pid 2)
+      intr: on
+      satp: user
+      locks: []
+      stack: [main, getcmd]
+      sp: {"on": user, switched: "`ld sp, 48(a0)` in `userret` ([[kernel/trampoline.S:118]]) and `sret` ([[kernel/trampoline.S:153]]), as the shell returned from `wait`"}
+    note: |
+      Back to the real run. `wc` won `tx_lock` once per byte and printed its line, then
+      exited. The shell (pid 2) woke in [[kernel:kwait]], looped, and called
+      [[user:getcmd]], which writes `"$ "` with one `write` of 2 bytes: one batch, so no other
+      process's write can come between the `$` and the space (an echo or a `printk` still
+      could).
+
+      On screen: `contribution` (end of `cat`'s first write), `48 336 2441 README` and a
+      newline (19 separate writes by `wc`), `$ ` (one write by the shell), then
+      `s: Russ Cox` (start of `cat`'s second write).
+
+      The three processes ran on different harts and none of them knew about the others.
+      The only lock that ordered these writes was `tx_lock`, taken once per batch; when
+      they happened was decided by scheduling.
+    others: |
+      Nothing stops a writer from being preempted in user mode between two of its own
+      `write` calls. `wc` could be descheduled after printing `48 3` and resume on another
+      hart a tick later. Each `write` is independent, so nothing needs to remember where it
+      left off, except `wc` itself, in its own stack.
+
+  - title: "panic: one hart stops the world's printing"
+    file: kernel/printk.c
+    lines: 137-146
+    focus: 140-143
+    state:
+      hart: 1
+      mode: S
+      proc: wc (pid 3)
+      intr: off
+      satp: kernel
+      locks: []
+      irq: {noff: 0, note: "the interrupted `copyin` held no spinlock; with `panicking` set, `printk` skips `pr.lock` and `uartputc_sync` skips push_off, so noff stays 0"}
+      stack: [usertrap, syscall, sys_write, filewrite, consolewrite, either_copyin, copyin, memmove, kernelvec, kerneltrap, panic]
+      sp: {"on": kernel, detail: "wc's kernel stack, a kernelvec frame on top of the copy's frames"}
+    note: |
+      Now suppose something goes badly wrong: a kernel bug makes hart 1 take an
+      unexpected trap while `wc` is in the kernel, copying a byte of its output in
+      [[copyin]]. [[kerneltrap]] prints `scause`,
+      `sepc` and `stval`, then calls [[panic]] ([[kernel/trap.c:153]]). (A hypothetical: in
+      our run nothing panicked.)
+
+      `panic` sets `panicking = 1` **before** printing. That one global flag changes every
+      hart's behavior:
+
+      - [[printk]] skips `pr.lock`. The lock might be held forever by the code that broke,
+        and the panic message matters more than tidy output.
+      - [[uartputc_sync]] skips [[push_off]]/[[pop_off]]: `pop_off` can itself call
+        `panic` ([[kernel/spinlock.c:110]], [[kernel/spinlock.c:112]]), and the panic may
+        have come from exactly that bookkeeping, so the panic path stays clear of it.
+
+      Then it prints `panic: ` and the message, sets `panicked = 1`, and spins forever.
+
+      On the stack, the unexpected trap is not a switch. `kernelvec` pushed its 256-byte frame
+      onto `wc`'s kernel stack, right on top of the frames of the copy ([[kernel/kernelvec.S:14]]), and
+      `kerneltrap` and `panic` run above it. Nothing below them will ever run again on hart 1.
+    others: |
+      With `pr.lock` skipped on every hart, a `printk` running on hart 2 at this moment can
+      mix into the panic message byte by byte. The design accepts that risk: getting the
+      message out without waiting on a possibly broken lock is worth more than keeping it
+      clean.
+
+  - title: After the panic, printing freezes the printer
+    file: kernel/uart.c
+    lines: 98-120
+    focus: 105-111
+    state:
+      hart: 2
+      mode: S
+      proc: none (scheduler)
+      intr: off
+      satp: kernel
+      locks: [cons.lock]
+      irq: {noff: 1, intena: 0, note: "only `cons.lock`: `panicking` is set, so line 106's push_off is skipped and noff does not reach 2"}
+      stack: [scheduler, kernelvec, kerneltrap, devintr, uartintr, consoleintr, consputc, uartputc_sync]
+      sp: {"on": scheduler, detail: "hart 2's slice of stack0, with a `kernelvec` frame on top"}
+    note: |
+      Once `panicked` is set, any thread that reaches [[uartputc_sync]] spins forever at
+      line 109, so the panic message stays the last kernel text on the screen. Say you
+      press a key after the panic: hart 2 takes the interrupt, [[consoleintr]] takes
+      `cons.lock` and tries to echo, and hart 2 freezes here, holding `cons.lock`, with
+      interrupts off. From then on any hart that wants `cons.lock` spins forever too.
+
+      Notice what is **not** frozen: [[uartwrite]] never looks at `panicked`. In this
+      version a process on another hart that is still being scheduled, like `cat` on hart
+      0, can keep sending batches through `uartwrite` after the panic message. (It can only keep going while the
+      transmitter is always ready: hart 2 froze inside [[uartintr]] before calling
+      [[plic_complete]] ([[kernel/trap.c:210]]), so the PLIC delivers no more UART
+      interrupts, and a `uartwrite` that ever has to sleep on `tx_chan` never wakes. We read
+      this from the code; we did not trigger a panic.) Whether it gets that far depends on
+      which locks the panicking hart left held.
+    others: |
+      | Path | Normal | `panicking` | `panicked` |
+      |---|---|---|---|
+      | [[printk]] | takes `pr.lock` | skips `pr.lock` | its bytes freeze the caller |
+      | [[uartputc_sync]] | `push_off` / `pop_off` | skipped | spins forever |
+      | [[uartwrite]] | `tx_lock`, sleeps | unchanged | unchanged |
+
+  - title: Three granularities, three locks
+    file: kernel/console.c
+    lines: 58-79
+    focus: 68-76
+    state:
+      hart: 0
+      mode: S
+      proc: cat (pid 5)
+      intr: on
+      satp: kernel
+      locks: []
+      irq: 0
+      stack: [usertrap, syscall, sys_write, filewrite, consolewrite]
+      sp: kernel
+    note: |
+      Back to a healthy machine, and `cat` copying its next batch. Here is the whole rule
+      for how output can mix in xv6:
+
+      | Who prints | Path | Stays together against `write`s | Against echoes and `printk` |
+      |---|---|---|---|
+      | `write` of *n* bytes | [[consolewrite]] → [[uartwrite]] | each 32-byte batch (`tx_lock`) | nothing |
+      | user [[user:printf]] | one `write` per byte | a single byte | nothing |
+      | the echo of a key | [[consputc]] → [[uartputc_sync]] | a single byte | blocked during `procdump` (`cons.lock`) |
+      | [[printk]] | `pr.lock` → [[consputc]] | a single byte | one call against other `printk`s |
+      | `printk` during a panic | no lock | a single byte | nothing |
+
+      Two paths reach the same 16550: a polite one that sleeps and takes turns (for
+      processes), and a blunt one that spins and ignores the queue (for the kernel and
+      interrupt handlers). Each exists because the other cannot work everywhere.
+
+      What did a crowded console cost? `wc`'s 19 bytes took 19 system calls, and each byte
+      could cost zero, one or several rounds of sleeping for `tx_lock`, depending on how
+      often it lost the race; `cat`'s 2441 bytes took 5 `write` calls and 77 batches. And not one byte was lost: every lock here decides *order*, never whether a
+      byte gets out.
+locks:
+  - lock: tx_lock (sleep-lock)
+    where: "[[uartwrite]]"
+    protects: "The UART transmitter for `write` output: one 32-byte batch at a time"
+  - lock: "tx_lock.lk (spinlock)"
+    where: "[[acquiresleep]], [[releasesleep]]"
+    protects: "The sleep-lock's `locked` flag and holder pid"
+  - lock: pr.lock (spinlock)
+    where: "[[printk]]"
+    protects: "One `printk` call's bytes against other `printk` calls; skipped while `panicking`"
+  - lock: cons.lock (spinlock)
+    where: "[[consoleintr]] (echo, `procdump`)"
+    protects: "The input buffer; as a side effect, keeps echoes out of `procdump`'s listing"
+  - lock: p->lock (spinlock)
+    where: "[[sleep_prepare]], [[sleep]], [[wakeup]]"
+    protects: "`p->chan` and `p->state` of writers waiting for `tx_lock` or `tx_chan`"
+  - lock: "THR / LSR (no lock)"
+    where: "[[uartputc_sync]], [[uartwrite]]"
+    protects: "Nothing: the check-then-write is racy across harts, and the 16-byte transmit FIFO absorbs it"
+  - lock: "panicking / panicked (no lock)"
+    where: "[[panic]], [[printk]], [[uartputc_sync]]"
+    protects: "Plain `volatile` flags, set once and never cleared; no lock, because a panicking kernel cannot trust its locks"
+quiz:
+  - q: "`wc`'s output line could in principle be split by a piece of `cat`'s output, but a single 32-byte piece of `cat`'s output can never be split by `wc`. Why?"
+    a: "`wc` calls `write` once per byte, so each byte is a separate `uartwrite` call that must take `tx_lock`, and `cat` can get the lock in between. `cat`'s batch is sent entirely while `cat` holds `tx_lock`, so no other `uartwrite` can send a byte in the middle."
+  - q: "Why can't `uartputc_sync` take `tx_lock` before writing a byte?"
+    a: "`tx_lock` is a sleep-lock: a waiter sleeps. `uartputc_sync` runs in interrupt handlers and with spinlocks held (`cons.lock`, `pr.lock`), where sleeping is forbidden, and sometimes with no process at all."
+  - q: "When `cat` releases `tx_lock`, `wc` is woken. Why does `cat` nonetheless often get the lock again first?"
+    a: "`releasesleep` only marks the lock free and makes waiters `RUNNABLE`; there is no hand-off or queue. `cat` is already running and re-enters `acquiresleep` within microseconds, while `wc` first has to be picked up by a scheduler."
+  - q: "`procdump` prints each line with two `printk` calls. Could another hart's `printk` appear between a process's fields and its newline? Could a keystroke echo?"
+    a: "Another `printk` could, because `pr.lock` is released between the two calls. An echo could not, because `procdump` runs inside `consoleintr` holding `cons.lock`, and the echo also needs `cons.lock`."
+  - q: "Why does `panic` set `panicking` before printing, and what would go wrong if `printk` still took `pr.lock` during a panic?"
+    a: "The panic may have happened while some hart held `pr.lock` (for example, inside `printk` itself). Taking it again would spin forever and the message would never appear. Skipping the lock (and `push_off`) gets the message out at the cost of possible mixing."
+  - q: "After a panic, a user process on another hart calls `write` on the console. Does its output appear? What about a key you type?"
+    a: "The `write` can still appear, because `uartwrite` does not check `panicked` (if that process is still being scheduled and does not need a lock the panicking hart holds), until it finds the transmitter busy, because the frozen echo never completed its UART interrupt. The key's echo goes through `uartputc_sync`, which freezes the hart that handles it."

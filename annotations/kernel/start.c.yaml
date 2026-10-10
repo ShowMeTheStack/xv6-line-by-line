@@ -1,0 +1,270 @@
+summary: |
+  The first C code xv6 runs. Every [[g:hart]] arrives here from [[kernel/entry.S]] with its
+  own stack, still in **machine mode**, the most powerful [[g:privilege-mode]].
+
+  The xv6 kernel is designed to run in **supervisor mode**, one level down. Machine mode
+  holds a few powers supervisor mode lacks, so [[start]] uses them once, to set up
+  everything the supervisor-mode kernel will need, and then leaves machine mode for good:
+
+  1. arrange for [[g:insn:mret|mret]] to "return" into [[main]] in supervisor mode;
+  2. hand all [[g:trap|traps]] to supervisor mode ([[g:delegation]]);
+  3. allow supervisor mode to access all of physical memory ([[g:pmp|PMP]]);
+  4. enable two hardware features: automatic page-table A/D bits and the supervisor timer;
+  5. remember the hart's ID in [[g:reg:tp|tp]], since supervisor mode cannot read it;
+  6. execute `mret`.
+
+  Every one of these steps writes a [[g:csr|CSR]], each through a one-line wrapper from
+  [[kernel/riscv.h]] such as [[w_mstatus]].
+
+  **Read before:** [[kernel/entry.S]]. **Read next:** [[kernel/main.c]].
+
+blocks:
+  - lines: 1-5
+    title: Headers
+    note: |
+      The kernel has no standard C library, so these are all xv6's own headers:
+      [[kernel/types.h]] (short names like `uint64`), [[kernel/param.h]] (limits such as
+      [[NCPU]]), [[kernel/memlayout.h]] (where devices and memory are),
+      [[kernel/riscv.h]] (the CSR access functions used below), and [[kernel/defs.h]]
+      (prototypes of kernel functions in other files).
+
+  - lines: 7-8
+    title: Forward declarations
+    note: |
+      [[start]] refers to two functions defined elsewhere: [[main]] in [[kernel/main.c]] and
+      [[timerinit]] further down this file. C requires a declaration before use. The empty
+      parentheses are an [[g:old-style-decl|old-style declaration]]: they say nothing about
+      parameters.
+
+  - lines: 10-11
+    title: The boot stacks
+    note: |
+      [[kernel/entry.S]] needs one stack per CPU before any C code can run, and this array
+      provides them: `4096 * NCPU` bytes, one 4096-byte slice per hart. With [[NCPU]] = 8
+      that is 32 KiB, enough for up to 8 harts; xv6 assumes QEMU never starts more.
+
+      Each hart keeps using its slice after boot: [[main]] and then [[scheduler]] run on
+      it for as long as the system is up.
+
+  - lines: 13-16
+    title: "start(): the machine-mode setup"
+    note: |
+      [[kernel/entry.S:19]] calls this function on every hart, in machine mode, with
+      `sp` pointing into [[stack0]]. It never returns. Each block of lines below changes one
+      piece of hardware configuration, and the comment above each block names it.
+
+  - lines: 17-21
+    title: Make mret switch to supervisor mode
+    note: |
+      [[g:insn:mret|mret]] (line 51) is the instruction that leaves machine mode. It switches
+      to whatever privilege mode is recorded in the `MPP` ("machine previous privilege")
+      field, bits 12–11 of [[g:csr:mstatus|mstatus]]. Normally the hardware fills that field
+      when a trap enters machine mode, so that `mret` goes back to where the trap came from.
+
+      Here no trap happened. xv6 writes the field itself, setting it to `01` (supervisor),
+      so that `mret` will "return" into supervisor mode for the first time. The pattern is
+      read–modify–write: read the whole register, change only the two MPP bits, write it
+      back, leaving the other fields as they were.
+
+  - lines: 23-25
+    title: Make mret jump to main()
+    note: |
+      `mret` also jumps to the address in [[g:csr:mepc|mepc]]. Storing the address of
+      [[main]] there means the hart continues in `main()`, in supervisor mode, on the same
+      stack.
+
+      The comment's "requires gcc -mcmodel=medany" is about taking `main`'s address. The
+      default code model can only form addresses below 2 GiB (or within 2 GiB below zero)
+      and `main` lives above `0x80000000`; `-mcmodel=medany` makes the compiler compute
+      addresses relative to the current instruction instead. See
+      [[g:flag-mcmodel|-mcmodel=medany]].
+
+  - lines: 27-28
+    title: Paging off, for now
+    note: |
+      Writing 0 to [[g:csr:satp|satp]] selects "Bare" mode: in supervisor mode, every
+      address is used as a physical address, untranslated. [[main]] needs this because the
+      kernel's [[g:page-table]] does not exist yet; [[kvminit]] builds it, and
+      [[kvminithart]] turns translation on by writing `satp` again.
+
+  - lines: 30-33
+    title: Let supervisor mode handle all traps and receive interrupts
+    note: |
+      Without these lines every [[g:trap]], from a system call to a timer tick, would go to
+      machine mode (on QEMU, where these registers start at 0), where xv6 has no handler at
+      all: it never even sets machine mode's trap-vector register, `mtvec`.
+
+      [[g:csr:medeleg|medeleg and mideleg]] each have one bit per trap cause; a set bit
+      [[g:delegation|delegates]] that cause to supervisor mode. `0xffff` sets the low 16
+      bits, which covers every exception and interrupt xv6 can encounter (causes 0–15, the
+      original set of standard causes). The spec makes bit 11 of `medeleg` (an `ecall` from
+      machine mode) read-only zero; QEMU in fact keeps it set (it reads back `0xbfff`), which
+      is harmless because xv6 never runs an `ecall` in machine mode.
+
+      Only *supervisor-level* interrupts are actually handed over. Machine-level timer,
+      software and external interrupts always stay in machine mode; xv6 never enables
+      them.
+
+      Line 33 then turns on two kinds of supervisor interrupt in [[g:csr:sie|sie]]: external
+      interrupts from devices (keyboard, disk), arriving through the [[g:plic|PLIC]], and
+      timer interrupts. These are only the individual switches. The global switch, the `SIE`
+      bit in [[g:csr:sstatus|sstatus]], stays off (it is 0 after reset on QEMU) until
+      [[scheduler]] calls [[intr_on]].
+
+  - lines: 35-38
+    title: Let supervisor mode use all of physical memory
+    note: |
+      [[g:pmp|Physical memory protection]] lets machine mode restrict which physical
+      addresses the lower modes may touch. If a hart implements PMP, a supervisor- or
+      user-mode access that matches no PMP entry fails. So xv6 sets up entry 0 to match, and
+      allow, everything:
+
+      - `pmpcfg0 = 0xf`, binary `00001111`. Entry 0's settings are the low byte: bits 0–2
+        (R, W, X) are 1, so reads, writes and execution are permitted; bits 4–3 (A) are
+        `01`, "TOR" (top of range), so the entry covers addresses from 0 up to (not
+        including) `pmpaddr0 × 4`; bit 7 (L, lock) is 0.
+      - `pmpaddr0 = 0x3fffffffffffff`, 54 one-bits. PMP address registers hold an address
+        shifted right by 2, so the range ends at `0x3fffffffffffff × 4 = 0xfffffffffffffc`:
+        essentially the whole 56-bit physical address space RISC-V allows (all but its last
+        4 bytes).
+
+      Because the entry is not locked, it does not restrict machine mode itself.
+
+  - lines: 40-41
+    title: Let the hardware maintain A and D bits
+    note: |
+      Each page-table entry has an "accessed" (A) bit and a "dirty" (D) bit. Setting the
+      `ADUE` bit (bit 61) in [[g:csr:menvcfg|menvcfg]] enables the [[g:svadu|Svadu]] extension:
+      the hardware sets A and D itself when a page is used or written. On QEMU, without it,
+      the first access to a page whose A bit is clear (or the first write when D is clear)
+      causes a page fault, and the kernel would need code to set the bits. xv6 has no such
+      code (it never touches the A and D bits), so it asks the hardware.
+
+  - lines: 43-44
+    title: Start the clock
+    note: |
+      Configures the supervisor timer and schedules the first [[g:timer-interrupt]]; see
+      [[timerinit]] below.
+
+  - lines: 46-48
+    title: Remember which CPU this is
+    note: |
+      The kernel often needs to know which hart it is running on, for example to find its
+      entry in the [[cpus]] array. The hart ID is in [[g:csr:mhartid|mhartid]], but that
+      CSR can only be read in machine mode, and this is the last moment in machine mode. So
+      xv6 copies the ID into the general-purpose register [[g:reg:tp|tp]], where the rest of
+      the kernel reads it with [[cpuid]] ([[kernel/proc.c:65]]).
+
+      The kernel must keep `tp` intact from now on. When a process runs in user mode its
+      code may change `tp`, so before returning to user mode the kernel saves the hart ID in
+      the process's trapframe ([[kernel/trap.c:119]]), and the trap entry code reloads `tp`
+      from there on the way back into the kernel ([[kernel/trampoline.S:79]]).
+
+  - lines: 50-52
+    title: Leave machine mode
+    note: |
+      `mret` acts on everything set up above: the privilege mode becomes supervisor (from
+      `mstatus.MPP`) and the program counter becomes the address of [[main]] (from `mepc`).
+      The hart is now running the kernel proper and never returns to machine mode.
+
+      Execution never reaches the closing brace on line 52.
+
+  - lines: 54-57
+    title: "timerinit(): set up the supervisor timer"
+    note: |
+      Called from [[start]], in machine mode, on every hart. It does three things, each of
+      which needs machine-mode privilege or prepares a later supervisor-mode step.
+
+  - lines: 58-59
+    title: Turn on the supervisor timer feature
+    note: |
+      Setting `STCE` (bit 63) of [[g:csr:menvcfg|menvcfg]] enables the [[g:sstc|Sstc]]
+      extension, which gives supervisor mode its own timer-compare CSR,
+      [[g:csr:stimecmp|stimecmp]]. Older RISC-V systems had only a machine-mode timer, and
+      the kernel needed machine-mode code to forward every tick; with Sstc the supervisor
+      kernel schedules its own timer interrupts.
+
+  - lines: 61-62
+    title: Let supervisor mode use the clock and the timer
+    note: |
+      [[g:csr:mcounteren|mcounteren]] decides which counters supervisor mode may access.
+      Bit 1 (value `2`) is the `TM` bit. It lets supervisor mode read the
+      [[g:csr:time|time]] counter and, with [[g:sstc|Sstc]], read and write
+      [[g:csr:stimecmp|stimecmp]], as the source comment says. Without it, both [[r_time]]
+      and [[w_stimecmp]] in [[clockintr]] would cause an illegal-instruction exception.
+
+  - lines: 64-66
+    title: Schedule the first tick
+    note: |
+      A supervisor timer interrupt becomes pending when [[g:csr:time|time]] reaches
+      `stimecmp`. On QEMU's `virt` machine `time` counts 10,000,000 ticks per second, so
+      "now + 1,000,000" is about a tenth of a second from now. The interrupt will only be
+      *taken* once supervisor interrupts are globally enabled; after that, each timer
+      interrupt is handled by [[clockintr]], which schedules the next one the same way
+      ([[kernel/trap.c:179]]).
+
+lines:
+  11: |
+    One array, `4096 * NCPU` bytes, in [[g:bss|.bss]] (it has no initializer). The
+    [[g:attribute|__attribute__]] `aligned(16)` places it at an address that is a multiple
+    of 16, because the RISC-V [[g:calling-convention]] requires `sp` to be 16-byte aligned,
+    and every stack top computed in [[kernel/entry.S]] is `stack0` plus a multiple of 4096.
+
+    Each slice is one hart's [[g:boot-stack]] and, after [[kernel/main.c:44]], its
+    [[g:scheduler-stack]]. Unlike kernel and user stacks, the slices have no guard pages:
+    `stack0` is at `0x80007890` in this build, not even page-aligned, so a hart that
+    overflowed its slice would silently overwrite the top of the slice below it (or, for
+    hart 0, the kernel variables just below `stack0`).
+  18: |
+    Read [[g:csr:mstatus|mstatus]] into `x` ([[r_mstatus]] is one `csrr` instruction).
+    `unsigned long` is 64 bits on RV64, the width of the register.
+  19: |
+    Clear the two MPP bits. [[MSTATUS_MPP_MASK]] is `3L << 11`, binary `11` in bits 12–11;
+    `~` inverts it, so the `&=` keeps every bit except those two.
+  20: |
+    Set MPP to `01` = supervisor. [[MSTATUS_MPP_S]] is `1L << 11`.
+  21: |
+    Write the modified value back with [[w_mstatus]] (one `csrw` instruction). Nothing
+    visible happens yet; the new MPP only matters when `mret` executes.
+  25: |
+    Store the address of [[main]] in [[g:csr:mepc|mepc]]. The cast to `uint64` turns the
+    function pointer into a plain number, the type [[w_mepc]] takes.
+  28: |
+    `satp = 0`: no address translation in supervisor mode until [[kvminithart]] turns it
+    on.
+  31: |
+    Delegate all exceptions (system calls, page faults, illegal instructions...) to
+    supervisor mode.
+  32: |
+    Delegate all supervisor-level interrupts (timer, external, software) to supervisor
+    mode.
+  33: |
+    Enable supervisor external interrupts ([[SIE_SEIE]], bit 9) and supervisor timer
+    interrupts ([[SIE_STIE]], bit 5), keeping whatever bits were already set. The pattern
+    `w_X(r_X() | bits)` sets bits in a CSR without disturbing the others.
+  37: |
+    PMP entry 0's upper bound: `0x3fffffffffffff` (the `ull` suffix makes it an
+    `unsigned long long` constant). See the block note for the arithmetic.
+  38: |
+    PMP entry 0's settings: R + W + X, matching mode TOR. This write is what actually
+    enables the entry.
+  41: |
+    Enable hardware updates of the A and D bits ([[MENVCFG_ADUE]] = `1L << 61`).
+  44: |
+    Set up the supervisor timer; see [[timerinit]].
+  47: |
+    Read this hart's ID. Machine mode only.
+  48: |
+    Keep it in [[g:reg:tp|tp]]. From here on, [[cpuid]] returns this number.
+  51: |
+    Leave machine mode, switching to supervisor mode and jumping to [[main]].
+    [[g:inline-asm|Inline assembly]] is needed because C has no way to express this
+    instruction.
+  59: |
+    Enable `stimecmp` ([[MENVCFG_STCE]] = `1L << 63`), keeping the A/D setting made on
+    line 41.
+  62: |
+    Allow supervisor mode to use [[g:csr:time|time]] and [[g:csr:stimecmp|stimecmp]]
+    (bit 1, `TM`, of [[g:csr:mcounteren|mcounteren]]).
+  65: |
+    Request a timer interrupt when [[g:csr:time|time]] reaches about 0.1 s from now.

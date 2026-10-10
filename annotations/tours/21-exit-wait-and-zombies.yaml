@@ -1,0 +1,742 @@
+title: exit, wait and zombies
+group: Processes
+prerequisites: [5, 16, 20]
+summary: |
+  `ls` has printed its listing. On hart 2 it calls `exit(0)`. On hart 0, the shell has been
+  asleep inside `wait(0)` since it forked `ls`. In the next few microseconds the two must
+  meet: the dying process has to tell its parent, the parent has to wake, collect the exit
+  status and free what is left of the child, and nothing may be freed while the child is
+  still using it.
+
+  The difficulty is that a process cannot dismantle itself. While `exit` runs, it is still
+  running in its own slot of the process table, on that slot's [[g:kernel-stack]], and its
+  parent still needs its exit status. So xv6 splits death in two: `exit`
+  releases everything it can and leaves a husk, a [[g:zombie]], and the parent's `wait`
+  finishes the job. In between, three locks choreograph the handover: [[kernel:wait_lock]],
+  the child's `p->lock`, and the parent's.
+
+  You will also see what happens to children whose parent dies first (they are handed to
+  `init`), how `init` reaps them, and the lost-wakeup race that `wait_lock` exists to
+  prevent. The system-call path itself is [[tour:5]]'s; sleeping and waking are explained in
+  [[tour:16]].
+cast: |
+  The machine has three [[g:hart|harts]]. When the tour starts:
+
+  | Hart | What it is doing |
+  |---|---|
+  | 0 | Idle in its [[kernel:scheduler]]. The shell (pid 2) went to sleep here in `wait` |
+  | 1 | Idle in its scheduler, or running whatever else is runnable |
+  | 2 | Running `ls` (pid 3, slot 2 of the process table) in user mode |
+
+  This hart assignment is staged to make the handover visible; any hart may run any
+  process. In our gdb run, `ls`'s exit and the shell's reaping happened on the same hart,
+  one after the other: that hart's scheduler found the shell `RUNNABLE` right after `ls`
+  left. Below, the shell resumes on hart 0 for clarity.
+
+  `init` (pid 1) is asleep in its own `wait`, waiting for the shell. `ls` has descriptors 0,
+  1 and 2 on the console, inherited from the shell ([[tour:20]]).
+steps:
+  - title: The shell went to sleep in wait
+    file: user/sh.c
+    lines: 159-178
+    focus: 172-174
+    state:
+      hart: 0
+      mode: U
+      proc: sh (pid 2)
+      intr: on
+      satp: user
+      locks: []
+      stack: [main]
+      sp: user
+    note: |
+      Rewind a little. Right after forking `ls` ([[tour:20]]), the shell called `wait(0)`
+      on hart 0. The argument is where to store the child's exit status; the shell passes a
+      null pointer because it does not care. ([[user:wait]] is a stub; `SYS_wait` is 3.)
+
+      [[sys_wait]] fetches the address with [[argaddr]] and calls [[kwait]]. The next two
+      steps show what `kwait` did then, on hart 0, while `ls` was still being built.
+      Everything after that is `ls`'s exit on hart 2.
+
+      A parent that never calls `wait` leaves its zombies around until it exits itself;
+      then they pass to `init`, which always waits (step 18).
+
+  - title: kwait's first scan finds a live child
+    file: kernel/proc.c
+    lines: 367-405
+    focus: 384-387
+    state:
+      hart: 0
+      mode: S
+      proc: sh (pid 2)
+      intr: off
+      satp: kernel
+      locks: [wait_lock, "ls's p->lock (proc[2])"]
+      irq: {noff: 2, intena: 1}
+      stack: [usertrap, syscall, sys_wait, kwait]
+      sp: {"on": kernel, switched: "`ld sp, 8(a0)` in [[uservec]] ([[kernel/trampoline.S:76]])", detail: "sh's kernel stack, KSTACK(1), top 0x3fffffc000"}
+    note: |
+      [[kwait]] takes [[wait_lock]] first, and keeps it for the whole scan and right up to
+      the decision to sleep. The `parent` fields it reads are protected by that lock
+      ([[kernel/proc.h:92]]).
+
+      The scan walks all 64 slots looking for `pp->parent == p`. Only slot 2, the child,
+      matches. For it, kwait also takes the child's `p->lock`, because `state` (and later
+      `xstate` and `pid`) are protected by `p->lock`. The lock order is `wait_lock` then
+      `p->lock`, the order used everywhere.
+
+      The child is not a `ZOMBIE` yet (it is `RUNNABLE`, `RUNNING`, or briefly `SLEEPING` on
+      a disk read while `exec` loads `ls`), so line 403 releases its lock and the scan continues. `havekids` is 1.
+    others: |
+      Holding `wait_lock` means no process anywhere can be in the middle of [[kexit]]'s
+      critical section, which also takes it. If `ls` were exiting on hart 2 right now, it
+      would be spinning at the top of that section, waiting for the shell to finish
+      looking.
+
+  - title: Registering, then sleeping
+    file: kernel/proc.c
+    lines: 405-419
+    focus: 413-414
+    state:
+      hart: 0
+      mode: S
+      proc: sh (pid 2)
+      intr: off
+      satp: kernel
+      locks: [wait_lock]
+      irq: {noff: 1, intena: 1, note: "noff 1 is `wait_lock`; `sleep_prepare` on line 414 makes it 2 for a moment (own `p->lock`)"}
+      stack: [usertrap, syscall, sys_wait, kwait]
+      sp: kernel
+    note: |
+      The shell has a child, has not been killed, and no child is dead yet, so it must wait.
+
+      [[sleep_prepare]]`(p)` registers the shell as waiting on the channel `p`, its own
+      `struct proc` address (`&proc[1]`). The channel is just a number both sides agree on;
+      a dying child will call `wakeup` on its `parent` pointer, which is the same address.
+
+      Then, in this order: release `wait_lock` (line 415), then [[sleep]] (line 416). The
+      shell is **registered before** it lets go of `wait_lock`. Step 16 shows the race this
+      ordering defeats.
+
+      What does the sleeping shell leave behind? Only its kernel stack, frozen, and the
+      `sp` and `ra` that [[swtch]] saved in `p->context` before moving hart 0 to its
+      scheduler stack ([[kernel/swtch.S:26]]):
+
+      ```text
+      sh's kernel stack (KSTACK(1), top 0x3fffffc000)
+        top ─► usertrap   32 bytes
+               syscall    32
+               sys_wait   32
+               kwait      80
+               sleep      32
+               sched      48
+               ◄─ p->context.sp (256 bytes below the top)
+      ```
+
+      Its user stack, the page at `0x4000` in its own page table, is untouched since the
+      `ecall`; the user `sp` waits in the trapframe ([[concept:stacks]]).
+
+      The shell is now `SLEEPING`, and (in our staging, where hart 2 has taken `ls`) hart
+      0's scheduler finds nothing else to run and waits in `wfi`. When it
+      wakes, `sleep` returns and line 417 takes `wait_lock` again before rescanning: the
+      `for (;;)` loop means every wakeup leads to a fresh scan, never to an assumption.
+
+  - title: ls finishes
+    file: user/ls.c
+    lines: 76-88
+    focus: 81-84
+    state:
+      hart: 2
+      mode: U
+      proc: ls (pid 3)
+      intr: on
+      satp: user
+      locks: []
+      stack: [main]
+      sp: user
+    note: |
+      Back to the present, on hart 2. `ls` was started with no arguments, so it listed `.`
+      and now calls `exit(0)`. The stub puts `SYS_exit` (2) in `a7` and executes `ecall`;
+      [[tour:5]] has the trip into the kernel.
+
+      `exit` never returns, in user space or in the kernel. Even a `main` that just returns
+      ends here, because [[user:start]] calls `exit(main(...))` ([[user/ulib.c:17]]).
+
+      The status, 0, means success. It will travel through the child's `struct proc`, the
+      `xstate` field, to whoever waits for it.
+
+  - title: sys_exit calls kexit
+    file: kernel/sysproc.c
+    lines: 10-17
+    focus: 13-16
+    state:
+      hart: 2
+      mode: S
+      proc: ls (pid 3)
+      intr: on
+      satp: kernel
+      locks: []
+      irq: 0
+      stack: [usertrap, syscall, sys_exit]
+      sp: {"on": kernel, switched: "`ld sp, 8(a0)` in [[uservec]] ([[kernel/trampoline.S:76]])", detail: "ls's kernel stack, KSTACK(2), top 0x3fffffa000"}
+    note: |
+      [[sys_exit]] fetches the status with [[argint]] and calls [[kexit]]. The `return 0`
+      is never reached; it exists only to keep the C compiler happy about a function that
+      returns `uint64`.
+
+      Hart 2 is on `ls`'s kernel stack, the page at `KSTACK(2)` that [[uservec]] switched to
+      at the `ecall`. Keep an eye on it: `kexit` will run on this stack to the very end, and
+      the stack will outlive `ls`.
+
+      [[kexit]] is also called by [[usertrap]] when a process has been killed
+      ([[kernel/trap.c:58]] before a system call, [[kernel/trap.c:82]] after any trap), with
+      status -1 ([[tour:23]]). That is the same function, so
+      everything below applies to a killed process too.
+
+  - title: Closing every open file
+    file: kernel/proc.c
+    lines: 322-340
+    focus: 333-340
+    state:
+      hart: 2
+      mode: S
+      proc: ls (pid 3)
+      intr: on
+      satp: kernel
+      locks: []
+      irq: 0
+      stack: [usertrap, syscall, sys_exit, kexit]
+      sp: kernel
+    note: |
+      [[kexit]] first checks that it is not `init` (if `init` exited, orphans would have no
+      one to reap them, so the kernel panics instead).
+
+      Then it closes all 16 descriptor slots. `ls` has three: 0, 1 and 2, all pointing to the
+      single console [[g:open-file]] that `init` opened at boot. Its [[g:reference-count]] is
+      9 (3 from `init`, 3 from the shell, 3 from `ls`), so these three [[fileclose]] calls
+      take it to 8, 7, 6. None reaches zero, so the file stays open for the shell and `init`.
+      (`ls` opened `.` while listing, but closed it itself.)
+
+      Why close files here, in `exit`, rather than leave it to the parent's `wait`? Because
+      closing can have effects other processes are waiting for: closing the last write end
+      of a [[g:pipe]] is what tells the reader "end of file" ([[tour:39]]). That should
+      happen when the process dies, not whenever its parent gets around to waiting.
+    others: |
+      The shell on hart 0, or any other process, may be using the same console file. Each
+      `ref--` takes `ftable.lock` inside [[fileclose]], so it cannot interleave with a
+      [[filedup]] or another close on hart 1. If a count did reach zero, `fileclose` would
+      release the inode through the log, which can sleep: that is why it is called here,
+      while `ls` holds no spinlocks at all.
+
+  - title: Letting go of the current directory
+    file: kernel/proc.c
+    lines: 342-345
+    focus: 342-345
+    state:
+      hart: 2
+      mode: S
+      proc: ls (pid 3)
+      intr: on
+      satp: kernel
+      locks: []
+      irq: 0
+      stack: [usertrap, syscall, sys_exit, kexit]
+      sp: kernel
+    note: |
+      `p->cwd` is a counted reference to the root directory's in-memory [[g:inode]].
+      [[iput]] drops it.
+
+      Why wrap a mere reference drop in a [[g:transaction]] ([[begin_op]] … [[end_op]])?
+      Because [[iput]] *might* write to the disk: if this were the last reference to an
+      inode with no links left (a directory deleted while the process sat in it), `iput`
+      would free its blocks and its on-disk inode. Every file-system write goes through
+      [[log_write]], which must be inside a transaction ([[tour:31]]). For the root directory nothing is written, but `kexit`
+      cannot know that in advance.
+
+      [[begin_op]] may sleep (if the log is being committed or is too full). That is one
+      more reason this happens early, before `kexit` takes any spinlock: a process holding a
+      spinlock must never sleep.
+
+  - title: Taking wait_lock and giving children away
+    file: kernel/proc.c
+    lines: 307-320
+    focus: 314-319
+    state:
+      hart: 2
+      mode: S
+      proc: ls (pid 3)
+      intr: off
+      satp: kernel
+      locks: [wait_lock]
+      irq: {noff: 1, intena: 1}
+      stack: [usertrap, syscall, sys_exit, kexit, reparent]
+      sp: kernel
+    note: |
+      [[kexit]] now takes [[wait_lock]] ([[kernel/proc.c:347]]) and calls [[reparent]].
+      From here on, interrupts are off on hart 2.
+
+      [[reparent]] looks for processes whose parent is `ls`. If it finds one, it makes
+      [[initproc]] the new parent and wakes `init`, in case that child is already a zombie
+      waiting to be collected. `ls` has no children, so the loop finds nothing.
+
+      Without this, a dead process's children would still point at the freed slot. If nobody
+      reused it, no one would ever reap them; if a new process took the slot, it would
+      wrongly find them as its own children.
+
+      Note that [[reparent]] reads every `pp->parent` **without** taking `pp->lock`. That is
+      correct: `parent` is protected by `wait_lock`, which hart 2 holds, so no other hart can
+      be changing any `parent` field right now.
+    others: |
+      `wait_lock` is a single global lock, so any other hart that reaches [[kexit]],
+      [[kwait]] or the parent assignment in [[kfork]] now spins. That serializes all
+      parent-child bookkeeping in the system. It is a simple design, and it is cheap because
+      the critical sections are short.
+
+  - title: Waking the parent, before dying
+    file: kernel/proc.c
+    lines: 347-360
+    focus: 352-353
+    state:
+      hart: 2
+      mode: S
+      proc: ls (pid 3)
+      intr: off
+      satp: kernel
+      locks: [wait_lock, "each p->lock in turn (inside wakeup)"]
+      irq: {noff: 2, intena: 1, note: "`wait_lock` plus whichever `p->lock` `wakeup` holds at this moment"}
+      stack: [usertrap, syscall, sys_exit, kexit, wakeup]
+      sp: kernel
+    note: |
+      `p->parent` is the shell's `struct proc`, `&proc[1]`: the channel the shell registered
+      on. [[wakeup]] walks the whole table taking each `p->lock` in turn. At slot 1 it finds
+      the shell with `chan == &proc[1]`, clears `chan`, and since the shell is `SLEEPING`,
+      makes it `RUNNABLE`.
+
+      It looks premature: `ls` is not a zombie yet. But the shell cannot see `ls` in any
+      in-between state, because the first thing the shell does after waking is
+      `acquire(&wait_lock)` (line 417), and hart 2 holds `wait_lock` until `ls` is fully a
+      zombie. Waking early just lets the shell start moving sooner.
+
+      Notice also what hart 2 does **not** hold yet: its own `p->lock`. [[wakeup]] visits
+      every slot, including slot 2, and takes its lock. If `kexit` already held its own
+      `p->lock` here, `acquire` would find it already held by this hart and panic
+      ([[kernel/spinlock.c:25]]). So the order inside [[kexit]] is forced: wake first, then lock
+      itself.
+    others: |
+      The shell is now `RUNNABLE`, but nobody is running it yet. Hart 0 went into `wfi` when
+      it had nothing to run, and [[wakeup]] sends no interrupt, so hart 0 looks again only
+      after its next interrupt. Any hart whose scheduler scans slot 1 first can take the
+      shell, often hart 2 itself, a moment after `ls` leaves. If the shell does get running
+      while hart 2 still holds `wait_lock`, it comes out of [[sleep]], reaches line 417 and
+      spins; either way is safe.
+
+  - title: Becoming a zombie
+    file: kernel/proc.c
+    lines: 347-365
+    focus: 355-358
+    state:
+      hart: 2
+      mode: S
+      proc: ls (pid 3)
+      intr: off
+      satp: kernel
+      locks: [wait_lock, "ls's p->lock"]
+      irq: {noff: 2, intena: 1, note: "`wait_lock` and `ls`'s own `p->lock`; line 360 brings it to 1 for `sched`"}
+      stack: [usertrap, syscall, sys_exit, kexit]
+      sp: kernel
+    note: |
+      Now `ls` takes its own `p->lock` (order: `wait_lock`, then `p->lock`, as always) and
+      writes two fields that are protected by it:
+
+      - `xstate = 0`, the exit status, kept for the parent;
+      - `state = ZOMBIE`.
+
+      A [[g:zombie]] has no open files and no current directory, but it still has its user
+      memory, its page table, its trapframe, its kernel stack and its slot in the table. It
+      does not free those itself: the slot must survive until the parent has read `xstate`,
+      and the slot, which comes with its kernel stack (kernel stacks are never freed in this
+      version, step 15), must not be handed back while this hart is still running on that
+      stack. xv6 puts all the freeing in one place, [[freeproc]], run by the parent.
+
+      Look at where hart 2 is standing while it writes `ZOMBIE`:
+
+      ```text
+      ls's kernel stack (KSTACK(2), top 0x3fffffa000)
+        top ─► usertrap
+               syscall
+               sys_exit
+               kexit  ◄─ sp
+      ```
+
+      A function cannot free the stack it is running on: [[kfree]] would fill the page with
+      junk while the function's own frames and return addresses are still in it, and
+      another hart could [[kalloc]] the page at once. xv6 never needs to. A kernel stack belongs to the slot,
+      not the process, so nobody frees it at all; it just must not be *reused* until `ls`
+      has left it.
+
+      Then line 360 releases `wait_lock`, **but not `p->lock`**. The shell, spinning on
+      hart 0, gets `wait_lock` now and starts its scan. When it reaches slot 2 it will need
+      `ls`'s `p->lock`, which hart 2 is still holding. Hold that thought.
+    others: |
+      One possible interleaving (the shell picked up quickly by another hart):
+
+      | Time | Hart 0 (sh in kwait) | Hart 2 (ls in kexit) |
+      |---|---|---|
+      | t1 | woken, `acquire(&wait_lock)`: spins | holds `wait_lock`, takes own `p->lock` |
+      | t2 | spinning | `xstate = 0`, `state = ZOMBIE` |
+      | t3 | gets `wait_lock` | `release(&wait_lock)` |
+      | t4 | scans: slot 2's parent is me; `acquire(&proc[2].lock)`: spins | calls [[sched]] |
+
+  - title: Into the scheduler, never to return
+    file: kernel/proc.c
+    lines: 472-497
+    focus: 494-495
+    state:
+      hart: 2
+      mode: S
+      proc: ls (pid 3)
+      intr: off
+      satp: kernel
+      locks: ["ls's p->lock"]
+      irq: {noff: 1, intena: 1, note: "`sched` saves this thread's intena (1) in a local on line 494; since `ls` never runs again, it is never restored"}
+      stack: [usertrap, syscall, sys_exit, kexit, sched]
+      sp: kernel
+    note: |
+      [[kexit]] calls [[sched]], which checks the rules for giving up the CPU: hold exactly
+      one lock (`p->lock`), interrupts off, state no longer `RUNNING`. All true. [[swtch]]
+      saves `ls`'s registers into `p->context` and resumes hart 2's scheduler thread.
+
+      Inside that `swtch`, line 26 (`ld sp, 8(a1)`, [[kernel/swtch.S:26]]) is the last
+      instruction hart 2 executes with `ls`'s stack in mind: line 11 (`sd sp, 8(a0)`,
+      [[kernel/swtch.S:11]]) already saved `sp` into `p->context` (pointing at `sched`'s
+      frame), and line 26 moves `sp` to hart 2's scheduler stack. `ls`'s kernel stack is left exactly as it is,
+      `usertrap → syscall → sys_exit → kexit → sched`, and no hart will ever look at those
+      frames again.
+
+      For any other process, that saved context would be resumed some day. Not this one: no
+      scheduler will ever pick a `ZOMBIE`, so `sched` never returns into `kexit`, and line
+      496 and the `panic("zombie exit")` on [[kernel/proc.c:364]] never run for it.
+
+  - title: Hart 2's scheduler lets go of the zombie
+    file: kernel/proc.c
+    lines: 444-469
+    focus: 455-463
+    state:
+      hart: 2
+      mode: S
+      proc: none (hart 2's scheduler)
+      intr: off
+      satp: kernel
+      locks: ["ls's p->lock"]
+      irq: {noff: 1, intena: 0, note: "after `swtch` returns, hart 2's intena still holds `ls`'s 1 until line 456 sets it to 0, so the release on line 463 leaves interrupts off"}
+      stack: [main, scheduler]
+      sp: {"on": scheduler, switched: "`ld sp, 8(a1)` in [[swtch]] ([[kernel/swtch.S:26]]), called from [[sched]]", detail: "hart 2's slice of stack0, top 0x8000a890"}
+    note: |
+      [[swtch]] "returns" into [[scheduler]] on hart 2, just after the `swtch` call on line
+      453 that started `ls` running some time ago. Hart 2 is now on its own **scheduler
+      stack**, its slice of [[stack0]], which belongs to the hart, not to any process.
+
+      The code after the `swtch` sets `c->proc = 0` and **releases `ls`'s `p->lock`**
+      (line 463). The lock was taken by `ls` in [[kexit]] and is released here, on the
+      far side of the switch, by the scheduler ([[tour:13]]). Only now, with hart 2 running
+      on its own stack and no longer touching `ls`'s kernel stack, is the zombie completely
+      still.
+
+      That is why the release has to wait until this point. If `ls` released its own lock
+      before calling `sched`, the parent could free the slot while hart 2 was still pushing
+      and popping on the slot's kernel stack in `sched` and `swtch`. A later `fork` could
+      then hand that stack to a new process, and two harts would be using one stack.
+
+      One line before the release, line 456 sets `mycpu()->intena = 0`. Hart 2's `struct
+      cpu` still held `ls`'s intena (1, from its system call), and without that line the
+      release on line 463 would turn interrupts on in the middle of the scheduler loop
+      ([[concept:locks#sched-intena]]).
+    others: |
+      This is the moment hart 0 was waiting for. Its `acquire(&proc[2].lock)` in [[kwait]]
+      succeeds only after hart 2's scheduler releases the lock, which happens only after
+      [[swtch]] has finished using `ls`'s kernel stack. Each hart has its own `sp`: hart 0's
+      points into the shell's kernel stack, hart 2's into its scheduler stack, and neither
+      points into `ls`'s.
+
+  - title: The parent's scan finds the zombie
+    file: kernel/proc.c
+    lines: 376-405
+    focus: 384-389
+    state:
+      hart: 0
+      mode: S
+      proc: sh (pid 2)
+      intr: off
+      satp: kernel
+      locks: [wait_lock, "ls's p->lock (proc[2])"]
+      irq: {noff: 2, intena: 1, note: "intena 1: `wait_lock` was re-taken on line 417 after `sleep` returned with interrupts on"}
+      stack: [usertrap, syscall, sys_wait, kwait]
+      sp: {"on": kernel, switched: "`ld sp, 8(a1)` in [[swtch]] ([[kernel/swtch.S:26]]), called by hart 0's scheduler", detail: "sh's kernel stack, KSTACK(1), the frames it slept on in step 3"}
+    note: |
+      The shell, back from [[sleep]] (on hart 0 in our staging; it could be any hart) and
+      holding `wait_lock`, rescans. Slot 2's
+      parent is the shell, so it takes slot 2's `p->lock`. The source comment on line 383 says
+      why: *make sure the child isn't still in exit() or swtch()*.
+
+      Suppose the shell did not take that lock and freed the zombie the moment it saw
+      `ZOMBIE`. Hart 0's [[freeproc]] would free the trapframe and page table and set
+      `state = UNUSED` and `pid = 0`, while hart 2 is still running as `ls`: still in
+      [[sched]] and [[swtch]], `myproc()` still returns slot 2, and it still writes `ls`'s
+      context. The fields `state`, `xstate` and `pid` would be written by two harts with no
+      common lock (the rule in [[kernel/proc.h:85]]).
+
+      In this version a new `fork` still could not grab the slot too early, but only because
+      [[allocproc]] must acquire `proc[2].lock` ([[kernel/proc.c:115]]), which hart 2 holds
+      until its scheduler releases it ([[kernel/proc.c:463]]). Taking `pp->lock` in `kwait`
+      makes the guarantee direct: once the parent holds it, the child's hart has finished
+      with the slot and its kernel stack, so the parent can dismantle it.
+
+      Here the scan finds `state == ZOMBIE`, and `pid = 3`.
+
+  - title: Delivering the exit status
+    file: kernel/proc.c
+    lines: 387-402
+    focus: 390-396
+    state:
+      hart: 0
+      mode: S
+      proc: sh (pid 2)
+      intr: off
+      satp: kernel
+      locks: [wait_lock, "ls's p->lock (proc[2])"]
+      irq: {noff: 2, intena: 1}
+      stack: [usertrap, syscall, sys_wait, kwait]
+      sp: kernel
+    note: |
+      If the caller passed an address, [[copyout]] writes the 4-byte `xstate` into the
+      caller's memory, using the **caller's** page table (`p` is the shell here). The shell
+      passed 0, so this is skipped; our gdb run printed `addr=0x0`.
+
+      A caller that cares looks like `usertests`'s `run()` ([[user/usertests.c:3427]]):
+      `wait(&xstatus)` with `xstatus` on its user stack. Then [[copyout]] walks the
+      parent's page table to find the physical page and writes 0 there ([[tour:28]]).
+
+      If the copy fails (a bad pointer), `wait` returns -1 and **leaves the zombie in
+      place**, so the status is not lost and a later `wait` can still collect it.
+
+      Notice that [[copyout]] runs with two spinlocks held and interrupts off. That is
+      allowed only because [[copyout]] never sleeps: even if the address lies in a lazily
+      allocated page that is not mapped yet, [[vmfault]] allocates it with [[kalloc]],
+      which may spin briefly on `kmem.lock` but never sleeps.
+
+  - title: Freeing the husk
+    file: kernel/proc.c
+    lines: 152-171
+    focus: 158-170
+    state:
+      hart: 0
+      mode: S
+      proc: sh (pid 2)
+      intr: off
+      satp: kernel
+      locks: [wait_lock, "ls's p->lock (proc[2])"]
+      irq: {noff: 2, intena: 1, note: "`wait_lock` and the child's `p->lock`; each `kfree` makes it 3 for a moment (`kmem.lock`)"}
+      stack: [usertrap, syscall, sys_wait, kwait, freeproc]
+      sp: kernel
+    note: |
+      [[kwait]] clears `pp->parent` and calls [[freeproc]], which frees what the zombie could
+      not free itself:
+
+      - the [[g:trapframe]] page, with [[kfree]];
+      - the user memory and the page table, with [[proc_freepagetable]]. For `ls` that is 4
+        user pages (code, data, guard, stack; `sz = 0x4000`) and 5 page-table pages. The
+        trampoline is unmapped but **not** freed: it is the kernel's own code, shared by
+        every process.
+
+      Then it wipes the fields and sets `state = UNUSED`. The slot is free for the next
+      `fork` ([[tour:20]]); the next command the shell runs will get slot 2 again, as pid 4.
+
+      Two stacks, two fates. `ls`'s **user stack**, the page at `0x3000`, is one of those 4
+      user pages: it goes back to the free list here, with the user page table. Its
+      **kernel stack** is not freed: each slot's stack was mapped once at boot
+      ([[proc_mapstacks]]) and is reused by whoever occupies the slot. The frames `ls` left
+      there (`usertrap … kexit → sched`) are never popped; the next occupant's first
+      `swtch` simply starts at the top again (`context.sp = kstack + PGSIZE`,
+      [[kernel/proc.c:147]]).
+
+      Finally the locks are released in reverse order, and `kwait` returns 3. [[syscall]]
+      puts 3 in the shell's `a0`, and the shell prints its next `$ `.
+    others: |
+      Each [[kfree]] takes `kmem.lock` briefly to push a page on the free list, nested inside
+      `wait_lock` and `p->lock`: three spinlocks at once, `noff` 3, the deepest nesting a
+      measured run of this kernel found, and by far the most common of the paths that reach
+      it ([[concept:locks#nesting]],
+      [[tour:51]]). A [[kalloc]] on hart 1 may immediately reuse one of `ls`'s
+      old pages. That is safe because [[kfree]] filled it with junk first, and nothing refers
+      to it any more: `ls`'s page table is gone too.
+
+  - title: The lost wakeup that wait_lock prevents
+    file: kernel/proc.c
+    lines: 405-419
+    focus: 407-414
+    state:
+      hart: 0
+      mode: S
+      proc: sh (pid 2)
+      intr: off
+      satp: kernel
+      locks: [wait_lock]
+      irq: {noff: 1, intena: 1, note: "noff 1 is `wait_lock`; `killed` on line 408 and `sleep_prepare` on line 414 each take own `p->lock`, making it 2 for a moment"}
+      stack: [usertrap, syscall, sys_wait, kwait]
+      sp: kernel
+    note: |
+      Go back to step 3. Why must `kwait` hold `wait_lock` from the start of its scan until
+      *after* `sleep_prepare`? Imagine it released the lock right after the scan:
+
+      | Time | Hart 0 (sh in kwait) | Hart 2 (ls in kexit) |
+      |---|---|---|
+      | t1 | scan: child not a zombie | |
+      | t2 | `release(&wait_lock)` | |
+      | t3 | | `acquire(&wait_lock)`, `wakeup(&proc[1])`: **shell not registered**, nothing happens |
+      | t4 | | `ZOMBIE`, release, `sched` |
+      | t5 | `sleep_prepare(p)`, `sleep()` | |
+      | t6 | asleep forever: the only wakeup is already gone | |
+
+      The shell would hang with a zombie child it never collects. With xv6's order, `ls`
+      cannot reach its `wakeup` until the shell releases `wait_lock`, and by then the shell
+      is registered. If the wakeup then comes between line 415 and line 416, it clears the
+      shell's `chan`, and [[sleep]] sees `chan == 0` and returns at once ([[tour:16]]).
+
+      This is the general recipe: the condition ("is there a zombie?") and the registration
+      must be covered by the same lock that the waker holds when it changes the condition.
+      Here that lock is `wait_lock`.
+
+  - title: When the parent dies first
+    file: user/zombie.c
+    lines: 1-14
+    focus: 11-13
+    state:
+      hart: 1
+      mode: U
+      proc: zombie (pid 4)
+      intr: on
+      satp: user
+      locks: []
+      stack: [main]
+      sp: user
+    note: |
+      `ls` had no children. To see [[reparent]] earn its keep, run the test program
+      `zombie`. It forks; the child exits at once; the parent pauses 5 ticks and then exits
+      too, **without ever calling `wait`**.
+
+      1. The child exits: it becomes a `ZOMBIE`, and its `wakeup(p->parent)` finds nobody
+         waiting on that channel. It stays a zombie.
+      2. Five ticks later the parent exits. Inside its [[kexit]], [[reparent]] finds the
+         zombie child, sets its `parent` to [[initproc]], and calls `wakeup(initproc)`.
+      3. `init`, asleep in [[kwait]] on channel `initproc`, wakes up, rescans, finds a
+         zombie child, and frees it.
+
+      The order inside [[kexit]] matters here too: [[reparent]] runs under `wait_lock`, so the
+      parent's own exit and `init`'s scan cannot interleave. `init` sees either the old
+      parent (and the zombie is not its child) or the new one, never a half-changed tree.
+    others: |
+      Reparenting to a process that is guaranteed to exist and to wait forever is what
+      bounds the life of a zombie. `init` (pid 1) can never exit ([[kexit]] panics if it
+      tries), so every orphan eventually reaches a parent that collects it.
+
+  - title: init, the reaper
+    file: user/init.c
+    lines: 26-54
+    focus: 39-52
+    state:
+      hart: 0
+      mode: U
+      proc: init (pid 1)
+      intr: on
+      satp: user
+      locks: []
+      stack: [main]
+      sp: user
+    note: |
+      `init`'s inner loop is a dedicated reaper. It calls `wait`, and:
+
+      - if the result is the shell's pid, the shell has exited (you typed Ctrl-D); break out
+        and start a new shell;
+      - if it is any other pid, it was an orphan that `init` inherited; ignore it and wait
+        again;
+      - if `wait` fails, something is very wrong.
+
+      `init` never cares about the status, so it passes 0, like the shell.
+
+      Most of the time `init` is asleep in [[kwait]] on its own channel. Three things wake
+      it: its child the shell exiting, [[reparent]] handing it the children of a dying
+      process, and an already-adopted orphan exiting later. All call `wakeup(initproc)`, so
+      one `sleep` covers every case, and the loop in
+      [[kwait]] sorts out which happened by rescanning.
+
+  - title: What dying cost
+    file: kernel/proc.c
+    lines: 322-365
+    focus: 355-358
+    state:
+      hart: 2
+      mode: S
+      proc: ls (pid 3)
+      intr: off
+      satp: kernel
+      locks: [wait_lock, "ls's p->lock"]
+      irq: {noff: 2, intena: 1}
+      stack: [usertrap, syscall, sys_exit, kexit]
+      sp: kernel
+    note: |
+      Look at the whole of [[kexit]] once more. Its last part is a short critical section
+      under `wait_lock`, and everything slow (closing files, the log transaction) happens
+      before it, while no spinlock is held.
+
+      The protocol in one table:
+
+      | Who | Holds | Does |
+      |---|---|---|
+      | child, `kexit` | `wait_lock` | reparent, wake parent |
+      | child, `kexit` | `wait_lock`, own `p->lock` | `xstate`, `ZOMBIE` |
+      | child's hart, `scheduler` | child's `p->lock` | release it only after leaving the child's stack |
+      | parent, `kwait` | `wait_lock`, child's `p->lock` | find the zombie, copy status, free it |
+      | parent, `kwait` | `wait_lock` | register to sleep, then release |
+
+      Three ideas carry it. A process cannot hand back the slot it is still running in, and
+      its parent still needs its exit status, so death has two halves. A lock held across a context switch tells another hart when the switch is
+      complete. And a waiter must register under the same lock the waker takes, or the
+      wakeup can be lost. `ls` is gone; slot 2 is `UNUSED`; the shell prints `$ `.
+locks:
+  - lock: wait_lock
+    where: "[[kwait]] (scan to sleep), [[kexit]] (reparent to zombie), [[kfork]] (set parent)"
+    protects: "Every `p->parent` field; also makes the parent's check-then-sleep atomic with respect to the child's wakeup"
+  - lock: "child's p->lock"
+    where: "[[kexit]] (taken last, held into [[sched]]), released by the [[scheduler]]; taken by [[kwait]]"
+    protects: "`state` and `xstate`; also signals that the zombie has left its kernel stack"
+  - lock: "parent's p->lock"
+    where: "[[sleep_prepare]], [[sleep]], [[killed]] in [[kwait]] (nested inside `wait_lock`)"
+    protects: "The shell's own `chan`, `state` and `killed` fields"
+  - lock: "each p->lock in turn"
+    where: "[[wakeup]] from [[kexit]] and [[reparent]]"
+    protects: "`chan` and `state` of each process examined"
+  - lock: ftable.lock
+    where: "[[fileclose]]"
+    protects: "The reference counts of open files"
+  - lock: "log (begin_op/end_op), itable.lock"
+    where: "[[kexit]] around [[iput]] of the cwd"
+    protects: "Any disk write `iput` might make; the inode's reference count"
+  - lock: kmem.lock
+    where: "[[kfree]] from [[freeproc]]"
+    protects: "The free-page list receiving the zombie's pages"
+  - lock: "(no lock) pp->parent read in reparent"
+    where: "[[reparent]]"
+    protects: "Not needed beyond `wait_lock`: `parent` is protected by `wait_lock`, not by `pp->lock`"
+quiz:
+  - q: "Why can't `kexit` free the process's trapframe, page table and slot itself, leaving nothing behind?"
+    a: "The parent still needs `xstate` and `pid`, so the slot must survive as a `ZOMBIE`; and the slot (with its kernel stack) must not be released while the child is still running on that stack. The parent's `kwait` does the freeing once it holds the child's `p->lock`, which proves the child has left."
+  - q: "In `kexit`, `wakeup(p->parent)` is called before `acquire(&p->lock)`. What would happen if the two were swapped?"
+    a: "`wakeup` takes every process's `p->lock`, including the exiting process's own. If that lock were already held by the same hart, `acquire` would panic. Waking first is safe because the parent cannot look until `wait_lock` is released, after `ZOMBIE` is set."
+  - q: "kwait sees `pp->state == ZOMBIE` only after acquiring `pp->lock`. Trace what could go wrong if it checked `state` without the lock and freed the slot immediately."
+    a: "The child might still be inside `sched`/`swtch` on hart 2, running as slot 2; hart 0 would wipe and free the slot underneath it, a data race on fields `p->lock` protects. Reuse by `fork` would still be blocked, but only because `allocproc` must take `proc[2].lock`, which hart 2 holds until its scheduler releases it. Taking the lock in `kwait` is what guarantees the child has completely left its kernel stack before the parent dismantles the slot."
+  - q: "Suppose `kwait` released `wait_lock` before calling `sleep_prepare`. Describe an interleaving that hangs the shell."
+    a: "The shell scans and finds no zombie, releases `wait_lock`; `ls` on another hart takes `wait_lock`, calls `wakeup(parent)` while the shell is not registered, becomes a zombie; the shell then registers and sleeps, and no further wakeup ever comes."
+  - q: "The shell calls `wait(0)`. Which part of `kwait` is skipped, and what would happen if the address were a bad pointer instead?"
+    a: "The `copyout` of `xstate` is skipped because `addr == 0`. With a bad pointer, `copyout` fails and `kwait` returns -1 without freeing the zombie, so a later `wait` can still collect it."
+  - q: "A process exits while its own child is already a zombie. Who frees the child, and what wakes them?"
+    a: "`reparent` in the exiting process sets the child's parent to `init` and calls `wakeup(initproc)`. `init`, sleeping in `kwait` on channel `initproc`, wakes, rescans, finds the zombie and frees it."

@@ -1,0 +1,832 @@
+title: "main: one hart builds the kernel, the others wait"
+group: Boot and build
+prerequisites: [2]
+summary: |
+  Three harts have just arrived in [[main]], in supervisor mode, each on its own boot stack,
+  with paging and interrupts off ([[tour:2]]). Line 13 splits them. Hart 0 goes off to build
+  the kernel: the console, the page allocator, the kernel page table, the process table, the
+  trap vectors, the interrupt controller, the buffer cache, the inode and file tables, the
+  disk driver and the first process. Harts 1 and 2 sit in a two-line loop, watching one
+  integer.
+
+  This tour follows hart 0 through that sequence, one call at a time, and keeps a running
+  count of something new: **locks**. Almost every init function creates one or more
+  [[g:spinlock|spinlocks]] or [[g:sleeplock|sleep-locks]] for a shared table, at the moment
+  that table comes into existence. By the end, the kernel has well over a hundred.
+
+  Then we watch the hand-off. Hart 0 sets [[started]] with a *release* store, harts 1 and 2
+  see it with *acquire* loads, and the ordering those two words guarantee is what `main`
+  relies on to keep them from using half-built tables. They print a line (racing for the console's lock), turn on
+  paging, install their trap vectors, and all three harts enter [[scheduler]] and start
+  competing for the first process.
+cast: |
+  | Hart | What it is doing |
+  |---|---|
+  | 0 | Entering the `if (cpuid() == 0)` branch of [[main]]: it will initialize everything |
+  | 1 | Spinning in the `else` branch, loading [[started]] over and over |
+  | 2 | The same as hart 1 |
+
+  All three have interrupts off and paging off. No process exists yet.
+steps:
+  - title: The fork in the road
+    file: kernel/main.c
+    lines: 1-45
+    focus: 9-19
+    state:
+      hart: 0
+      mode: S
+      intr: off
+      satp: bare
+      locks: []
+      stack: [main]
+      sp: {"on": boot, detail: "hart 0's slice of `stack0`, `0x80007890`–`0x80008890`"}
+      irq: 0
+    note: |
+      [[cpuid]] returns `tp`, which [[start]] set to the hart's ID. On hart 0 it is 0, so
+      hart 0 enters the long `if` branch. Every line from 14 to 31 is one subsystem being
+      brought to life.
+
+      The plan is deliberately simple: **one** hart initializes, the others wait. The init
+      functions write tables that the whole kernel shares. If three harts ran them at once,
+      each of those tables would need locking from its very first byte, including the code
+      that creates the locks. Serializing boot avoids that chicken-and-egg problem entirely.
+
+      Keep in mind two facts that hold for this whole branch: interrupts are off on hart 0
+      (`sstatus.SIE` is 0: QEMU resets it to 0 and nothing since has set it), and no process exists, so [[myproc]] would
+      return 0. Nothing can preempt hart 0, and nothing can sleep.
+
+      All of it runs on hart 0's **boot stack**, its 4 KiB slice of [[stack0]] set up by
+      [[_entry]] ([[tour:2]]), with no guard page below it. Each init function pushes its
+      frame there and pops it on return. No process exists, so no process's kernel stack is
+      in use; those stacks are about to be created by [[kvminit]] ([[concept:stacks]]).
+    others: |
+      Harts 1 and 2 are on line 35, each loading [[started]] in a tight loop. They read
+      **nothing else**. That is what makes the next eighteen lines safe without locks: the
+      only shared memory the waiting harts touch is the flag itself.
+
+  - title: "consoleinit: the first lock"
+    file: kernel/console.c
+    lines: 192-203
+    focus: 195-202
+    state:
+      hart: 0
+      mode: S
+      intr: off
+      satp: bare
+      locks: []
+      stack: [main, consoleinit]
+      sp: boot
+      irq: 0
+    note: |
+      The very first thing hart 0 does is get the console working, so that everything after
+      it can print.
+
+      - [[initlock]]`(&cons.lock, "cons")` creates the **first spinlock** of the boot. It
+        will protect the console's input buffer, which the UART interrupt handler (on any
+        hart) fills and [[consoleread]] (on any hart) empties ([[tour:37]]). `initlock`
+        does not acquire anything: it only sets `locked = 0` and `cpu = 0`, and records the
+        name for debugging.
+      - [[uartinit]] programs the UART: 38,400 baud, 8 data bits, FIFOs on, transmit and
+        receive interrupts enabled. At its end it creates the second lock, `tx_lock`, a
+        [[g:sleeplock|sleep-lock]] named "uart", for serializing writers ([[tour:5]]).
+        Inside it is a third: the sleep-lock's own spinlock.
+      - `devsw[CONSOLE]` gets two function pointers, so that `read` and `write` on the
+        console device reach [[consoleread]] and [[consolewrite]].
+
+      Locks created so far: `cons.lock`, `tx_lock` (with its inner spinlock).
+    others: |
+      Writing `devsw[1]` with no lock is safe because nobody else can read it yet: harts 1
+      and 2 only look at [[started]], and no process exists to make a system call. Later,
+      every hart will read `devsw` without a lock as well, because after boot it never
+      changes again.
+
+  - title: "printk: hart 0 takes its first lock"
+    file: kernel/printk.c
+    lines: 62-77
+    focus: 73-77
+    state:
+      hart: 0
+      mode: S
+      intr: off
+      satp: bare
+      locks: [pr.lock]
+      stack: [main, printk]
+      sp: boot
+      irq: {noff: 1, intena: 0}
+    note: |
+      [[printkinit]] creates `pr.lock`, and lines 16–18 of [[main]] print the banner:
+
+      ```
+
+      xv6 kernel is booting
+
+      ```
+
+      Each [[printk]] call **acquires** `pr.lock` before printing and releases it after, so
+      that two harts printing at once do not interleave their characters. Right now only hart
+      0 is printing, and the lock is free. But [[acquire]] runs its full protocol anyway:
+
+      1. [[push_off]] disables interrupts (already off) and records in `cpus[0]` that they
+         were off, so the matching [[pop_off]] will leave them off.
+      2. An atomic swap ([[g:insn-amoswap|amoswap.w.aq]]) sets `locked` to 1 and returns
+         the old value, 0: acquired on the first try.
+      3. `lk->cpu = mycpu()`, which works because `tp` holds the hart ID.
+
+      The characters go out through [[consputc]] and [[uartputc_sync]], which polls the UART
+      until it can accept each byte. Each [[uartputc_sync]] does its own [[push_off]], so
+      hart 0's `noff` goes from 1 to 2 and back for every character. Those [[pop_off]]s never
+      reach `noff` 0, so they leave interrupts off, and because `intena` is 0, the final
+      release of `pr.lock` leaves them off too ([[concept:locks#noff]]). No sleeping, no
+      interrupts: exactly what printing must look like before the scheduler exists.
+    others: |
+      In a few minutes of story time, harts 1 and 2 will each call [[printk]] at almost the
+      same instant, and this lock will finally have a contest to settle (step 15).
+
+  - title: "kinit: 32,735 pages, 32,735 trips through kmem.lock"
+    file: kernel/kalloc.c
+    lines: 26-63
+    focus: 60-61
+    state:
+      hart: 0
+      mode: S
+      intr: off
+      satp: bare
+      locks: [kmem.lock]
+      stack: [main, kinit, freerange, kfree]
+      sp: boot
+      irq: {noff: 1, intena: 0}
+    note: |
+      [[kinit]] creates `kmem.lock` and gives the page allocator all free RAM: every page
+      from [[end]] rounded up (`0x80021000` in this build) to [[PHYSTOP]] (`0x88000000`).
+      That is 32,735 pages of 4 KiB.
+
+      [[freerange]] calls [[kfree]] on each page. `kfree` fills the page with junk (`1`
+      bytes), then pushes it onto the free list **under `kmem.lock`**: 32,735 acquires and
+      releases, every one uncontended. The last page freed, `0x87fff000`, ends up at the head
+      of the list, so it will be the first page [[kalloc]] hands out.
+
+      Why take the lock at all, when only one hart is running? Because `kfree` is the same
+      function that will be called later, from any hart, at any time. It always follows the
+      rule; the rule is cheap when nobody else is there.
+
+      (QEMU's device-tree blob at `0x87e00000`, whose address the boot ROM passed in `a1`,
+      is inside this range. The junk fill overwrites it. xv6 never reads it.)
+    others: |
+      After boot, the free list is one of the hottest shared structures in the kernel: a
+      `fork` on hart 1 and a page fault on hart 2 can both call [[kalloc]] at the same
+      moment. Without `kmem.lock`, both could read the same `kmem.freelist`, both take the
+      same page, and two processes would share memory without knowing it ([[tour:27]]).
+
+  - title: "kvminit and kvminithart: paging on, for hart 0 only"
+    file: kernel/vm.c
+    lines: 65-84
+    focus: 66-70
+    state:
+      hart: 0
+      mode: S
+      intr: off
+      satp: bare
+      locks: []
+      stack: [main, kvminit]
+      sp: boot
+      irq: 0
+    note: |
+      [[kvminit]] builds the kernel's page table with [[kvmmake]]: device registers, the
+      kernel's code and data, all of RAM, the trampoline, and 64 kernel stacks. In this build
+      it takes 166 pages from [[kalloc]] (102 page-table pages and 64 stack pages), each
+      allocation under `kmem.lock`. The root ends up at `0x87fff000`, the first page
+      `kalloc` returned.
+
+      Line 21 of [[main]] then calls [[kvminithart]], which writes `satp` and turns on
+      paging **on hart 0**. Because the kernel maps memory at the same addresses it occupies
+      physically, hart 0's next instruction fetch still works.
+
+      The details, mapping by mapping, are the subject of [[tour:24]]. What matters here is
+      where the result lives: in a global, [[kernel_pagetable]], which harts 1 and 2 will
+      read as soon as they are allowed to.
+
+      The 64 stack pages are the future **kernel stacks**, one per process slot, mapped by
+      [[proc_mapstacks]] at [[KSTACK]] addresses near the top of the address space, each with
+      an unmapped [[g:guard-page]] below it. They are allocated now, once, and never freed.
+      Hart 0 is not running on any of them: it is still on its boot stack, which lies in
+      `.bss` and is reached through the direct mapping of the kernel's data, so turning on
+      paging leaves `sp` valid.
+    others: |
+      `satp` is a per-hart register. Turning on paging on hart 0 does nothing to harts 1 and
+      2: they are still spinning on [[started]] with paging off, using physical addresses.
+      For a while, the three harts are running in different translation modes, and that is
+      fine.
+
+  - title: "procinit: 66 more locks"
+    file: kernel/proc.c
+    lines: 46-59
+    focus: 52-58
+    state:
+      hart: 0
+      mode: S
+      intr: off
+      satp: kernel
+      locks: []
+      stack: [main, procinit]
+      sp: boot
+      irq: 0
+    note: |
+      [[procinit]] prepares the process table, 64 [[kernel:proc|struct proc]] entries:
+
+      - `pid_lock` ("nextpid") protects [[nextpid]], the counter [[allocpid]] increments.
+      - `wait_lock` protects the parent/child relationships that [[kwait]] and [[kexit]]
+        use ([[tour:21]]).
+      - Each process's own `p->lock` ("proc"), 64 of them. It will guard that process's
+        `state`, `chan`, `killed`, `xstate` and `pid`, the fields every hart's scheduler reads.
+      - `p->state = UNUSED` (it is already 0 in `.bss`, but this says it) and `p->kstack`,
+        the virtual address of the kernel stack [[kvmmake]] just mapped:
+        [[KSTACK]]`(0)` = `0x3fffffd000` for `proc[0]`, down to `0x3ffff7f000` for
+        `proc[63]`.
+
+      Why a lock per process instead of one for the whole table? Because three schedulers
+      will scan this table continuously. With one big lock, every scan on every hart would
+      block every other. With 64 small ones, two harts only collide when they look at the
+      **same** process at the same moment.
+
+      Locks created so far: 70 spinlocks and 1 sleep-lock.
+
+  - title: "trapinit and trapinithart: a global lock, a per-hart register"
+    file: kernel/trap.c
+    lines: 19-30
+    focus: 19-23
+    state:
+      hart: 0
+      mode: S
+      intr: off
+      satp: kernel
+      locks: []
+      stack: [main, trapinit]
+      sp: boot
+      irq: 0
+    note: |
+      These two functions show the split that runs through all of `main`: **init** functions
+      set up shared memory once, **inithart** functions set up the calling hart's own
+      hardware.
+
+      - [[trapinit]] creates `tickslock` ("time"), which protects [[ticks]], the global
+        tick counter. Only hart 0's timer handler increments it ([[clockintr]]), but any
+        hart may read it in `pause` ([[tour:14]]). Shared data, so it is created once.
+      - [[trapinithart]] writes [[g:csr:stvec|stvec]] = [[kernelvec]] (`0x800055b0`):
+        "when a trap happens while in the kernel, go here". `stvec` is a per-hart CSR, so
+        this sets it on hart 0 only. Harts 1 and 2 will call `trapinithart` themselves.
+
+      Interrupts are still off, so `stvec` will not be used yet. But exceptions cannot be
+      turned off, and [[start]] delegated them all to supervisor mode: if hart 0 made a bad memory access now, it would trap to `kernelvec`, and
+      [[kerneltrap]] would print a message and panic, instead of jumping to whatever `stvec`
+      held at reset.
+
+  - title: "plicinit and plicinithart: shared priorities, private enables"
+    file: kernel/plic.c
+    lines: 11-30
+    focus: 11-17
+    state:
+      hart: 0
+      mode: S
+      intr: off
+      satp: kernel
+      locks: []
+      stack: [main, plicinit]
+      sp: boot
+      irq: 0
+    note: |
+      The [[g:plic|PLIC]] routes device interrupts to harts. Its registers are memory-mapped
+      ([[g:mmio]]), and some are shared, some per hart:
+
+      - [[plicinit]] sets the **priority** of the UART (IRQ 10) and the disk (IRQ 1) to 1.
+        There is one priority register per device, for the whole machine: written once,
+        by hart 0. A priority of 0 would mean "never interrupt".
+      - [[plicinithart]] writes **this hart's** enable register and threshold. The PLIC has
+        a separate block of registers for each hart: hart 0's supervisor enable is at
+        `0x0c002080`, hart 1's at `0x0c002180`, hart 2's at `0x0c002280` ([[PLIC_SENABLE]]).
+
+      After line 26 of [[main]], the PLIC will deliver UART and disk interrupts to hart 0.
+      After harts 1 and 2 run their own `plicinithart`, to them as well, and whichever hart
+      claims an interrupt first handles it ([[tour:9]]).
+    others: |
+      No lock guards these writes, and none is needed. The shared priority registers are
+      written only here, before any other hart is released. Each per-hart register block is
+      written only by its own hart, at different addresses: hart 1 writing `0x0c002180` can
+      never disturb hart 0's `0x0c002080`. It is [[stack0]]'s partition trick again, applied
+      to a device.
+
+  - title: "binit: 30 buffers, 30 sleep-locks"
+    file: kernel/bio.c
+    lines: 25-52
+    focus: 40-51
+    state:
+      hart: 0
+      mode: S
+      intr: off
+      satp: kernel
+      locks: []
+      stack: [main, binit]
+      sp: boot
+      irq: 0
+    note: |
+      [[binit]] sets up the [[g:buffer-cache]]: `NBUF` = 30 in-memory copies of disk blocks,
+      threaded onto a doubly linked list in least-recently-used order.
+
+      Two kinds of lock appear, and the difference is important:
+
+      - `bcache.lock`, a spinlock, protects the **list** and each buffer's `dev`, `blockno`
+        and `refcnt`: which block is cached where. It is held only briefly: for the search in
+        [[bget]] and the list updates in [[brelse]], `bpin` and `bunpin`.
+      - Each buffer's `b->lock`, a **sleep-lock** ("buffer"), protects the buffer's
+        **contents** while a process reads or modifies the block. It may be held for a long
+        time, across a disk read that sleeps for an interrupt ([[tour:29]]), which a
+        spinlock must never be.
+
+      That pattern (a spinlock for the index, a sleep-lock for each item) is how xv6 keeps
+      long waits from blocking short lookups. You will see it again in the very next step.
+
+      Running total: 102 spinlocks (including the 31 inside sleep-locks) and 31
+      sleep-locks.
+
+  - title: "iinit and fileinit: the inode and file tables"
+    file: kernel/fs.c
+    lines: 174-192
+    focus: 183-192
+    state:
+      hart: 0
+      mode: S
+      intr: off
+      satp: kernel
+      locks: []
+      stack: [main, iinit]
+      sp: boot
+      irq: 0
+    note: |
+      [[iinit]] follows the same pattern as [[binit]]: `itable.lock`, a spinlock, protects
+      the table of `NINODE` = 50 in-memory [[g:inode|inodes]] (which inode is cached in which
+      slot, and its reference count). Each `inode.lock`, a sleep-lock, protects one inode's
+      contents while a process uses it, possibly across disk reads.
+
+      [[fileinit]] ([[kernel/file.c:22]]) creates one more spinlock, `ftable.lock`, for the
+      table of 100 open files. No per-entry lock there: `ftable.lock` guards allocation
+      and each entry's reference count, and the offset `f->off` is updated while holding the
+      file's inode sleep-lock ([[ilock]]), not a lock of its own.
+
+      Notice what is **not** done: no disk block is read. Reading the superblock requires
+      waiting for the disk, and waiting means sleeping, which needs a process. There is no
+      process yet. The file system's real initialization, [[fsinit]], is postponed until the
+      first process runs ([[tour:4]]).
+
+  - title: "virtio_disk_init: the disk driver"
+    file: kernel/virtio_disk.c
+    lines: 61-72
+    focus: 66-72
+    state:
+      hart: 0
+      mode: S
+      intr: off
+      satp: kernel
+      locks: []
+      stack: [main, virtio_disk_init]
+      sp: boot
+      irq: 0
+    note: |
+      [[virtio_disk_init]] creates `disk.vdisk_lock` and checks that the device at
+      `0x10001000` really is a [[g:virtio]] block device: magic value `0x74726976` ("virt"),
+      version 2 (the modern interface QEMU was told to provide), device ID 2 (a disk).
+
+      The rest of the function (lines 74–153) negotiates features with the device and gives
+      it three pages from [[kalloc]] for its request queues ([[g:virtqueue]]), telling the
+      device their **physical** addresses: the device does not go through the CPU's page
+      table.
+
+      `vdisk_lock` will protect those queues and the driver's bookkeeping. Any hart may
+      start a disk request, and any hart may take the disk's completion interrupt, so both
+      sides take this lock ([[tour:29]]).
+
+      With this, every lock the running kernel needs at boot exists, except one: `log.lock`,
+      created by [[initlog]] when the first process runs [[fsinit]].
+
+  - title: "userinit: the first process, built under its own lock"
+    file: kernel/proc.c
+    lines: 217-231
+    focus: 224-228
+    state:
+      hart: 0
+      mode: S
+      intr: off
+      satp: kernel
+      locks: ["proc[0].lock"]
+      stack: [main, userinit]
+      sp: boot
+      irq: {noff: 1, intena: 0}
+    note: |
+      [[userinit]] creates process 1. [[allocproc]] finds `proc[0]` unused and returns with
+      its `p->lock` **held**; it took `pid_lock` briefly to get pid 1, and `kmem.lock` four
+      times for the trapframe and page-table pages. [[namei]]`("/")` takes `itable.lock` to
+      find the root inode's slot (no disk read: the inode is only reserved, not loaded).
+
+      Then `p->state = RUNNABLE`, and the lock is released.
+
+      (`itable.lock` is also held briefly inside [[namei]] on line 226.)
+
+      `RUNNABLE` is the signal that every hart's scheduler looks for, and it is written
+      under `p->lock`, the same lock each scheduler will hold while reading it. Right now
+      the lock is still uncontested (harts 1 and 2 are only spinning on [[started]]), but
+      from the moment they are released it is the only thing that keeps two of them from
+      running the same process at once.
+
+      The whole story of process 1, from here to the shell prompt, is [[tour:4]].
+
+  - title: The release store
+    file: kernel/main.c
+    lines: 29-45
+    focus: 33
+    state:
+      hart: 0
+      mode: S
+      intr: off
+      satp: kernel
+      locks: []
+      stack: [main]
+      sp: boot
+      irq: 0
+    note: |
+      Hart 0 is done. Line 33 sets [[started]] to 1, but not with `started = 1`. It uses
+      `__atomic_store_n(..., __ATOMIC_RELEASE)`, which compiled to
+
+      ```
+      80000f0a: fence rw,w
+      80000f0e: sw    a4,0(a5)     # started = 1
+      ```
+
+      The `fence rw,w` is the point. It forces every memory load and store hart 0 made
+      *before* it (the page-table entries, `kernel_pagetable`, the process table, `devsw`)
+      to be ordered before the store to `started`. (The PLIC priority writes are device
+      I/O, which `fence rw,w` does not cover; nothing on the other harts depends on seeing
+      them in order.) Without it, RISC-V's memory model lets a hart's stores reach other
+      harts in a different order from the one the program wrote them in
+      ([[g:memory-barrier]]). And the C compiler, too, could move ordinary stores past a
+      plain one.
+
+      `started` is the one shared variable that other harts read *while* hart 0 may still
+      be writing it, without a lock. A lock would have given the same guarantee (its
+      [[release]] contains the same fence), but the readers here are spinning anyway, so a
+      bare flag with the right ordering is enough.
+    others: |
+      What a plain store would *permit* (a hypothetical; this build happens to survive it,
+      see below):
+
+      | Time | Hart 0 | Hart 1 |
+      |---|---|---|
+      | t1 | `kernel_pagetable = 0x87fff000` (not yet visible to other harts) | |
+      | t2 | plain `started = 1` becomes visible first | |
+      | t3 | | sees `started == 1`, leaves the loop |
+      | t4 | | [[kvminithart]] reads `kernel_pagetable`: **0** |
+      | t5 | | `satp` names physical page 0 as the root page table; the next instruction fetch faults, and with no `stvec` installed yet, hart 1 just keeps faulting |
+
+      RISC-V's memory model allows t2 before t1: nothing orders two stores to different
+      addresses unless a fence does. In this build the bad case cannot actually happen to
+      `kernel_pagetable`. After `kvminit`, hart 0 calls [[release]] many times (the last in
+      [[userinit]], [[kernel/proc.c:230]]), and each call carries its own `fence rw,w`.
+      Harts 1 and 2 also run [[acquire]] inside `printk` before `kvminithart`. The
+      release/acquire pair on `started` makes `main` correct by design, not by the accident
+      of which locks happen to be taken in between.
+
+  - title: The acquire loads on harts 1 and 2
+    file: kernel/main.c
+    lines: 29-45
+    focus: 34-36
+    state:
+      hart: [1, 2]
+      mode: S
+      intr: off
+      satp: bare
+      locks: []
+      stack: [main]
+      sp: {"on": boot, detail: "harts 1 and 2, each on its own slice of `stack0`"}
+      irq: 0
+    note: |
+      Meanwhile harts 1 and 2 have been running this loop since [[tour:2]] ended:
+
+      ```
+      80000e74: lw    a5,0(a4)     # load started
+      80000e76: fence r,rw
+      80000e7a: sext.w a5,a5
+      80000e7c: beqz  a5,80000e74
+      ```
+
+      The `fence r,rw` after the load is the **acquire**: no load or store after it may be
+      performed before the load of `started`. So once a hart sees 1, everything it reads
+      next (the page-table pointer, the process table) is at least as new as what hart 0
+      wrote before its release.
+
+      Release on the writer, acquire on the reader: each half is useless alone.
+      `volatile` on the declaration of [[started]] is the older, weaker tool; the atomic
+      builtins are what actually guarantee the ordering.
+
+      There is no sleeping and no lock in this loop. The harts burn their cycles reading
+      one cached word. That is acceptable for the time hart 0 needs to boot (about 1.5 s of wall-clock time
+      under QEMU in one measured run, most of it [[kinit]] filling 128 MiB with junk); for anything
+      longer, xv6 uses [[sleep]] ([[tour:16]]).
+    others: |
+      | Time | Hart 0 | Hart 1 | Hart 2 |
+      |---|---|---|---|
+      | t1 | `fence rw,w`; `started = 1` | `lw`: 0 | `lw`: 0 |
+      | t2 | `j` to [[scheduler]] | `lw`: **1**; `fence r,rw` | `lw`: 0 |
+      | t3 | scanning `proc[]` | leaves the loop | `lw`: **1**; `fence r,rw` |
+      | t4 | | [[printk]] | [[printk]] |
+
+      Which of harts 1 and 2 notices first is a matter of timing. Both will see it.
+
+  - title: Two harts, one console lock
+    file: kernel/main.c
+    lines: 29-45
+    focus: 38
+    state:
+      hart: [1, 2]
+      mode: S
+      intr: off
+      satp: bare
+      locks: [pr.lock]
+      stack: [main, printk]
+      sp: boot
+      irq: {noff: 1, intena: 0}
+    note: |
+      Each waiting hart announces itself: `printk("hart %d starting\n", cpuid())`. In the
+      real run for this tour, the output was
+
+      ```
+      hart 2 starting
+      hart 1 starting
+      ```
+
+      and in other runs the order is reversed. Both lines are always whole. That is
+      `pr.lock` at work, with a real contest for the first time.
+
+      The state above shows the winner of the race, inside [[printk]], holding `pr.lock`.
+      The loser is spinning in [[acquire]] on its `amoswap`, with interrupts off.
+
+      Note that harts 1 and 2 are still in Bare mode here: they print by writing the UART at
+      its physical address. Paging on, for them, is the next line.
+    others: |
+      The race, with and without the lock:
+
+      | Time | Hart 1 | Hart 2 |
+      |---|---|---|
+      | t1 | `amoswap` on `pr.lock`: gets 0, owns it | `amoswap`: gets 1, spins |
+      | t2 | prints `hart 1 starting\n` | spinning |
+      | t3 | [[release]]: `fence rw,w`; `locked = 0` | `amoswap`: gets 0, owns it |
+      | t4 | continues to `kvminithart` | prints `hart 2 starting\n` |
+
+      Without `pr.lock`, both would call [[consputc]] character by character at the same
+      time, and the console could show `hhaarrtt  12  ssttaarrttiinngg`. The UART has one
+      transmit register; the lock decides whose characters go into it.
+
+  - title: Harts 1 and 2 turn on paging
+    file: kernel/vm.c
+    lines: 72-84
+    focus: 81-83
+    state:
+      hart: [1, 2]
+      mode: S
+      intr: off
+      satp: kernel
+      locks: []
+      stack: [main, kvminithart]
+      sp: boot
+      irq: 0
+    note: |
+      Each of harts 1 and 2 calls [[kvminithart]]: `sfence.vma`, write `satp` with
+      [[MAKE_SATP]]`(kernel_pagetable)` = `0x8000000000087fff` (mode 8 = Sv39, root page
+      number `0x87fff`), `sfence.vma` again.
+
+      They load the **same** page table hart 0 built. No lock is needed to read it because
+      it is no longer changing: hart 0 finished it before the release store, and nothing
+      modifies the kernel page table after boot. Read-only shared data is the easiest kind
+      to share.
+
+      The `sfence.vma` instructions act on the calling hart's own [[g:tlb]]. Each hart has
+      its own TLB, so each must flush its own; hart 0's flush back in step 5 did nothing for
+      harts 1 and 2. [[tour:24]] has the details.
+    others: |
+      This step is the payoff of the release/acquire pair: `kernel_pagetable` is one of the
+      values hart 0 wrote before `started`, and the two fences guarantee that harts 1 and 2
+      see `0x87fff000` here, not the 0 it was at reset.
+
+  - title: Per-hart trap vector and interrupt enables
+    file: kernel/main.c
+    lines: 29-45
+    focus: 40-41
+    state:
+      hart: [1, 2]
+      mode: S
+      intr: off
+      satp: kernel
+      locks: []
+      stack: [main]
+      sp: boot
+      irq: 0
+    note: |
+      The remaining two calls are the **inithart** halves of what hart 0 did earlier:
+
+      - [[trapinithart]]: this hart's `stvec` = [[kernelvec]].
+      - [[plicinithart]]: this hart's PLIC enable bits for the UART and disk, and its
+        priority threshold.
+
+      Notice what harts 1 and 2 do **not** call: [[kinit]], [[procinit]], [[binit]] and the
+      rest. Those initialize shared tables, and the tables exist already. Calling them again
+      would wipe out hart 0's work: [[kinit]] would put pages already in use back on the
+      free list, and [[procinit]] would mark process 1 `UNUSED`.
+
+      The division of `main` is now complete. Shared state: initialized once, by hart 0,
+      before `started`. Per-hart state: initialized by each hart, for itself.
+
+  - title: Three schedulers, one runnable process
+    file: kernel/proc.c
+    lines: 428-470
+    focus: 447-453
+    state:
+      hart: any
+      mode: S
+      intr: off
+      satp: kernel
+      locks: ["proc[0].lock"]
+      stack: [main, scheduler]
+      sp: {"on": scheduler, detail: "the same `stack0` slice as the boot stack: `main` called `scheduler` and never returns (on hart 0, `sp = 0x80008810`)"}
+      irq: {noff: 1, intena: 0, note: "`p->lock` taken right after `intr_off()` on line 442, so intena is 0"}
+    note: |
+      Line 44 of [[main]]: every hart calls [[scheduler]], and none of them will ever
+      return. Each sets its `cpus[id].proc = 0` and starts looping over the 64 processes.
+
+      No instruction moves `sp` here. `scheduler`'s frame (96 bytes) is pushed on the same
+      slice of [[stack0]], just below `main`'s, and because `main` never gets control back,
+      that slice is from now on the hart's **scheduler stack** ([[concept:stacks#scheduler]]):
+
+      ```text
+      hart 1's slice of stack0
+        0x80009890 top
+                   start's frame (abandoned)
+                   main's frame
+        0x80009870 scheduler's frame
+        0x80009810 ◄─ sp while scheduler loops
+      ```
+
+      Line 441 is the first time on any hart that interrupts are turned **on**, for a moment.
+      Each hart's first timer interrupt was scheduled 0.1 s after [[timerinit]], and boot
+      took far longer (about 1.5 s under QEMU), so on each hart's first pass a timer
+      interrupt is almost certainly pending and is taken right here. On hart 0,
+      [[clockintr]] increments [[ticks]] under `tickslock` and calls [[wakeup]], which
+      briefly takes each `p->lock` in turn; with no current process there is nothing to
+      yield, and the scheduler carries on. Interrupts go off again at
+      line 442, before any lock is taken.
+
+      Such an interrupt has no stack of its own to go to. `stvec` points at [[kernelvec]]
+      (set by [[trapinithart]]), and `kernelvec` pushes its 256-byte save area onto
+      **whatever stack is current**: here, the scheduler stack. In `gdb`, hart 1 enters
+      `kernelvec` from the scheduler with `sp = 0x80009810`, so the frame occupies
+      `0x80009710`–`0x80009810` until [[kerneltrap]] returns and `kernelvec` pops it.
+
+      For each process, the scheduler takes `p->lock` and checks `p->state`. Exactly one
+      process is `RUNNABLE`: process 1, in `proc[0]`. The state above shows the hart that
+      wins it, holding `proc[0].lock` as it sets `RUNNING` and calls [[swtch]].
+    others: |
+      Three harts reach `proc[0]` at about the same time:
+
+      | Time | Hart 0 | Hart 1 | Hart 2 |
+      |---|---|---|---|
+      | t1 | `acquire(&proc[0].lock)`: wins | `acquire`: spins | in [[printk]] or later |
+      | t2 | sees `RUNNABLE`, sets `RUNNING` | spinning | `acquire`: spins |
+      | t3 | [[swtch]] to process 1 | spinning | spinning |
+      | t4 | (process 1 releases the lock in [[forkret]]) | gets it, sees `RUNNING`, releases | gets it, sees `RUNNING`, releases |
+
+      Without `p->lock`, two harts could both read `RUNNABLE` before either wrote
+      `RUNNING`, and both would switch to process 1, running one process on two CPUs with
+      one kernel stack. The lock makes "check the state and claim it" one indivisible step.
+      Which hart wins is not fixed: in the `gdb` runs for this tour it was sometimes hart 0
+      and sometimes hart 1. The timeline shows one possibility.
+
+  - title: What main built
+    file: kernel/main.c
+    lines: 9-45
+    focus: 44
+    state:
+      hart: [0, 1, 2]
+      mode: S
+      intr: off
+      satp: kernel
+      locks: []
+      stack: [main, scheduler]
+      sp: {"on": scheduler, detail: "each hart's own `stack0` slice, now its scheduler stack for good"}
+      irq: 0
+    note: |
+      In the time it takes to print three lines, hart 0 created the kernel's shared world,
+      and every shared table got its lock as it was born:
+
+      | Init function | Locks created |
+      |---|---|
+      | [[consoleinit]] / [[uartinit]] | `cons.lock`; `tx_lock` (sleep-lock) |
+      | [[printkinit]] | `pr.lock` |
+      | [[kinit]] | `kmem.lock` |
+      | [[procinit]] | `pid_lock`, `wait_lock`, 64 × `p->lock` |
+      | [[trapinit]] | `tickslock` |
+      | [[binit]] | `bcache.lock`; 30 × buffer sleep-lock |
+      | [[iinit]] | `itable.lock`; 50 × inode sleep-lock |
+      | [[fileinit]] | `ftable.lock` |
+      | [[virtio_disk_init]] | `disk.vdisk_lock` |
+
+      That is 155 spinlocks (74 standalone plus the inner spinlock of each of the 81
+      sleep-locks) and 81 sleep-locks. Of the functions that initialize shared state, only
+      [[kvminit]] and [[plicinit]] create no lock: they write data that never changes after
+      boot.
+
+      The cost of boot's simplicity is that harts 1 and 2 did nothing useful until hart 0
+      finished. The pay-off is that no init function had to worry about concurrency at all,
+      except to create the locks that everyone after boot will need. The one moment of real
+      synchronization was a single flag with a release fence and an acquire fence.
+
+      From now on, three harts run [[scheduler]] loops in parallel, and every shared
+      structure is touched only under its lock. [[tour:4]] follows the process they are
+      fighting over.
+
+      One more thing `main` leaves behind: three stacks, one per hart, each with its own
+      `sp`. The boot stack each hart started on in [[_entry]] is now its scheduler stack,
+      for good. Whenever a hart runs a process, its `sp` will move to that process's kernel
+      stack in [[swtch]], and come back here in the next `swtch`.
+locks:
+  - lock: cons.lock
+    where: "created in [[consoleinit]]"
+    protects: "The console input buffer (`cons.buf`, `r`, `w`, `e`)"
+  - lock: "tx_lock (sleep-lock)"
+    where: "created in [[uartinit]]"
+    protects: "The UART transmitter: one writing thread at a time"
+  - lock: pr.lock
+    where: "[[printk]]: hart 0's banner, then harts 1 and 2's \"hart N starting\""
+    protects: "Whole `printk` messages, so lines from different harts do not interleave"
+  - lock: kmem.lock
+    where: "[[kfree]] (32,735 times in [[kinit]]), [[kalloc]] (in [[kvmmake]], [[virtio_disk_init]], [[userinit]])"
+    protects: "The free-page list"
+  - lock: "pid_lock, wait_lock, p->lock"
+    where: "created in [[procinit]]; `pid_lock` and `proc[0].lock` taken in [[userinit]]; `p->lock` taken by every [[scheduler]]"
+    protects: "`nextpid`; parent/child links; each process's `state`, `chan`, `killed`, `xstate`, `pid`"
+  - lock: tickslock
+    where: "created in [[trapinit]]; taken by [[clockintr]] on hart 0"
+    protects: "`ticks`"
+  - lock: "bcache.lock and 30 buffer sleep-locks"
+    where: "created in [[binit]]"
+    protects: "The buffer list and identities; each buffer's contents"
+  - lock: "itable.lock and 50 inode sleep-locks"
+    where: "created in [[iinit]]; `itable.lock` taken by [[namei]] in [[userinit]]"
+    protects: "Which inode is cached where and its reference count; each inode's contents"
+  - lock: ftable.lock
+    where: "created in [[fileinit]]"
+    protects: "The open-file table"
+  - lock: disk.vdisk_lock
+    where: "created in [[virtio_disk_init]]"
+    protects: "The virtio queues and the driver's descriptor bookkeeping"
+  - lock: "started (release/acquire flag, not a lock)"
+    where: "[[main]]"
+    protects: "Orders all of hart 0's initialization before harts 1 and 2 read any shared table"
+  - lock: "(no lock) devsw, kernel_pagetable, PLIC priorities"
+    where: "[[consoleinit]], [[kvminit]], [[plicinit]]"
+    protects: "Written once by hart 0 before `started`, never modified afterwards: read-only shared data needs no lock"
+  - lock: "(no lock) stvec, satp, PLIC per-hart enables"
+    where: "[[trapinithart]], [[kvminithart]], [[plicinithart]]"
+    protects: "Per-hart registers or per-hart device registers, each written only by its own hart"
+quiz:
+  - q: "Why can't hart 0 call `fsinit()` (which reads the superblock from disk) during `main`, alongside `binit` and `iinit`?"
+    a: |
+      Reading a disk block waits for a disk interrupt by calling `sleep()`, and sleeping
+      requires a current process whose state can be set to `SLEEPING`. During `main` no
+      process exists (and interrupts are off), so `fsinit` is postponed until the first
+      process runs, in `forkret`.
+  - q: "`kfree` takes `kmem.lock` 32,735 times during `kinit`, with no other hart able to compete. Why not skip the lock during boot?"
+    a: |
+      `kfree` is the same function used after boot by any hart at any time, and it must
+      always take the lock then. A special no-lock path would add code and a way to get it
+      wrong, to save a cost that only occurs once.
+  - q: "Hart 0 used a plain `started = 1;` instead of `__atomic_store_n(..., __ATOMIC_RELEASE)`. Describe an interleaving that breaks hart 1."
+    a: |
+      Under RISC-V's memory model, two plain stores to different addresses can become
+      visible to other harts in either order. So in general hart 1 could see `started == 1`
+      before an earlier store to a shared table, such as `kernel_pagetable`. It would then
+      load `satp` with a root at physical page 0 and fault on its next instruction fetch.
+      (This build would happen to survive: every `release()` hart 0 calls after `kvminit`,
+      the last in `userinit`, contains a `fence rw,w`. The compiler can't move the store
+      either, because it is inside a call to another file. Relying on this would be
+      fragile; the release store states the requirement explicitly.)
+  - q: "Harts 1 and 2 call `trapinithart()` and `plicinithart()` but not `trapinit()` and `plicinit()`. What is the rule that decides this?"
+    a: |
+      Functions without `hart` initialize shared state (memory or machine-wide device
+      registers) and must run once. Functions ending in `hart` set up per-hart state: CSRs such
+      as `stvec` and `satp`, which only the hart itself can write, and that hart's PLIC
+      enable/threshold block, which xv6 has each hart write for itself using `cpuid()`.
+  - q: "Why does each process get its own `p->lock` instead of one lock for the whole process table?"
+    a: |
+      All three schedulers scan the table constantly. One table lock would make every scan
+      exclude every other hart's scan. With a lock per process, two harts only wait for each
+      other when they look at the same process at the same moment.
+  - q: "All three schedulers reach `proc[0]` at about the same time. What makes sure exactly one of them runs process 1?"
+    a: |
+      Each scheduler holds `proc[0].lock` while it checks `p->state == RUNNABLE` and sets it
+      to `RUNNING`. The first hart to get the lock claims the process; the others get the
+      lock later and see `RUNNING`, so they skip it.

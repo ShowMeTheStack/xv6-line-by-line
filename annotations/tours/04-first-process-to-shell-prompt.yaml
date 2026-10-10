@@ -1,0 +1,1119 @@
+title: From the first process to the shell prompt
+group: Boot and build
+prerequisites: [3]
+summary: |
+  At the end of [[main]], the kernel is built but nothing is running. There is no `init`
+  program in memory, no shell, no user code at all: just one entry in the process table,
+  marked `RUNNABLE`, with an empty address space. Less than a second later, the console
+  shows
+
+  ```
+  init: starting sh
+  $
+  ```
+
+  and two processes are asleep, waiting for you.
+
+  This tour follows that second: [[userinit]] creating process 1, three schedulers racing
+  to run it, [[forkret]] doing the file-system setup that `main` could not do, [[kexec]]
+  loading `/init` from the disk image built in [[tour:1]], the first drop into user mode,
+  `init` creating the console device and forking the shell, and the shell printing its
+  prompt and blocking in `read`.
+
+  It is also the first time a process **moves between harts**. Whenever it waits for the
+  disk, or later, once it runs with interrupts on, whenever a timer tick makes it yield,
+  the hart it was on goes off to do something else, and whichever hart's scheduler finds
+  it runnable again picks it up (often the same hart, sometimes another). The run this tour follows (traced with `gdb`) is
+  one real interleaving among many; your boot will differ in the details, never in the
+  outcome.
+cast: |
+  | Hart | What it is doing |
+  |---|---|
+  | 0 | Finishing [[main]]: about to call [[userinit]] |
+  | 1 | Spinning on [[started]], waiting for hart 0 ([[tour:3]]) |
+  | 2 | The same as hart 1 |
+
+  Interrupts are off on all three harts. The process table is empty.
+steps:
+  - title: allocproc claims a slot under its lock
+    file: kernel/proc.c
+    lines: 105-150
+    focus: 116-126
+    state:
+      hart: 0
+      mode: S
+      intr: off
+      satp: kernel
+      locks: ["proc[0].lock"]
+      stack: [main, userinit, allocproc]
+      sp: {"on": boot, detail: "hart 0's slice of `stack0`; process 1's kernel stack exists but is unused"}
+      irq: {noff: 1, intena: 0}
+    note: |
+      [[userinit]] begins with [[allocproc]], the same function [[kfork]] will use for
+      every later process. It walks the table, taking each `p->lock` in turn, looking for
+      `UNUSED`. `proc[0]` is free, so it jumps to `found` **still holding `proc[0].lock`**.
+
+      [[allocpid]] takes `pid_lock` for an instant to hand out the next pid: **1**. Then
+      `p->state = USED`: the slot is reserved but not yet runnable.
+
+      Holding `p->lock` from the check to the claim is what makes "find a free slot"
+      safe. Right now no other hart can compete, but later two harts forking at once will
+      both run this loop, and without the lock both could see the same `UNUSED` slot and
+      both take it.
+    others: |
+      Harts 1 and 2 are still in their loop on [[started]] and cannot see `proc[0]` at all.
+      The lock is uncontended. It is taken anyway because `allocproc` cannot know who might
+      be watching: after boot, every hart's [[scheduler]] reads `proc[0].state` under this
+      same lock.
+
+  - title: A trapframe, a page table and a kernel context
+    file: kernel/proc.c
+    lines: 124-150
+    focus: 128-149
+    state:
+      hart: 0
+      mode: S
+      intr: off
+      satp: kernel
+      locks: ["proc[0].lock"]
+      stack: [main, userinit, allocproc]
+      sp: {"on": boot, detail: "hart 0's slice of `stack0`; `p->context.sp` only records a future `sp`"}
+      irq: {noff: 1, intena: 0}
+    note: |
+      Still under the lock, [[allocproc]] gives the process what it needs to run in the
+      kernel. In this build, `gdb` shows:
+
+      | Field | Value |
+      |---|---|
+      | `p->trapframe` | `0x87f56000`, a fresh page from [[kalloc]] |
+      | `p->pagetable` | `0x87f55000`, built by [[proc_pagetable]]: only the trampoline and the trapframe are mapped |
+      | `p->kstack` | `0x3fffffd000`, mapped at boot by [[proc_mapstacks]] |
+      | `p->context.ra` | `0x8000193a`, [[forkret]] |
+      | `p->context.sp` | `0x3fffffe000`, the top of the kernel stack |
+
+      The four pages (trapframe, page-table root, and two lower-level page-table pages for
+      the top of the address space) cost four trips through `kmem.lock`.
+
+      The `context` is the trick that starts every process. [[swtch]] restores `ra` and
+      `sp` and executes `ret`, which jumps to `ra`. So the first time any scheduler switches
+      to this process, it will "return" into [[forkret]] on this process's own kernel stack,
+      as if the process had been running there all along.
+
+  - title: userinit marks process 1 runnable
+    file: kernel/proc.c
+    lines: 217-231
+    focus: 224-228
+    state:
+      hart: 0
+      mode: S
+      intr: off
+      satp: kernel
+      locks: ["proc[0].lock"]
+      stack: [main, userinit]
+      sp: boot
+      irq: {noff: 1, intena: 0}
+    note: |
+      Back in [[userinit]], three short lines and one remarkable omission.
+
+      - `initproc = p`: the kernel remembers process 1. Orphans will be given to it.
+      - `p->cwd = namei("/")`: the working directory is the root. This only reserves an
+        in-memory inode slot for inode 1 under `itable.lock`; it does not read the disk.
+      - `p->state = RUNNABLE`, then release the lock.
+
+      The omission: **no user memory**. `p->sz` is 0. There is no program in this address
+      space, not even a tiny bootstrap. Older versions of xv6 copied a hand-assembled
+      `initcode` here; this version does not. Process 1 will get its program the same way
+      every other process does, from the file system with [[kexec]], and it will do that
+      from inside the kernel before ever reaching user mode.
+
+      Line 33 of [[main]] then sets [[started]] ([[tour:3]]), and all three harts head for
+      their schedulers.
+    others: |
+      `p->state = RUNNABLE` is written under `proc[0].lock`, and every scheduler reads
+      `p->state` under that same lock. That pairing, not the [[started]] flag, is what
+      protects this field from now on. Even a hart that somehow skipped the flag would see
+      either `USED` (skip it) or `RUNNABLE` (claim it), never a half-written value.
+
+  - title: Three schedulers race for process 1
+    file: kernel/proc.c
+    lines: 428-470
+    focus: 447-453
+    state:
+      hart: 0
+      mode: S
+      intr: off
+      satp: kernel
+      locks: ["proc[0].lock"]
+      stack: [main, scheduler]
+      sp: {"on": scheduler, detail: "the boot stack's new role: hart 0's slice of `stack0`, `sp = 0x80008810`"}
+      irq: {noff: 1, intena: 0, note: "the scheduler acquires after `intr_off()` on line 442: intena 0"}
+    note: |
+      Each hart's [[scheduler]] scans `proc[0]` through `proc[63]`, taking each `p->lock`
+      and checking for `RUNNABLE`. Only `proc[0]` qualifies. In the run this tour follows,
+      hart 0 got there first; in other runs, hart 1 did.
+
+      Each hart scans on its own **scheduler stack**: the same slice of [[stack0]] it booted
+      on, which became the scheduler stack when [[main]] called [[scheduler]] and never got
+      control back ([[tour:3]]).
+
+      The winner, holding `proc[0].lock`:
+
+      1. sets `p->state = RUNNING`, so that other schedulers will skip it;
+      2. sets `cpus[0].proc = p`, so that [[myproc]] on this hart returns process 1;
+      3. calls [[swtch]] to switch from the scheduler's context to the process's.
+
+      It does **not** release `proc[0].lock` before switching. The lock travels with the
+      switch, and the process releases it, in [[forkret]] here, or after `sched()` returns in
+      [[yield]] or [[sleep]] for a process that stopped earlier. The same hand-off in the
+      other direction is the one that matters: a process giving up the hart keeps `p->lock`
+      until the scheduler is running on its own stack, so no other hart can resume it while
+      its registers are still being saved ([[tour:13]]). The scheduler took the lock right
+      after `intr_off()` on line 442, so hart 0 has `noff = 1`, `intena = 0`, and that one
+      [[push_off]] level crosses the switch together with the lock ([[concept:locks#handoff]]).
+    others: |
+      | Time | Hart 0 | Hart 1 | Hart 2 |
+      |---|---|---|---|
+      | t1 | `acquire(&proc[0].lock)`: wins the `amoswap` | `acquire`: spins | still printing "hart 2 starting" |
+      | t2 | `RUNNABLE` → `RUNNING`; [[swtch]] | spinning | `acquire`: spins |
+      | t3 | in [[forkret]]: `release(&p->lock)` | gets the lock: `RUNNING`, skip | spinning |
+      | t4 | [[fsinit]] … | scans `proc[1..63]`: all `UNUSED` | gets the lock: skip |
+
+      Harts 1 and 2 find nothing to run, execute `wfi` and doze until an interrupt
+      arrives. Each loop briefly enables interrupts at line 441 so that a pending timer or
+      device interrupt can be taken.
+
+  - title: swtch saves the scheduler
+    file: kernel/swtch.S
+    lines: 1-41
+    focus: 10-25
+    state:
+      hart: 0
+      mode: S
+      intr: off
+      satp: kernel
+      locks: ["proc[0].lock"]
+      stack: [main, scheduler, swtch]
+      sp: {"on": scheduler, detail: "hart 0's slice of `stack0`; line 11 saves `sp = 0x80008810` in `cpus[0].context`"}
+      irq: {noff: 1, intena: 0}
+    note: |
+      [[swtch]] saves the scheduler's callee-saved registers (`ra`, `sp`, `s0`–`s11`)
+      into `cpus[0].context`, then starts loading the process's from `proc[0].context`:
+      line 25 loads `ra = forkret`.
+
+      Line 11 is the one to watch: `sd sp, 8(a0)` records where hart 0's scheduler stack
+      stands, `0x80008810`, just below `scheduler`'s frame. `cpus[0].context` is only a
+      save area, not a stack; the scheduler's frames stay where they are, in hart 0's slice
+      of [[stack0]], and the saved `sp` is the way back to them.
+
+  - title: "ld sp: onto process 1's empty kernel stack"
+    file: kernel/swtch.S
+    lines: 1-41
+    focus: 26-40
+    state:
+      hart: 0
+      mode: S
+      intr: off
+      satp: kernel
+      locks: ["proc[0].lock"]
+      stack: [swtch]
+      sp: {"on": kernel, switched: "`ld sp, 8(a1)` in [[swtch]] ([[kernel/swtch.S:26]])", detail: "process 1's `KSTACK(0)`, empty: `sp = 0x3fffffe000`, `ra = forkret`"}
+      irq: {noff: 1, intena: 0, note: "the level the scheduler pushed, now carried by process 1's thread along with the lock"}
+    note: |
+      Line 26, `ld sp, 8(a1)`, is the moment hart 0 leaves its scheduler stack. Only two of
+      the values loaded from `proc[0].context` are non-zero, and [[allocproc]] put both
+      there: `ra = forkret` and `sp = 0x3fffffe000`, the top of `KSTACK(0)`.
+
+      ```text
+      hart 0's stack0 slice                process 1's kernel stack, KSTACK(0)
+        start (abandoned), main,             0x3fffffe000 top ◄─ sp
+        scheduler                            … nothing: never used …
+        (saved sp 0x80008810                 0x3fffffd000 bottom, guard page below
+         in cpus[0].context)
+      ```
+
+      The final `ret` jumps to `ra`. Hart 0 is now running [[forkret]], on process 1's
+      kernel stack, as process 1. Nothing was "returned to": this is the first time this
+      kernel thread has ever run, and its stack is **empty**. That is why the call stack
+      above shows only `swtch`: the scheduler's frames are still in hart 0's slice of
+      [[stack0]], but they are no longer on the stack `sp` points into. This `ld sp` is one
+      of only four instructions in xv6 that switch stacks ([[concept:stacks]]); it never
+      goes from one process's stack straight to another's, only between a process and a
+      scheduler.
+    others: |
+      Each hart has its own `sp`. Harts 1 and 2 are still on their own scheduler stacks, in
+      their own slices of [[stack0]], spinning on `proc[0].lock`. Even if one of them later
+      ran process 1 (as hart 2 will), it would do so by loading process 1's saved
+      `p->context.sp` into *its own* `sp`: a kernel stack belongs to a process slot, not to a hart, and only the
+      hart running that process uses it.
+
+  - title: forkret, the first code process 1 runs
+    file: kernel/proc.c
+    lines: 510-543
+    focus: 522-528
+    state:
+      hart: 0
+      mode: S
+      intr: off
+      satp: kernel
+      locks: []
+      stack: [forkret]
+      sp: {"on": kernel, detail: "process 1's `KSTACK(0)`: only `forkret`'s 48-byte frame"}
+      irq: 0
+    note: |
+      [[forkret]] first releases `p->lock`, the lock the scheduler acquired on this
+      process's behalf. Now other schedulers may look at `proc[0]` again (they will see
+      `RUNNING` and skip it).
+
+      Then the `static int first`. Process 1 is the only process that will ever see it
+      set. It clears it and calls [[fsinit]], with a comment that says why this could not
+      happen in `main`: reading the disk means sleeping, and only a process can sleep.
+
+      Part of the reason is the stack. `gdb` shows `sp = 0x3fffffe000` at `forkret`'s first
+      instruction; its prologue pushes the first frame process 1's kernel stack has ever
+      held (48 bytes). A sleeping thread leaves its frames on its own stack while the hart
+      goes off to run something else. `main` had only the hart's boot stack, which the hart
+      itself keeps using, so it had nowhere to leave them.
+
+      Interrupts stay **off** here, and that surprises people. The scheduler's [[acquire]]
+      recorded "interrupts were off" in `cpus[0].intena`, so the [[release]] on line 520
+      leaves them off ([[concept:locks#intena]]). Process 1 will run [[fsinit]] and [[kexec]] with interrupts off on
+      its hart, and no timer can preempt it until it reaches user mode. Its disk interrupts
+      are taken by a hart that is idling in its scheduler loop, which briefly enables
+      interrupts on every pass. That includes process 1's own hart once process 1 is asleep.
+    others: |
+      `first` is a shared global read and written with no lock. That is safe only because
+      of timing: the one process that can reach this line with `first == 1` is process 1,
+      and it clears the flag long before it can fork any other process. Every later process
+      also starts in `forkret` (that is how `allocproc` sets them up), but finds `first == 0`.
+
+  - title: fsinit reads block 1
+    file: kernel/fs.c
+    lines: 29-49
+    focus: 35-36
+    state:
+      hart: 0
+      mode: S
+      intr: off
+      satp: kernel
+      locks: ["buffer for block 1 (sleep-lock)"]
+      stack: [forkret, fsinit, readsb]
+      sp: kernel
+      irq: 0
+    note: |
+      [[fsinit]] reads the [[g:superblock]], block 1 of `fs.img`, the block `mkfs` wrote in
+      [[tour:1]]. [[bread]] asks the buffer cache: block 1 is not cached, so [[bget]] takes
+      `bcache.lock`, recycles a free buffer, releases `bcache.lock`, and acquires the
+      buffer's **sleep-lock**. Then [[virtio_disk_rw]] sends a read request to the disk.
+
+      When the data arrives, [[readsb]] copies it into the global `sb`:
+      `magic = 0x10203040`, `size = 2000`, `nlog = 31`, `logstart = 2`, `inodestart = 33`,
+      `bmapstart = 46`. The magic number check on line 45 is the kernel's only defense
+      against booting from a disk that is not an xv6 file system.
+
+      Then [[initlog]] (next step but one) and [[ireclaim]], which reads all 13 inode blocks
+      (33–45) looking for inodes that were orphaned by a crash. On a fresh image it finds
+      none.
+
+  - title: Waiting for the disk, and waking up somewhere else
+    file: kernel/virtio_disk.c
+    lines: 274-298
+    focus: 290
+    state:
+      hart: 0
+      mode: S
+      intr: off
+      satp: kernel
+      locks: ["buffer for block 1 (sleep-lock)"]
+      stack: [forkret, fsinit, readsb, bread, virtio_disk_rw]
+      sp: kernel
+      irq: 0
+    note: |
+      The disk is a separate device. After [[virtio_disk_rw]] notifies it (line 284), the
+      process must wait for the completion interrupt. It registers on the channel `b` with
+      [[sleep_prepare]], releases `disk.vdisk_lock`, and calls [[sleep]], which marks it
+      `SLEEPING` under `p->lock` and switches back to hart 0's scheduler ([[tour:16]]).
+
+      Process 1 is now frozen inside `virtio_disk_rw`, still holding the buffer's
+      sleep-lock, which is allowed: sleep-locks may be held while sleeping. It must not hold
+      `vdisk_lock` (a spinlock) while asleep, because the interrupt handler needs it.
+      [[sched]] saves process 1's `intena`, 0 (it has had interrupts off since [[forkret]]),
+      and puts it back on whichever hart resumes it, so process 1 keeps running with
+      interrupts off there too ([[concept:locks#sched-intena]]).
+
+      Frozen means: its frames stay on its kernel stack, and the `ld sp, 8(a1)` in
+      [[swtch]], called from [[sched]], moves hart 0's `sp` back to the scheduler stack.
+
+      ```text
+      process 1's kernel stack, KSTACK(0), while it sleeps
+        0x3fffffe000 top
+                     forkret
+                     fsinit     (readsb is inlined here in this build: no frame of its own)
+                     bread
+                     virtio_disk_rw
+                     sleep
+                     sched      ◄─ p->context.sp (saved by swtch)
+      ```
+
+      The disk finishes. Its interrupt goes to whichever hart claims it at the PLIC.
+      [[virtio_disk_intr]] takes `vdisk_lock`, sets `b->disk = 0`, and calls
+      [[wakeup]]`(b)`, which makes process 1 `RUNNABLE`. Then **any** scheduler may pick it
+      up. In the traced run, [[fsinit]] started on hart 0, and by the time it reached
+      [[ireclaim]] process 1 was running on **hart 2**.
+    others: |
+      | Time | Hart 0 | Hart 1 | Hart 2 |
+      |---|---|---|---|
+      | t1 | process 1: `sleep()`; switch to scheduler | `wfi` | `wfi` |
+      | t2 | scheduler: nothing runnable; `wfi` | | |
+      | t3 | | disk interrupt: [[virtio_disk_intr]] → [[wakeup]]: process 1 `RUNNABLE` | |
+      | t4 | still in `wfi` | back in its scheduler, scans | a timer tick ends its `wfi`; scans |
+      | t5 | `acquire(&proc[0].lock)`: spins | | `acquire`: wins, runs process 1 |
+
+      (Which hart takes the interrupt is up to the PLIC; the table shows one possibility.
+      [[wakeup]] only updates `p->chan` and `p->state` under `p->lock`; it sends no signal to
+      a hart sitting in `wfi`.
+      An idle hart notices the runnable process only after some interrupt of its own,
+      such as its next timer tick, ends the `wfi`.)
+
+      Whichever scheduler wins the `p->lock` runs process 1, returning out of [[sleep]] on
+      a different hart, with its kernel stack and its sleep-lock intact. The kernel stack,
+      the call chain and the locks held belong to the process's thread, not to the hart.
+
+  - title: initlog creates the last boot lock
+    file: kernel/log.c
+    lines: 54-64
+    focus: 60-63
+    state:
+      hart: any
+      mode: S
+      intr: off
+      satp: kernel
+      locks: []
+      stack: [forkret, fsinit, initlog]
+      sp: {"on": kernel, detail: "process 1's `KSTACK(0)`, frames intact, reloaded by `swtch` on whichever hart resumed it"}
+      irq: 0
+    note: |
+      [[initlog]] creates `log.lock`, the one lock `main` did not create, and points the log
+      at block 2.
+
+      [[recover_from_log]] then does what a file system must do on every boot before
+      anything else touches the disk: read the log header (block 2), and if it describes a
+      committed transaction that may not have reached its home blocks, copy those blocks
+      into place ([[tour:32]]). On a fresh image the header says `n = 0`: nothing to do.
+      Then it writes the empty header back.
+
+      Doing this here, before [[kexec]] reads a single file, guarantees that no process ever
+      sees a half-applied transaction from before a crash. It is the second reason
+      [[fsinit]] must run in a process: these reads and the write all sleep for the disk.
+
+  - title: kexec opens /init
+    file: kernel/exec.c
+    lines: 27-58
+    focus: 46-57
+    state:
+      hart: 2
+      mode: S
+      intr: off
+      satp: kernel
+      locks: ["inode 7 /init (sleep-lock)"]
+      stack: [forkret, kexec]
+      sp: {"on": kernel, detail: "process 1's `KSTACK(0)`, now on hart 2"}
+      irq: 0
+    note: |
+      Line 532 of [[forkret]] calls `kexec("/init", {"/init", 0})`, the kernel half of the
+      `exec` system call, called directly. It is the same code that will later replace the
+      shell's child with `ls` or `cat` ([[tour:22]]).
+
+      - [[begin_op]] joins a file-system transaction (`log.lock` held briefly).
+      - [[namei]]`("/init")` locks the root inode (inode 1, block 33), reads the root
+        directory (block 47), finds the entry `init` → **inode 7**.
+      - [[ilock]] takes inode 7's sleep-lock and copies the inode out of block 33 (already
+        in the buffer cache from [[ireclaim]]).
+      - [[readi]] reads the ELF header from the file's first block, 189. Magic number OK,
+        entry point `0xbc`, 4 program headers.
+      - [[proc_pagetable]] builds a **new** page table. The old one, from [[allocproc]],
+        stays in use until the new image is complete.
+
+      Each of those reads may sleep on the disk, and each sleep is another chance for
+      process 1 to change harts.
+
+  - title: Loading the two segments
+    file: kernel/exec.c
+    lines: 59-81
+    focus: 60-78
+    state:
+      hart: any
+      mode: S
+      intr: off
+      satp: kernel
+      locks: ["inode 7 /init (sleep-lock)"]
+      stack: [forkret, kexec]
+      sp: kernel
+      irq: 0
+    note: |
+      Of the 4 program headers, 2 are `LOAD` (the other two describe RISC-V attributes and
+      the stack and are skipped):
+
+      | Segment | Virtual address | In file | In memory | Permissions |
+      |---|---|---|---|---|
+      | code | `0x0` | `0xa01` bytes | `0xa01` | read, execute |
+      | data | `0x1000` | `0x10` bytes | `0x30` | read, write |
+
+      For each, [[uvmalloc]] allocates zeroed pages (under `kmem.lock`) and maps them with
+      `PTE_U` plus the segment's permissions, then [[loadseg]] reads the bytes from the file
+      into those pages through their kernel addresses. After both, `sz = 0x1030`.
+
+      [[iunlockput]] releases inode 7's sleep-lock and [[end_op]] ends the transaction.
+      Nothing was written to the disk, so the commit has nothing to do.
+
+  - title: The user stack and the point of no return
+    file: kernel/exec.c
+    lines: 83-140
+    focus: 89-138
+    state:
+      hart: any
+      mode: S
+      intr: off
+      satp: kernel
+      locks: []
+      stack: [forkret, kexec]
+      sp: kernel
+      irq: 0
+    note: |
+      [[kexec]] rounds `sz` up to `0x2000` and adds two pages: a guard page at
+      `0x2000`–`0x3000` (made inaccessible to user mode by [[uvmclear]]) and the stack page
+      `0x3000`–`0x4000`. Then it builds `main`'s arguments at the top of the stack:
+
+      | Address | Contents |
+      |---|---|
+      | `0x3ff0` | the string `"/init"` (6 bytes, 16-byte aligned) |
+      | `0x3fe0` | `argv[0] = 0x3ff0`, `argv[1] = 0` |
+
+      Lines 133–138 commit: the process gets the new page table, `sz = 0x4000`, saved
+      `epc = 0xbc` ([[user:start]]), saved `sp = 0x3fe0`, and `a1 = 0x3fe0` (`argv`). The
+      empty page table from [[allocproc]] is freed. `kexec` returns `argc = 1`, which
+      [[forkret]] stores in `a0`.
+
+      Two stacks are involved here, and only one is in use. The hart is running `kexec` on
+      process 1's **kernel** stack. The new **user** stack is just a page in the new page
+      table: `kexec` writes the strings and `argv` into it with [[copyout]], through that
+      table, and nobody's `sp` points into it yet. Line 137 only *prepares* a future `sp`:
+      the value in the trapframe that `userret` will load ([[concept:stacks#user]]).
+
+      Everything up to line 133 can fail and leave the process unchanged. After it, the old
+      image is gone. For process 1 the old image was empty, but for every later `exec` this
+      ordering is what lets a failed `exec` return -1 to a program that still exists.
+
+  - title: forkret heads for user mode
+    file: kernel/proc.c
+    lines: 528-543
+    focus: 538-542
+    state:
+      hart: 0
+      mode: S
+      intr: off
+      satp: kernel
+      locks: []
+      stack: [forkret]
+      sp: {"on": kernel, detail: "process 1's `KSTACK(0)`, back on hart 0"}
+      irq: 0
+    note: |
+      The last disk read in [[kexec]] slept, and in the traced run process 1 woke up on
+      **hart 0** again. So the remaining lines of [[forkret]] run on hart 0.
+
+      Lines 539–542 do by hand what [[usertrap]] does at the end of every system call:
+
+      1. [[prepare_return]] sets up the trapframe and the CSRs for the trip to user mode
+         (next step).
+      2. [[MAKE_SATP]]`(p->pagetable)`: the `satp` value for process 1's new page table.
+      3. Compute the address of [[userret]] **in the trampoline page**,
+         `TRAMPOLINE + (userret - trampoline)` = `0x3ffffff09c`, and call it as a function
+         with `satp` as its argument.
+
+      Why not call `userret` at its kernel address, `0x8000609c`? Because `userret` switches
+      to the user page table, and the kernel address is not mapped there. The trampoline
+      address is mapped in both, so the instruction after the `satp` switch can still be
+      fetched.
+
+  - title: prepare_return records hart 0 in the trapframe
+    file: kernel/trap.c
+    lines: 97-132
+    focus: 108-131
+    state:
+      hart: 0
+      mode: S
+      intr: off
+      satp: kernel
+      locks: []
+      stack: [forkret, prepare_return]
+      sp: {"on": kernel, detail: "`forkret`'s frame, then `prepare_return`'s 16 bytes: `sp = 0x3fffffdfc0`"}
+      irq: 0
+    note: |
+      [[prepare_return]] fills in the trapframe fields the trampoline will need the next
+      time process 1 traps into the kernel:
+
+      | Field | Value |
+      |---|---|
+      | `kernel_satp` | the kernel page table, `0x8000000000087fff` |
+      | `kernel_sp` | `0x3fffffe000`, the top of process 1's kernel stack |
+      | `kernel_trap` | [[usertrap]] |
+      | `kernel_hartid` | **0**, from `tp` |
+
+      and the registers `sret` will use: `stvec` = [[uservec]] in the trampoline,
+      `sstatus.SPP = 0` (return to user mode), `sstatus.SPIE = 1` (interrupts on in user
+      mode), `sepc = 0xbc`.
+
+      `kernel_sp` is the *top* of the stack, not the current `sp` (which is
+      `0x3fffffdfc0`, below the frames of `forkret` and `prepare_return`). [[userret]] never returns, so `forkret`'s frame
+      is simply abandoned, and the next trap from user mode starts on an empty kernel stack.
+      That is true of every trap: a process in user mode has nothing on its kernel stack.
+
+      `kernel_hartid = 0` is correct because a process in user mode never changes hart: it
+      will trap back into the kernel on hart 0. After that trap, the kernel may move it,
+      and the next `prepare_return` records the new hart ([[tour:5]]).
+
+      Interrupts were already off (`forkret` never turned them on), and the `intr_off` on
+      line 108 keeps them off while `stvec` points at user-trap code.
+
+  - title: userret switches to init's page table
+    file: kernel/trampoline.S
+    lines: 100-153
+    focus: 111-117
+    state:
+      hart: 0
+      mode: S
+      intr: off
+      satp: user
+      locks: []
+      stack: [userret]
+      sp: {"on": none, detail: "`sp` still `0x3fffffdfd0`, a kernel-stack address that `init`'s page table does not map"}
+      irq: 0
+    note: |
+      [[userret]], running from the trampoline page:
+
+      - [[g:insn-fence-i|fence.i]] (line 107) makes this hart's instruction fetches see the
+        code that was just written to memory. `init`'s code was written by [[loadseg]] as
+        ordinary data stores, perhaps on another hart, and is about to be executed as
+        instructions. (xv6 runs `fence.i` on every return to user, needed or not.)
+      - `sfence.vma`, `csrw satp, a0`, `sfence.vma`: switch hart 0 to process 1's page
+        table. The trampoline is mapped at `0x3ffffff000` there too, so execution continues.
+
+      Now look at `sp`. It still holds `0x3fffffdfd0`, an address inside process 1's kernel
+      stack, but the page table that was just installed does not map the kernel stacks. From
+      here until `sret` the hart has **no usable stack** at all: first this address, then,
+      from line 118, the user's `sp`, which supervisor code cannot use. That is fine
+      because the trampoline never pushes anything; it only loads from `TRAPFRAME`, which
+      this table does map.
+
+  - title: "ld sp, then sret: user mode for the first time"
+    file: kernel/trampoline.S
+    lines: 100-153
+    focus: 118-153
+    state:
+      hart: 0
+      mode: S
+      intr: off
+      satp: user
+      locks: []
+      stack: [userret]
+      sp: {"on": none, switched: "`ld sp, 48(a0)` in [[userret]] ([[kernel/trampoline.S:118]]) loads the user's `sp`", detail: "`sp = 0x3fe0`, `init`'s user stack pointer; supervisor code cannot use it until `sret`"}
+      irq: 0
+    note: |
+      - Restore every user register from the trapframe. Only three were set by the kernel:
+        `sp = 0x3fe0`, `a0 = 1`, `a1 = 0x3fe0`. The rest still hold the junk byte that
+        [[kalloc]] filled the trapframe page with (`0x0505050505050505`). That is harmless,
+        because `start` never reads a register before writing it.
+      - [[g:insn-sret|sret]] (line 153): mode becomes user, interrupts are enabled (from
+        `SPIE`), and `pc = sepc = 0xbc`.
+
+      Line 118, `ld sp, 48(a0)`, moves `sp` to `init`'s **user stack**: `sp = 0x3fe0`,
+      pointing at the `argv` array that [[kexec]] built. From here to `sret` the hart is still
+      in supervisor mode with the user page table, and supervisor code cannot use user pages,
+      so the strip says no usable stack and nothing is pushed. `sret` does not touch `sp`; by
+      changing the mode to user it makes the stack usable, so the first user instruction
+      finds it ready.
+
+      ```text
+      init's user stack page (0x3000–0x4000)
+        0x4000 top
+        0x3ff0 "/init"
+        0x3fe0 argv[0] = 0x3ff0, argv[1] = 0   ◄─ sp
+               … free …
+        0x3000 bottom; guard page 0x2000–0x3000 below
+      ```
+
+      Process 1's kernel stack is left with nothing that matters on it: `forkret`'s frame
+      is abandoned, and the next trap will start at its top again.
+
+      After the `sret`, process 1 is in user mode, with interrupts on, on hart 0, at the
+      first instruction of [[user:start]]: the first user instruction this machine has
+      run. (The state above shows the highlighted lines, after `ld sp` and before the
+      `sret`.)
+
+  - title: init looks for the console and does not find it
+    file: user/init.c
+    lines: 12-24
+    focus: 19-21
+    state:
+      hart: 0
+      mode: U
+      proc: init (pid 1)
+      intr: on
+      satp: user
+      locks: []
+      stack: [start, main]
+      sp: {"on": user, switched: "`sret` ([[kernel/trampoline.S:153]]) returned to user mode, making the user stack usable", detail: "`init`'s user stack page, `0x3000`–`0x4000`; its kernel stack is empty"}
+    note: |
+      [[user:start]] calls `main(1, argv)`. The first thing `init` does is open `console`,
+      a relative path, so it is looked up in the working directory, `/`.
+
+      On a fresh `fs.img` it fails. `mkfs` creates only directories and regular files
+      ([[tour:1]]), so there is no `console` entry. [[sys_open]] returns -1, and `init`
+      creates the device file with [[mknod]]: a file of type `T_DEVICE` with major number
+      `CONSOLE` (1). Then it opens it again.
+
+      This happens once per disk image. The next boot finds `/console` already there, and
+      the first `open` succeeds.
+
+      From here on, every action of `init` is a system call, each with the full journey of
+      [[tour:5]], and each a chance to continue on a different hart.
+
+  - title: mknod creates inode 23
+    file: kernel/sysfile.c
+    lines: 413-431
+    focus: 428
+    state:
+      hart: 0
+      mode: S
+      proc: init (pid 1)
+      intr: on
+      satp: kernel
+      locks: ["inode 23 console (sleep-lock)"]
+      stack: [usertrap, syscall, sys_mknod]
+      sp: {"on": kernel, switched: "`ld sp, 8(a0)` in [[uservec]] ([[kernel/trampoline.S:76]])", detail: "`init`'s `KSTACK(0)`, empty at the trap, now `usertrap` → `syscall` → `sys_mknod`"}
+      irq: 0
+    note: |
+      [[sys_mknod]] runs inside a file-system transaction ([[begin_op]] … [[end_op]]),
+      because creating a file changes several disk blocks that must change together or not
+      at all. [[create]]:
+
+      1. locks the root directory inode (sleep-lock) and checks that `console` does not
+         exist;
+      2. [[ialloc]] scans the inode blocks for a free inode and finds **23**, the first one
+         after `sync` (22), in block 34;
+      3. locks the new inode, sets `major = 1`, `minor = 0`, `nlink = 1`, writes it;
+      4. [[dirlink]] adds the entry `console → 23` to the root directory, in block 47;
+      5. unlocks the directory and returns the new inode still locked.
+
+      Line 428 releases inode 23. At [[end_op]] the transaction commits. Stopping in
+      [[commit]] shows the log header listing **3 blocks**: 34 (inode 23), 47 (the root
+      directory) and 33 (the root inode, rewritten by [[writei]]). They are written to the
+      log, the header is written, and then they are copied to their home locations
+      ([[tour:31]]).
+    others: |
+      Two sleep-locks are held at once inside [[create]]: the directory's, then the new
+      inode's. Always in that order (parent before child), which is how xv6 avoids
+      deadlock between two processes creating files in the same directory
+      ([[tour:18]]). Here no other process exists to compete, but the code cannot know that.
+
+  - title: open returns descriptor 0
+    file: kernel/sysfile.c
+    lines: 362-395
+    focus: 368-385
+    state:
+      hart: 0
+      mode: S
+      proc: init (pid 1)
+      intr: on
+      satp: kernel
+      locks: ["inode 23 console (sleep-lock)"]
+      stack: [usertrap, syscall, sys_open]
+      sp: {"on": kernel, switched: "`ld sp, 8(a0)` in [[uservec]]: a new system call, on an empty stack again", detail: "`init`'s `KSTACK(0)`"}
+      irq: 0
+    note: |
+      The second `open("console", O_RDWR)` finds inode 23, locks it, and sees `T_DEVICE`.
+
+      - [[filealloc]] takes `ftable.lock` and claims the first free `struct file`:
+        `ftable.file[0]`, with `ref = 1`.
+      - [[fdalloc]] puts it in the first free slot of process 1's `ofile[]`: **0**.
+      - The file is `FD_DEVICE`, major 1. Reads and writes on it will go through
+        `devsw[1]`, set up by [[consoleinit]] in [[tour:3]].
+
+      Descriptor 0 is standard input ([[g:standard-streams]]). `init` never says "make this
+      standard input": it is simply the lowest free number, and on a process with no open
+      files that is 0. Every Unix shell relies on this lowest-free rule for redirection.
+    others: |
+      `ftable.lock` protects the whole table of 100 files: two harts opening files at once
+      would otherwise both see `ftable.file[0].ref == 0` and both claim it. `ofile[]`, by
+      contrast, needs no lock: it belongs to process 1 alone, and process 1 is
+      single-threaded.
+
+  - title: "dup, dup: three descriptors, one file"
+    file: kernel/sysfile.c
+    lines: 37-66
+    focus: 54-66
+    state:
+      hart: 2
+      mode: S
+      proc: init (pid 1)
+      intr: on
+      satp: kernel
+      locks: []
+      stack: [usertrap, syscall, sys_dup]
+      sp: {"on": kernel, switched: "`ld sp, 8(a0)` in [[uservec]], once for each `dup`", detail: "`init`'s `KSTACK(0)`, on hart 2"}
+      irq: 0
+    note: |
+      `init` calls `dup(0)` twice ([[user/init.c:23]]). Each [[sys_dup]] puts the same
+      `struct file *` in the next free descriptor (1, then 2) and calls [[filedup]], which
+      increments `ref` under `ftable.lock`. Now:
+
+      | Descriptor | Points to | `ref` |
+      |---|---|---|
+      | 0, 1, 2 | `ftable.file[0]` (console) | 3 |
+
+      Standard input, output and error are one open file. Every process from now on
+      inherits these three descriptors through `fork`.
+
+      In the traced run, the `open` ran on hart 0 and the two `dup`s on **hart 2**. The
+      `open` itself never waited for the disk: blocks 34 and 47 were still in the buffer
+      cache from `mknod`, and its transaction wrote nothing. What moved process 1 was a
+      timer interrupt. User code and system calls run with interrupts on, so a tick can make
+      the process [[yield]] ([[tour:11]]), and then any hart's scheduler can pick it up. A
+      user program never notices which hart it is on.
+
+  - title: "init: starting sh, then fork"
+    file: user/init.c
+    lines: 26-54
+    focus: 26-37
+    state:
+      hart: 2
+      mode: U
+      proc: init (pid 1)
+      intr: on
+      satp: user
+      locks: []
+      stack: [start, main]
+      sp: {"on": user, switched: "`ld sp, 48(a0)` in [[kernel:userret]] ([[kernel/trampoline.S:118]]) and `sret` ([[kernel/trampoline.S:153]])", detail: "`init`'s user stack"}
+    note: |
+      `printf("init: starting sh\n")` writes to descriptor 1. The user-space [[user:printf]]
+      sends each character with its own `write(fd, &c, 1)`, so this one line is **18 system
+      calls**, each the full journey of [[tour:5]]. They reach [[consolewrite]] and the UART,
+      and the line appears on your terminal.
+
+      Then [[fork]]. The parent (`init`, `pid > 0`) goes on to `wait`. The child
+      (`pid == 0`) will `exec("sh", argv)` with `argv = {"sh", 0}`. The name is relative:
+      it works because the child inherits `init`'s working directory, `/`, where `mkfs` put
+      `sh` as inode 13.
+
+      If the shell ever exits, the outer `for` loop starts a new one. `init` itself must
+      never exit: [[kexit]] panics if it tries.
+
+  - title: kfork and the lock dance
+    file: kernel/proc.c
+    lines: 256-305
+    focus: 301
+    state:
+      hart: 2
+      mode: S
+      proc: init (pid 1)
+      intr: off
+      satp: kernel
+      locks: ["proc[1].lock"]
+      stack: [usertrap, syscall, sys_fork, kfork]
+      sp: {"on": kernel, switched: "`ld sp, 8(a0)` in [[uservec]] ([[kernel/trampoline.S:76]])", detail: "`init`'s `KSTACK(0)`; the child gets its own empty `KSTACK(1)`"}
+      irq: {noff: 1, intena: 1}
+    note: |
+      [[kfork]] calls [[allocproc]] (`proc[1]`, **pid 2**, returned locked), copies `init`'s
+      4 pages of user memory with [[uvmcopy]], copies the trapframe and sets the child's
+      `a0 = 0` (so `fork` returns 0 in the child), and [[filedup]]s descriptors 0–2:
+      `ftable.file[0].ref` goes from 3 to **6**.
+
+      What the child does **not** get is a copy of `init`'s kernel stack. [[allocproc]] gave
+      it `proc[1]`'s own, `KSTACK(1)` (`0x3fffffb000`–`0x3fffffc000`), **empty**, with
+      `context.ra = forkret` and `context.sp = 0x3fffffc000`, exactly as for process 1. Only
+      the *user* stack is copied, as one of the 4 pages [[uvmcopy]] duplicates. Right now
+      hart 2 is on `init`'s kernel stack, with `usertrap` … `kfork` on it.
+
+      Then a dance with three locks:
+
+      1. `release(&np->lock)`;
+      2. `acquire(&wait_lock)`, set `np->parent = p`, release;
+      3. `acquire(&np->lock)` again, set `RUNNABLE`, release.
+
+      Why not keep `np->lock` the whole time? Because xv6's lock order says `wait_lock`
+      must be taken **before** any `p->lock` ([[kernel/proc.c:26]]). [[kexit]] and [[kwait]]
+      take them in that order; taking them in the opposite order here could deadlock
+      against them, for example `kexit` on another hart holds `wait_lock` while its
+      [[wakeup]] call acquires every `p->lock`, including `np`'s ([[tour:18]]). The
+      highlighted line is step 3, holding `proc[1].lock` with interrupts off. This acquire
+      ran inside a system call with interrupts on, so [[push_off]] recorded `intena = 1` and
+      the release on line 302 turns them back on, unlike the release in [[forkret]] (step 7)
+      ([[concept:locks#intena]]).
+    others: |
+      The instant `np->state = RUNNABLE` is written and the lock released, any scheduler
+      may run the child, possibly before `kfork` has even returned in the parent:
+
+      | Time | Hart 0 | Hart 2 (init in kfork) |
+      |---|---|---|
+      | t1 | spins on `proc[1].lock` | holds `proc[1].lock`, sets `RUNNABLE` |
+      | t2 | still spinning | `release(&np->lock)` |
+      | t3 | gets the lock, sees `RUNNABLE`, sets `RUNNING`, calls [[swtch]] | returns pid 2 |
+      | t4 | child (pid 2) in [[forkret]], on its own empty kernel stack | `init` returns to user mode |
+
+      Parent and child are now running at the same time on two harts. Neither may assume
+      the other has run first.
+
+  - title: init waits
+    file: kernel/proc.c
+    lines: 367-419
+    focus: 416
+    state:
+      hart: 0
+      mode: S
+      proc: init (pid 1)
+      intr: on
+      satp: kernel
+      locks: []
+      stack: [usertrap, syscall, sys_wait, kwait]
+      sp: {"on": kernel, switched: "`ld sp, 8(a0)` in [[uservec]]: a new system call", detail: "`init`'s `KSTACK(0)`, on hart 0"}
+      irq: 0
+    note: |
+      `init` calls `wait(0)`. In the traced run it had moved to hart 0 by then. [[kwait]]
+      takes `wait_lock` and scans the table for children. It finds pid 2 (`parent == init`)
+      and checks its state under `proc[1].lock`: not `ZOMBIE`. So it registers on its own
+      `struct proc` as the channel with [[sleep_prepare]], releases `wait_lock`, and calls
+      [[sleep]].
+
+      Process 1 is now `SLEEPING`, and will stay so until a child of its own exits: the
+      shell, or an orphan that [[reparent]] handed to it. (Each hand-over also wakes `init`
+      briefly; it rescans, finds no zombie yet, and sleeps again.) The state above is the moment of the call
+      to `sleep()` on line 416: `wait_lock` already released, interrupts on. Inside
+      [[sleep]], `init` gives up hart 0, which goes back to its scheduler.
+    others: |
+      `wait_lock` is held across the scan and released only after [[sleep_prepare]]. If the
+      child exited between the scan and the registration, its [[kexit]] would have to take
+      `wait_lock` to call [[wakeup]], so it waits until `init` is registered. No lost wakeup:
+      the exit either happens before the scan (and `init` finds a `ZOMBIE`) or after the
+      registration (and the wakeup clears `init`'s channel) ([[tour:21]]).
+
+  - title: The shell prints its prompt
+    file: user/sh.c
+    lines: 133-160
+    focus: 135-143
+    state:
+      hart: any
+      mode: U
+      proc: sh (pid 2)
+      intr: on
+      satp: user
+      locks: []
+      stack: [start, main, getcmd]
+      sp: {"on": user, switched: "`ld sp, 48(a0)` in [[kernel:userret]] and `sret` ([[kernel/trampoline.S:153]]), for `sh`", detail: "`sh`'s own user stack, built by [[kernel:kexec]]"}
+    note: |
+      The child, pid 2, began in [[forkret]] like every new process (with `first` now 0,
+      it goes straight to [[prepare_return]]), returned from `fork` with 0, and called
+      `exec("sh", argv)`. In the traced run all of that happened on hart 0. [[kexec]] loaded
+      inode 13 and named the process `sh`.
+
+      The shell's `main` first makes sure descriptors 0–2 are open: it opens `console`
+      until it gets a descriptor ≥ 3. Here the very first `open` returns **3** (0–2 were
+      inherited from `init`), so it closes it at once. That `open` allocated a second
+      `struct file` and freed it again; `ftable.file[0].ref` is still 6.
+
+      Then [[getcmd]]: `write(2, "$ ", 2)`, one system call that sends both characters to
+      the console (standard error, which is the same open file as standard output). The
+      prompt appears.
+    others: |
+      Two processes now exist. `init` (pid 1) is asleep in [[kwait]]. `sh` (pid 2) is
+      running. The other two harts are idle in their schedulers, executing `wfi` until an
+      interrupt arrives.
+
+  - title: sh blocks in read, waiting for you
+    file: kernel/console.c
+    lines: 87-108
+    focus: 106
+    state:
+      hart: any
+      mode: S
+      proc: sh (pid 2)
+      intr: on
+      satp: kernel
+      locks: []
+      stack: [usertrap, syscall, sys_read, fileread, consoleread, sleep]
+      sp: {"on": kernel, switched: "`ld sp, 8(a0)` in [[uservec]] ([[kernel/trampoline.S:76]])", detail: "`sh`'s `KSTACK(1)` (`0x3fffffb000`–`0x3fffffc000`)"}
+      irq: 0
+    note: |
+      [[getcmd]] calls [[gets]], which calls `read(0, &c, 1)`, one character at a time.
+      The system call reaches [[consoleread]] through `devsw[1].read`.
+
+      [[consoleread]] takes `cons.lock` and checks the input buffer: `cons.r == cons.w`,
+      nothing typed. It registers on `&cons.r` with [[sleep_prepare]], releases `cons.lock`,
+      and calls [[sleep]]. The shell is now `SLEEPING`.
+
+      The state above is the moment of that call: no lock held, interrupts on (system calls
+      run with interrupts enabled after [[usertrap]]'s `intr_on`). It does not matter on
+      which hart this happens, and in general you cannot know.
+
+      The shell now has two stacks with something on them, and neither is in use by any
+      hart:
+
+      ```text
+      sh's user stack                 sh's kernel stack, KSTACK(1)
+        start                           usertrap
+        main                            syscall
+        getcmd                          sys_read
+        gets  ◄─ saved sp               fileread
+        (the read stub pushes nothing)  consoleread
+                                        sleep
+                                        sched  ◄─ p->context.sp
+      ```
+
+      The user `sp` is saved in the trapframe (by [[uservec]]), the kernel `sp` in
+      `p->context` (by [[swtch]]). When the shell wakes, a scheduler's `swtch` reloads the
+      second, and the return to user mode reloads the first.
+
+      When you type a key, the UART interrupts, some hart's [[consoleintr]] puts the
+      character in `cons.buf` under `cons.lock`, and when the line is complete it calls
+      [[wakeup]]`(&cons.r)`. That is [[tour:37]].
+    others: |
+      `cons.lock` is held across the check of `cons.r == cons.w` and the registration, but
+      not across `sleep()` itself, and it does not need to be. [[sleep_prepare]] registered
+      the shell *before* the lock was released, so a keystroke handled on another hart
+      between line 105 and line 106 clears `p->chan` in [[wakeup]], and [[sleep]] returns at
+      once instead of sleeping through it.
+
+  - title: The machine at rest
+    file: kernel/proc.c
+    lines: 428-470
+    focus: 465-468
+    state:
+      hart: [0, 1, 2]
+      mode: S
+      intr: off
+      satp: kernel
+      locks: []
+      stack: [main, scheduler]
+      sp: {"on": scheduler, switched: "`ld sp, 8(a1)` in [[swtch]], called from [[sched]] by each sleeper on the hart it was running on", detail: "each hart on its own `stack0` slice"}
+      irq: 0
+    note: |
+      All three harts are back in [[scheduler]], find nothing `RUNNABLE`, and execute `wfi`.
+      The process table holds two sleepers:
+
+      | pid | Name | State | Waiting on | Where |
+      |---|---|---|---|---|
+      | 1 | `init` | `SLEEPING` | its own `struct proc` | [[kwait]] |
+      | 2 | `sh` | `SLEEPING` | `&cons.r` | [[consoleread]] |
+
+      And the stacks: each hart's `sp` is in its own slice of [[stack0]], its scheduler
+      stack. A hart that was running a process got back there through the `ld sp, 8(a1)` in
+      the [[swtch]] that process's [[sched]] made; a hart that never ran one never left it.
+      The two sleepers' kernel stacks, `KSTACK(0)` for `init` and `KSTACK(1)` for `sh`,
+      hold their frozen call chains, ending in `sleep` and `sched`; no hart's `sp` points
+      into them. When a timer or device interrupt ends a `wfi`, `kernelvec` pushes its frame
+      onto that hart's scheduler stack (at line 441, when interrupts come on), and pops it
+      again.
+
+      What it took to get here, counted from the traced boot: one `userinit`, two
+      `forkret`s, two `kexec`s, one `fork`, 23 system calls from `init` before its `fork`
+      (2 `open`, 1 `mknod`, 2 `dup`, 18 single-character `write`s), dozens of disk reads,
+      and one 3-block log commit. Process 1 ran on harts 0, 2, 0, 2 and 0 again. It
+      could change harts whenever it slept or was preempted by a timer, but it often
+      resumed on the same hart.
+
+      The ideas to keep:
+
+      - **Processes begin in the kernel.** Every process, including the first, starts in
+        [[forkret]] via a hand-made `context`, on an empty kernel stack of its own, and
+        leaves for user mode through the same `prepare_return`/`userret` path a system call
+        uses.
+      - **Apart from a few trampoline instructions that use no stack, a hart is always on
+        exactly one stack**: its boot stack, which becomes its
+        scheduler stack; a process's kernel stack, entered by `swtch` or by `uservec`'s
+        `ld sp`; or a user stack, loaded by `userret`'s `ld sp` and usable once `sret`
+        returns to user mode.
+      - **Giving up the hart is what moves a process.** Every sleep, and every timer
+        `yield` once interrupts are on, returns the hart to its scheduler, and any hart may
+        resume the process.
+      - **Locks were taken in the same patterns as in steady state**: `p->lock` to claim a
+        process, sleep-locks across disk waits, `wait_lock` before `p->lock`, `ftable.lock`
+        for shared file slots. Boot is just the first time they are used.
+locks:
+  - lock: "p->lock (spinlock)"
+    where: "[[allocproc]], [[userinit]], [[scheduler]] (held across [[swtch]]), released in [[forkret]]; [[kfork]], [[sleep]], [[wakeup]]"
+    protects: "`p->state` and the claim on a process: exactly one scheduler can run it"
+  - lock: "pid_lock (spinlock)"
+    where: "[[allocpid]]"
+    protects: "`nextpid`, so pids 1 and 2 are unique"
+  - lock: "kmem.lock (spinlock)"
+    where: "[[kalloc]] in [[allocproc]], [[uvmalloc]], [[uvmcopy]]"
+    protects: "The free-page list"
+  - lock: "itable.lock (spinlock)"
+    where: "[[namei]] in [[userinit]] and [[kexec]], [[iget]]"
+    protects: "Which inode is cached in which slot, and its reference count"
+  - lock: "bcache.lock (spinlock)"
+    where: "[[bget]]"
+    protects: "The buffer list and each buffer's identity"
+  - lock: "buffer sleep-lock"
+    where: "[[bread]] → [[virtio_disk_rw]], held while sleeping for the disk"
+    protects: "A buffer's contents while one process reads or modifies the block"
+  - lock: "disk.vdisk_lock (spinlock)"
+    where: "[[virtio_disk_rw]], [[virtio_disk_intr]]"
+    protects: "The virtio queues; released before sleeping"
+  - lock: "log.lock (spinlock)"
+    where: "created in [[initlog]]; [[begin_op]], [[end_op]]"
+    protects: "The log's counters and header"
+  - lock: "inode sleep-lock"
+    where: "[[ilock]] in [[kexec]], [[create]], [[sys_open]]"
+    protects: "One inode's contents while a process uses it, possibly across disk reads"
+  - lock: "ftable.lock (spinlock)"
+    where: "[[filealloc]], [[filedup]]"
+    protects: "The open-file table and each file's `ref`"
+  - lock: "wait_lock (spinlock)"
+    where: "[[kfork]], [[kwait]]"
+    protects: "`p->parent`; taken before any `p->lock`"
+  - lock: "tx_lock (uart sleep-lock)"
+    where: "[[uartwrite]] via [[consolewrite]], for each of init's 18 one-byte writes and the shell's prompt"
+    protects: "The UART transmitter: one writer at a time; may sleep waiting for the transmit-ready interrupt"
+  - lock: "cons.lock (spinlock)"
+    where: "[[consoleread]]"
+    protects: "The console input buffer"
+  - lock: "(no lock) first"
+    where: "[[forkret]]"
+    protects: "Read and cleared only by process 1, before any other process can exist"
+  - lock: "(no lock) p->ofile[]"
+    where: "[[fdalloc]], [[sys_dup]]"
+    protects: "Private to its single-threaded process"
+quiz:
+  - q: "The scheduler holds `proc[0].lock` when it calls `swtch`, and `forkret` releases it. Why does the lock cross the switch instead of being released first?"
+    a: |
+      Because every process resumes in code that releases `p->lock`: `forkret`, or the end
+      of `yield`/`sleep`. The convention exists for the opposite direction. A process giving
+      up the hart calls `swtch` while still holding `p->lock`, and only the scheduler,
+      already off the process's stack, releases it. Otherwise another hart could start the
+      process while its registers were still being saved on its kernel stack
+      ([[tour:13]]).
+  - q: "Why must `fsinit` run in `forkret` instead of in `main`?"
+    a: |
+      It reads the disk, and waiting for a disk read means calling `sleep()`, which needs a
+      current process to mark `SLEEPING`. During `main` there is no process. (It also
+      replays the log before any file is read.)
+  - q: "In the traced run, `fsinit` started on hart 0 and `ireclaim` ran on hart 2. Explain how the process moved."
+    a: |
+      Each disk read sleeps until the disk interrupt. Sleeping returns hart 0 to its
+      scheduler. The interrupt's `wakeup` makes process 1 `RUNNABLE`, and whichever
+      scheduler acquires `proc[0].lock` first runs it, here hart 2's. The kernel stack and
+      the buffer sleep-lock go with the process.
+  - q: "`kfork` releases `np->lock`, takes `wait_lock`, then takes `np->lock` again. Why not just hold `np->lock` throughout?"
+    a: |
+      The kernel's lock order requires `wait_lock` before any `p->lock`. `kexit` and `kwait`
+      take `wait_lock` then a `p->lock`; taking `np->lock` then `wait_lock` here could
+      deadlock against them.
+  - q: "After `init`'s two `dup` calls and its `fork`, what is `ftable.file[0].ref`, and why?"
+    a: |
+      6. `open` set it to 1, the two `dup`s made it 3 (descriptors 0, 1, 2 of `init`), and
+      `fork` called `filedup` on each of the child's 3 inherited descriptors.
+  - q: "Process 1 runs `fsinit` and `kexec` with interrupts off on its hart. How does its disk interrupt ever get handled?"
+    a: |
+      While process 1 waits, it is asleep and its hart is back in the scheduler, which
+      enables interrupts briefly on every loop. The PLIC delivers the disk interrupt to
+      whichever hart has interrupts enabled and claims it first, often an idle hart in its
+      scheduler.

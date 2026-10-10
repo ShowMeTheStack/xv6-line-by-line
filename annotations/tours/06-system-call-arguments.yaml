@@ -1,0 +1,818 @@
+title: System-call arguments and user pointers
+group: Traps and system calls
+prerequisites: [5]
+summary: |
+  You type `cat README`. Before `cat` can print a single byte, it must ask the kernel to
+  open a file, and to do that it hands the kernel a **pointer**: the address of the
+  string `"README"` in its own memory. That pointer is just a number chosen by a user
+  program. It might be correct. It might point at the kernel's own code, at a page the
+  program does not own, at the very top of the address space, or at a string with no end.
+
+  This tour follows `open("README", O_RDONLY)` from the moment `cat` makes the call until
+  the kernel holds a safe private copy of the name: [[argraw]], [[argint]], [[argstr]],
+  [[fetchstr]] and [[copyinstr]], which walks `cat`'s page table by hand, one page at a
+  time. Then it feeds the same code the nastiest pointers that `usertests` can think of,
+  and watches each one fail cleanly instead of crashing the kernel.
+
+  [[tour:5]] showed how a system call gets into the kernel and back. This tour stays in
+  the gap between "the kernel has the user's registers" and "the kernel can use what they
+  mean". The rule you will see enforced at every step: **the kernel never trusts user
+  memory, and it copies each user argument exactly once.**
+cast: |
+  The machine has three [[g:hart|harts]]. The numbers below come from one run of this
+  build (after boot, `cat README` typed at the prompt); a different run may use other
+  harts.
+
+  | Hart | What it is doing |
+  |---|---|
+  | 0 | Running `cat` (pid 3) in user mode: the process this tour follows |
+  | 1 | Its [[kernel:scheduler]] is looking for work, or it runs whatever else is runnable |
+  | 2 | The same: idle in its scheduler, or running another process |
+
+  The shell (pid 2) is asleep in [[kernel:kwait]], waiting for `cat`. Later steps switch
+  to `usertests`, run the same way.
+steps:
+  - title: cat passes a pointer to its own memory
+    file: user/cat.c
+    lines: 24-43
+    focus: 35
+    state:
+      hart: 0
+      mode: U
+      proc: cat (pid 3)
+      intr: on
+      satp: user
+      locks: []
+      stack: [main]
+      sp: {"on": user, detail: "`cat`'s user stack page, `0x3000`–`0x4000`, with `argv` and its strings at the top"}
+    note: |
+      `cat` has `argc = 2`, and on line 35 it calls `open(argv[1], O_RDONLY)`. Where does
+      `argv[1]` point? When the shell ran `cat`, [[kexec]] built a fresh user stack and
+      copied the argument strings onto it ([[kernel/exec.c:101]]). In this build, `cat`'s
+      memory looks like this (`p->sz` is `0x4000`, four pages):
+
+      | User address | Contents |
+      |---|---|
+      | `0x0000`–`0x1fff` | `cat`'s code and data |
+      | `0x2000`–`0x2fff` | [[g:guard-page]]: mapped, but without `PTE_U` |
+      | `0x3fc0` | `argv[0] = 0x3ff0`, `argv[1] = 0x3fe0`, `argv[2] = 0` |
+      | `0x3fe0` | `"README\0"` |
+      | `0x3ff0` | `"cat\0"` |
+
+      So the first argument of `open` is the number `0x3fe0`, and the second is
+      `O_RDONLY`, which is 0 ([[kernel/fcntl.h]]).
+
+      Notice that the string has already crossed the user/kernel boundary twice: the
+      shell's `exec` copied it *into* the kernel, and `kexec` copied it back *out* to
+      `cat`'s new stack. Now it must come in again. User data never stays in the kernel
+      by accident; it is copied in on purpose, each time it is needed.
+
+  - title: The stub adds the number 15
+    file: user/usys.S
+    lines: 48-52
+    focus: 50-51
+    state:
+      hart: 0
+      mode: U
+      proc: cat (pid 3)
+      intr: on
+      satp: user
+      locks: []
+      stack: [main, open]
+      sp: user
+    note: |
+      [[user:open]] is a [[g:syscall-stub]] like the `write` stub of [[tour:5]]. By the
+      [[g:calling-convention]] the compiler already put the arguments in registers:
+      `a0 = 0x3fe0`, `a1 = 0`. In `cat.asm`, the call site is `li a1,0`, `ld a0,0(s2)`
+      (load `argv[1]` from address `0x3fc8`, held in `s2`), `jal 3ec <open>`.
+
+      The stub sets `a7 = 15` ([[kernel:SYS_open]]) at address `0x3ec` and executes `ecall`
+      at `0x3ee`. From here the path into the kernel is exactly the one [[tour:5]] follows:
+      [[uservec]] saves all 31 registers into `cat`'s [[g:trapframe]], switches to the
+      kernel page table, and [[usertrap]] calls [[syscall]], which calls `syscalls[15]`,
+      [[sys_open]].
+
+      When `sys_open` starts, gdb shows `cat`'s trapframe with `a0 = 0x3fe0`, `a1 = 0`,
+      `a7 = 0xf`, and `epc = 0x3f2`: the `ecall` address plus 4, already advanced by
+      `usertrap`.
+
+      Those saved registers are everything the kernel knows about the request. Two of them
+      are plain values. One of them is a promise ("there is a string at `0x3fe0`") that
+      the kernel will verify the hard way.
+
+  - title: sys_open makes room for a private copy
+    file: kernel/sysfile.c
+    lines: 328-340
+    focus: 331-339
+    state:
+      hart: 0
+      mode: S
+      proc: cat (pid 3)
+      intr: on
+      satp: kernel
+      locks: []
+      stack: [usertrap, syscall, sys_open]
+      sp: {"on": kernel, switched: "`ld sp, 8(a0)` in [[kernel:uservec]] ([[kernel/trampoline.S:76]])", detail: "`cat`'s kernel stack, `0x3fffff9000`–`0x3fffffa000`; `path` at `0x3fffff9f10`"}
+      irq: 0
+    note: |
+      [[sys_open]] declares `char path[MAXPATH]`: 128 bytes ([[kernel/param.h]]) on
+      `cat`'s [[g:kernel-stack]]. In this run that stack is the page at
+      `0x3fffff9000`–`0x3fffffa000` in the kernel's address space, and `path` sits at
+      `0x3fffff9f10`, 240 bytes below the top.
+
+      That stack was empty when the `ecall` arrived: [[uservec]]'s `ld sp, 8(a0)`
+      ([[kernel/trampoline.S:76]]) pointed `sp` at its top, `0x3fffffa000`, and the frames of
+      [[usertrap]], [[syscall]] and `sys_open` (with `path` inside it) are everything on it.
+      `cat`'s user stack, with `"README"` on it, is a different page in a different page
+      table ([[concept:stacks]]).
+
+      The kernel stack is a single 4096-byte page with an unmapped [[g:guard-page]] below
+      it. A path buffer of a few kilobytes here would risk running off the stack, which is
+      why `MAXPATH` is small, and why [[sys_exec]], which needs room for long argument
+      strings, uses whole pages from [[kalloc]] instead.
+
+      The order of the work matters. First the arguments are fetched (lines 337–338).
+      Only if that succeeds does `sys_open` call [[begin_op]] and start touching the file
+      system. A bad pointer costs one failed copy and a `return -1`, with no transaction
+      to undo, no lock to release, no inode to put back.
+    others: |
+      Hart 1 could be in `sys_open` at this very moment for another process. There is no
+      conflict: each hart has its own `sp`, pointing into the kernel stack of the process it
+      is running, and each process has its own kernel stack, so each call has its own `path`
+      buffer, and the copy that follows reads only the calling process's memory. Nothing
+      in argument fetching is shared, so nothing in it needs a lock.
+
+  - title: argraw reads the saved registers, not the live ones
+    file: kernel/syscall.c
+    lines: 34-54
+    focus: 37-51
+    state:
+      hart: 0
+      mode: S
+      proc: cat (pid 3)
+      intr: on
+      satp: kernel
+      locks: []
+      stack: [usertrap, syscall, sys_open, argint, argraw]
+      sp: kernel
+      irq: 0
+    note: |
+      Every argument helper ends up in [[argraw]], which returns `p->trapframe->a0` …
+      `a5`. Why the trapframe and not the registers themselves? Because the registers have
+      long since been reused: [[uservec]] overwrote `a0` (with `TRAPFRAME`), `sp`, `tp`, `t0` and `t1`, and every C
+      function since then has used `a0`–`a5` for its own arguments. The trapframe is the
+      only place where `cat`'s values survive.
+
+      It is also the only place that stays correct if `cat` is preempted. Interrupts are on
+      ([[usertrap]] enabled them), so a timer interrupt may switch `cat` out right here
+      and resume it later on hart 1 or 2 ([[tour:8]]). The trapframe moves with the
+      process, so `argraw` returns the same numbers on any hart.
+
+      `n` is chosen by kernel code (a constant like `0` or `1` in `sys_open`), never by
+      the user, so an out-of-range `n` is a kernel bug and [[panic]]s. The *values* are a
+      different matter: they are whatever `cat` put in its registers. `argraw` does not
+      judge them. Judging is the job of whoever knows what the value is supposed to mean.
+    others: |
+      `cpus[0].proc` is read here through [[myproc]], with interrupts briefly off, as
+      [[tour:5]] explains. The trapframe itself needs no lock: only `cat`'s own kernel
+      thread reads or writes it while `cat` is in the kernel, and `cat` is running here,
+      on one hart.
+
+  - title: argint and argaddr check nothing, on purpose
+    file: kernel/syscall.c
+    lines: 56-81
+    focus: 57-61
+    state:
+      hart: 0
+      mode: S
+      proc: cat (pid 3)
+      intr: on
+      satp: kernel
+      locks: []
+      stack: [usertrap, syscall, sys_open, argint]
+      sp: kernel
+      irq: 0
+    note: |
+      [[argint]]`(1, &omode)` stores the low 32 bits of the saved `a1`: `omode = 0`
+      (gdb agrees). [[argaddr]] stores a full 64-bit value. Neither returns an error, and
+      neither can: any integer is a legal integer, and any 64-bit number is a legal
+      *address*. Whether it is a *good* address depends on what is mapped there, and on
+      when you look.
+
+      That is the point of the comment on lines 63–65. A check here, such as "is `addr`
+      below `p->sz`?", would be checked at one moment and relied on at another. The copy
+      routines check every page at the moment they touch it, which is the only check that
+      means anything.
+
+      The integer arguments are validated by their users instead. `omode` is only tested
+      with `&` and compared with `O_RDONLY`, so any value is harmless. A file descriptor goes through [[argfd]], which
+      rejects anything outside `0..NOFILE-1` before indexing `ofile[]`. A system-call number
+      is range-checked in [[syscall]] before it indexes the table. An unchecked integer
+      used as an array index would let a user program make the kernel read or call
+      anything; xv6 checks each one right where it is used.
+
+  - title: argstr hands the pointer to fetchstr
+    file: kernel/syscall.c
+    lines: 10-32
+    focus: 23-32
+    state:
+      hart: 0
+      mode: S
+      proc: cat (pid 3)
+      intr: on
+      satp: kernel
+      locks: []
+      stack: [usertrap, syscall, sys_open, argstr, fetchstr]
+      sp: kernel
+      irq: 0
+    note: |
+      [[argstr]]`(0, path, MAXPATH)` reads `addr = 0x3fe0` with `argaddr` and calls
+      [[fetchstr]]`(0x3fe0, path, 128)`. `fetchstr` passes the job to [[copyinstr]],
+      along with two things only the kernel can supply: `cat`'s page table
+      (`p->pagetable`, physical page `0x87f24000` in this run) and its size (`p->sz`,
+      `0x4000`).
+
+      Compare [[fetchaddr]] above it, which reads one 8-byte value (used by `exec` to read
+      the `argv` array). It checks the range itself, with two tests: `addr >= p->sz`
+      *and* `addr + 8 > p->sz`. The second alone would be fooled by
+      `addr = 0xfffffffffffffffc`, where `addr + 8` wraps around to 4. User numbers are
+      adversarial; even the arithmetic on them must be checked for overflow.
+
+      `fetchstr` returns [[strlen]]`(buf)`. That call is safe only because `copyinstr`
+      promises that, on success, `buf` contains a terminating NUL within `max` bytes.
+      Without that promise, `strlen` would run off the end of `path` into the rest of the
+      kernel stack.
+
+  - title: copyinstr starts at the page containing the string
+    file: kernel/vm.c
+    lines: 407-452
+    focus: 418-425
+    state:
+      hart: 0
+      mode: S
+      proc: cat (pid 3)
+      intr: on
+      satp: kernel
+      locks: []
+      stack: [usertrap, syscall, sys_open, argstr, fetchstr, copyinstr]
+      sp: kernel
+      irq: 0
+    note: |
+      The hart is running with the *kernel* page table. In that table, `0x3fe0` means
+      nothing useful (it is unmapped), and other user addresses would be worse: user
+      address `0x80000000` is, to the kernel, the start of its own code. So [[copyinstr]]
+      never dereferences `srcva`. It translates it through `cat`'s page table, in
+      software:
+
+      1. `va0 = PGROUNDDOWN(0x3fe0) = 0x3000`, the page holding the string.
+      2. [[walkaddr]]`(pagetable, 0x3000)` returns the physical address of that page, or 0.
+      3. If 0, [[vmfault]] gets one chance to produce the page (for lazily allocated
+         memory, step 17). If that fails too, the whole copy fails with -1.
+
+      The loop runs once per page because consecutive virtual pages need not be
+      consecutive in physical memory. A string that crosses a page boundary must be
+      translated again at the boundary, and the second page may be missing even when the
+      first was fine (step 16).
+
+  - title: walkaddr refuses anything that is not user memory
+    file: kernel/vm.c
+    lines: 118-139
+    focus: 127-138
+    state:
+      hart: 0
+      mode: S
+      proc: cat (pid 3)
+      intr: on
+      satp: kernel
+      locks: []
+      stack: [usertrap, syscall, sys_open, argstr, fetchstr, copyinstr, walkaddr]
+      sp: kernel
+      irq: 0
+    note: |
+      [[walkaddr]] is three refusals and a lookup:
+
+      - `va >= MAXVA` → 0. This test is there for safety, not convenience: [[walk]]
+        [[panic]]s on such an address, and a user program must never be able to choose
+        an argument that panics the kernel.
+      - No [[g:pte]], or `PTE_V` clear → 0: nothing is mapped there.
+      - `PTE_U` clear → 0. This is the subtle one. `cat`'s page table *does* map pages the
+        program may not touch: the [[g:trapframe]] at `TRAPFRAME`, the [[g:trampoline]],
+        and the stack [[g:guard-page]] at `0x2000`. The hardware blocks user-mode access to
+        them because `PTE_U` is clear, but a kernel copying on the user's behalf must apply
+        the same rule itself. Otherwise `read(fd, (char *)TRAPFRAME, n)` would let `cat`
+        have the kernel overwrite `kernel_satp`, `kernel_sp` and `kernel_trap` with bytes
+        of its choosing, and the next trap would jump wherever `cat` liked, in supervisor
+        mode. ([[copyout]] uses the same `walkaddr`.)
+
+      For `0x3000`, gdb shows the final PTE is `0x21fc70d7`. The low bits `0xd7` are
+      `V R W U A D`: valid, readable, writable, user, and the accessed and dirty bits that
+      QEMU's MMU set when `cat` used its stack (xv6 never sets them; the RISC-V spec also
+      allows hardware that faults instead and leaves this to software). The physical page is `0x87f1c000`. The guard
+      page's PTE is `0x21fc7407`: `V R W`, no `U`.
+
+  - title: walk reads cat's page table through the direct map
+    file: kernel/vm.c
+    lines: 98-116
+    focus: 104-115
+    state:
+      hart: 0
+      mode: S
+      proc: cat (pid 3)
+      intr: on
+      satp: kernel
+      locks: []
+      stack: [usertrap, syscall, sys_open, argstr, fetchstr, copyinstr, walkaddr, walk]
+      sp: kernel
+      irq: 0
+    note: |
+      [[walk]] does what the MMU would do with [[g:sv39]], three levels of 512-entry
+      tables. For `va = 0x3000` the three 9-bit indexes are 0, 0 and 3:
+
+      | Level | Table (physical) | Index | PTE | Points to |
+      |---|---|---|---|---|
+      | 2 | `0x87f24000` | 0 | `0x21fc8001` (`V`) | table at `0x87f20000` |
+      | 1 | `0x87f20000` | 0 | `0x21fc7c01` (`V`) | table at `0x87f1f000` |
+      | 0 | `0x87f1f000` | 3 | `0x21fc70d7` | page `0x87f1c000` |
+
+      (Values from this run.) A PTE holds a *physical* address, and the kernel is running
+      with paging on. How can it follow one? Because the kernel page table maps all of RAM
+      at virtual address = physical address, the [[g:direct-map]]. `PTE2PA(*pte)` is
+      directly usable as a pointer. The same trick lets `copyinstr` read the string itself
+      at `0x87f1c000 + 0xfe0`.
+
+      `alloc` is 0: looking up a user address must never build page-table pages.
+    others: |
+      No lock protects `cat`'s page table during this walk. Who else could change it?
+      Only `cat`'s own system calls modify it (`sbrk`, `exec`, and [[vmfault]] on its
+      behalf), and `cat` is busy here. Its page table is freed only after `cat` exits.
+      Other harts walk *other* processes' tables at the same moment, through the same
+      kernel page table, which no one changes after boot: no lock needed there either.
+
+  - title: The copy, byte by byte, until the NUL
+    file: kernel/vm.c
+    lines: 407-452
+    focus: 426-451
+    state:
+      hart: 0
+      mode: S
+      proc: cat (pid 3)
+      intr: on
+      satp: kernel
+      locks: []
+      stack: [usertrap, syscall, sys_open, argstr, fetchstr, copyinstr]
+      sp: kernel
+      irq: 0
+    note: |
+      `n = PGSIZE - (0x3fe0 - 0x3000) = 32`: at most 32 bytes remain on this page, fewer
+      than `max = 128`. The inner loop reads from `p = 0x87f1cfe0` and copies `R`, `E`,
+      `A`, `D`, `M`, `E`, then finds `\0`, writes it to `dst`, sets `got_null`, and
+      `copyinstr` returns 0.
+
+      Seven bytes were written into `path`. In this run gdb shows the remaining 121 bytes
+      still holding leftovers from earlier function calls on the kernel stack. That is fine:
+      everything after the NUL is ignored. But it shows why `copyinstr` must *guarantee*
+      the NUL.
+
+      The two ways out without a NUL both return -1:
+
+      - `max` reaches 0: the string is longer than the caller's buffer (step 15).
+      - A page is missing: the string runs into memory the process does not own (step 16).
+
+      Back in [[fetchstr]], `strlen(path)` is 6; `argstr` returns 6, and `sys_open` stores
+      it in `n`. From now on `sys_open` uses only `path`, its own copy, at
+      `0x3fffff9f10`. It will never read `0x3fe0` again.
+    others: |
+      Interrupts are on throughout the copy. If hart 0's timer fires in the middle of the
+      loop, `cat` may be switched out and finish the copy on hart 2. Nothing here depends
+      on the hart: `pagetable` is `cat`'s, `dst` is on `cat`'s kernel stack, and `pa0` is a
+      physical address valid on every hart.
+
+  - title: From here on, only the kernel's copy is used
+    file: kernel/sysfile.c
+    lines: 337-360
+    focus: 350
+    state:
+      hart: 0
+      mode: S
+      proc: cat (pid 3)
+      intr: on
+      satp: kernel
+      locks: []
+      stack: [usertrap, syscall, sys_open]
+      sp: kernel
+      irq: 0
+    note: |
+      With `path = "README"` safely on the kernel stack, `sys_open` starts a file-system
+      transaction ([[begin_op]], [[tour:31]]) and calls [[namei]]`(path)` to find the inode
+      ([[tour:34]]). Path lookup will read directory blocks, take sleep-locks, and maybe
+      sleep waiting for the disk. All of it works on bytes the user can no longer touch.
+
+      This is the defense against a classic bug called **time-of-check to time-of-use**
+      (TOCTOU). Imagine a kernel that validated the user's string ("does it name a file
+      this user may open?") and then, later, read the name *again* from user memory to
+      use it. In an operating system with multithreaded processes or shared memory, a
+      second thread could rewrite the string in between. xv6 processes are
+      single-threaded and share no memory, so nothing but `cat` itself can change
+      `cat`'s memory, and `cat` is stopped in this system call. The attack cannot happen
+      in xv6 today. But "copy once, then use only the copy" makes the question
+      irrelevant, which is exactly the property you want: the kernel's reasoning about a
+      value holds as long as the value lives in the kernel.
+    others: |
+      What the copy-once rule prevents, on a hypothetical kernel that re-reads user
+      memory and has two threads in one process (xv6 has neither):
+
+      | Time | Hart 0 (in the kernel for thread A) | Hart 1 (thread B, user mode) |
+      |---|---|---|
+      | t1 | reads the name: `"README"`, checks it is allowed | |
+      | t2 | sleeps, waiting for the disk | writes `"secret"` over the same bytes |
+      | t3 | wakes, re-reads the name from user memory: `"secret"` | |
+      | t4 | opens a file it never checked | |
+
+      With one copy into `path` at t1, the write at t2 changes nothing the kernel will
+      ever look at.
+
+  - title: exec copies a two-level structure, one level at a time
+    file: kernel/sysfile.c
+    lines: 458-499
+    focus: 465-486
+    state:
+      hart: any
+      mode: S
+      proc: pid 3, still named sh
+      intr: on
+      satp: kernel
+      locks: []
+      stack: [usertrap, syscall, sys_exec]
+      sp: {"on": kernel, detail: "pid 3's kernel stack, earlier, during its `exec` system call"}
+      irq: 0
+    note: |
+      Step back in time to the `exec("cat", argv)` that created `cat` in the first place.
+      The shell forked a child (pid 3), and that child, still running the shell's code,
+      made this call. [[sys_exec]] faces a harder version of the same problem: `argv` is a *user
+      pointer to an array of user pointers to strings*. Every level is untrusted.
+
+      - [[argstr]] copies the program name into `path[MAXPATH]`, as in `open`.
+      - The loop reads `argv[i]` with [[fetchaddr]], one 8-byte pointer at a time, into
+        the kernel variable `uarg`. That pointer is now a kernel copy too.
+      - Each string is copied with [[fetchstr]] into a whole page from [[kalloc]], with a
+        limit of `PGSIZE` (4096) bytes, too much for the kernel stack.
+      - At most `MAXARG - 1` (31) argument strings plus the terminating 0: an array with no
+        0 in its first 32 slots ends in `goto bad`, not in an endless loop.
+
+      Every failure path frees every page already allocated. A hostile program can make
+      `exec` fail, but cannot make it leak memory: `usertests` checks this by counting
+      free pages before and after its tests ([[user:countfree]]).
+
+      [[kexec]] then receives only kernel copies. It never sees a user pointer.
+    others: |
+      Each [[kalloc]] here briefly takes `kmem.lock`, the one lock shared by every hart
+      that allocates memory. The strings are then filled in with no lock held, because
+      the page now belongs to this call alone.
+
+  - title: usertests fires five ridiculous pointers
+    file: user/usertests.c
+    lines: 120-136
+    focus: 124-134
+    state:
+      hart: 1
+      mode: U
+      proc: usertests (pid 4)
+      intr: on
+      satp: user
+      locks: []
+      stack: [main, drivetests, runtests, run, copyinstr1]
+      sp: {"on": user, detail: "the usertests child's (pid 4) user stack"}
+    note: |
+      Now the hostile cases. Run `usertests copyinstr1` right after boot: the shell (pid 2)
+      runs `usertests` (pid 3), whose [[user:run]] forks a child (pid 4) to run the test,
+      so that a test that crashes kills only that child. Say the child runs on hart 1. The
+      later `usertests` steps assume each test is run the same way, right after a fresh
+      boot, so its child is again pid 4.
+
+      [[user:copyinstr1]] passes five addresses as the path to `open`. Each is a deliberate
+      trap for a careless kernel:
+
+      | Address | What it is |
+      |---|---|
+      | `0x80000000` | `KERNBASE`: in the *kernel's* page table, the first byte of kernel code |
+      | `0x3fffffe000` | `TRAPFRAME`: mapped in this process's table, but not `PTE_U` |
+      | `0x3ffffff000` | `TRAMPOLINE`: mapped everywhere, not `PTE_U` |
+      | `0x4000000000` | `MAXVA`: the first address beyond what xv6's page tables cover |
+      | `0xffffffffffffffff` | the top of the 64-bit space; rounding down still lands above `MAXVA` |
+
+      The test passes if every `open` returns -1, and if the kernel is still alive
+      afterwards. In this build it prints `test copyinstr1: OK`.
+
+  - title: "Bad pointers die in walkaddr and vmfault"
+    file: kernel/vm.c
+    lines: 454-478
+    focus: 463-468
+    state:
+      hart: 1
+      mode: S
+      proc: usertests (pid 4)
+      intr: on
+      satp: kernel
+      locks: []
+      stack: [usertrap, syscall, sys_open, argstr, fetchstr, copyinstr, vmfault]
+      sp: {"on": kernel, switched: "`ld sp, 8(a0)` in [[kernel:uservec]] ([[kernel/trampoline.S:76]])", detail: "the child's kernel stack, with `path` in `sys_open`'s frame"}
+      irq: 0
+    note: |
+      Follow each address through [[copyinstr]]. [[walkaddr]] returns 0 for all five:
+      `0x80000000` has no PTE in the child's table, `TRAPFRAME` and `TRAMPOLINE` lack
+      `PTE_U`, and the last two are at or above `MAXVA` (and the check catches them before
+      [[walk]] could panic). Then `copyinstr` gives [[vmfault]] its chance, and `vmfault`
+      refuses at line 463: every one of them is at or above `p->sz`. `copyinstr` returns -1,
+      [[sys_open]] returns -1, and `open` returns -1 in the child.
+
+      Now imagine the kernel had simply dereferenced the pointer, with its own page table
+      loaded:
+
+      - `0x80000000` would have *worked*, copying the kernel's own instructions into
+        `path`. A user program could then probe kernel memory by opening files.
+      - `0x3fffffe000` is a [[g:guard-page]] in the kernel's table (below the trampoline,
+        above the first kernel stack), so the load would fault in supervisor mode. That
+        ends in `panic: kerneltrap` ([[tour:10]]): hart 1 stops for good, the console freezes,
+        and the whole machine has to be restarted. One bad `open` would take down the
+        entire system.
+
+      Line 466 matters for the [[g:guard-page]] at `0x2000` in `cat`: it is below `p->sz`,
+      so the size test passes, but it is already mapped (without `PTE_U`), so
+      [[ismapped]] makes `vmfault` refuse rather than hand it out as a fresh page.
+
+  - title: A string exactly as long as the buffer
+    file: user/usertests.c
+    lines: 138-200
+    focus: 144-160
+    state:
+      hart: 1
+      mode: U
+      proc: usertests (pid 4)
+      intr: on
+      satp: user
+      locks: []
+      stack: [main, drivetests, runtests, run, copyinstr2]
+      sp: user
+    note: |
+      [[user:copyinstr2]] builds a string of exactly `MAXPATH` (128) `x` characters, with
+      its NUL at index 128, one byte past what the kernel's `path` buffer can hold. This is
+      the classic off-by-one.
+
+      In [[copyinstr]], `max` starts at 128. The inner loop copies 128 `x`s into
+      `path[0..127]`, and `max` reaches 0 before the NUL is seen. `got_null` is still 0, so
+      `copyinstr` returns -1. It did **not** write a NUL at `path[128]`: that byte belongs
+      to whatever lies above the buffer on the kernel stack. A routine that "helpfully"
+      terminated the string there would corrupt the kernel stack, under the control of a
+      user program.
+
+      `unlink`, `open`, `link` and `exec` all go through [[argstr]] with `MAXPATH`, so all
+      four refuse. The test then forks a child of its own, which tries
+      `exec("echo", {big, big, big, 0})` with `big` a 4096-character string: [[sys_exec]]
+      gives [[fetchstr]] a `PGSIZE` limit, so the same rule rejects it one level up, and
+      that child exits with 747 to prove `exec` returned.
+
+      In a correct kernel, "too long" and "bad pointer" look the same to the caller: -1.
+
+  - title: A string that runs off the end of memory
+    file: user/usertests.c
+    lines: 202-244
+    focus: 206-226
+    state:
+      hart: 1
+      mode: U
+      proc: usertests (pid 4)
+      intr: on
+      satp: user
+      locks: []
+      stack: [main, drivetests, runtests, run, copyinstr3]
+      sp: user
+    note: |
+      [[user:copyinstr3]] grows the heap until its top `top` is page-aligned, then stores a
+      single `x` in the very last byte it owns, `top - 1`, and passes that address as a
+      path. The string has a valid first byte and no end: the next byte is at `top`, which
+      is `p->sz`.
+
+      In [[copyinstr]]: the first iteration translates the last page, `n = 1`, copies the
+      `x`, and leaves the inner loop without a NUL. `srcva` moves to `top`. The second
+      iteration's [[walkaddr]] returns 0, and [[vmfault]] refuses because
+      `top >= p->sz`. Return -1.
+
+      This is why the translation sits *inside* the loop over pages. A routine that checked
+      only the first byte's page, then copied until a NUL, would walk off the end of the
+      process's memory, into whatever physical page happened to follow in the direct
+      map: another process's data, or a kernel page table.
+
+      Note what `copyinstr` left behind: an `x` in `path[0]` and no terminator. Harmless,
+      because the -1 means nobody will read `path`. Partial results of a failed copy are
+      never used.
+
+  - title: A string on a page that does not exist yet
+    file: user/usertests.c
+    lines: 2743-2776
+    focus: 2746-2757
+    state:
+      hart: 1
+      mode: U
+      proc: usertests (pid 4)
+      intr: on
+      satp: user
+      locks: []
+      stack: [main, drivetests, runtests, run, lazy_copyinstr]
+      sp: user
+    note: |
+      Now a pointer that is *legitimate* but has no page behind it. [[user:lazy_copyinstr]]
+      aligns the heap, then calls [[user:sbrklazy]]`(2 * PGSIZE)`: [[sys_sbrk]] raises
+      `p->sz` by two pages without allocating anything ([[tour:26]]).
+
+      `p[4095] = '/'` is a user-mode store to the first lazy page. It page-faults, and
+      [[usertrap]] calls [[vmfault]] to allocate a zeroed page ([[tour:10]]); the store
+      then succeeds. The second page is never touched by the program.
+
+      `open(&p[4095], O_RDONLY)` passes a one-character string whose NUL lives at
+      `p[4096]`, on that untouched page. In [[copyinstr]]: the first page translates and
+      gives `/`. On the second page, [[walkaddr]] returns 0, but this time [[vmfault]]
+      agrees: the address is below `p->sz` and not mapped. It allocates a page, fills it
+      with zeros, maps it, and returns its physical address. The first byte is `\0`. The
+      copy succeeds, `path = "/"`, and `open` returns a descriptor for the root directory.
+
+      So the kernel treats a lazy page the same way whether the program or the kernel
+      touches it first. A system call must not fail just because the program had not yet
+      used memory it owns.
+
+  - title: Allocating that page takes the one shared lock
+    file: kernel/kalloc.c
+    lines: 65-82
+    focus: 74-76
+    state:
+      hart: 1
+      mode: S
+      proc: usertests (pid 4)
+      intr: off
+      satp: kernel
+      locks: [kmem.lock]
+      stack: [usertrap, syscall, sys_open, argstr, fetchstr, copyinstr, vmfault, kalloc]
+      sp: {"on": kernel, switched: "`ld sp, 8(a0)` in [[kernel:uservec]] ([[kernel/trampoline.S:76]])", detail: "the child's kernel stack"}
+      irq: {noff: 1, intena: 1}
+    note: |
+      [[vmfault]] calls [[kalloc]]. Everything so far in this tour touched only one
+      process's private state. The free-page list is different: it is shared by all
+      harts. So `kalloc` takes `kmem.lock`, a [[g:spinlock]], pops one page, and releases
+      it.
+
+      For the three lines inside the lock, interrupts are **off** on hart 1:
+      [[acquire]] called [[push_off]]. If a timer interrupt could arrive here and this
+      thread were switched out while holding `kmem.lock`, every other hart that needed
+      memory would spin until it was switched back in ([[g:interrupts-and-locks]]).
+      [[push_off]] found them on (this is a system call) and recorded `intena = 1`, which is
+      why [[release]] turns them back on ([[concept:locks#intena]]).
+
+      The `memset(…, 5, …)` junk fill happens *after* the release: no reason to make other
+      harts wait while 4096 bytes are written. [[vmfault]] then overwrites the junk with
+      zeros, because a user page must never leak a previous owner's data, and
+      [[mappages]] installs it with `PTE_R | PTE_W | PTE_U`. Then `copyinstr` continues
+      with interrupts back on.
+    others: |
+      Three harts, three allocations, one lock:
+
+      | Time | Hart 0 | Hart 1 (usertests) | Hart 2 |
+      |---|---|---|---|
+      | t1 | `kalloc`: `acquire(&kmem.lock)` → wins | `acquire`: spins | |
+      | t2 | `freelist = r->next` | spins | `acquire`: spins |
+      | t3 | `release` | wins | spins |
+      | t4 | fills its page with 5s | takes the next page, `release` | wins |
+
+      Without the lock, harts 0 and 1 could both read the same `freelist` at t2 and hand
+      out the same physical page twice: two processes would share memory without knowing
+      it. The critical section is three lines of C (six instructions in this build), so the
+      spinning is short.
+
+  - title: copyin with a spinlock held, for a pipe
+    file: kernel/pipe.c
+    lines: 77-107
+    focus: 95-100
+    state:
+      hart: 1
+      mode: S
+      proc: usertests (pid 4)
+      intr: off
+      satp: kernel
+      locks: [pi->lock]
+      stack: [usertrap, syscall, sys_write, filewrite, pipewrite, copyin]
+      sp: {"on": kernel, detail: "the writer's kernel stack, holding `pi->lock` with interrupts off"}
+      irq: {noff: 1, intena: 1}
+    note: |
+      [[user:copyin]] in `usertests` tests the other direction of trust: `write` with a bad
+      *buffer* pointer, such as `write(fds[1], (char *)0x80000000, 8192)` on a pipe.
+      [[sys_write]] takes the pointer with [[argaddr]], unchecked, and [[filewrite]] hands
+      it to [[pipewrite]].
+
+      `pipewrite` copies one byte at a time with [[copyin]], **while holding `pi->lock`**,
+      a spinlock, so interrupts are off on hart 1. `copyin` follows the same pattern as
+      `copyinstr`: [[walkaddr]] fails, [[vmfault]] refuses (`0x80000000` is above
+      `p->sz`), return -1. Since no byte was written yet (`i == 0`), `pipewrite` returns -1.
+
+      Calling `copyin` with a spinlock held is allowed only because `copyin` never sleeps.
+      At worst it calls `kalloc`, which takes `kmem.lock` briefly and returns. That nests
+      `kmem.lock` inside `pi->lock`: `noff` goes to 2, and releasing `kmem.lock` only drops
+      it back to 1, leaving interrupts off ([[concept:locks#noff]]). If copying
+      user memory could wait for a disk (as it can in systems that page to disk), this code
+      would deadlock or would have to be rewritten.
+
+      For a regular file, the same bad pointer reaches `copyin` inside [[writei]], holding
+      the inode's and the buffer's sleep-locks, with interrupts on. `writei` copies 0 bytes,
+      and [[filewrite]] returns -1. For the console, [[consolewrite]] returns 0 bytes
+      written. The test demands -1 for the regular file and accepts -1 or 0 for the console
+      and the pipe: anything but a successful write.
+    others: |
+      Suppose a reader of this pipe is on hart 2, in [[piperead]]. It spins in `acquire`
+      for `pi->lock` while hart 1 fails its copy. That is safe because the wait is
+      short: `copyin` returns quickly whether it succeeds or not. A process with a bad
+      pointer cannot hold another process up for longer than one failed page walk.
+
+  - title: open returns a descriptor
+    file: kernel/sysfile.c
+    lines: 376-395
+    focus: 394
+    state:
+      hart: 0
+      mode: S
+      proc: cat (pid 3)
+      intr: on
+      satp: kernel
+      locks: []
+      stack: [usertrap, syscall, sys_open]
+      sp: {"on": kernel, detail: "back to `cat` (pid 3): its kernel stack, `sys_open`'s frame on top"}
+      irq: 0
+    note: |
+      Back to `cat` on hart 0 (or wherever it was last scheduled). `"README"` named a
+      regular file, so `sys_open` fills in a `struct file` and returns descriptor 3: `cat`
+      inherited 0, 1 and 2 from the shell. [[syscall]] stores 3 in `p->trapframe->a0`, and
+      `open` returns 3 in user mode ([[tour:5]]).
+
+      What did one path argument cost? Two saved registers read from the trapframe; one
+      three-level page-table walk; seven bytes copied through the direct map; one
+      `strlen`. A few hundred instructions at most, far less than the trap itself.
+
+      And what did it buy?
+
+      - **Translate, don't dereference.** A user address means something only in the
+        user's page table. [[walkaddr]] applies the user's rules (`PTE_V`, `PTE_U`,
+        `MAXVA`, `p->sz`) in software.
+      - **Check at the moment of use, page by page.** [[argaddr]] checks nothing;
+        [[copyinstr]] checks each page as it reads it.
+      - **Bound everything.** `MAXPATH`, `PGSIZE`, `MAXARG`; no NUL in time means -1.
+      - **Copy once.** After `argstr`, the kernel works only on `path`.
+      - **Fail with -1, never with a panic.** Every hostile pointer in `usertests` ends
+        as an ordinary error return, and the other harts never notice.
+locks:
+  - lock: "no lock: the trapframe"
+    where: "[[argraw]]"
+    protects: "Nothing needed: only the process's own kernel thread uses its trapframe while it is in the kernel"
+  - lock: "no lock: the user page table"
+    where: "[[walkaddr]], [[walk]], [[copyinstr]]"
+    protects: "Nothing needed: only the process's own system calls change its page table, and it is busy in this one"
+  - lock: "no lock: the kernel path buffer"
+    where: "[[sys_open]]"
+    protects: "Nothing needed: `path` is on the process's own kernel stack"
+  - lock: "kmem.lock (spinlock)"
+    where: "[[kalloc]], via [[vmfault]] for a lazy page, and in [[sys_exec]] for each argument page"
+    protects: "The free-page list shared by all harts"
+  - lock: "pi->lock (spinlock)"
+    where: "[[pipewrite]], held across each one-byte [[copyin]]"
+    protects: "The pipe's buffer and counters; safe to hold across `copyin` because `copyin` never sleeps"
+quiz:
+  - q: "`argaddr` performs no check on the address it returns. Why is that not a security hole?"
+    a: |
+      The address is never dereferenced. It is only ever passed to [[copyin]],
+      [[copyout]] or [[copyinstr]], which translate it through the process's page table
+      and check every page at the moment they read or write it. A check in `argaddr` would
+      be redundant.
+  - q: "`cat`'s page table maps `TRAPFRAME`. What stops `open((char *)TRAPFRAME, 0)` from making the kernel read `cat`'s trapframe, and why does the same check matter even more for `read`?"
+    a: |
+      [[walkaddr]] returns 0 for any page without `PTE_U`, and [[vmfault]] then refuses
+      because `TRAPFRAME` is above `p->sz`. Reading is the lesser danger: the same check in
+      [[copyout]] is what stops `read(fd, (char *)TRAPFRAME, n)` from overwriting
+      `kernel_trap` or `kernel_satp`, which would let `cat` choose where the next trap
+      jumps in supervisor mode.
+  - q: "Why does `walkaddr` test `va >= MAXVA` itself instead of leaving it to `walk`?"
+    a: |
+      [[walk]] panics on such an address. The value comes from a user program, and no user
+      argument may be able to panic the kernel. `walkaddr` turns it into an ordinary
+      "not mapped" result.
+  - q: "A user passes a path of exactly 128 non-NUL bytes. What does `copyinstr` write into `path`, and why must it not write a 129th byte?"
+    a: |
+      It copies 128 bytes into `path[0..127]`, runs out of `max` before finding a NUL,
+      and returns -1. `path` has only 128 bytes; a NUL at `path[128]` would overwrite
+      whatever lies next on the kernel stack.
+  - q: "`pipewrite` calls `copyin` while holding the spinlock `pi->lock`. What property of `copyin` makes that safe, and what would go wrong without it?"
+    a: |
+      `copyin` never sleeps: at worst it calls [[kalloc]], which holds `kmem.lock` briefly.
+      If it could sleep while `pi->lock` is held (with interrupts off), another hart
+      spinning for `pi->lock` could wait indefinitely, and sleeping with a spinlock held
+      breaks xv6's scheduler rules ([[sched]] panics unless only `p->lock` is held).
+  - q: "xv6 processes are single-threaded, so nothing can change `cat`'s memory while `cat` is in `sys_open`. Why is copying the path once into `path` still the right design?"
+    a: |
+      It makes the kernel's correctness independent of what user memory does later: every
+      check and every use sees the same bytes, even across sleeps in [[namei]]. In a
+      kernel with multithreaded processes or shared memory, re-reading user memory after
+      checking it is a time-of-check to time-of-use bug; with one copy, it cannot arise.

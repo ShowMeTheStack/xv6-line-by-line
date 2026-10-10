@@ -1,0 +1,709 @@
+title: The buffer cache
+group: File system
+prerequisites: [17, 29]
+summary: |
+  xv6 keeps exactly 30 disk blocks in memory at a time. Every file-system operation, on
+  every hart, goes through those 30 buffers: reading a directory, allocating a block,
+  updating an inode, writing the log. The [[g:buffer-cache]] in [[kernel/bio.c]] has two
+  jobs. It saves disk reads, and, just as important, it guarantees that there is **at most
+  one copy** of each block in memory, and that only one process at a time works on it.
+
+  This tour follows the moment that tests both jobs. You run `logstress f1 f2`, a test
+  program whose children write two files in parallel. Both children need a new data block
+  at the same time, so both call `balloc`, and both ask for **block 46**, the free-block
+  bitmap of a fresh `fs.img` in this build, which nobody has read since boot. (The exact overlap is illustrative: it is one
+  possible timing, chosen because it is the case the code must handle.) Child A on
+  hart 1 gets there first and misses; child B on hart 2 arrives a moment later and finds A's
+  half-filled buffer. Two locks of different kinds and a reference count, updated in a
+  carefully chosen order, make sure that the bitmap is read from disk once, that the two children
+  take turns, and that the buffer cannot be recycled under either of them.
+
+  On the way you will see the LRU list, how the log pins buffers, and the one way the cache
+  can fail: `panic("bget: no buffers")`.
+cast: |
+  `logstress f1 f2` (pid 3) has forked two children. Each opened its file and is in its
+  first `write`. Both are inside a log transaction ([[tour:31]]).
+
+  | Hart | What it is doing |
+  |---|---|
+  | 0 | Idle, or running `logstress` (pid 3), which is waiting for its children |
+  | 1 | Child A (pid 4), writing `f1` (inode 24): needs a new block, about to read the bitmap |
+  | 2 | Child B (pid 5), writing `f2` (inode 25): about to do the same, a moment later |
+
+  (Simplified: in a traced run of this build, pid 4 did read block 46 from disk first; the
+  exact overlap with pid 5 shown here is one possible timing, chosen because it is the one
+  the code must handle.)
+steps:
+  - title: Both children need a free block
+    file: kernel/fs.c
+    lines: 63-90
+    focus: 73-75
+    state:
+      hart: 1
+      mode: S
+      proc: child A (pid 4)
+      intr: on
+      satp: kernel
+      locks: ["f1's ip->lock (sleep-lock)"]
+      irq: 0
+      stack: [usertrap, syscall, sys_write, filewrite, writei, bmap, balloc]
+      sp: kernel
+    note: |
+      `f1` is empty, so [[writei]] asks [[bmap]] for file block 0, and `bmap` finds no block
+      there and calls [[balloc]]. To find a free disk block, `balloc` reads the free-block
+      bitmap, one bit per block ([[g:free-bitmap]]). With 2,000 blocks and 8,192 bits per
+      block, the whole bitmap fits in one block: `BBLOCK(0, sb)` = `sb.bmapstart` = **46**.
+
+      So child A calls `bread(1, 46)`, holding only its own inode's [[g:sleeplock]].
+
+      At almost the same moment, child B on hart 2 does exactly the same thing for `f2`.
+      The two children hold *different* inode locks (inodes 24 and 25), so nothing has
+      serialized them yet. The bitmap block is the first thing they share.
+
+  - title: Thirty buffers and a list
+    file: kernel/bio.c
+    lines: 16-33
+    focus: 25-33
+    state:
+      hart: 1
+      mode: S
+      proc: child A (pid 4)
+      intr: on
+      satp: kernel
+      locks: ["f1's ip->lock (sleep-lock)"]
+      irq: 0
+      stack: [usertrap, syscall, sys_write, filewrite, writei, bmap, balloc, bread]
+      sp: kernel
+    note: |
+      The whole cache is one global structure, [[bcache]] (at `0x800157e8` in this build):
+
+      - `buf[NBUF]`: 30 buffers ([[NBUF]] = `MAXOPBLOCKS * 3`), each holding one block.
+      - `head`: a dummy buffer that anchors a circular doubly linked list through all 30.
+        `head.next` is the most recently used, `head.prev` the least recently used.
+      - `lock`: one [[g:spinlock]] for the cache's bookkeeping.
+
+      There is no hash table: finding a block means walking the list. With 30 entries that
+      is cheap, and it keeps the code short.
+
+      The 30 buffers are statically allocated; there is no `kalloc` here. If all 30 are in
+      use, the cache cannot grow. That is the source of the panic at the end of this tour.
+
+  - title: What a buffer knows
+    file: kernel/buf.h
+    lines: 1-11
+    focus: 1-10
+    state:
+      hart: 1
+      mode: S
+      proc: child A (pid 4)
+      intr: on
+      satp: kernel
+      locks: ["f1's ip->lock (sleep-lock)"]
+      irq: 0
+      stack: [usertrap, syscall, sys_write, filewrite, writei, bmap, balloc, bread]
+      sp: kernel
+    note: |
+      Each [[buf]] has two kinds of fields, protected by two different locks:
+
+      | Field | Meaning | Protected by |
+      |---|---|---|
+      | `dev`, `blockno` | which block this buffer holds | `bcache.lock` |
+      | `refcnt` | how many threads hold or wait for it, plus pins | `bcache.lock` |
+      | `prev`, `next` | position in the LRU list | `bcache.lock` |
+      | `lock` | the buffer's [[g:sleeplock]] | (itself) |
+      | `valid` | `data` holds the block's contents | `lock` (set to 0 under `bcache.lock` when relabeling a buffer nobody holds) |
+      | `data` | the 1024 bytes of the block | `lock` |
+      | `disk` | the disk driver owns it | `disk.vdisk_lock` ([[tour:29]]) |
+
+      This split is the key to the whole file. The **spinlock** `bcache.lock` is held for
+      a few instructions, to look things up and count users. The **sleep-lock** `b->lock`
+      is held for a long time, possibly across a disk read, by the one thread using the
+      block's contents.
+
+  - title: At boot, the list is built backwards
+    file: kernel/bio.c
+    lines: 35-52
+    focus: 42-51
+    state:
+      hart: 0
+      mode: S
+      proc: none (boot)
+      intr: off
+      satp: kernel
+      locks: []
+      irq: 0
+      stack: [main, binit]
+      sp:
+        "on": boot
+        switched: "flashback to boot: `add sp, sp, a0` in `_entry` ([[kernel/entry.S:17]]) set it at power-on"
+        detail: "hart 0's slice of `stack0`, `0x80007890`–`0x80008890`"
+    note: |
+      Long before our scenario, hart 0 ran [[binit]] during boot. It makes `head` point to
+      itself, then inserts each buffer at the **front** of the list, from `buf[0]` to
+      `buf[29]`. The result: `head.next` is `buf[29]` and `head.prev` (the least recently
+      used end) is `buf[0]`.
+
+      All buffers start with `refcnt = 0` and `valid = 0` (`bcache` is a global with no
+      initializer, so it starts zeroed), so the first miss after boot recycles `buf[0]`, the
+      second `buf[1]`, and so on. Each buffer also gets its sleep-lock initialized, named
+      "buffer".
+
+  - title: Child A scans the cache
+    file: kernel/bio.c
+    lines: 54-72
+    focus: 62-72
+    state:
+      hart: 1
+      mode: S
+      proc: child A (pid 4)
+      intr: off
+      satp: kernel
+      locks: ["f1's ip->lock (sleep-lock)", bcache.lock]
+      irq: {noff: 1, intena: 1}
+      stack: [usertrap, syscall, sys_write, filewrite, writei, bmap, balloc, bread, bget]
+      sp:
+        "on": kernel
+        switched: "back to child A, on its kernel stack since `ld sp, 8(a0)` in [[uservec]] ([[kernel/trampoline.S:76]])"
+    note: |
+      [[bget]] takes `bcache.lock` (interrupts off on hart 1) and walks the list from the
+      most recently used end, looking for device 1, block 46.
+
+      Block 46 is not there. Since boot, the cache has held the superblock, the log header,
+      the inode blocks, the root directory and pieces of programs, but nobody has
+      allocated a block yet, so nobody has needed the bitmap.
+
+      Searching from the most recent end is a small optimization: blocks that were just used
+      are the ones most likely to be wanted again.
+    others: |
+      Child B on hart 2 calls [[bget]] for block 46 a moment later and spins in
+      [[acquire]] on `bcache.lock`. Interrupts are off on hart 2 while it spins. The wait
+      is short: A's critical section is at most two passes over 30 buffers (the hit scan,
+      then the recycling scan), though nothing guarantees B is next if a third hart also
+      wants the lock.
+
+  - title: A miss recycles the least recently used free buffer
+    file: kernel/bio.c
+    lines: 74-88
+    focus: 76-82
+    state:
+      hart: 1
+      mode: S
+      proc: child A (pid 4)
+      intr: off
+      satp: kernel
+      locks: ["f1's ip->lock (sleep-lock)", bcache.lock]
+      irq: {noff: 1, intena: 1}
+      stack: [usertrap, syscall, sys_write, filewrite, writei, bmap, balloc, bread, bget]
+      sp: kernel
+    note: |
+      Now `bget` walks backwards from `head.prev`, the **least** recently used buffer,
+      looking for one with `refcnt == 0`: a buffer nobody holds, nobody waits for and the
+      log has not pinned. The first one found becomes block 46:
+
+      - `dev = 1`, `blockno = 46`: from now on, any scan finds this buffer as block 46.
+      - `valid = 0`: its `data` still holds the *old* block's bytes, which must not be
+        mistaken for the bitmap.
+      - `refcnt = 1`: child A's claim.
+
+      All of this happens under `bcache.lock`, so no other hart can see a half-relabeled
+      buffer. Then line 82 releases `bcache.lock`, and line 83 takes the buffer's
+      sleep-lock with [[acquiresleep]]. The order is forced: `acquiresleep` may sleep, and sleeping with `bcache.lock` held would leave noff at 2 and trip [[sched]]'s `sched locks` panic. The raised `refcnt` keeps the buffer from being recycled in the gap ([[concept:locks#unusual]]). In our timing child A gets it at once: the buffer had
+      `refcnt == 0`, so nobody held its sleep-lock (step 15 shows why). Nothing forces A to
+      win, though. If A were preempted between lines 82 and 83, B could take the sleep-lock
+      first, see `valid == 0`, and do the disk read itself. The result would be the same:
+      whoever gets the lock first reads the block.
+
+      Recycling a buffer never writes the old contents to disk. In xv6 a buffer with
+      unwritten changes is always pinned by the log (`refcnt > 0`), so a recyclable buffer
+      is always clean.
+
+  - title: Child B finds A's buffer
+    file: kernel/bio.c
+    lines: 57-72
+    focus: 66-67
+    state:
+      hart: 2
+      mode: S
+      proc: child B (pid 5)
+      intr: off
+      satp: kernel
+      locks: ["f2's ip->lock (sleep-lock)", bcache.lock]
+      irq: {noff: 1, intena: 1}
+      stack: [usertrap, syscall, sys_write, filewrite, writei, bmap, balloc, bread, bget]
+      sp: kernel
+    note: |
+      Hart 2 gets `bcache.lock` as soon as hart 1 releases it, and scans. This time block 46
+      **is** in the list: child A labeled it a moment ago, even though its data has not
+      been read yet.
+
+      Child B increments `refcnt` to 2, releases `bcache.lock`, and calls [[acquiresleep]].
+
+      The increment happens **before** the spinlock is released, and that ordering matters.
+      `refcnt` is how the recycler knows a buffer is wanted. If B released `bcache.lock`
+      first and incremented later, there would be a window where B is about to use the
+      buffer but `refcnt` does not show it.
+    others: |
+      | Time | Hart 1 (child A) | Hart 2 (child B) |
+      |---|---|---|
+      | t1 | `bget`: miss, relabels a buffer as 46, `refcnt = 1` | spins on `bcache.lock` |
+      | t2 | releases `bcache.lock` | gets `bcache.lock` |
+      | t3 | `acquiresleep`: gets the buffer | scan finds 46: `refcnt = 2` |
+      | t4 | `valid == 0`: starts the disk read | releases `bcache.lock`, `acquiresleep`: must wait |
+
+      Without `bcache.lock`, both could miss at the same time and relabel *two different*
+      buffers as block 46. Each child would read its own copy of the bitmap, both would
+      find bit 1006 clear, and both would take block 1006 for their files. The log records block
+      *numbers*, so only one of the two copies would be written at commit, and the other
+      child's change would be lost. One copy per block is a correctness rule, not an
+      optimization.
+
+  - title: Child B sleeps on the buffer's lock
+    file: kernel/sleeplock.c
+    lines: 21-34
+    focus: 25-26
+    state:
+      hart: 2
+      mode: S
+      proc: child B (pid 5)
+      intr: off
+      satp: kernel
+      locks: ["f2's ip->lock (sleep-lock)", "block 46 b->lock.lk (spinlock)"]
+      irq: {noff: 1, intena: 1}
+      stack: [usertrap, syscall, sys_write, filewrite, writei, bmap, balloc, bread, bget, acquiresleep]
+      sp:
+        "on": kernel
+        detail: "child B's kernel stack; when it sleeps, every frame shown stays here"
+    note: |
+      Inside [[acquiresleep]], child B takes the sleep-lock's own small spinlock, `lk->lk`,
+      and finds `locked == 1`: child A owns the buffer. So B registers to wait with
+      [[sleep_prepare]]`(lk)`, releases `lk->lk`, and calls [[sleep]]. Hart 2 is free to run
+      something else ([[tour:17]]). Sleeping is legal because B's only spinlock, `lk->lk`, was released first; `f2`'s inode lock is a sleep-lock, which noff does not count ([[concept:locks#sleep-locks]]).
+
+      This is the moment a sleep-lock earns its keep. Child A is about to wait for the disk,
+      which takes far longer than a context switch. If buffers were protected by
+      spinlocks, child B would burn hart 2, with interrupts off, for the whole disk read.
+
+      Notice what B is holding while it sleeps: `f2`'s inode lock. That is fine. Anybody who
+      wants `f2` will wait for B, and B waits for A, and A waits only for the disk. Waiting
+      chains are safe as long as they never form a cycle, and xv6 always takes an inode
+      lock before the buffer locks under it, never the other way around.
+
+      What B leaves behind is its half-finished `write`, on its own **kernel stack**
+      ([[concept:stacks#kernel]]). [[sleep]] calls [[sched]], and [[swtch]] saves B's
+      registers in `p->context` and loads hart 2's scheduler stack
+      ([[kernel/swtch.S:26]]). B's stack keeps every frame:
+
+      ```text
+      child B's kernel stack, while it sleeps on the buffer's lock
+        top ─► usertrap · syscall · sys_write · filewrite · writei
+               bmap · balloc · bread (bget is inlined into it in this build) · acquiresleep
+               sleep · sched                ← p->context.sp points here
+      ```
+
+      A sleep-lock costs no hart while it waits precisely because a whole call chain can
+      be parked on a kernel stack like this. Hart 2 moves on with nothing of B's on its
+      own stack.
+
+  - title: Child A reads the bitmap from disk
+    file: kernel/bio.c
+    lines: 90-102
+    focus: 96-100
+    state:
+      hart: 1
+      mode: S
+      proc: child A (pid 4)
+      intr: on
+      satp: kernel
+      locks: ["f1's ip->lock (sleep-lock)", "block 46 b->lock (sleep-lock)"]
+      irq: 0
+      stack: [usertrap, syscall, sys_write, filewrite, writei, bmap, balloc, bread]
+      sp:
+        "on": kernel
+        detail: "child A's kernel stack, which will hold the disk wait of [[tour:29]]"
+    note: |
+      Back on hart 1, [[bread]] sees `valid == 0` and calls [[virtio_disk_rw]] to read block
+      46. [[tour:29]] follows that read in full: child A sleeps until the disk interrupt, still
+      holding the buffer's sleep-lock, and wakes with the bitmap in `data`. `bread` sets
+      `valid = 1`.
+
+      Now there are two sleepers involving this buffer: child A, waiting for the disk
+      (channel: the buffer), and child B, waiting for child A (channel: the buffer's
+      sleep-lock). They are woken by different events.
+
+      While A waits for the disk, two kernel stacks are frozen at once, each in its own
+      slot's page: A's ends in `bread · virtio_disk_rw · sleep · sched`, B's in `bread ·
+      acquiresleep · sleep · sched` (`bget` is inlined into `bread` in this build). Harts 1 and 2 have switched to their scheduler stacks
+      and are free for other work, and
+      the disk interrupt will be taken on whatever stack some hart happens to be using
+      ([[tour:29]]), never on A's or B's.
+
+  - title: Child A takes a block and pins the bitmap
+    file: kernel/bio.c
+    lines: 139-153
+    focus: 143
+    state:
+      hart: 1
+      mode: S
+      proc: child A (pid 4)
+      intr: off
+      satp: kernel
+      locks: ["f1's ip->lock (sleep-lock)", "block 46 b->lock (sleep-lock)", log.lock, bcache.lock]
+      irq: {noff: 2, intena: 1, note: "`log.lock` from `log_write`, then `bcache.lock` in `bpin`: releasing `bcache.lock` takes noff back to 1, which must leave interrupts off because `log.lock` is still held ([[concept:locks#noff]])"}
+      stack: [usertrap, syscall, sys_write, filewrite, writei, bmap, balloc, log_write, bpin]
+      sp: kernel
+    note: |
+      In [[balloc]], child A finds the first clear bit, bit 1006 in a fresh image (blocks
+      0–1005 were filled by `mkfs`), sets it in `data`, and calls [[log_write]] instead of
+      writing the block to disk ([[tour:31]]).
+
+      `log_write` records "block 46 is part of this transaction" and, since 46 is new to the
+      transaction, calls [[bpin]]: `refcnt++` under `bcache.lock`. Now `refcnt` is 3: child
+      A, child B, and the pin.
+
+      Why pin? The modified bitmap now exists **only** in this buffer. The disk still has
+      the old bitmap until the transaction commits. If the buffer were recycled before
+      then, the change would be lost. The pin is an extra reference that no process owns:
+      it keeps `refcnt` above zero, so `bget` will not recycle the buffer, until the commit
+      calls [[bunpin]].
+
+      Lock order here: `log.lock` (taken in `log_write`), then `bcache.lock`. Nothing in xv6
+      takes them in the opposite order. ([[concept:locks#order]])
+
+  - title: Child A releases the sleep-lock first
+    file: kernel/sleeplock.c
+    lines: 36-44
+    focus: 40-42
+    state:
+      hart: 1
+      mode: S
+      proc: child A (pid 4)
+      intr: off
+      satp: kernel
+      locks: ["f1's ip->lock (sleep-lock)", "block 46 b->lock.lk (spinlock)"]
+      irq: {noff: 1, intena: 1}
+      stack: [usertrap, syscall, sys_write, filewrite, writei, bmap, balloc, brelse, releasesleep]
+      sp: kernel
+    note: |
+      `balloc` is done with the bitmap and calls [[brelse]]. The first thing `brelse` does
+      ([[kernel/bio.c:122]]) is [[releasesleep]]: clear `locked` and call
+      [[wakeup]]`(lk)`. Child B, asleep on that channel, becomes `RUNNABLE`.
+
+      Only after that does `brelse` touch `refcnt`. The order is deliberate: it keeps the
+      rule that a buffer with `refcnt == 0` is never locked (step 15).
+
+  - title: refcnt goes down, but the buffer stays put
+    file: kernel/bio.c
+    lines: 114-137
+    focus: 124-136
+    state:
+      hart: 1
+      mode: S
+      proc: child A (pid 4)
+      intr: off
+      satp: kernel
+      locks: ["f1's ip->lock (sleep-lock)", bcache.lock]
+      irq: {noff: 1, intena: 1}
+      stack: [usertrap, syscall, sys_write, filewrite, writei, bmap, balloc, brelse]
+      sp: kernel
+    note: |
+      Under `bcache.lock`, `brelse` decrements `refcnt` from 3 to 2. Only when it reaches
+      **0**, meaning nobody holds it, nobody waits for it and the log has not pinned it,
+      does `brelse` move the buffer to the front of the list (lines 128–133): unlink it,
+      then insert it right after `head`.
+
+      Here it is still 2 (child B and the pin), so the buffer stays where it is. That is
+      harmless: `bget` only recycles buffers with `refcnt == 0`, so the list position of a
+      buffer in use does not matter. What matters is where it lands when it is finally
+      released.
+
+      When `brelse` returns, `balloc` calls `bzero(dev, 1006)`, which reads block 1006 into
+      another buffer, clears it and logs it: a second buffer pinned by the same transaction.
+    others: |
+      Child B may already be running again on another hart. If it reaches `bcache.lock`
+      now (it does not need it yet, but another process might), it waits a few instructions
+      for this decrement. `refcnt` and the list links are only ever touched under
+      `bcache.lock`.
+
+  - title: Child B wakes to a valid buffer
+    file: kernel/bio.c
+    lines: 90-102
+    focus: 97
+    state:
+      hart: 0
+      mode: S
+      proc: child B (pid 5)
+      intr: on
+      satp: kernel
+      locks: ["f2's ip->lock (sleep-lock)", "block 46 b->lock (sleep-lock)"]
+      irq: 0
+      stack: [usertrap, syscall, sys_write, filewrite, writei, bmap, balloc, bread]
+      sp:
+        "on": kernel
+        switched: "`ld sp, 8(a1)` in [[swtch]] ([[kernel/swtch.S:26]]), called by hart 0's scheduler"
+        detail: "child B's kernel stack, with the frames it left on hart 2"
+    note: |
+      Child B's `sleep` returns, possibly on a different hart (hart 0, say). `acquiresleep`
+      loops, finds `locked == 0`, takes the buffer, and `bget` returns.
+
+      Moving to hart 0 costs nothing, because B's state was never on hart 2. Hart 0's
+      scheduler ran [[swtch]], whose `ld sp, 8(a1)` ([[kernel/swtch.S:26]]) pointed `sp` at
+      B's parked kernel stack; `sched` and `sleep` returned on it, and the frames below them
+      are exactly as B left them.
+
+      In [[bread]], `valid` is now 1: child A's read filled the buffer. **No second disk
+      read.** That is the cache's first job done: two processes wanted block 46 at the
+      same time, and the disk was asked once.
+
+      In [[balloc]], child B scans the bitmap *as child A left it*: bit 1006 is set, so it
+      takes **1007**. That is the cache's second job: because there is only one copy of
+      block 46 and only one holder at a time, B sees A's change, and the two children cannot
+      both take 1006.
+
+      B's [[log_write]] finds 46 already in the transaction (log absorption), so it does
+      not pin again. `refcnt` stays 2 (B and the pin).
+
+  - title: Child B releases; the pin keeps the buffer
+    file: kernel/bio.c
+    lines: 114-137
+    focus: 124-126
+    state:
+      hart: 0
+      mode: S
+      proc: child B (pid 5)
+      intr: off
+      satp: kernel
+      locks: ["f2's ip->lock (sleep-lock)", bcache.lock]
+      irq: {noff: 1, intena: 1}
+      stack: [usertrap, syscall, sys_write, filewrite, writei, bmap, balloc, brelse]
+      sp: kernel
+    note: |
+      Child B's [[brelse]] releases the sleep-lock (nobody is waiting), then decrements
+      `refcnt` from 2 to **1**. The 1 is the pin. Nobody holds the buffer, but it still
+      cannot be recycled, and `brelse` still does not move it to the head.
+
+      This is the state of block 46 until the commit: unlocked, unowned, dirty, pinned.
+      Any process that calls `bread(1, 46)` before then, for example a third `balloc`,
+      finds it with a quick scan, gets the modified data, and adds its own change on top.
+      That is how a single transaction gathers changes from several processes ([[tour:31]]).
+
+  - title: Why a buffer with refcnt 0 is never locked
+    file: kernel/bio.c
+    lines: 57-88
+    focus: 66-67
+    state:
+      hart: 2
+      mode: S
+      proc: child B (pid 5)
+      intr: off
+      satp: kernel
+      locks: ["f2's ip->lock (sleep-lock)", bcache.lock]
+      irq: {noff: 1, intena: 1}
+      stack: [usertrap, syscall, sys_write, filewrite, writei, bmap, balloc, bread, bget]
+      sp: kernel
+    note: |
+      The recycler in [[bget]] relies on one invariant: **if `refcnt == 0`, nobody holds,
+      waits for, or is about to take the buffer's sleep-lock.** That is what lets it relabel
+      a buffer without asking anyone.
+
+      Two orderings keep it true:
+
+      - Every thread increments `refcnt` under `bcache.lock` **before** it releases that
+        lock and calls `acquiresleep` (lines 67–69 here, and 81–83 on the miss path).
+      - Every thread calls `releasesleep` **before** it decrements `refcnt` (lines 122
+        and 125 in [[brelse]]).
+
+      So each thread's share of `refcnt` covers the whole time it holds or waits for the
+      sleep-lock, and a recyclable buffer's lock is always free. Now break the first rule:
+      suppose child B released `bcache.lock` and only then incremented `refcnt`.
+
+      | Time | Hart 2 (B) | Hart 0 (C) |
+      |---|---|---|
+      | t1 | scan finds 46 cached and unheld (`refcnt == 0`, e.g. after an earlier commit, and say it has drifted to the LRU tail); releases `bcache.lock` **without** incrementing | |
+      | t2 | | `bget(77)` misses; recycling scan from the tail finds 46's buffer with `refcnt == 0`; relabels it 77, `valid = 0`, `refcnt = 1` |
+      | t3 | `refcnt++` (now 2), `acquiresleep`: waits | `acquiresleep`, reads block 77, `brelse` |
+      | t4 | gets the lock: `valid == 1`, `blockno == 77`; `balloc` uses block 77's data **as the bitmap** | |
+
+      Child B would allocate blocks from a "bitmap" that is really some other block, and
+      log it as block 46. Incrementing before releasing closes the t1–t2 window: from the
+      moment B's scan finds the buffer, `refcnt` counts B.
+    others: |
+      The second rule (unlock, then decrement) is what makes the invariant exactly true.
+      Reversing it in today's `brelse` would cost time, not correctness: after the decrement
+      the releasing thread no longer touches `data`, `valid` or `blockno`, so a recycler
+      that relabels the buffer in that window just finds the sleep-lock still held, sleeps
+      briefly in `acquiresleep`, and is woken by `releasesleep`. But "`refcnt == 0` means
+      unlocked" would no longer hold, and any code that used `b` after its decrement would
+      be using a buffer that may already belong to another block. The first rule is
+      different: breaking it corrupts data, as the timeline shows.
+
+  - title: The commit unpins and the buffer moves to the head
+    file: kernel/log.c
+    lines: 66-85
+    focus: 78-81
+    state:
+      hart: 2
+      mode: S
+      proc: the last process to call end_op
+      intr: on
+      satp: kernel
+      locks: ["log block's lock (sleep-lock)", "block 46 b->lock (sleep-lock)"]
+      irq: 0
+      stack: [usertrap, syscall, sys_write, filewrite, end_op, commit, install_trans]
+      sp: kernel
+    note: |
+      Later, when the transaction commits ([[tour:31]]), [[install_trans]] copies each logged
+      block to its home location. For block 46:
+
+      1. `bread(dev, 46)`: a cache hit (it was pinned), `refcnt` 1 → 2.
+      2. Copy in the data from the log block and [[bwrite]] it to block 46 on disk.
+      3. [[bunpin]]: `refcnt` 2 → 1. The disk now has the change, so the pin's job is done.
+      4. [[brelse]]: `refcnt` 1 → **0**, and now the buffer finally moves to the front of
+         the LRU list.
+
+      A dirty buffer reaches `refcnt == 0` only after it has been written home. That is
+      why `bget` can recycle a zero-count buffer without ever writing it back.
+
+  - title: LRU in action
+    file: kernel/bio.c
+    lines: 114-137
+    focus: 126-134
+    state:
+      hart: 2
+      mode: S
+      proc: the last process to call end_op
+      intr: off
+      satp: kernel
+      locks: [bcache.lock]
+      irq: {noff: 1, intena: 1}
+      stack: [usertrap, syscall, sys_write, filewrite, end_op, commit, install_trans, brelse]
+      sp: kernel
+    note: |
+      Every time a buffer's count drops to zero, it goes to the front. So the list is
+      always ordered by the time of each buffer's last release:
+
+      | Position | Buffer |
+      |---|---|
+      | `head.next` | block 46, just installed |
+      | … | log block 3, released by `install_trans` just before 46, then the other log blocks `write_log` used |
+      | … | blocks used at boot, or by the last `exec` |
+      | `head.prev` | the buffer released longest ago |
+
+      The next miss anywhere takes the buffer at the **tail** with `refcnt == 0`, the
+      least recently released one: an approximation of "the block least likely to be
+      needed soon". The first scan (for hits) starts at the front, where recently used
+      blocks are; the recycling scan starts at the back.
+
+      Blocks 1006, 1007 and inode block 34 are still pinned at this instant (they come later
+      in the log), so they have not moved; each jumps to the front as `install_trans`
+      releases it.
+
+      (Simplified: buffers that are pinned or held are skipped by the recycling scan but
+      keep their old list position, so the list is ordered by last release, not by last
+      use.)
+
+  - title: When every buffer is busy
+    file: kernel/bio.c
+    lines: 74-88
+    focus: 87
+    state:
+      hart: any
+      mode: S
+      proc: any process calling bread
+      intr: off
+      satp: kernel
+      locks: [bcache.lock]
+      irq: {noff: 1, intena: 1, note: "intena 1 when the caller is a system call, as usual; it would be 0 if the caller were pid 1's `fsinit` at boot ([[tour:32]])"}
+      stack: [bread, bget]
+      sp: kernel
+    note: |
+      If the recycling scan reaches `head` again without finding `refcnt == 0`, all 30
+      buffers are held, waited for, or pinned, and xv6 gives up:
+      `panic("bget: no buffers")`. There is no waiting for a buffer to free up.
+
+      What keeps this from happening? Partly sizing, partly luck. A running transaction pins at most
+      [[LOGBLOCKS]] = 30 blocks, and each file-system operation holds only a few buffers at
+      once (`writei` holds one data buffer, `balloc` one bitmap buffer). In a traced run of
+      `logstress f1 f2 f3` in this build, most commits pinned 12 to 16 buffers (never more than
+      16), and the panic never happened.
+
+      Notice that [[NBUF]] and `LOGBLOCKS` are both 30. A transaction that filled all 30 log
+      slots would pin every buffer, and the commit's own [[write_log]] would panic asking
+      for a 31st. [[begin_op]] prevents that only indirectly. It admits an operation only
+      while `lh.n + 10 × (running operations) ≤ 30`, so `lh.n` reaches 30 only if the
+      operations running at the end each log a full 10 new blocks. By our count, no xv6
+      operation logs more than 7 (a 3,072-byte `filewrite` chunk: up to 4 data blocks, the
+      bitmap, an indirect block and the inode block), so in this build a commit pins at
+      most 27. Nothing bounds readers, though. `read` takes no `begin_op`, so 31 processes
+      each waiting for a disk read of a different block would also hit this panic. The
+      code relies on these margins; it does not enforce them.
+
+  - title: What the cache bought
+    file: kernel/bio.c
+    lines: 1-14
+    focus: 8-14
+    state:
+      hart: 0
+      mode: S
+      proc: child B (pid 5)
+      intr: on
+      satp: kernel
+      locks: ["f2's ip->lock (sleep-lock)"]
+      irq: 0
+      stack: [usertrap, syscall, sys_write, filewrite, writei]
+      sp: kernel
+    note: |
+      Two children asked for block 46 at the same time. The cache read it from disk once,
+      handed it to them one at a time, and kept the changed bitmap in memory, pinned,
+      until the log made the change durable.
+
+      The cost: one pass for a hit and two for a miss, over a 30-entry list, under a global
+      spinlock for every `bread`,
+      and a sleep whenever another process holds the block you want. On three harts this is
+      rarely a bottleneck. Larger systems split `bcache.lock` into per-bucket locks over a
+      hash table, which is a well-known xv6 lab exercise.
+
+      The key ideas:
+
+      - **At most one buffer per block**, enforced by doing lookup and relabeling under one
+        spinlock.
+      - **Two locks with two jobs**: `bcache.lock` (short, spinning) for the cache's
+        bookkeeping; `b->lock` (long, sleeping) for a block's contents.
+      - **`refcnt` counts claims**, taken before the sleep-lock and dropped after it, so a
+        zero count means nobody holds or waits for the buffer.
+      - **Pins** keep dirty buffers in the cache until the log has written them home.
+      - **LRU**: released buffers go to the front; misses recycle from the back.
+locks:
+  - lock: "bcache.lock (spinlock)"
+    where: "[[bget]], [[brelse]], [[bpin]], [[bunpin]]"
+    protects: "Each buffer's `dev`, `blockno` and `refcnt`, and the LRU list links"
+  - lock: "b->lock (sleep-lock)"
+    where: "[[bget]] (acquire), [[brelse]] (release)"
+    protects: "A buffer's `data` and `valid`: one thread works on a block's contents at a time, across disk reads"
+  - lock: "b->lock.lk (spinlock inside the sleep-lock)"
+    where: "[[acquiresleep]], [[releasesleep]], [[holdingsleep]]"
+    protects: "The sleep-lock's `locked` flag and holder pid"
+  - lock: "ip->lock (sleep-lock)"
+    where: "[[writei]]'s caller ([[filewrite]] via [[ilock]])"
+    protects: "Each child's own inode; different inodes, so the children are not serialized until block 46"
+  - lock: "disk.vdisk_lock (spinlock)"
+    where: "[[virtio_disk_rw]], [[virtio_disk_intr]] (step 9, [[tour:29]])"
+    protects: "The virtio rings and each buffer's `disk` flag"
+  - lock: "p->lock (spinlock)"
+    where: "[[sleep_prepare]], [[sleep]], [[wakeup]]"
+    protects: "Child B's `chan` and `state` while it waits for the buffer's sleep-lock and is woken by `releasesleep` (and child A's while it waits for the disk)"
+  - lock: "log.lock (spinlock)"
+    where: "[[log_write]], taken before `bcache.lock` in [[bpin]]"
+    protects: "The in-memory log header, deciding whether a block needs a new pin"
+quiz:
+  - q: "Child B's `bget` finds block 46 before child A's disk read has finished. Why doesn't B get stale data?"
+    a: "B must take the buffer's sleep-lock, which A holds through the whole read. When B gets it, A has set `valid = 1`, so B's `bread` sees valid data and does not read again."
+  - q: "Why must `bget` increment `refcnt` before releasing `bcache.lock`, not after?"
+    a: "`refcnt` is how other harts' `bget` know the buffer is wanted. In the window after the release and before a late increment, another hart could see `refcnt == 0` and relabel the buffer for a different block, and the thread would then lock and use a buffer that no longer holds the block it asked for."
+  - q: "What would go wrong if two harts could each miss on block 46 at the same time and get two different buffers for it?"
+    a: "Each would set a bit (quite possibly the same one) in its own copy of the bitmap. The log records block numbers, not buffers, so only one copy would reach disk and the other change would be lost: a block could be handed out twice, or recorded as free while in use."
+  - q: "After child A's `brelse`, block 46 has `refcnt == 2` and is not moved to the head of the LRU list. Why doesn't that matter?"
+    a: "`bget` recycles only buffers with `refcnt == 0`, so a buffer in use is never chosen no matter where it is in the list. It moves to the head when its count finally reaches 0, after the commit unpins it."
+  - q: "Why does `bget` never write a buffer's old contents to disk before recycling it?"
+    a: "Every modified buffer is pinned by `log_write` and stays pinned until `install_trans` has written it home and unpinned it. So a buffer with `refcnt == 0` is always clean, and its old contents can be discarded."
+  - q: "`NBUF` and `LOGBLOCKS` are both 30. Describe how `bget: no buffers` could happen during a commit."
+    a: "If one transaction logged 30 distinct blocks, all 30 buffers would be pinned. `write_log` then calls `bread` for a log block that is not cached, `bget` finds no buffer with `refcnt == 0`, and panics. `begin_op` lets `lh.n` reach 30 only if the operations running at the end each log a full 10 new blocks; no xv6 operation logs more than about 7, so in this build it does not happen."

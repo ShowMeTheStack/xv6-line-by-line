@@ -1,0 +1,1889 @@
+published: true
+title: Ticket spinlocks
+area: Concurrency
+stars: 2
+branch: ext/20-ticketlock
+prerequisites: {tours: [13, 15, 19, 50, 52], concepts: [locks]}
+summary: |
+  Every [[g:spinlock]] in this tree is one word and one atomic swap. When the holder lets go,
+  the next hart whose `amoswap` happens to reach the word first takes the lock. Nothing
+  remembers who has been waiting longest. In this lab you replace that loop with a **ticket
+  lock**: a hart takes a number and waits until its number is called, like at a deli counter,
+  so harts get the lock in the order they asked.
+
+  The change is about thirty lines in two files (`spinlock.c` and `spinlock.h`), and every line raises a question about
+  hardware and timing. Which of the two counters must be updated atomically, and which need
+  not be? What memory ordering does each step need, and which instructions does the compiler
+  turn them into? What happens when a 32-bit counter wraps around? Interrupts are already off
+  while a hart waits for a lock: was that only a convenience before, and is it still? What
+  exactly does `holding()` mean when there is no "locked" flag any more?
+
+  You also build the instrument to see the difference: a system call that makes three
+  processes hammer one kernel lock and keeps score. On QEMU the result is not what the
+  textbook predicts, and the lab shows what we measured and why.
+learn:
+  - "Why the swap loop in [[acquire]] promises mutual exclusion but no order, and what a fair lock has to remember that it does not."
+  - "Which parts of a lock need an atomic read-modify-write, which need only ordering, and which need neither; and how C11 atomics with acquire and release ordering turn into RISC-V instructions in this build."
+  - "How unsigned arithmetic modulo 2^32 behaves when a counter wraps, which comparisons survive the wrap, and how to make a wrap bug show up in seconds instead of hours."
+  - "Does a hart that is only *waiting* for a lock, not yet holding it, need interrupts off? Is the answer the same for a free-for-all as for a queue?"
+  - "What [[holding]] and `lk->cpu` promise, why they name a hart, and why the order of two stores in [[release]] matters."
+  - "How to measure fairness on three harts, and why aggregate numbers on an emulator can hide what a per-acquisition measurement shows."
+spec: |
+  **The lock.** Replace the swap loop with a lock that hands itself to waiting harts in the
+  order they asked for it: first come, first served (FIFO), with no hart passed over by a
+  later arrival. `struct spinlock` keeps its size and its `name` and `cpu` fields; what
+  replaces the `locked` flag is yours to design (the think section works it out).
+
+  **What must not change.**
+
+  - `acquire` still calls [[push_off]] first and panics `acquire` if this hart already holds
+    the lock; `release` still panics `release` if it does not, and calls [[pop_off]] last.
+  - [[holding]] still answers "does *this hart* hold the lock", so that `p->lock` can still be
+    acquired by the scheduler and released by the process on the same hart
+    ([[concept:locks#handoff]]).
+  - Use the compiler's C11 atomic built-ins (`__atomic_...`), not hand-written assembly, and
+    read `kernel/kernel.asm` to see what they became.
+  - Any counter you add must keep working when it wraps around from its largest value to 0.
+  - **`usertests -q` must print `ALL TESTS PASSED` on three harts.**
+
+  **The instrument.** A test system call, `int lockbench(int nproc, int total, struct lbstat
+  *st)`. `lockbench(0, total, 0)` resets it, and fails with -1 while a run is in progress
+  (a reset reinitializes the lock under any holder). Then `nproc` processes call it at once; each
+  waits at a start line until all have arrived, then acquires and releases one kernel lock,
+  `benchlock`, until `total` acquisitions have been made in all. Inside the critical section
+  it checks that nobody else is inside and keeps score: acquisitions per caller and per hart,
+  the wait for each acquisition (timed with the `time` CSR), and the longest run of
+  acquisitions by one hart.
+
+  **The test program**, `locktest [nproc [total]]` (3 processes and 300,000 acquisitions by
+  default), prints the numbers and checks one thing, mutual exclusion:
+
+  ```text
+  $ locktest
+  locktest: 3 processes, 300000 acquisitions of one lock
+  locktest: process 0: 101214 acquisitions, wait mean 768 ns, longest 87 us
+  locktest: process 1: 98549 acquisitions, wait mean 786 ns, longest 75 us
+  locktest: process 2: 100237 acquisitions, wait mean 781 ns, longest 88 us
+  locktest: per hart: 103565 94352 102083
+  locktest: longest run by one hart: 24
+  locktest: 203 ms, 1477 acquisitions per ms
+  locktest: mutual exclusion (300000 counted, 0 overlaps): OK
+  locktest: fairness is not checked: compare the numbers above
+  ```
+
+  The last line is deliberate. Fairness is something to measure, not to assert: the
+  numbers vary from run to run and with the load on the machine running QEMU, and the
+  measurement that shows the ticket lock's real property needs a counter inside
+  `acquire` itself (see Measure).
+think:
+  - title: What does the swap loop promise, and what does it not?
+    q: |
+      Three harts want the same lock. Hart 0 holds it; harts 1 and 2 are spinning in
+      [[acquire]]. Hart 0 releases it, and a moment later wants it again. Who gets the lock
+      next? Is there any bound on how many times hart 1 can be passed over before it gets in?
+      Commit to an answer before the hints.
+    hints:
+      - |
+        Read the loop at [[kernel/spinlock.c:37]] and the release at
+        [[kernel/spinlock.c:73]]. What does a hart that fails a swap remember about its
+        attempt?
+      - |
+        After the `sw zero` that frees the lock, every spinning hart and the releasing hart
+        (if it calls `acquire` again) race to execute the next `amoswap`. The memory system
+        orders the swaps; the code does not.
+      - |
+        Compare "the lock is free, whoever swaps first wins" with "the lock goes to whoever
+        has waited longest". The second needs some state that records arrival order. What
+        is the smallest such state?
+    answer: |
+      The swap loop promises **mutual exclusion and nothing else**. When hart 0 stores 0
+      into `locked`, the next `amoswap.w.aq` to reach that word, from any hart, wins. A
+      failed swap leaves no trace: hart 1's thousand earlier attempts count for nothing.
+
+      So there is no bound. Hart 1 can lose every race, in principle forever (starvation).
+      The likeliest winner is often the hart that just released: it is already running, it is
+      a few instructions away from its next `acquire`, and on real multi-core hardware it
+      still has the lock's cache line in its own cache, while the spinners must fetch it. Linux
+      met exactly this: its x86 spinlock (an atomic decrement, as unfair as a swap) was
+      replaced by ticket locks in Linux 2.6.25 (2008), after Nick Piggin measured threads on an
+      8-core, two-socket Opteron differing by up to 2× in run time, some passed over up to a
+      million times
+      ([LKML](https://lkml.iu.edu/hypermail/linux/kernel/0711.0/0125.html),
+      [LWN](https://lwn.net/Articles/267968)).
+
+      What QEMU shows is another matter, and worth measuring rather than assuming. In this
+      lab's measurement (three processes, 300,000 acquisitions, nine runs), the swap loop
+      gave each process between 97,150 and 102,533 of them: close to even. But counted one
+      acquisition at a time, it let a waiter be passed by as many as 126 others while it
+      spun. The ticket lock built below never let anybody be passed by more than 2, the
+      number of other harts.
+    checks:
+      - id: lab20-01
+        level: 1
+        type: line
+        q: |
+          In the original [[acquire]], click the line where the decision "which waiting hart
+          gets the lock next" is made.
+        code: kernel/spinlock.c:19-42
+        answer: 37
+        lines:
+          24: |
+            You may have thought the order is fixed when interrupts are turned off.
+            [[push_off]] only affects this hart; it decides nothing between harts.
+          25: |
+            You may have thought [[holding]] queues the caller. It only checks whether this
+            hart already holds the lock, to turn a self-deadlock into a panic.
+          41: |
+            You may have thought recording the owner decides who owns it. By line 41 the
+            race is already won; `lk->cpu` is bookkeeping for `holding()`.
+        why_wrong: |
+          Look for the one instruction that can fail or succeed depending on what other harts
+          did a moment earlier.
+        explain: |
+          Line 37 compiles to the `amoswap.w.aq` loop. Each attempt either finds 0 and wins or
+          finds 1 and retries; whichever hart's swap reaches the word first after the release
+          wins. Nothing on any line records how long a hart has waited. See
+          [[concept:locks#amoswap]].
+      - id: lab20-02
+        level: 2
+        type: tf
+        q: |
+          True or false: with the original swap loop on three harts, a hart that has been
+          spinning in `acquire` gets the lock after at most two other acquisitions.
+        answer: false
+        why_tf: |
+          You may have thought spinning harts form a line. They do not: each failed swap is
+          forgotten, so the order of winners depends only on timing.
+        reasons:
+          - text: "False: a failed swap leaves no record, so any other hart, including the one that just released, can win every race."
+            correct: true
+            why: That is the reason. Nothing bounds the number of times one hart loses.
+          - text: "True: the memory system serves atomic operations to the same word in the order they were issued."
+            why: |
+              You may have thought the hardware queues atomic operations fairly. It orders
+              them, but in whatever order they arrive; a hart that is a few instructions
+              closer, or holds the cache line, arrives first again and again.
+          - text: "True: interrupts are off while spinning, so no hart can be delayed."
+            why: |
+              You may have mixed up "not interrupted" with "fair". Interrupts being off keeps a
+              spinner on its hart; it says nothing about which swap wins.
+          - text: "False: but only because QEMU runs one hart at a time."
+            why: |
+              You may have thought QEMU interleaves harts on one host thread. This QEMU uses
+              multi-threaded TCG, one host thread per hart, so the harts truly run in
+              parallel; and the argument is about the code, not the emulator.
+        explain: |
+          A test-and-set lock gives mutual exclusion only. Order needs state: some record of
+          who arrived when. The measured worst case on QEMU was a waiter passed by 126 other
+          acquisitions during one wait.
+  - title: How do you hand out turns?
+    q: |
+      Design the smallest data structure that lets harts get a lock in the order they asked
+      for it, using only one atomic instruction per `acquire`. Which field must be changed
+      with an atomic read-modify-write, and which field can be changed with an ordinary store?
+      Why?
+    hints:
+      - |
+        Think of a deli counter: a roll of numbered tickets, and a display showing the number
+        now being served. How does a customer know it is their turn?
+      - |
+        Two harts must never get the same number, even if they ask at the same instant. But
+        how many harts ever change the number on the display, and when?
+      - |
+        Two unsigned counters in `struct spinlock`. The one handed out needs a fetch-and-add
+        that returns the old value; the RISC-V "A" extension has an AMO for that. The other is
+        written only by one hart at a time; think about which one and why.
+    answer: |
+      Two counters, `next` and `serving`, both starting at the same value:
+
+      - **Take a ticket:** `my = fetch_and_add(&lk->next, 1)`. This must be one atomic
+        read-modify-write. With a plain load and store, two harts could both read 7, both
+        store 8, and both hold ticket 7: both would enter. On RISC-V the fetch-and-add is the
+        AMO `amoadd.w`, one instruction that returns the old value.
+      - **Wait:** spin until `lk->serving == my`.
+      - **Release:** `lk->serving = lk->serving + 1`. This needs **no** atomic
+        read-modify-write, because only one hart ever writes `serving`: the holder, while it
+        holds the lock. A load, an add and a single store are enough. (The store must still
+        be one indivisible store with the right ordering; that is the next question.)
+
+      The lock is free when `next == serving` (no ticket handed out that has not been
+      served). The queue is implicit: the waiting harts hold the numbers `serving+1`,
+      `serving+2`, … and get in in that order. With three harts, a waiter can be passed by at
+      most the two others.
+
+      `struct spinlock` keeps its size: `locked` was a 4-byte `uint` padded to 8, and two
+      `uint` counters fill the same 8 bytes, so `name` stays at offset 8 and `cpu` at 16, and
+      nothing else in the kernel that embeds a spinlock changes layout.
+    checks:
+      - id: lab20-03
+        level: 2
+        type: choice
+        q: |
+          A learner writes the ticket step as `my = lk->next; lk->next = my + 1;` (plain
+          C, no atomics). What can go wrong on three harts?
+        options:
+          - text: "Two harts read the same `next`, both get the same ticket, and both enter the critical section when it is called."
+            correct: true
+            why: |
+              The load and the store are separate instructions; another hart's load can fall
+              between them. Both harts then wait for the same number and both proceed.
+          - text: "Nothing, because interrupts are off in acquire."
+            why: |
+              You may have thought interrupts are the only source of interleaving. On three
+              harts the other harts run at the same time; [[push_off]] only stops this hart
+              from being interrupted.
+          - text: "The ticket counter can go backwards, so a hart waits forever, but mutual exclusion holds."
+            why: |
+              You may have spotted the lost update but drawn only half the conclusion. A lost
+              increment means two harts hold the same number, and that number is called once:
+              both enter. The waiting-forever case is a different bug.
+          - text: "It is wrong only on real hardware; QEMU executes each instruction atomically."
+            why: |
+              You may have thought emulated instructions cannot interleave. Each hart runs on
+              its own host thread here, and a load and a store are two instructions.
+        explain: |
+          Handing out numbers is a read-modify-write that several harts do at once, so it must
+          be one atomic instruction: `__atomic_fetch_add` becomes `amoadd.w`. Bumping
+          `serving` is done by one hart at a time (the holder), so it needs ordering but not
+          atomicity of the read-modify-write. See [[concept:locks#riscv]].
+      - id: lab20-04
+        level: 1
+        type: match
+        q: |
+          Match each operation of the ticket lock to what it needs.
+        pairs:
+          - left: "take a ticket from `next`"
+            right: an atomic read-modify-write (`amoadd.w`)
+            why: |
+              You may have thought a load and a store suffice. Several harts take tickets at
+              once; only an AMO guarantees different numbers.
+          - left: "wait until `serving` equals the ticket"
+            right: a load with acquire ordering, repeated
+            why: |
+              You may have thought waiting needs an atomic write, like the swap loop. It only
+              reads; the ordering keeps the critical section after the read that sees the
+              ticket.
+          - left: "let the next ticket in"
+            right: a store with release ordering, by the holder only
+            why: |
+              You may have thought release needs an AMO because the counter is shared. Only
+              the holder writes `serving`; what it needs is that the critical section's
+              accesses are visible first.
+          - left: "check whether the lock is free"
+            right: compare `next` with `serving`
+            why: |
+              You may have looked for a flag. There is none: the lock is held or awaited
+              exactly when some ticket has been handed out but not yet served.
+        explain: |
+          Only the ticket needs an atomic read-modify-write. The other steps need ordering
+          (next question) or nothing at all. That is why release in the reference solution is
+          `lw`, `addiw`, `fence rw,w`, `sw`, with no AMO.
+  - title: What ordering does each step need, and what will the compiler emit?
+    q: |
+      Before writing code, decide the memory ordering of each of the three steps: taking the
+      ticket, the load in the spin loop, and the store in release. Which of them must be
+      acquire, which release, which can be relaxed? Then predict the RISC-V instructions: will
+      the ticket be `amoadd.w` or `amoadd.w.aq`? Where will a `fence` appear, and which kind?
+    hints:
+      - |
+        Read [[concept:locks#fence]] and the original lock: `.aq` on the swap, `fence rw,w`
+        before the freeing store. Then ask, for each step: which memory accesses must not
+        move across it?
+      - |
+        The critical section must not start before *the load that sees your number*. Taking a
+        ticket protects nothing by itself: before your number is called, you touch no shared
+        data.
+      - |
+        One of the three steps needs no ordering, one needs acquire, one needs release. Ask
+        which step grants the right to touch the data and which gives it up. Then look for
+        `fence` in `kernel/kernel.asm` and work out what each one orders.
+    answer: |
+      - **Ticket: relaxed.** `__atomic_fetch_add(&lk->next, 1, __ATOMIC_RELAXED)` compiles to
+        `amoadd.w a4,a5,(s1)` at `0x80000e58` in the branch's build (commits 3 and 4 compile
+        these functions to the same addresses): no `.aq`, no `.rl`. Nothing needs
+        ordering against it. The ticket is just a number; owning it gives no right to touch
+        shared data.
+      - **Spin: acquire.** `__atomic_load_n(&lk->serving, __ATOMIC_ACQUIRE)` compiles to
+        `lw a5,0(a5)` at `0x80000e62` followed by `fence r,rw` at `0x80000e64`, on every
+        iteration. The fence keeps every later load and store (the critical section) after the
+        load that finally sees `serving == my`, and so after the previous holder's release
+        store.
+      - **Release: release.** `__atomic_store_n(&lk->serving, lk->serving + 1,
+        __ATOMIC_RELEASE)` compiles to `lw a5,4(s1)`, `addiw a5,a5,1`, `fence rw,w` at
+        `0x80000ef0`, `sw a5,0(a4)` at `0x80000ef4`. The fence publishes the critical
+        section's accesses before the store that lets the next hart in. The plain `lw` that
+        reads `serving` first is fine: only this hart writes it.
+
+      Compared with the original: the old acquire put its ordering on the AMO itself
+      (`amoswap.w.aq`); the ticket lock moves it to the load that ends the wait. The release
+      side compiles to the same `fence rw,w` and a single `sw`.
+
+      The `fence r,rw` costs something on every spin iteration, not only the last. A
+      production lock would spin with relaxed loads and add one acquire fence after the loop;
+      this lab keeps the version whose C reads most directly.
+    checks:
+      - id: lab20-05
+        level: 2
+        type: number
+        q: |
+          In this build, how many `fence` instructions does one hart execute in
+          `acquire` + `release` of a ticket lock if it finds the lock free (its first load
+          already sees its number)? Count only `acquire` and `release` themselves.
+        answer: 2
+        wrong:
+          1: |
+            You may have counted only the release fence, thinking a free lock needs no
+            ordering on the way in. The acquire load always runs at least once and is always
+            followed by `fence r,rw`.
+          3: |
+            You may have counted a fence for the ticket too. It is relaxed: `amoadd.w`
+            with no ordering bits and no fence.
+          0: |
+            You may have expected the AMO to carry all the ordering, as `amoswap.w.aq` did.
+            The ticket lock puts its ordering on the spin load and the release store.
+        why_wrong: |
+          Count one `fence r,rw` per spin iteration (here, one iteration) and one `fence rw,w`
+          in release.
+        explain: |
+          One iteration of the loop executes `lw` + `fence r,rw`; release executes
+          `fence rw,w` + `sw`. Every extra iteration while waiting adds another `fence r,rw`.
+          See [[concept:locks#fence]] and [[tour:19]].
+      - id: lab20-06
+        level: 3
+        type: choice
+        q: |
+          Why is it safe for the ticket's `__atomic_fetch_add` to be `__ATOMIC_RELAXED`?
+        options:
+          - text: "Holding a ticket grants no access to shared data; the critical section is ordered after the acquire load that sees the ticket called."
+            correct: true
+            why: |
+              Ordering is needed where the right to touch the data begins. That moment is the
+              load that observes `serving == my`, and it carries acquire ordering.
+          - text: "Because AMOs on RISC-V are always fully ordered."
+            why: |
+              You may have thought atomicity implies ordering. An AMO without `.aq`/`.rl` is
+              atomic but may be reordered with other accesses to other addresses.
+          - text: "Because interrupts are off, so no other access can happen in between."
+            why: |
+              You may have confused interrupts with memory ordering. Ordering is about how
+              other harts observe this hart's accesses; interrupts on this hart do not enter
+              into it.
+          - text: "It is not safe; it only works because the host CPU running QEMU orders memory strongly."
+            why: |
+              You may have reasoned that every lock step needs acquire. The ticket step does
+              not touch protected data, so nothing has to stay behind it; this is correct under
+              RVWMO, not only on a strongly ordered host.
+        explain: |
+          Put ordering exactly where a right begins or ends: acquire on the load that grants
+          the lock, release on the store that hands it on. The ticket itself is bookkeeping.
+  - title: What happens when the counters wrap?
+    q: |
+      `next` and `serving` are 32-bit `uint`s. A busy lock hands out 2^32 tickets sooner than
+      you might think. When `next` goes from `0xffffffff` to `0`, does your acquire still work?
+      Would `while (serving < my)` (wait while it is not yet my turn) work as well as
+      `while (serving != my)`? What about a signed comparison? And how would you *test* the
+      wrap without waiting for four billion acquisitions?
+    hints:
+      - |
+        C defines unsigned arithmetic modulo 2^32: `0xffffffff + 1 == 0`. Write down the
+        tickets around the wrap: holder `0xffffffff`, waiters `0`, `1`.
+      - |
+        Equality only asks "is it exactly my number". An ordering comparison asks "has the
+        display passed my number", which assumes numbers only grow.
+      - |
+        Which comparison never asks which of two numbers is bigger? And to test the wrap,
+        where could the counters start so that it happens in seconds?
+    answer: |
+      With `!=` the wrap is harmless. Tickets are compared only for equality, and modulo 2^32
+      every outstanding ticket is distinct as long as fewer than 2^32 harts wait at once
+      (with three harts, at most three tickets are outstanding). The holder of `0xffffffff`
+      releases by storing `0xffffffff + 1`, which is `0`, and the hart holding ticket `0`
+      sees its number. The gdb session in the reveal shows exactly that handoff.
+
+      Ordering comparisons break at the wrap:
+
+      - **Unsigned `serving < my`:** when the holder has `0xffffffff` and a waiter takes
+        ticket `0`, the test `0xffffffff < 0` is false, so the waiter stops waiting and walks
+        in while the holder is still inside. Clinic 2 shows the result.
+      - **Signed `(int)serving < (int)my`:** `0xffffffff` is −1 and `0` is 0, so the
+        unsigned wrap is fine; but at `0x7fffffff` → `0x80000000` the signed values jump from
+        the largest positive to the most negative, and the same break happens there.
+
+      To make a wrap happen at once, the reference solution starts every lock's counters at
+      `0xffffff00`, 256 tickets below the wrap, as Linux starts the 32-bit tick count
+      (`jiffies`) five minutes before it wraps. The busy locks wrap during boot. But a test only checks the
+      wrap you place it at: the signed comparison passes it (clinic 2).
+    checks:
+      - id: lab20-07
+        level: 2
+        type: choice
+        q: |
+          The holder has ticket `0xffffffff`; a waiter has ticket `0x00000000`. The code waits
+          with `while (__atomic_load_n(&lk->serving, __ATOMIC_ACQUIRE) < my)` on `uint`s. What
+          happens?
+        options:
+          - text: "The waiter stops waiting immediately and enters while the holder is still inside."
+            correct: true
+            why: |
+              It waits only while `serving < my`, and `0xffffffff < 0` is false. Two harts are
+              in the critical section.
+          - text: "The waiter waits until serving wraps to 0, then enters: correct behaviour."
+            why: |
+              You may have computed the comparison mod 2^32 in your head. `<` on unsigned
+              numbers compares magnitudes: `0xffffffff` is the largest value, not "just below
+              0".
+          - text: "The waiter waits forever, because serving can never be less than 0."
+            why: |
+              You may have read the loop condition backwards. It *keeps waiting* while
+              `serving < my`; since that is already false, it never waits at all.
+          - text: "The compiler rejects the comparison of two unsigned values that may wrap."
+            why: |
+              You may have expected a warning. Comparing two `uint`s is perfectly legal C; the
+              bug is in the logic.
+        explain: |
+          Only equality survives wraparound for free. The recorded boots of exactly this
+          mistake all panicked with `panic: release` (clinic 2), though one `locktest` run
+          crosses `benchlock`'s wrap only once and catches the bug only if a waiter takes its
+          ticket at that moment.
+      - id: lab20-08
+        level: 3
+        type: number
+        q: |
+          The kernel supports up to `NCPU` = 8 harts. Suppose all 8 run. The counters are
+          32-bit and compared with `!=`, and a hart holds at most one ticket for a given lock
+          (it waits with interrupts off, and taking a second ticket for a lock it holds
+          panics). At most how many tickets for one lock can be outstanding at once (handed
+          out and not yet served past), counting the holder's?
+        answer: 8
+        wrong:
+          3: |
+            You may have counted the three harts QEMU runs in this lab. The question supposes
+            all 8 that the kernel supports ([[kernel/param.h:2]]).
+          4294967296: |
+            You may have computed how many tickets the counter can name. That is how many
+            would have to be outstanding for `!=` to confuse two of them; in practice the
+            number is bounded by the harts.
+          7: |
+            You may have left out the holder. Its ticket stays outstanding until it releases.
+        why_wrong: |
+          Each hart holds at most one ticket, and a ticket stays outstanding until its holder
+          releases the lock.
+        explain: |
+          With at most 8 outstanding tickets and 2^32 distinct values, `serving == my` can
+          never confuse two of them. That is why equality is safe across the wrap.
+  - title: Is push_off still only about interrupt handlers?
+    q: |
+      [[acquire]] calls [[push_off]] before anything else. In the original lock that stops an
+      interrupt handler on this hart from wanting a lock this hart *holds*. Suppose a learner
+      moves `push_off()` after the wait ("interrupts off only once I hold it"). With the swap
+      loop, how bad is that? With tickets, what can an interrupt (or a [[yield]] on a timer
+      tick) do to a hart that has taken a ticket but is still waiting?
+    hints:
+      - |
+        Look at who takes locks from interrupt context: [[clockintr]] takes `tickslock` on
+        hart 0 ([[kernel/trap.c:170]]); every handler that calls [[wakeup]] takes `p->lock`s;
+        [[kerneltrap]] calls [[yield]], which takes the process's own `p->lock`. See
+        [[concept:locks#handlers]].
+      - |
+        A waiter in the swap loop owns nothing: if it is interrupted, the others just keep
+        swapping. A waiter with a ticket owns a place in the line. Every ticket after it is
+        served only after it.
+      - |
+        Work out the case "hart 0 holds ticket N for `tickslock` but has not been served; the
+        timer interrupts it; `clockintr` takes ticket N+1". Who can make progress?
+    answer: |
+      `push_off` must still come first, and with tickets it matters far more.
+
+      With the swap loop and a late `push_off`, the danger window is only between winning the
+      swap and the `csrrci` inside `push_off`: a handful of instructions in which the lock is
+      held with interrupts on. An interrupt there whose handler wants the same lock spins
+      forever on its own hart.
+
+      With tickets, the window is the **whole wait**. A hart that has taken ticket N and is
+      spinning with interrupts on can be interrupted. If the handler on that hart wants the
+      same lock, it takes ticket N+1 and spins. Ticket N is called, but its owner is the
+      interrupted code underneath the handler, which cannot run until the handler returns,
+      and the handler waits for N to finish. Every later ticket, on every hart, waits too.
+      The hart need not hold the lock at all. And it need not be a device handler: a timer
+      interrupt in [[kerneltrap]] calls [[yield]], which acquires the process's own `p->lock`;
+      if the interrupted code was waiting for that very lock (in [[killed]], say), the
+      process queues behind itself. Clinic 3 recorded both cases.
+
+      With interrupts off from before the ticket until the release, a hart holding a ticket
+      always reaches the front and gets through: noff > 0 means SIE = 0
+      ([[concept:locks#invariant]]). The patch that brought ticket locks to Linux makes the
+      same point: with tickets, a CPU can no longer re-enable interrupts while it spins on a
+      lock that interrupt handlers take
+      ([LKML](https://lkml.iu.edu/hypermail/linux/kernel/0711.0/0125.html)).
+    checks:
+      - id: lab20-09
+        level: 2
+        type: state
+        q: |
+          A process is in [[sys_uptime]] on hart 0, inside the reference `acquire(&tickslock)`,
+          spinning because another hart holds the lock. Interrupts were on before the system
+          call's first `acquire`, and no other lock is held. Fill in the machine state of hart
+          0 while it spins.
+        state: {mode: S, stack: kernel, satp: kernel, sie: "off", noff: "1", intena: "1"}
+        why:
+          mode: You may have thought spinning happens in user mode. The process trapped into the kernel with `ecall`; it is in supervisor mode.
+          stack: You may have thought a spinning hart uses the scheduler's stack. The wait happens inside the system call, on the process's own kernel stack.
+          satp: You may have thought the user page table is still installed. uservec switched to the kernel page table before usertrap ran.
+          sie: You may have thought interrupts stay on until the lock is held. push_off runs first in acquire, before the ticket is taken.
+          noff: You may have thought noff counts only locks held. push_off has already counted this acquire, before the wait.
+          intena: You may have thought intena is 0 inside acquire. It records SIE before the outermost push_off, and usertrap had turned interrupts on.
+        why_wrong: |
+          In the reference lock, `push_off` comes first, so interrupts are off and noff is 1
+          during the whole wait, even though the lock is not held yet.
+        explain: |
+          Waiting with a ticket is part of the critical path of every later ticket, so it must
+          be uninterruptible. `noff` 1, SIE off, `intena` 1 (from [[kernel/trap.c:66]]). See
+          [[concept:locks#intena]].
+      - id: lab20-10
+        level: 3
+        type: choice
+        q: |
+          With `push_off` moved after the wait, the recorded freezes all had the same shape.
+          Which?
+        options:
+          - text: "The ticket being served belonged to code interrupted on some hart, while a handler on that same hart waited for a later ticket."
+            correct: true
+            why: |
+              In the 3 freezes (of 8) where gdb recovered the interrupted frame, `serving`
+              equalled the ticket saved in it, and the handler (`clockintr`, or `yield` from a
+              timer interrupt) spun on a later one. The other 5 had the same queue shape
+              (`cpu` 0, a served ticket nobody was spinning with); their interrupted frames
+              were not unwound.
+          - text: "Two harts held the lock at once and corrupted `ticks`."
+            why: |
+              You may have thought the bug breaks mutual exclusion. It does not: tickets still
+              serialise entry. It breaks progress.
+          - text: "The lock was held by a hart that had gone to sleep in the scheduler."
+            why: |
+              You may have thought of a sleeping holder. In every recorded freeze `lk->cpu` was
+              0: nobody held the lock; its owner's turn had come but it could not run.
+          - text: "pop_off panicked because interrupts were on."
+            why: |
+              You may have expected the invariant check to fire. With push_off and pop_off
+              still paired, `pop_off` saw SIE off each time; nothing panicked, the machine
+              just stopped.
+        explain: |
+          A ticket is a promise that everyone behind you will wait for you. Keep it only while
+          you cannot be interrupted. Clinic 3 has the gdb output.
+  - title: What does holding() mean now, and in what order does release write?
+    q: |
+      There is no `locked` flag any more. How does [[holding]] tell "this hart holds the
+      lock" now? Is `lk->cpu == mycpu()` alone enough? And [[release]] must do two writes:
+      clear `lk->cpu` and let the next ticket in. Does the order matter? What could another
+      hart see in between?
+    hints:
+      - |
+        Read [[holding]] ([[kernel/spinlock.c:80]]) and the order of lines 51 and 73 in
+        [[release]] ([[kernel/spinlock.c:51]], [[kernel/spinlock.c:73]]). Then think about the scheduler: it acquires a `p->lock`
+        that the process later releases ([[concept:locks#handoff]]).
+      - |
+        Once `serving` is advanced, the next hart may already be inside and may already have
+        written its own `cpu` into `lk->cpu`.
+      - |
+        "Held" needs no new field: it can be read off the two counters. Of release's two
+        writes, which one hands the lock to someone else? Do everything that is yours before
+        it.
+    answer: |
+      `holding(lk)` becomes `lk->next != lk->serving && lk->cpu == mycpu()`. The first half
+      says "some ticket has been handed out and not yet served past", i.e. the lock is held or
+      awaited; the second says this hart recorded itself as the holder. `lk->cpu` is written
+      only by the holder (in `acquire` after its wait, and to 0 in `release`), so in the
+      reference code it alone would give the same answer; the first half keeps the check
+      meaning what it said before ("held, and by me"), and costs two loads.
+
+      It still names a **hart**, not a process. That is what lets `p->lock` cross [[swtch]]:
+      the scheduler acquires it ([[kernel/proc.c:446]]) and the process releases it in
+      [[yield]], [[sleep]] or [[forkret]], on the same hart. The ticket lock does not care which
+      thread executes the release store.
+
+      **Order in release:** `lk->cpu = 0` must come *before* the release store. After the
+      store, the next ticket's hart may enter at once and set `lk->cpu` to itself; a late
+      `lk->cpu = 0` from the old holder would erase it, and the new holder's own `release`
+      would then fail `holding()` and panic `release`. The original code has the same order
+      for the same reason (the comment in [[concept:locks#fence]]). In this build the window
+      in the wrong order is one instruction; clinic 4 widened it to see what happens.
+    checks:
+      - id: lab20-11
+        level: 2
+        type: order
+        q: |
+          Put the reference `release` in order.
+        items:
+          - "check holding(lk), panic \"release\" if this hart does not hold it"
+          - "lk->cpu = 0"
+          - "load serving and add 1"
+          - "fence rw,w"
+          - "sw the new serving"
+          - "pop_off()"
+        why_wrong: |
+          You may have put the release store before clearing `lk->cpu`, or `pop_off` before the
+          store. Clear the owner while you still own the lock; publish and hand on with the
+          fenced store; only then let interrupts back on.
+        explain: |
+          Everything that belongs to the holder (the `holding()` check, clearing `cpu`) happens
+          while the lock is still held. The fence publishes the critical section, the store
+          hands the lock on, and `pop_off` comes last, so interrupts stay off until the lock is
+          gone ([[concept:locks#noff]]).
+      - id: lab20-12
+        level: 2
+        type: tf
+        q: |
+          True or false: with the ticket lock, the scheduler can still `acquire` a process's
+          `p->lock` and let the process `release` it after [[swtch]].
+        answer: true
+        why_tf: |
+          You may have thought a ticket belongs to a thread. It belongs to nobody in
+          particular: the release store just advances `serving`, and `holding()` checks the
+          hart.
+        reasons:
+          - text: "True: both run on the same hart, holding() checks lk->cpu against mycpu(), and any code may advance serving."
+            correct: true
+            why: That is why the handoff survives. Neither the counters nor holding() know about threads.
+          - text: "True: the ticket number is stored in struct proc."
+            why: |
+              You may have looked for per-thread state. The ticket is a local variable in
+              `acquire` and is forgotten once the wait ends.
+          - text: "False: release must be done by the thread that took the ticket."
+            why: |
+              You may have carried over a rule from sleep-locks, which check the pid. A
+              spinlock checks the hart.
+          - text: "False: the scheduler's ticket would still be outstanding after swtch."
+            why: |
+              You may have thought a ticket stays outstanding while the lock is held. Exactly
+              one is: the holder's, and whoever releases advances `serving` past it.
+        explain: |
+          The ticket lock changes how harts wait, not what "held" means. The handoff of
+          [[concept:locks#handoff]] works unchanged; `usertests` exercises it millions of
+          times.
+  - title: What does fairness cost, and how will you see it?
+    q: |
+      Before measuring, predict. On real multi-core hardware, what does every spinning hart
+      read in a ticket lock, and what happens to those harts when the holder releases? What
+      happens to the line if the hart whose number is called next is slow to notice (its
+      thread is delayed)? And on QEMU, whose harts are host threads, which of these effects
+      can you expect to see at all? Design an experiment that would show the difference
+      between the two locks.
+    hints:
+      - |
+        Every waiter loads `serving`. One word, one cache line, read by everyone. Compare the
+        swap loop, where every waiter *writes* the word.
+      - |
+        FIFO means the lock waits for the next ticket's hart, even if another hart is ready
+        and closer. What if that hart's host thread is descheduled for a millisecond?
+      - |
+        Aggregate shares (who got how many) are easy to measure and can hide a lot. Count,
+        for each acquisition, how many other acquisitions happened between the moment the
+        hart asked and the moment it got in.
+    answer: |
+      **Costs on real hardware (reasoned, not measured here).** All waiters spin on the same
+      word. Each release is one store that invalidates every waiter's copy of the line, and
+      all of them fetch it again, though only one can proceed: traffic grows with the number
+      of waiters. The swap loop is worse while spinning (every iteration is a write), but a
+      ticket lock is no cure for contention. Scalable locks (MCS, and the qspinlock Linux uses
+      today) give each waiter its own word to spin on.
+
+      FIFO has its own cost: the lock goes to the next ticket even if that hart is slow, so a
+      delayed waiter delays everyone behind it. On a virtual machine whose virtual CPUs can be
+      descheduled by the host, this "lock-waiter preemption" is a well-known problem for
+      ticket locks.
+
+      **On QEMU.** QEMU's TCG runs each hart as a host thread. There is no
+      model of RISC-V caches, so the cache-line effects above do not appear as such, and host
+      scheduling adds noise of its own. We measured (see Measure): aggregate shares are close
+      to even with **both** locks, throughput differs by less than the run-to-run noise, but
+      a counter added inside `acquire` shows the property exactly: with tickets, no waiter was
+      ever passed by more than 2 others in 2.7 million acquisitions; with the swap loop, about 2
+      percent of acquisitions were passed by 2 or more, and the worst by 126. Tickets also
+      spun about twice as many iterations per acquisition (40–50 against about 20), because
+      the hart that just released now waits its turn instead of walking straight back in; but
+      each iteration is a load rather than an AMO, and in the same builds the mean wait was not
+      longer (709–905 ns against 865–1,098 ns). Iterations are not time.
+    checks:
+      - id: lab20-13
+        level: 3
+        type: multi
+        q: |
+          Which of these did the measurements on QEMU (three harts, three processes hammering
+          one lock) actually show?
+        options:
+          - text: "With tickets, no waiter was passed by more than 2 other acquisitions."
+            correct: true
+            why: The per-acquisition counter recorded a maximum of 2 in every ticket-lock run, as FIFO with three harts predicts.
+          - text: "With the swap loop, some waiters were passed by many more than 2."
+            correct: true
+            why: The worst cases in nine runs were between 4 and 126.
+          - text: "With the swap loop, one process got far more acquisitions than the others."
+            why: |
+              You may have expected the textbook starvation picture. On QEMU each process got
+              between 97,150 and 102,533 of 300,000 acquisitions with the swap loop: nearly
+              even in aggregate. The unfairness is in individual waits.
+          - text: "The ticket lock had clearly higher throughput."
+            why: |
+              You may have expected less contention on the lock word to show up as speed.
+              Throughput moved by more between runs (and with the load on the host) than
+              between the two locks, and the direction flipped between builds.
+          - text: "The ticket lock spun more per acquisition."
+            correct: true
+            why: Mean spin iterations were about 40–50 per acquisition for tickets against about 20 for the swap loop. (Each is a cheap load, and the mean wait was not longer.)
+        explain: |
+          Measure the property you claim (here: how many others can pass one waiter), not a
+          proxy (aggregate shares, throughput) that the environment can swamp. See Measure.
+build: |
+  **Start from the frozen commit**, in your own clone of xv6:
+
+  ```text
+  git checkout -b my-ticketlock 06aad25
+  ```
+
+  **Build the instrument first, and measure the old lock.**
+
+  1. **The system call.** `SYS_lockbench` (23) in `kernel/syscall.h`, the `extern` and the
+     table entry in `kernel/syscall.c`, `entry("lockbench")` in `user/usys.pl`, the prototype
+     in `user/user.h`, a `struct lbstat` in a header both sides include, and the handler in
+     a new `kernel/lockbench.c` (add `$K/lockbench.o` to `OBJS`). The handler's loop is
+     `push_off`, read the `time` CSR, `acquire`, read it again, keep score, `release`,
+     `pop_off`. Keep the start line (the barrier) outside any lock and with interrupts on.
+     The reset reinitializes the lock, so it must refuse while any caller is mid-run: count
+     the callers under a second lock and make the reset fail unless the count is 0.
+  2. **The program.** `user/locktest.c` and `$U/_locktest` in `UPROGS`. Run it on the
+     original lock and keep the output: that is your "before".
+
+  **Then change the lock**, in an order that keeps the kernel bootable:
+
+  3. **The struct.** Replace `locked` with `next` and `serving`; `initlock` sets both. Fix
+     every use of `locked` (only `kernel/spinlock.c` has them: `grep -n locked kernel/*.c`;
+     the `locked` in `sleeplock.c` is a different struct).
+  4. **acquire, release, holding** together: the kernel cannot boot with only half of them.
+     Then read `kernel/kernel.asm` and find `amoadd.w`, the `lw` + `fence r,rw` loop and the
+     `fence rw,w` + `sw`. If the loop has no `lw` inside it, see clinic 1.
+     Test: boot, `locktest`, `usertests -q`.
+  5. **The wrap.** Start the counters near `0xffffffff` and run everything again.
+
+  **Debugging.** Run QEMU with three harts (`-smp 3`) and attach gdb. A lock bug usually
+  shows as one of three things:
+
+  - `panic: acquire` / `panic: release`: [[holding]] disagreed. Break on [[panic]] and print
+    the lock (`up`, then `p/x *lk`): `next`, `serving` and `cpu` tell you who was in line and
+    who the lock thinks holds it.
+  - A silent freeze. Attach gdb, `info threads`, `thread apply all bt`, and print the lock
+    each hart is spinning on. In `acquire`, the ticket is in a register (`a4` in this build)
+    and `serving` is in memory: if the lock's `serving` equals a ticket nobody is spinning
+    with, its owner is stuck somewhere else, often underneath an interrupt handler on the
+    same hart. The frame below `kernelvec` is not unwound by gdb; read `sepc` in
+    [[kerneltrap]]'s frame and the registers that [[kernelvec]] saved on the stack (`a4` at
+    offset 104) to see the interrupted code's ticket.
+  - Nothing at all. Several real bugs in this lab never failed on QEMU (clinics 4 and 5).
+    When the reasoning says a bug is there, widen the window or accept that the test cannot
+    see it.
+clinic:
+  - bug: Spinning on a plain load
+    change: |
+      The wait reads `serving` as an ordinary C variable:
+
+      ```diff
+      -  while (__atomic_load_n(&lk->serving, __ATOMIC_ACQUIRE) != my)
+      +  while (lk->serving != my)
+           ;
+      ```
+
+      (The clinic kernels were built without `lockbench`'s reset check; `spinlock.c` is the
+      same, but their kernel addresses are lower than in the branch's build, e.g. `acquire` at
+      `0x80000db4` instead of `0x80000e3e`.)
+
+      The compiler is allowed to assume no other thread changes `lk->serving` inside the
+      loop, and it does. The whole loop became:
+
+      ```text
+      80000dd4:  lw   a4,4(s1)                # serving, loaded once
+      80000dd6:  bne  a4,a5,80000dd6          # branch to itself
+      ```
+    symptom: |
+      xv6 kernel is booting
+
+      hart 1 starting
+
+      (the console stays like this; gdb attached after 30 seconds, second boot:)
+        Id   Target Id                    Frame
+      * 1    Thread 1.1 (CPU#0 [running]) 0x0000000080000dd6 in acquire (lk=lk@entry=0x8000fe18 <proc>) at kernel/spinlock.c:52
+        2    Thread 1.2 (CPU#1 [running]) 0x0000000080000dd6 in acquire (lk=lk@entry=0x8000fe18 <proc>) at kernel/spinlock.c:52
+        3    Thread 1.3 (CPU#2 [running]) 0x0000000080000dd6 in acquire (lk=lk@entry=0x8000f948 <pr>) at kernel/spinlock.c:52
+
+      Thread 3 (Thread 1.3 (CPU#2 [running])):
+      #0  0x0000000080000dd6 in acquire (lk=lk@entry=0x8000f948 <pr>) at kernel/spinlock.c:52
+      #1  0x000000008000057a in printk (fmt=fmt@entry=0x800070a0 "hart %d starting\n") at kernel/printk.c:71
+      #2  0x0000000080001064 in main () at kernel/main.c:38
+
+      Thread 2 (Thread 1.2 (CPU#1 [running])):
+      #0  0x0000000080000dd6 in acquire (lk=lk@entry=0x8000fe18 <proc>) at kernel/spinlock.c:52
+      #1  0x00000000800020fe in sleep_prepare (chan=chan@entry=0x80015848 <bcache+24>) at kernel/proc.c:551
+      #2  0x0000000080005c7a in virtio_disk_rw (b=b@entry=0x80015848 <bcache+24>, write=write@entry=0) at kernel/virtio_disk.c:288
+      [...]
+
+      Thread 1 (Thread 1.1 (CPU#0 [running])):
+      #0  0x0000000080000dd6 in acquire (lk=lk@entry=0x8000fe18 <proc>) at kernel/spinlock.c:52
+      #1  0x0000000080002190 in wakeup (chan=chan@entry=0x80007878 <tx_chan>) at kernel/proc.c:581
+      #2  0x0000000080000a18 in uartintr () at kernel/uart.c:145
+      [...]
+
+      Thread 3 (Thread 1.3 (CPU#2 [running])):
+      $4 = 0xffffffffffffff03
+
+      Thread 2 (Thread 1.2 (CPU#1 [running])):
+      $5 = 0xffffffffffffff03
+
+      Thread 1 (Thread 1.1 (CPU#0 [running])):
+      $6 = 0xffffffffffffff02
+
+      Thread 3 (Thread 1.3 (CPU#2 [running])):
+      $7 = 0xffffffffffffff04
+
+      Thread 2 (Thread 1.2 (CPU#1 [running])):
+      $8 = 0xffffffffffffff04
+
+      Thread 1 (Thread 1.1 (CPU#0 [running])):
+      $9 = 0xffffffffffffff03
+      [...]
+
+      Thread 3 (Thread 1.3 (CPU#2 [running])):
+      $13 = {next = 0xffffff05, serving = 0xffffff04, name = 0x80007028, cpu = 0x0}
+
+      Thread 2 (Thread 1.2 (CPU#1 [running])):
+      $14 = {next = 0xffffff05, serving = 0xffffff03, name = 0x80007180, cpu = 0x0}
+
+      Thread 1 (Thread 1.1 (CPU#0 [running])):
+      $15 = {next = 0xffffff05, serving = 0xffffff03, name = 0x80007180, cpu = 0x0}
+    why: |
+      Three boots, the same freeze before the shell (one without gdb, two with): the console
+      stopped after `hart 1 starting`, and gdb found all three harts at `0x80000dd6`, the `bne` that branches to
+      itself. The three groups of values are `thread apply all p/x $a4` (the copy of `serving`
+      each hart loaded once), `p/x $a5` (each hart's ticket) and `p/x *lk` (the lock in
+      memory). Thread 1 is hart 0, thread 3 is hart 2.
+
+      Read the memory and the registers together. On hart 2, `pr.lock`'s `serving` is
+      `0xffffff04` in memory, and hart 2's ticket (`a5`) is `0xffffff04`: its turn has come.
+      But it compares its ticket with `a4`, the copy of `serving` it loaded *once*,
+      `0xffffff03`, and will compare with that copy forever. Hart 0 (in a UART interrupt, in
+      [[wakeup]]) is in the same state for `proc[0].lock`: ticket `0xffffff03`, `serving` in
+      memory `0xffffff03`, stale copy `0xffffff02`. Hart 1 waits behind hart 0 for the same
+      lock, with ticket `0xffffff04`. Nobody holds anything (`cpu = 0x0`); every lock is
+      merely waiting for a hart that cannot see its own number.
+
+      Without an atomic (or `volatile`) access, C lets the compiler assume a plain variable
+      does not change unless this thread writes it, and moving a loop-invariant load out of
+      a loop is a standard optimization even at xv6's `-O`. The original swap loop could not
+      be broken this way: `amoswap` is an atomic built-in, which the compiler must execute
+      every time. `__atomic_load_n` makes every iteration a real load, and its acquire
+      ordering supplies the fence.
+
+      The freeze happens at the first contended lock; with three harts booting at once, the
+      first is during boot.
+  - bug: "Waiting while serving < my"
+    change: |
+      An ordering comparison instead of equality, on the same `uint`s:
+
+      ```diff
+      -  while (__atomic_load_n(&lk->serving, __ATOMIC_ACQUIRE) != my)
+      +  while (__atomic_load_n(&lk->serving, __ATOMIC_ACQUIRE) < my)
+           ;
+      ```
+
+      (`bne` became `bltu` at `0x80000de0`.) Everything else as in the reference, including
+      commit 4, which starts every lock at `0xffffff00`.
+    symptom: |
+      $ locktest
+      locktest: 3 processes, 300000 acquisitions of one lock
+      panic: release
+
+      (gdb from reset, a second boot, at the panic:)
+      Thread 3 hit Breakpoint 1, panic (s=s@entry=0x80007078 "release") at kernel/printk.c:139
+      [...]
+      #1  0x0000000080000e86 in release (lk=lk@entry=0x8000f9b0 <benchlock>) at kernel/spinlock.c:64
+      #2  0x0000000080000ca8 in sys_lockbench () at kernel/lockbench.c:114
+      [...]
+      $15 = {next = 0x3, serving = 0x0, name = 0x80007048, cpu = 0x0}
+
+      (another boot, gdb attached from reset; the panic came before the shell:)
+      xv6 kernel is booting
+
+      hart 2 starting
+      hart 1 starting
+      panic: release
+    why: |
+      Four boots of this kernel: two panicked `release` during `locktest`, two during boot
+      (one, with gdb, in [[wakeup]] releasing `proc[1].lock`; one without gdb). The bug can
+      only fire at a wrap: away from it a waiter always has `serving <= my`, so `<` and `!=`
+      agree. The panic we stopped in `locktest` shows the wrap directly.
+
+      The lock was at the wrap: the holder had ticket `0xffffffff`, so `serving` was
+      `0xffffffff`. A hart that took ticket `0` tested `0xffffffff < 0`, which is false, and
+      walked in while the holder was still inside. Two holders; each wrote its hart into
+      `lk->cpu`. The first to release cleared `lk->cpu` and advanced `serving` to `0`; the
+      second then called [[release]], [[holding]] found `cpu == 0`, not its own hart, and
+      panicked. gdb shows the aftermath: `serving` is `0`, three tickets (`0`, `1`, `2`) are
+      out, and nobody is recorded as the holder. Without the `holding()` check the damage
+      would have been silent: both releases would have advanced `serving`, the counters would
+      have agreed again, and the only trace would be whatever the two harts did to the
+      protected data while both were inside.
+
+      Without commit 4 the counters would start at 0 and this kernel would pass every test
+      for about an hour of hammering one lock. With the counters starting 256 below the wrap,
+      busy locks wrap during boot and `benchlock` wraps in every `locktest`. That still is not
+      certain: one `locktest` run crosses the wrap once and catches the bug only if a waiter
+      takes its ticket at that moment. In one batch, both `locktest` runs that reached the
+      wrap panicked; in another (5 boots, all of which panicked), 3 of the 8 runs that
+      crossed the wrap passed with `0 overlaps: OK`.
+
+      **The signed variant** (`(int)serving < (int)my`) shows the limit of that test. With the
+      counters at `0xffffff00` it wraps from −1 to 0, which a signed comparison handles: one
+      boot passed `locktest` twice and `usertests -q`, another passed five `locktest`s. Its
+      wrap is at `0x7fffffff` → `0x80000000`. Starting the counters at `0x7fffff00` instead,
+      it failed the same way, only less often: one boot passed two `locktest`s and
+      `usertests -q`; the next passed three `locktest`s and then printed `panic: release` in
+      the fourth. A wrap test checks only the wrap you put it at; equality has none.
+  - bug: Turning interrupts off only once the lock is held
+    change: |
+      `push_off()` moved from the top of `acquire` to just after the wait:
+
+      ```diff
+       acquire(struct spinlock *lk)
+       {
+         uint my;
+
+      -  push_off(); // disable interrupts to avoid deadlock.
+         if (holding(lk))
+           panic("acquire");
+         ...
+         while (__atomic_load_n(&lk->serving, __ATOMIC_ACQUIRE) != my)
+           ;
+      +  push_off(); // disable interrupts now that we hold it.
+      ```
+
+      To compare, the same change was made to the *original* swap-loop lock (commit 2). The
+      stress program was tour 52's `lockstress up 300000` (not on the branch): three
+      processes, each calling `uptime()` 300,000 times, so `tickslock` is hammered from all
+      three harts while [[clockintr]] takes it on hart 0 ten times a second.
+    symptom: |
+      $ lockstress up 300000
+      [...]
+      u1.201000 u0.220000 u2.209000 u1.202000 u0.221000
+
+      (the end of the progress line: the console stopped there; 60 seconds later gdb attached)
+        Id   Target Id                    Frame
+      * 1    Thread 1.1 (CPU#0 [running]) acquire (lk=lk@entry=0x80015818 <tickslock>) at kernel/spinlock.c:51
+        2    Thread 1.2 (CPU#1 [running]) acquire (lk=0x80015818 <tickslock>) at kernel/spinlock.c:51
+        3    Thread 1.3 (CPU#2 [running]) acquire (lk=0x80015818 <tickslock>) at kernel/spinlock.c:51
+
+      Thread 3 (Thread 1.3 (CPU#2 [running])):
+      #0  acquire (lk=0x80015818 <tickslock>) at kernel/spinlock.c:51
+      #1  0x0000000080002cc2 in sys_uptime () at kernel/sysproc.c:108
+      #2  0x0000000080002ac6 in syscall () at kernel/syscall.c:148
+      #3  0x000000008000284c in usertrap () at kernel/trap.c:68
+      #4  0x0000003ffffff09c in ?? ()
+      [...]
+
+      Thread 1 (Thread 1.1 (CPU#0 [running])):
+      #0  acquire (lk=lk@entry=0x80015818 <tickslock>) at kernel/spinlock.c:51
+      #1  0x000000008000270e in clockintr () at kernel/trap.c:170
+      #2  0x00000000800027a2 in devintr () at kernel/trap.c:215
+      #3  0x00000000800028dc in kerneltrap () at kernel/trap.c:149
+      #4  0x00000000800057b8 in kernelvec () at kernel/kernelvec.S:38
+      Backtrace stopped: frame did not save the PC
+      [...]
+
+      Thread 3 (Thread 1.3 (CPU#2 [running])):
+      $4 = 0x9aa91
+
+      Thread 2 (Thread 1.2 (CPU#1 [running])):
+      $5 = 0x9aa93
+
+      Thread 1 (Thread 1.1 (CPU#0 [running])):
+      $6 = 0x9aa92
+      [...]
+      $13 = {next = 0x9aa94, serving = 0x9aa90, name = 0x80007270, cpu = 0x0}
+      [...]
+      (the frame under kernelvec on hart 0, unwound by hand:)
+      kvbt: interrupted code at sepc=0x80000dce, sp=0x3fffff3f80
+      #0  acquire (lk=0x80015818 <tickslock>) at kernel/spinlock.c:51
+      #1  0x0000000080002cc2 in sys_uptime () at kernel/sysproc.c:108
+      #2  0x0000000080002ac6 in syscall () at kernel/syscall.c:148
+      #3  0x000000008000284c in usertrap () at kernel/trap.c:68
+      #4  0x0000003ffffff09c in ?? ()
+      kvbt: saved a4=0x9aa90 a5=0x9aa8f
+    why: |
+      **Tickets:** 8 of 15 boots froze (8 of 28 `lockstress up` runs). **Swap loop with the
+      same mistake:** 1 of 7 boots froze (1 of 17 runs). Pooled, those numbers are weak
+      evidence, because the boots ran while the computer was doing different amounts of other
+      work, and timings on QEMU depend on that. The fair comparison is two batches in which
+      both kernels booted at the same time on the same computer: 7 of 8 ticket boots froze
+      and 0 of 8 swap-loop boots did. Load changes how often either freezes, but not the
+      order.
+
+      The capture above is the textbook case. (We unwound the interrupted frame in 3 of the 8
+      ticket freezes; the other 5 showed the same queue: `cpu` 0 and a served ticket that no
+      spinning hart held.) `tickslock` is serving ticket `0x9aa90`, and
+      nobody is recorded as holding it (`cpu = 0x0`). The tickets handed out are `0x9aa90` to
+      `0x9aa93`. Harts 2 and 1 spin with `0x9aa91` and `0x9aa93` in `a4` (in this build the
+      ticket is in `a4`; the `$4`–`$6` values are `thread apply all p/x $a4`), hart 0's
+      [[clockintr]] with `0x9aa92`. Ticket `0x9aa90` is in no
+      spinning hart's registers: it was saved by [[kernelvec]] on hart 0's stack, in the frame
+      of the `sys_uptime` that the timer interrupted while it waited (`sepc` `0x80000dce` is
+      the top of the spin loop, and its saved `a5` holds the last `serving` it read,
+      `0x9aa8f`). Its turn came while it was underneath `clockintr`, and `clockintr` waits for
+      its turn after it. Harts 1 and 2 still take timer interrupts and may [[yield]], but that
+      cannot help: the code that owns `0x9aa90` can only run on hart 0, underneath
+      `clockintr`.
+
+      Another freeze had the same shape without a device handler. A process on hart 2 was in
+      [[killed]] ([[kernel/trap.c:81]]), waiting with a ticket for its own `p->lock`. The timer
+      interrupted it; [[kerneltrap]] called [[yield]] ([[kernel/trap.c:158]]), which took a
+      ticket for that same `p->lock` ([[kernel/proc.c:504]]): the process queued behind
+      itself. The scheduler on hart 1 and `clockintr`'s [[wakeup]] on hart 0 (holding
+      `tickslock`) queued for the same lock, and the whole machine stopped.
+
+      With the swap loop, a waiter holds nothing; the only window is the few instructions
+      between winning the swap and the `csrrci` in [[push_off]]. We did not attach gdb to the
+      one swap-loop freeze, so where it stopped is not recorded.
+
+      Deleting `push_off()` outright (instead of moving it) fails at once: the first
+      [[release]], in the first `printk` of [[main]], reaches [[pop_off]] with noff 0 and the
+      console shows only `panic: pop_off`.
+  - bug: Letting the next ticket in before clearing lk->cpu
+    change: |
+      The two writes in `release` swapped:
+
+      ```diff
+      -  lk->cpu = 0;
+      -
+         __atomic_store_n(&lk->serving, lk->serving + 1, __ATOMIC_RELEASE);
+      +  lk->cpu = 0;
+      ```
+
+      In this build the window is one instruction: `sw a5,0(a4)` (the release store) is
+      followed directly by `sd zero,16(s1)`.
+    symptom: |
+      $ locktest
+      [...]
+      locktest: mutual exclusion (300000 counted, 0 overlaps): OK
+      (five locktest runs, then usertests -q:)
+      ALL TESTS PASSED
+      $ locktest
+      [...]
+      locktest: mutual exclusion (300000 counted, 0 overlaps): OK
+
+      (a copy with a 1000-iteration delay loop between the two writes, gdb from reset:)
+      xv6 kernel is booting
+
+      hart 1 starting
+      hart 2 starting
+      panic: release
+
+      #1  0x0000000080000eac in release (lk=lk@entry=0x80020be0 <disk+296>) at kernel/spinlock.c:64
+      #2  0x0000000080005d0c in virtio_disk_rw (b=b@entry=0x80015848 <bcache+24>, write=write@entry=0) at kernel/virtio_disk.c:297
+      [...]
+      $15 = {next = 0xffffff03, serving = 0xffffff02, name = 0x80007658, cpu = 0x0}
+    why: |
+      As written, the bug never showed: six `locktest` runs (1.8 million acquisitions of
+      `benchlock` from three harts) and `usertests -q` passed. For it to fail, the next hart
+      must see the new `serving`, leave its loop and store its own `cpu` into `lk->cpu`, all
+      between two consecutive instructions of the old holder.
+
+      The widened copy shows what the bug does when it hits. Reconstructed from the code and
+      the lock's state: a [[virtio_disk_intr]] on another hart released `disk.vdisk_lock` and, during its delay, [[virtio_disk_rw]] on hart 0 took
+      the lock (ticket `0xffffff02`) and recorded `cpu = cpus[0]`. The delayed `lk->cpu = 0`
+      then erased that. When `virtio_disk_rw` released, [[holding]] saw `cpu == 0` and
+      panicked `release`; gdb shows `serving` at the panicking hart's own ticket and `cpu` 0.
+      The original code clears `cpu` first for exactly this reason
+      ([[concept:locks#fence]]). A test that passes says little when the window is one
+      instruction wide.
+  - bug: Releasing with a plain increment
+    change: |
+      No atomic store, no ordering:
+
+      ```diff
+      -  __atomic_store_n(&lk->serving, lk->serving + 1, __ATOMIC_RELEASE);
+      +  lk->serving++;
+      ```
+
+      The compiled `release` loses its fence: `sd zero,16(s1)`, `lw a5,4(s1)`,
+      `addiw a5,a5,1`, `sw a5,4(s1)`, then the call to `pop_off`.
+    symptom: |
+      $ locktest
+      [...]
+      locktest: mutual exclusion (300000 counted, 0 overlaps): OK
+      (three locktest runs, then:)
+      $ usertests -q
+      [...]
+      ALL TESTS PASSED
+      $ lockstress up 100000
+      [...] lockstress up 100000 done
+      $ locktest
+      [...]
+      locktest: mutual exclusion (300000 counted, 0 overlaps): OK
+    why: |
+      Nothing failed: four `locktest` runs, `usertests -q` and 300,000 `uptime` calls from
+      three harts. This is the same result as [[tour:52]]'s break 7, and for the same reason.
+      The fence orders the critical section's stores before the store that lets the next
+      hart in. RVWMO permits a store to become visible to other harts before an earlier store
+      to a different address; when QEMU's TCG runs on an x86-64 host, stores become visible
+      in program order, so the reordering the fence forbids does not occur there. On real RISC-V
+      hardware the next holder could read `bench.count` (or `ticks`, or a `p->state`) as it
+      was *before* the previous critical section's writes.
+
+      Two more things this change gives up, also invisible here. A plain `lk->serving++`
+      lets the compiler reorder the critical section's own stores past it (inside `release`
+      it cannot see them, which is why the build happened to keep the order). And the
+      spinners in other harts read `serving` with atomic loads while this store is not
+      atomic: in C11 terms that is a data race, undefined behaviour, even though RISC-V's
+      aligned `sw` is in fact a single store. Not failing is not a pass.
+reveal:
+  - title: "The instrument: a system call that hammers one lock"
+    commit: 1
+    file: kernel/syscall.c
+    lines: 100-137
+    focus: 106-134
+    diff: true
+    state:
+      hart: 1
+      mode: S
+      proc: locktest (pid 3)
+      intr: "on"
+      satp: kernel
+      locks: []
+      stack: [usertrap, syscall, sys_lockbench]
+      sp: {"on": kernel, detail: "locktest's kernel stack"}
+      irq: 0
+    note: |
+      Before changing the lock, the lab builds a way to watch it. The first commit adds a
+      system call, number 23, with the usual registrations ([[tour:5]] has the path): the
+      `#define` in `kernel/syscall.h`, the `extern` and `[SYS_lockbench] = sys_lockbench` here,
+      a stub from `user/usys.pl`, a prototype in `user/user.h`, and `struct lbstat` in
+      `kernel/lockbench.h`, which the kernel and `locktest` both include so that they agree
+      on its layout.
+
+      The story of this reveal is one recorded run of the finished branch, under gdb, on three
+      harts: `locktest` is pid 3, and its first call, `lockbench(0, 300000, 0)` (reset), was
+      caught entering `sys_lockbench` on hart 1. Its three children, pids 4, 5 and 6, will
+      hammer the lock on harts 0, 2 and 1.
+
+      At that breakpoint gdb recorded the pid (3), hart 1's `sstatus` (`0x8000000200006022`:
+      SIE, bit 1, is set; interrupts are on since [[kernel/trap.c:66]]) and `cpus[1].noff` (0):
+      a system call in progress, no lock held.
+  - title: One lock, and a score kept under it
+    commit: 1
+    file: kernel/lockbench.c
+    lines: 1-54
+    focus: 12-54
+    diff: true
+    state:
+      hart: 1
+      mode: S
+      proc: locktest (pid 3)
+      intr: "off"
+      satp: kernel
+      locks: [runlock]
+      stack: [usertrap, syscall, sys_lockbench, benchreset]
+      sp: kernel
+      irq: {noff: 1, intena: 1}
+    note: |
+      `benchlock` is an ordinary `struct spinlock`, nothing special: whatever [[acquire]] and
+      [[release]] do to every lock in the kernel, they do to this one. The `bench` struct is
+      the data it protects: the target, the count so far, and the score. Its fields are
+      written only with `benchlock` held, except by the reset, and read without it only by the
+      spin on `arrived` and after the run is over; that is why plain C is enough for them.
+
+      `benchreset` calls [[initlock]] again, which is only safe when nobody is using the lock.
+      Reinitializing a lock that a hart holds sets `next == serving` under it; the holder's
+      own `release` then fails [[holding]] and the kernel panics `release`. Any process can
+      call `lockbench(0, ...)`, so a comment is not enough: a second spinlock, `runlock`,
+      protects `running`, the number of callers between their start line and the end of their
+      run, and the reset refuses (returns -1) unless it is 0. (With only the comment, typing
+      `locktest 3 3000000 &` and then `locktest` panics the kernel. Verify shows the same two
+      commands with `runlock`.) `runlock` is never passed to `initlock`: a zeroed
+      `struct spinlock` is a free lock under both the old and the new `acquire`.
+
+      The reset matters later: commit 4 makes `initlock` start the counters just below the
+      wrap, and this reset is what makes every `locktest` run cross it.
+
+      `inside` and `overlaps` are the mutual-exclusion check: the critical section sets
+      `inside`, and a hart that finds it already set counts an overlap. It cannot catch every
+      overlap (two harts could miss each other), so `locktest` also checks that the counts add
+      up.
+  - title: A start line, outside any lock
+    commit: 1
+    file: kernel/lockbench.c
+    lines: 86-116
+    focus: 104-116
+    state:
+      hart: 0
+      mode: S
+      proc: locktest (pid 4)
+      intr: "on"
+      satp: kernel
+      locks: []
+      stack: [usertrap, syscall, sys_lockbench]
+      sp: kernel
+      irq: 0
+    note: |
+      Each of the three children calls `lockbench(3, 300000, &st)`. To compare locks, they
+      must contend from the first acquisition, so each one counts itself in `running` (under
+      `runlock`, which keeps a reset out until it is done), checks in (incrementing `arrived`
+      under `benchlock`) and then spins until all three have arrived.
+
+      The start-line spin is deliberately **outside** any lock and with interrupts **on**
+      (noff 0). The third child may not even be running yet: it may be RUNNABLE, waiting for
+      a hart. If the first two spun with interrupts off, no timer interrupt could make them
+      [[yield]], and on a machine with fewer harts than callers the third would never run.
+      With interrupts on, a timer tick can take the hart away, and nothing is held that
+      anyone else needs.
+
+      `arrived` is read with `__atomic_load_n(..., __ATOMIC_RELAXED)`: an atomic load, so the
+      compiler must re-read it on every iteration (clinic 1 shows what a plain read in a loop
+      becomes), and relaxed, because the start line protects no data. This state is reasoned
+      from the code; gdb did not stop here.
+    others: |
+      Hart 2 is running pid 5 through the same check-in; hart 1 is running pid 6, or pid 3,
+      the parent, which has forked and is about to block in `read` on the pipe. Only
+      `arrived` is shared, and it only grows.
+  - title: "The loop: time the wait, keep score, let go"
+    commit: 1
+    file: kernel/lockbench.c
+    lines: 116-145
+    focus: 118-131
+    state:
+      hart: 1
+      mode: S
+      proc: locktest (pid 6)
+      intr: "off"
+      satp: kernel
+      locks: []
+      stack: [usertrap, syscall, sys_lockbench, acquire]
+      sp: kernel
+      irq: {noff: 2, intena: 1, note: "lockbench's own push_off (line 119) plus acquire's; recorded by gdb on hart 1 while it waited for benchlock"}
+    note: |
+      Each iteration is `push_off`, read the `time` CSR, [[acquire]], read it again, keep
+      score, [[release]], [[pop_off]]. The extra `push_off` at line 119 keeps a timer interrupt
+      from landing between the two `r_time()` calls, so the wait measured is the lock's, not a
+      context switch's. The `time` CSR counts at 10 MHz on QEMU's `virt` machine: one tick is
+      100 ns.
+
+      So a hart waiting for `benchlock` is at noff 2, SIE off, `intena` 1 (interrupts were on
+      when the system call reached line 119). gdb recorded exactly that on hart 1
+      (`cpus[1].noff = 2`, `intena = 1`, `sstatus = 0x8000000200006020`, SIE bit clear).
+
+      Between iterations, after line 130, noff drops to 0 and interrupts are on again for a
+      few instructions: that is where a timer tick can preempt the process. The stop test is
+      made with the lock held (line 123), so every caller sees the same final count and
+      leaves.
+
+      At this commit `acquire` is still the original swap loop; the state above was recorded
+      on the finished branch, where the noff and `intena` values are the same.
+    others: |
+      In the recorded snapshot, hart 2 (pid 5) held `benchlock` and hart 0 (pid 4) was
+      between iterations: in [[pop_off]] just after its `intr_on` (`0x80000eb2`), with
+      `cpus[0].noff = 0` and SIE back on (`sstatus = 0x8000000200006022`).
+  - title: Inside the critical section
+    commit: 1
+    file: kernel/lockbench.c
+    lines: 56-84
+    focus: 61-83
+    state:
+      hart: 2
+      mode: S
+      proc: locktest (pid 5)
+      intr: "off"
+      satp: kernel
+      locks: [benchlock]
+      stack: [usertrap, syscall, sys_lockbench, critical]
+      sp: kernel
+      irq: {noff: 2, intena: 1, note: "lockbench's push_off plus benchlock's; recorded by gdb (cpus[2].noff = 2, intena = 1)"}
+    note: |
+      gdb stopped hart 2 here, at the first instruction of `critical` (inlined into
+      `sys_lockbench`, `0x80000d54`), holding `benchlock` with `bench = {count = 237, last =
+      0, run = 1, maxrun = 2}`: 237 acquisitions so far, the previous one by hart 0.
+
+      [[cpuid]] is safe because interrupts are off: the process cannot move to another hart
+      in the middle. The run counter records how many acquisitions in a row the same hart
+      made; a test-and-set lock that lets the releasing hart walk straight back in would show
+      up as long runs. But long runs also come from waiters that are not in line at all (a
+      process preempted between iterations, a host thread delayed), under either lock: the
+      measured runs do not separate the two locks (Measure). The caller's own count, per-hart tally and waits go into `st`, its private
+      copy on its kernel stack, which is copied out to user space at the end.
+
+      `inside` is accessed with relaxed atomics so that the load and both stores stay real
+      memory accesses. As plain C, the store of 1 followed later by the store of 0, with no
+      read of it in between, is the kind of dead store a compiler may delete. In this build
+      they are `lw` at `0x80000d5c`, `sw` at `0x80000d6c` and `sw zero` at `0x80000d28`. It is a
+      tripwire, not a lock: mutual exclusion is still the lock's job.
+    others: |
+      Hart 1 (pid 6) was spinning in `acquire(&benchlock)`. On the finished branch it held
+      the next ticket, `0xfffffff1`; on the original lock it would simply be retrying its
+      `amoswap`.
+  - title: "locktest: three processes at the start line"
+    commit: 2
+    file: user/locktest.c
+    lines: 26-80
+    focus: 29-43
+    diff: true
+    state:
+      hart: 1
+      mode: U
+      proc: locktest (pid 3)
+      intr: "on"
+      satp: user
+      locks: []
+      stack: [main]
+      sp: user
+    note: |
+      The test resets the benchmark (giving up if another run is in progress), makes a pipe,
+      forks three children that call
+      `lockbench` and write their `struct lbstat` into the pipe, and reads the three results.
+      A `struct lbstat` is 80 bytes; all three fit in the pipe's 512-byte buffer at once, and
+      [[pipewrite]] copies each one while holding the pipe's lock, so every `read` gets one
+      whole struct.
+
+      It checks one thing: every acquisition was counted once (`sum == total`, `count ==
+      total`) and no overlap was seen. Everything else is printed for you to compare, and the
+      last line says so. On the original lock (this commit, recorded without the reset check,
+      which changes nothing in a single run), a recorded run:
+
+      ```text
+      $ locktest
+      locktest: 3 processes, 300000 acquisitions of one lock
+      locktest: process 0: 99499 acquisitions, wait mean 780 ns, longest 14 us
+      locktest: process 1: 100141 acquisitions, wait mean 780 ns, longest 43 us
+      locktest: process 2: 100360 acquisitions, wait mean 771 ns, longest 61 us
+      locktest: per hart: 99883 98971 101146
+      locktest: longest run by one hart: 22
+      locktest: 201 ms, 1492 acquisitions per ms
+      locktest: mutual exclusion (300000 counted, 0 overlaps): OK
+      locktest: fairness is not checked: compare the numbers above
+      ```
+
+      Aggregate shares on QEMU are close to even with either lock (Measure has the numbers).
+      Seeing the difference takes a counter inside `acquire`, which this lab adds only in a
+      scratch copy, never on the branch.
+  - title: Two counters in the same eight bytes
+    commit: 3
+    file: kernel/spinlock.h
+    lines: 1-11
+    diff: true
+    state:
+      hart: 1
+      mode: S
+      proc: locktest (pid 6)
+      intr: "off"
+      satp: kernel
+      locks: []
+      stack: [usertrap, syscall, sys_lockbench, acquire]
+      sp: kernel
+      irq: {noff: 2, intena: 1, note: "lockbench's push_off (lockbench.c:119) plus acquire's; recorded by gdb on hart 1"}
+    note: |
+      `locked` was a 4-byte `uint` followed by 4 bytes of padding before the 8-byte `name`
+      pointer. `next` and `serving` fill those same 8 bytes: `name` stays at offset 8, `cpu`
+      at 16, and the struct is still 24 bytes. Every structure that embeds a spinlock
+      (`struct proc`, `struct pipe`, every sleep-lock) keeps its layout.
+
+      In the recorded run, while hart 2 held `benchlock`, gdb printed it as
+      `{next = 0xfffffff2, serving = 0xfffffff0, name = 0x80007048, cpu = 0x8000fb30}`:
+      ticket `0xfffffff0` was being served (hart 2's, and `0x8000fb30` is `&cpus[2]`), ticket
+      `0xfffffff1` was hart 1's, and `0xfffffff2` was the next to hand out. Two tickets
+      outstanding, the holder's and one waiter's. (The values are near `0xffffffff` because
+      commit 4 starts the counters there; at this commit they would start at 0.)
+  - title: Taking a ticket
+    commit: 3
+    file: kernel/spinlock.c
+    lines: 20-51
+    focus: 27-38
+    diff: true
+    state:
+      hart: 0
+      mode: S
+      proc: locktest (pid 4)
+      intr: "off"
+      satp: kernel
+      locks: []
+      stack: [usertrap, syscall, sys_lockbench, acquire]
+      sp: kernel
+      irq: {noff: 2, intena: 1, note: "recorded by gdb at the amoadd (cpus[0].noff = 2, intena = 1)"}
+    note: |
+      [[push_off]] still comes first, and the [[holding]] check still turns "this hart
+      already holds it" into a panic instead of a hang: with tickets, a hart that took a
+      second ticket for a lock it holds would wait for itself forever.
+
+      Then the ticket: `__atomic_fetch_add(&lk->next, 1, __ATOMIC_RELAXED)`, one instruction
+      in this build (commits 3 and 4 compile `acquire` identically), `amoadd.w a4,a5,(s1)` at
+      `0x80000e58` (`a5` = 1, `s1` = `lk`, whose first word is `next`). It adds 1 to `next` in memory and returns the old value in `a4`, with
+      no other hart able to touch the word in between.
+
+      gdb stopped hart 0 (pid 4) on that instruction with `benchlock` at `{next = 0xfffffff2,
+      serving = 0xfffffff0}`, executed it with `stepi`, and read `a4 = 0xfffffff2` and
+      `next = 0xfffffff3`. Hart 0 is now third in line: hart 2 holds `0xfffffff0`, hart 1
+      waits with `0xfffffff1`.
+
+      Relaxed is enough: holding a ticket gives no right to touch `bench`. The ordering that
+      matters comes on the next line.
+    others: |
+      Hart 1 (pid 6) was in the wait loop at `0x80000e62` with its ticket `0xfffffff1` in
+      `a4`; hart 2 (pid 5) was in the critical section. Had hart 0 and hart 1 executed their
+      `amoadd`s at the same instant, the memory system would have ordered them, and they would
+      still have got different numbers.
+  - title: Waiting for your number
+    commit: 3
+    file: kernel/spinlock.c
+    lines: 38-51
+    focus: 40-47
+    state:
+      hart: 1
+      mode: S
+      proc: locktest (pid 6)
+      intr: "off"
+      satp: kernel
+      locks: []
+      stack: [usertrap, syscall, sys_lockbench, acquire]
+      sp: kernel
+      irq: {noff: 2, intena: 1, note: "lockbench's push_off plus acquire's, not yet holding benchlock; recorded by gdb on hart 1"}
+    note: |
+      The loop compiled to five instructions:
+
+      ```text
+      80000e5e:  addi   a5,s1,4         # &lk->serving
+      80000e62:  lw     a5,0(a5)        # load serving
+      80000e64:  fence  r,rw            # acquire: later loads and stores stay after it
+      80000e68:  sext.w a5,a5
+      80000e6a:  bne    a5,a4,80000e5e  # not my number yet: again
+      ```
+
+      `a4` holds the ticket, `0xfffffff1` on hart 1 when gdb stopped it at `0x80000e62`. Every
+      iteration loads `serving` again, because `__atomic_load_n` is an atomic access the
+      compiler may not hoist (clinic 1), and every iteration runs the fence. The fence matters
+      only on the last iteration: it keeps the critical section's loads and stores after the
+      load that saw the ticket, and so after the release store that published the previous
+      holder's work.
+
+      Compare the original loop: every iteration was an `amoswap`, an atomic *write*. Here
+      the waiters only read. And `==` (`bne` to keep waiting) is the only comparison: it is
+      what keeps the wrap harmless (commit 4).
+
+      After the loop, `lk->cpu = mycpu()` records the owner, exactly as before.
+    others: |
+      Hart 2 is in the critical section; hart 0 is about to take ticket `0xfffffff2` and wait
+      in this same loop (previous step). When hart 2 releases, only hart 1's comparison can
+      succeed. Under the swap loop, hart 1, hart 0 and, if it came back quickly, hart 2 itself
+      would all race.
+  - title: "Release: clear the owner, then serve the next number"
+    commit: 3
+    file: kernel/spinlock.c
+    lines: 53-72
+    focus: 57-69
+    diff: true
+    state:
+      hart: 2
+      mode: S
+      proc: locktest (pid 5)
+      intr: "off"
+      satp: kernel
+      locks: [benchlock]
+      stack: [usertrap, syscall, sys_lockbench, release]
+      sp: kernel
+      irq: {noff: 2, intena: 1}
+    note: |
+      Release is three steps, compiled as:
+
+      ```text
+      80000ee4:  sd     zero,16(s1)     # lk->cpu = 0
+      80000ee8:  lw     a5,4(s1)        # serving
+      80000eea:  addiw  a5,a5,1         # + 1
+      80000eec:  addi   a4,s1,4         # &lk->serving
+      80000ef0:  fence  rw,w            # release ordering
+      80000ef4:  sw     a5,0(a4)        # the next ticket may enter
+      80000ef6:  jal    pop_off
+      ```
+
+      No AMO: only the holder writes `serving`, so reading it with a plain `lw` and writing
+      it back cannot lose an update. What the store needs is ordering, and that is the
+      `fence rw,w`, the same fence the original release had: every load and store of the
+      critical section is ordered before the `sw` that lets the next hart in.
+
+      The order of the first and last stores matters. `lk->cpu = 0` comes first, while this
+      hart still owns the lock. After the `sw`, the next hart may be inside within a few
+      instructions and store its own `cpu`; clearing `cpu` after that would erase the new
+      owner (clinic 4).
+
+      [[pop_off]] comes after the store: interrupts stay off until the lock is handed on. The
+      state shown is reasoned for hart 2 releasing `benchlock` (the recorded snapshot of this
+      code is at the wrap, two steps from the end).
+    others: |
+      Harts 1 and 0 are in the wait loop. The `sw` changes `serving` to `0xfffffff1`; hart 1's
+      next `lw` sees it, its `bne` falls through, and it is in. Hart 0 loads the same new
+      value, compares it with `0xfffffff2`, and keeps waiting. One store, and every waiter
+      re-reads the word: on real hardware, every waiter's cached copy of that line is
+      invalidated, even though only one of them can proceed.
+  - title: holding() without a flag
+    commit: 3
+    file: kernel/spinlock.c
+    lines: 72-82
+    focus: 76-82
+    diff: true
+    state:
+      hart: 2
+      mode: S
+      proc: locktest (pid 5)
+      intr: "off"
+      satp: kernel
+      locks: [benchlock]
+      stack: [usertrap, syscall, sys_lockbench, release, holding]
+      sp: kernel
+      irq: {noff: 2, intena: 1}
+    note: |
+      "Is the lock held?" becomes `lk->next != lk->serving`: some ticket has been handed out
+      and not yet served past. "By me?" is unchanged: `lk->cpu == mycpu()`. The compiled code
+      loads both counters (`lw a4,0(a0)`, `lw a5,4(a0)` at `0x80000dd4`) and calls [[mycpu]]
+      only if they differ.
+
+      `lk->cpu` is written only by the holder, so in this code the second half alone would
+      give the same answer; the first half keeps the meaning "held, and by me" that callers
+      such as [[sched]] rely on ([[kernel/proc.c:485]]).
+
+      Interrupts must be off here, as the comment says: [[mycpu]] names the hart, and an
+      interrupt that moved this thread to another hart between the load of `lk->cpu` and the
+      call would compare against the wrong one. All three callers, `acquire` (after its
+      `push_off`), `release` and [[sched]], run with noff > 0.
+  - title: The p->lock handoff does not notice
+    commit: 3
+    file: kernel/proc.c
+    lines: 434-466
+    focus: 446-463
+    state:
+      hart: 1
+      mode: S
+      proc: none (scheduler)
+      intr: "off"
+      satp: kernel
+      locks: ["p->lock (pid 6)"]
+      stack: [main, scheduler]
+      sp: {"on": scheduler, detail: "hart 1's scheduler stack"}
+      irq: {noff: 1, intena: 0}
+    note: |
+      Nothing in `proc.c` changes, and that is worth checking. The [[scheduler]] acquires a
+      process's `p->lock` (line 446), takes a ticket, waits its turn, and [[swtch]]es to the
+      process with the lock held. The process releases it in [[yield]], [[sleep]] or
+      [[forkret]]: a different thread, on the same hart. When the process gives up the hart,
+      it acquires its own `p->lock` and the scheduler releases it at line 463.
+      ([[concept:locks#handoff]], [[tour:13]].)
+
+      The ticket lock is fine with that. The ticket was a local variable in the scheduler's
+      `acquire` and is forgotten once the wait ends. `release` only checks `holding()` (same
+      hart) and advances `serving`, whichever thread runs it.
+
+      What does change is how the scheduler waits. Every scheduler scans all 64 slots, taking
+      each `p->lock` in turn; when two schedulers reach the same slot, the second now queues
+      for it in order instead of racing. These locks are taken constantly: each of the five
+      `p->lock`s gdb printed had been acquired more than 1,600 times 20 seconds after boot, at
+      an idle shell, and more than 370,000 times by the end of `usertests -q`. The state is
+      reasoned from the code.
+    others: |
+      Hart 1's pid 6 is one of the `locktest` children. When it is RUNNABLE, any of the three
+      schedulers may reach its slot; whichever took the earlier ticket gets it, and the other
+      finds it RUNNING when its turn comes.
+  - title: Interrupts off before the ticket, not after
+    commit: 3
+    file: kernel/spinlock.c
+    lines: 22-47
+    focus: 27
+    state:
+      hart: 0
+      mode: S
+      proc: lockstress (any worker)
+      intr: "off"
+      satp: kernel
+      locks: []
+      stack: [usertrap, syscall, sys_uptime, acquire]
+      sp: kernel
+      irq: {noff: 1, intena: 1}
+    note: |
+      Line 27 did not change, but its job grew. In the original lock, interrupts had to be off
+      while a lock was *held*, so that a handler on this hart could not want it. With tickets,
+      they must be off while a hart *waits*, too: from the moment it takes a ticket, every
+      later ticket depends on it.
+
+      Picture hart 0 in [[sys_uptime]] with ticket N for `tickslock`, spinning. If interrupts
+      were on, the timer could interrupt it, and [[clockintr]] would take ticket N+1
+      ([[kernel/trap.c:170]]). Ticket N is called, but its owner is underneath the handler,
+      and the handler is waiting for N. Clinic 3 moved `push_off` after the loop and caught
+      exactly this, with the ticket in the interrupted frame equal to `serving`.
+
+      With `push_off` first, the state above holds during the whole wait: noff 1, SIE off,
+      `intena` 1. The timer interrupt stays pending until [[release]]'s [[pop_off]] turns
+      interrupts back on, and `clockintr` then takes its ticket on a hart that holds none.
+      (Reasoned from the code.)
+    others: |
+      Harts 1 and 2 are running other `lockstress` workers, taking tickets for `tickslock` in
+      the same way. Because none of them can be interrupted while holding a ticket, each
+      ticket is served and released in a bounded time, and `clockintr` on hart 0 waits at
+      most for the tickets taken before it.
+  - title: Starting just below the wrap
+    commit: 4
+    file: kernel/spinlock.c
+    lines: 1-24
+    focus: 11-23
+    diff: true
+    state:
+      hart: 0
+      mode: S
+      proc: none (boot)
+      intr: "off"
+      satp: bare
+      locks: []
+      stack: [main, kinit, initlock]
+      sp: boot
+      irq: 0
+    note: |
+      The only change of commit 4: `next` and `serving` start at `0xffffff00`, 256 tickets
+      below the wrap. Equality never cared where they start; the point is to make the wrap
+      happen early. This is the same trick Linux plays with its tick counter: it starts the
+      32-bit tick count (`jiffies`) five minutes before it wraps.
+
+      The state shows [[kinit]] on hart 0 initializing `kmem.lock`, before paging is on. Then
+      [[freerange]] frees about 32,700 pages, one [[kfree]] and one `acquire`/`release` of
+      `kmem.lock` each: that lock wraps long before the shell starts. gdb, attached 20 seconds
+      after boot at an idle shell, found `kmem.lock` at `0x7fb7`, `bcache.lock` at `0x362`
+      and the five `p->lock`s it printed at `0x5b4` to `0x63e` (all wrapped), while
+      `tickslock` (`0xffffffc7`), `wait_lock`, `pid_lock`, `cons.lock` and the others had not
+      wrapped yet. After `usertests -q` every lock it printed had wrapped except `cons.lock`.
+
+      Without this commit, a comparison that cannot handle the wrap would pass every test
+      here and fail after about an hour of hammering one lock, once. With it, clinic 2's bug
+      panicked on every boot we ran, though a single `locktest` run catches it only if a waiter
+      is in line at the moment of the crossing.
+  - title: The queue across the wrap
+    commit: 4
+    file: kernel/spinlock.c
+    lines: 26-57
+    focus: 44-53
+    state:
+      hart: 1
+      mode: S
+      proc: locktest (pid 6)
+      intr: "off"
+      satp: kernel
+      locks: []
+      stack: [usertrap, syscall, sys_lockbench, acquire]
+      sp: kernel
+      irq: {noff: 2, intena: 1, note: "recorded by gdb: cpus[1].noff = 2, intena = 1"}
+    note: |
+      `locktest`'s reset reinitialized `benchlock`, so its counters started at `0xffffff00`
+      and wrap after 256 acquisitions (3 check-ins at the start line, then 253 in the loop),
+      with three harts contending. gdb stopped the run when hart 2 (pid 5) entered the
+      critical section holding ticket `0xffffffff`:
+
+      ```text
+      benchlock = {next = 0x1, serving = 0xffffffff, name = 0x80007048, cpu = 0x8000fb30}
+      bench.count = 252
+      hart 1 (pid 6): spinning at 0x80000e64, a4 = 0x0 (its ticket),
+                      a5 = 0xffffffffffffffff (the serving it last read)
+      hart 0 (pid 4): reading the time CSR, about to call acquire (noff 1)
+      ```
+
+      Hart 1 took the ticket after `0xffffffff`, which is `0`, and `next` moved on to `1`.
+      There is nothing special to do: hart 1 waits for `serving == 0`, and the holder will
+      store `0xffffffff + 1`, which in 32 bits is `0`.
+
+      An ordering test would fail right here: `serving < my` is `0xffffffff < 0`, false, and
+      hart 1 would walk in now (clinic 2).
+    others: |
+      Hart 2 holds `benchlock` with noff 2. Hart 0 (pid 4) has finished its previous
+      iteration and is between its own `push_off` (noff 1) and `acquire`; it will take
+      ticket `1`.
+  - title: The handoff from 0xffffffff to 0
+    commit: 4
+    file: kernel/spinlock.c
+    lines: 59-78
+    focus: 63-77
+    state:
+      hart: 2
+      mode: S
+      proc: locktest (pid 5)
+      intr: "off"
+      satp: kernel
+      locks: [benchlock]
+      stack: [usertrap, syscall, sys_lockbench, release]
+      sp: kernel
+      irq: {noff: 2, intena: 1, note: "recorded by gdb at the fence (cpus[2].noff = 2, intena = 1)"}
+    note: |
+      gdb stopped hart 2 at the `fence rw,w` (`0x80000ef0`) of that same release:
+
+      ```text
+      benchlock = {next = 0x1, serving = 0xffffffff, name = 0x80007048, cpu = 0x0}
+      hart 2: a5 = 0x0              (serving + 1, already computed)
+      hart 1: a4 = 0x0, spinning    hart 0: still reading the time CSR
+      ```
+
+      `cpu` is already 0 (line 66 ran first). Then two `stepi`s on hart 2, the fence and the
+      `sw`:
+
+      ```text
+      benchlock = {next = 0x2, serving = 0x0, name = 0x80007048, cpu = 0x8000fab0}
+      hart 2 at 0x80000ef6 (the call to pop_off)
+      hart 1 at 0x80000e76 (in acquire, just after recording itself in lk->cpu)
+      hart 0 at 0x80000e5c (in acquire, just after its amoadd)
+      ```
+
+      During those two steps the other harts kept running (gdb's default): hart 1 saw
+      `serving = 0`, left its loop and recorded `cpu = &cpus[1]` (`0x8000fab0`); hart 0 took
+      ticket `1` (`next` is now `2`) and will wait for the next release. FIFO across the wrap,
+      by plain modular arithmetic.
+
+      Summing up what the four commits cost: `acquire` lost its `amoswap` and gained an
+      `amoadd` and a fence per spin iteration; `release` is the same instructions as before
+      plus a load, an add and an address computation; no struct changed size. What they
+      bought, measured with a counter inside `acquire`: no waiter passed by more than the two
+      other harts.
+    others: |
+      In `locktest` this crossing happens once per run, 256 acquisitions in, while all three
+      harts are contending, and every run's mutual-exclusion check passed (verify).
+verify: |
+  On the branch (`ext/20-ticketlock`, 4 commits), built with the project toolchain and run
+  on three harts (`-smp 3 -m 128M`), in one boot:
+
+  ```text
+  $ locktest
+  locktest: 3 processes, 300000 acquisitions of one lock
+  locktest: process 0: 101214 acquisitions, wait mean 768 ns, longest 87 us
+  locktest: process 1: 98549 acquisitions, wait mean 786 ns, longest 75 us
+  locktest: process 2: 100237 acquisitions, wait mean 781 ns, longest 88 us
+  locktest: per hart: 103565 94352 102083
+  locktest: longest run by one hart: 24
+  locktest: 203 ms, 1477 acquisitions per ms
+  locktest: mutual exclusion (300000 counted, 0 overlaps): OK
+  locktest: fairness is not checked: compare the numbers above
+  $ usertests -q
+  usertests starting
+  [...]
+  test lazy_sbrk: OK
+  test partial_write: OK
+  test unlinkcwd: OK
+  ALL TESTS PASSED
+  $ locktest
+  locktest: 3 processes, 300000 acquisitions of one lock
+  locktest: process 0: 101462 acquisitions, wait mean 810 ns, longest 74 us
+  locktest: process 1: 102318 acquisitions, wait mean 801 ns, longest 43 us
+  locktest: process 2: 96220 acquisitions, wait mean 858 ns, longest 87 us
+  locktest: per hart: 96220 105315 98465
+  locktest: longest run by one hart: 32
+  locktest: 216 ms, 1388 acquisitions per ms
+  locktest: mutual exclusion (300000 counted, 0 overlaps): OK
+  locktest: fairness is not checked: compare the numbers above
+  ```
+
+  A reset while a run is in progress is refused (another boot of the same kernel; the
+  background run's output arrives after the second prompt):
+
+  ```text
+  $ locktest 3 3000000 &
+  $ locktest: 3 processes, 3000000 acquisitions of one lock
+  locktest
+  locktest: 3 processes, 300000 acquisitions of one lock
+  locktest: another lockbench run is in progress
+  $ locktest: process 0: 1005673 acquisitions, wait mean 827 ns, longest 2014 us
+  [...]
+  locktest: mutual exclusion (3000000 counted, 0 overlaps): OK
+  locktest: fairness is not checked: compare the numbers above
+  locktest
+  locktest: 3 processes, 300000 acquisitions of one lock
+  [...]
+  locktest: mutual exclusion (300000 counted, 0 overlaps): OK
+  ```
+
+  Without `runlock`, the same two commands print `panic: release`.
+
+  `usertests -q` passing on three harts means every lock in the kernel, including every
+  `p->lock` handed across `swtch`, works as a ticket lock, and every busy one crossed the
+  wrap during the run (a second boot, with gdb attached after `usertests`, found every lock
+  it printed wrapped except `cons.lock`). `locktest` crosses the wrap of `benchlock` with three
+  harts contending and found every acquisition counted once. Each commit builds on its own;
+  commit 2 (the original lock with the instrument) also passes `usertests -q`.
+
+  Shares need not be equal: in another run of this lock, process 2 got 89,392
+  acquisitions and the others about 105,000. A FIFO lock serves whoever is in line; it does
+  not guarantee equal shares to a process that is sometimes *not* in line (preempted between
+  iterations, or its host thread delayed).
+measure: |
+  **Aggregate numbers** (three processes × 300,000 acquisitions, three boots of each kernel,
+  alternating, three `locktest` runs per boot). These kernels lacked commit 1's reset check,
+  which adds only a check-in and check-out under `runlock` around each run and leaves the
+  measured loop unchanged:
+
+  | | swap loop (commit 2) | ticket lock (commit 4) |
+  |---|---|---|
+  | smallest / largest share of one process | 97,150 / 102,533 | 97,123 / 102,545 |
+  | mean wait of one process | 739–902 ns | 863–996 ns |
+  | longest single wait in a run | 14 µs – 4,004 µs | 19–144 µs |
+  | longest run by one hart (see below) | 14–54 | 6–36 |
+  | throughput (acquisitions per ms) | 1,351–1,630 | 1,209–1,351 |
+
+  On QEMU both locks share the lock nearly evenly in aggregate. The swap loop does not
+  starve anyone here. Run lengths do not separate the locks either: other runs of the ticket
+  lock gave 68, 72 and 86, because a waiter that is not in line (preempted, or its host thread
+  delayed) lets the other harts take turn after turn under either lock. The longest waits
+  (milliseconds) and the throughput track what else the computer is doing more than the
+  lock: other builds of the same lock gave 1,115 and 1,010 acquisitions per ms, builds
+  differing by one line gave as little as 591 (measured while the computer was busy with
+  other work; your times will differ), and in the instrumented builds below the ticket lock
+  was the faster one (1,408–1,754 against 1,107–1,345). We do not claim a throughput
+  difference.
+
+  **Per acquisition.** A scratch copy of each kernel (never the branch) counted, inside
+  `acquire`, how many other acquisitions of the same lock happened between the moment a
+  hart asked and the moment it got in, and how many times it went round the spin loop
+  (a counter `acqs` in `struct spinlock`, incremented by each new holder, and two per-hart
+  fields to hand the numbers to `lockbench`). For the ticket lock the count starts right
+  after the `amoadd`, for the swap loop right before the first `amoswap`: in both cases, the
+  moment the hart joins the contest. Nine runs of three processes per lock:
+
+  | | swap loop | ticket lock |
+  |---|---|---|
+  | most acquisitions that passed one waiter (per run) | 12, 4, 4, 126, 7, 4, 7, 14, 6 | 2 in every run |
+  | acquisitions passed by 2 or more (per run of 300,000) | about 4,900–7,200 | 47–179 |
+  | acquisitions passed by 3 or more (per run) | 56–216 | 0 |
+  | mean spin iterations per acquisition | 19–22 | 40–50 |
+
+  The ticket lock's bound is exact: with three harts and interrupts off while waiting, at
+  most two tickets can be ahead of yours, and 2.7 million acquisitions never saw more. The
+  swap loop usually behaves too (about 98% of acquisitions were passed by at most one
+  other), but nothing stops the occasional waiter from losing 126 races in a row. With two
+  processes the bound for tickets is 1, and it held; the swap loop's worst was 3.
+
+  Tickets spin about twice as many iterations per acquisition, because a hart that releases
+  and immediately asks again now goes to the back of the line and waits, where under the
+  swap loop it often walked straight back in. But iterations are not time: a ticket
+  iteration is a load and a fence, a swap-loop iteration an AMO, and in these same
+  instrumented builds the mean wait of one process was not longer with tickets (709–905 ns)
+  than with the swap loop (865–1,098 ns).
+
+  **What QEMU cannot show.** QEMU's multi-threaded TCG runs each hart as a host thread and
+  does not model RISC-V caches. On real hardware
+  the swap loop's unfairness comes largely from cache-line ownership, and the ticket lock's
+  cost from every waiter re-fetching the `serving` line after each release; neither is
+  modelled. The FIFO property, which is a property of the code, shows exactly.
+further: |
+  - **Spin on relaxed loads, fence once.** Move the acquire ordering out of the loop: spin
+    with `__ATOMIC_RELAXED` loads and put one `__atomic_thread_fence(__ATOMIC_ACQUIRE)`
+    after it. Read the new `kernel.asm` and measure spin iterations again. Teaches the
+    difference between an acquire load and an acquire fence.
+  - **Proportional backoff.** A waiter knows how many tickets are ahead of it (`my -
+    serving`). Pause for that many short delays before re-reading. Teaches why ticket locks
+    make backoff easy and swap loops do not.
+  - **An MCS lock.** Give each waiter its own node to spin on, linked into a queue with one
+    atomic swap. Teaches how real kernels avoid every waiter re-reading one word, and why the
+    node must live somewhere other than the stack of a thread that might move.
+  - **Lock statistics.** Turn the measurement counters into a permanent feature, per lock
+    name, printed by Ctrl-P ([[procdump]]). Teaches how Linux's `lockstat` finds the locks
+    worth fixing, and what a counter on every `acquire` costs.
+  - **A trylock.** `int tryacquire(struct spinlock *)` that never waits. Work out why "take
+    a ticket, give it back if it is not called" is impossible, and what compare-and-swap
+    (LR/SC) on both counters at once would need.

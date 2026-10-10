@@ -1,0 +1,120 @@
+summary: |
+  The [[g:context-switch]] itself: 29 instructions (14 stores, 14 loads and a `ret`) that stop
+  one kernel thread and resume another. [[swtch]] saves the current thread's registers into one `struct context` and
+  loads another thread's registers from a second one. When it executes `ret`, it "returns"
+  into the other thread, at the point where that thread once called `swtch`.
+
+  In xv6 every switch goes between a process and its CPU's [[scheduler]] thread: [[sched]]
+  calls `swtch(&p->context, &mycpu()->context)` to give up the CPU, and [[scheduler]] calls
+  `swtch(&c->context, &p->context)` to run a process. A process never switches directly to
+  another process.
+
+  This has to be assembly: C cannot name registers, and the stack pointer it would need to
+  save is the very one it is running on.
+
+  **Read before:** `struct context` in [[kernel/proc.h]]. **Read next:** [[scheduler]] and
+  [[sched]] in [[kernel/proc.c]].
+
+blocks:
+  - lines: 1-5
+    title: The interface
+    note: |
+      [[swtch]] is called like a C function, with two pointers, `old` in
+      [[g:reg:a0|a0]] and `new` in `a1` ([[g:calling-convention]]). Its prototype is in
+      [[kernel/defs.h]]. Both point at a `struct context` ([[kernel/proc.h:2]]): 14
+      eight-byte slots, `ra`, `sp`, then `s0` to `s11`, at offsets 0, 8, 16, ..., 104.
+
+  - lines: 8-9
+    title: Export the label
+    note: |
+      [[g:dir-globl|.globl]] makes `swtch` visible to the linker, so C code in
+      [[kernel/proc.c]] can call it. This file has no `.section` directive, so the code goes
+      in the default `.text` section; the build places it at `0x800023e0`
+      (`kernel/kernel.asm`).
+
+  - lines: 10-23
+    title: Save the current thread's registers into old
+    note: |
+      Fourteen [[g:insn:sd|sd]] instructions store the current values into `*old`.
+
+      **Why only these registers?** Because [[swtch]] is an ordinary function call as far as
+      the C compiler is concerned. The [[g:calling-convention]] says a called function may
+      destroy `t0`–`t6` and `a0`–`a7`, so the compiler never keeps a value it still needs in
+      them across a call; if it needs one later, it has already saved it on the stack, which
+      stays intact. It also says a called function must *preserve* `s0`–`s11` and `sp`, so
+      the caller may keep live values in them. `swtch` saves exactly those, plus `ra`.
+
+      You can see this in the build: [[scheduler]] keeps the loop variable `p` in `s1`
+      across its call to `swtch`, and [[sched]] keeps its local `intena` in `s3`. Both
+      values survive only because `swtch` saves and restores the `s` registers.
+
+      **What is not saved, and why:**
+
+      - The program counter: `ra` stands in for it. It holds the address right after the
+        `call swtch` in the caller, which is exactly where this thread should resume.
+      - [[g:reg:tp|tp]]: it holds the hart ID, a property of the CPU, not of the thread. A
+        process may stop on one CPU and resume on another; it must then see the new CPU's
+        ID, so `tp` must not travel with it.
+      - [[g:reg:gp|gp]]: the kernel does not use it.
+      - Floating-point registers: the kernel contains no floating-point instructions (the
+        disassembly has none), so kernel threads never change them. Moreover, the `FS`
+        field of `mstatus` is 0 (Off) at reset on QEMU and xv6 never sets it, so any
+        floating-point instruction would trap anyway.
+      - The user registers: when the process trapped into the kernel, they were already saved
+        in its [[g:trapframe]], which stays in memory.
+      - CSRs such as [[g:csr:satp|satp]] and [[g:csr:sstatus|sstatus]]: all kernel threads
+        share the kernel page table, and the interrupt state is handled by `intena` (see
+        [[sched]]).
+
+  - lines: 25-38
+    title: Load the new thread's registers from new
+    note: |
+      Fourteen [[g:insn:sd|ld]] instructions load `ra`, `sp` and `s0`–`s11` from `*new`.
+      The moment `sp` is loaded (line 26), the CPU is on the other thread's stack: the
+      scheduler's stack (one of the boot stacks in [[stack0]]) or a process's
+      [[g:kernel-stack]].
+
+      Nothing is lost by loading over the old values, because they were all saved first.
+      `a0` and `a1` are not touched, so `new` stays valid while it is read.
+
+  - lines: 39-40
+    title: Return into the other thread
+    note: |
+      [[g:insn:ret|ret]] jumps to the address in `ra`, which now comes from `new`. There are
+      two cases:
+
+      - The other thread was switched out earlier by its own call to `swtch`. Then `ra` is
+        the instruction after that call (in [[sched]] or [[scheduler]]), and from that
+        thread's point of view `swtch` has simply returned, with its `s` registers and stack
+        exactly as it left them.
+      - The other thread is a brand-new process that has never run. [[allocproc]] set its
+        `context.ra` to [[forkret]] and its `context.sp` to the top of its empty kernel
+        stack ([[kernel/proc.c:146]]), so `ret` "returns" into the start of [[forkret]].
+
+lines:
+  10: |
+    Save the return address: where the current thread continues when it is switched back
+    in.
+  11: |
+    Save the stack pointer. Everything else the current thread needs (its local variables,
+    its saved caller-saved registers, its chain of return addresses) is on this stack.
+  12: |
+    Save `s0` (also the frame pointer, since the kernel is compiled with
+    `-fno-omit-frame-pointer`).
+  25: |
+    Load the other thread's return address. `ret` on line 40 jumps there.
+  26: |
+    Switch stacks. From here on the CPU is running on the other thread's stack.
+
+    Called from [[sched]], this moves from the process's [[g:kernel-stack]] to this hart's
+    [[g:scheduler-stack]]; called from [[scheduler]], from the scheduler stack to the chosen
+    process's kernel stack (its top, for a process that has never run). Never from one
+    process straight to another. The stack being left keeps all its frames exactly as they
+    are, and `old->sp`, saved on line 11, records where to find them
+    ([[concept:stacks#switches]]).
+  27: |
+    `s0` to `s11` are restored on this and the following lines, at the same offsets they
+    were saved at.
+  40: |
+    Jump to the other thread's `ra`: the instruction after its own call to `swtch`, or
+    [[forkret]] for a new process.

@@ -1,0 +1,639 @@
+summary: |
+  The kernel half of every [[g:system-call|system call]] that deals with files: `open`,
+  `read`, `write`, `close`, `dup`, `fstat`, `link`, `unlink`, `mkdir`, `mknod`, `chdir`,
+  `pipe` and `exec`. Each `sys_` function is reached through the table in
+  [[kernel/syscall.c]] after a user program executes `ecall`.
+
+  The functions here mostly *check and translate*. They fetch the arguments the user passed in
+  registers ([[g:syscall-arguments]]), turn a small integer [[g:file-descriptor]] into a
+  pointer to an [[g:open-file]], turn a [[g:path-name]] into an [[g:inode]], and then hand the
+  real work to the layers below: [[kernel/file.c]] (open files), [[kernel/fs.c]] (inodes and
+  directories), [[kernel/pipe.c]] and [[kernel/exec.c]].
+
+  Two disciplines run through the file and are worth watching for in every function:
+
+  - **Transactions.** Every call that may change the disk, or may drop the last reference to
+    an inode (which can free it), runs between [[begin_op]] and [[end_op]], so that all its
+    disk writes form one [[g:transaction]] in the [[g:write-ahead-log]] and survive a crash
+    together or not at all.
+  - **Inode locking order.** When two inodes must be locked at once, the directory is locked
+    before the entry inside it. Following one order everywhere is what prevents
+    [[g:deadlock]].
+
+  **Read before:** [[kernel/syscall.c]], [[kernel/file.c]], [[kernel/fs.c]]. **Read next:**
+  [[kernel/exec.c]] and [[kernel/pipe.c]].
+
+blocks:
+  - lines: 1-17
+    title: Headers
+    note: |
+      The opening comment sums up the file well: these functions check arguments, because
+      user code cannot be trusted, and call into [[kernel/file.c]] and [[kernel/fs.c]].
+
+      The include order matters in xv6 because its headers do not include each other:
+      [[kernel/proc.h]] uses `struct spinlock`, so [[kernel/spinlock.h]] must come first;
+      [[kernel/file.h]] embeds a `struct sleeplock` in `struct inode`, so
+      [[kernel/sleeplock.h]] must come before it. [[kernel/fcntl.h]] supplies the `O_` flags
+      that `open` takes, and [[kernel/stat.h]] the `T_DIR`/`T_FILE`/`T_DEVICE` inode types.
+
+  - lines: 19-35
+    title: "argfd(): turn a descriptor argument into an open file"
+    note: |
+      A [[g:file-descriptor]] is only an index into the calling process's `ofile` array
+      ([[NOFILE]] = 16 slots). User code can pass any integer, so before using it the kernel
+      checks that it is in range and that the slot actually holds an [[g:open-file]].
+
+      `n` says which system call argument holds the descriptor (0 for the first). The two
+      output pointers are optional: callers pass 0 for the result they do not need. Only
+      [[sys_close]] wants the number itself, because it must clear the slot.
+
+      No lock is needed to read `ofile`: a process's descriptor table is only ever touched by
+      that process itself, and an xv6 process has a single thread.
+
+  - lines: 37-52
+    title: "fdalloc(): give an open file the lowest free descriptor"
+    note: |
+      Scans the calling process's `ofile` array from slot 0 and stores `f` in the first empty
+      slot. Choosing the *lowest* free number is a Unix rule that programs rely on: the shell
+      redirects output by closing descriptor 1 and then opening a file, knowing the new file
+      will land in slot 1 ([[user/sh.c]]).
+
+      As the comment says, `fdalloc` takes over the caller's reference to `f` on success: it
+      does not increment `f->ref`. The slot now owns the reference that the caller got from
+      [[filealloc]] or [[filedup]], and [[sys_close]] (or [[kexit]]) will eventually drop it.
+      On failure (all 16 slots in use) it returns -1 and the caller still owns its
+      reference and must release it.
+
+  - lines: 54-66
+    title: "sys_dup(): a second descriptor for the same open file"
+    note: |
+      `dup(fd)` returns a new descriptor that refers to the *same* [[g:open-file]] as `fd`,
+      not a copy of it. Both descriptors then share one `struct file`, and therefore one file
+      offset: a `write` through either one advances the position for both. The shell uses
+      this when it builds pipelines.
+
+      Because two `ofile` slots now point at the same `struct file`, its
+      [[g:reference-count]] must go up by one; [[filedup]] does that under the file table's
+      lock. The order (find a slot first, then take the reference) means a full descriptor
+      table costs nothing to undo.
+
+  - lines: 68-80
+    title: "sys_read(): read from a descriptor"
+    note: |
+      `read(fd, buf, n)`. The buffer address `p` is a *user* virtual address. [[argaddr]]
+      does not check it; the check happens later, when the data is actually copied, in
+      [[copyout]] (via [[either_copyout]]), which refuses addresses the process does not own.
+      A negative `n` is rejected by [[fileread]].
+
+      [[fileread]] dispatches on the kind of open file: a pipe goes to [[piperead]], a device
+      to the driver's function in [[devsw]], an inode to [[readi]].
+
+  - lines: 82-95
+    title: "sys_write(): write to a descriptor"
+    note: |
+      The mirror image of [[sys_read]]. Note that there is no [[begin_op]] here even though
+      writing a file changes the disk: [[filewrite]] opens its own transactions, several of
+      them for a large write, because one [[g:transaction]] may only touch a limited number of
+      blocks ([[MAXOPBLOCKS]]).
+
+  - lines: 97-108
+    title: "sys_close(): release a descriptor"
+    note: |
+      Empties the `ofile` slot, then drops the slot's reference to the [[g:open-file]] with
+      [[fileclose]]. The `struct file` itself survives if other descriptors (from `dup` or
+      `fork`) still refer to it; only when the last reference goes does [[fileclose]] close
+      the pipe end or release the inode, inside its own transaction.
+
+  - lines: 110-120
+    title: "sys_fstat(): copy a file's metadata to the user"
+    note: |
+      `fstat(fd, &st)` fills a user-space `struct stat` ([[kernel/stat.h]]) with the inode's
+      device, [[g:inode-number]], type, [[g:link-count]] and size. [[filestat]] locks the
+      inode to read those fields consistently and then copies the structure out with
+      [[copyout]]. It returns -1 for a pipe, which has no inode.
+
+  - lines: 122-130
+    title: "sys_link(): give an existing file a second name"
+    note: |
+      `link(old, new)` adds a directory entry `new` that names the same [[g:inode]] as `old`.
+      Afterwards the two names are equal: neither is the "original", and the file's data
+      survives until both are removed. The inode's [[g:link-count]] (`nlink`) records how many
+      directory entries name it.
+
+      [[argstr]] copies each path from user memory into a kernel buffer of [[MAXPATH]] (128)
+      bytes. Copying first matters: the kernel must never work directly on user memory that
+      the program could change while the kernel is looking at it. `name` will receive the
+      last element of `new`, at most [[DIRSIZ]] (14) characters.
+
+  - lines: 132-153
+    title: Find the old file and count the new link in advance
+    note: |
+      Everything from here to the end runs in one [[g:transaction]], so a crash leaves the
+      disk either before the link or after it, never half-way.
+
+      Directories cannot be linked: a second name for a directory could create a cycle in the
+      tree and would confuse `..`. [[NLINK_MAX]] protects `nlink`, a `short`, from
+      overflowing.
+
+      Notice that `nlink` is incremented *before* the new directory entry exists, and the
+      inode is then unlocked. Two reasons:
+
+      - **Lock order.** The next step locks the parent directory of `new`. Holding a file's
+        lock while waiting for a directory's lock is the reverse of the order everyone else
+        uses ([[sys_unlink]] locks the directory, then the file), and could
+        [[g:deadlock]]. So `ip` is unlocked first.
+      - **Reserve the link while the lock is held.** The check against [[NLINK_MAX]] and the
+        increment happen in one hold of `ip`'s lock, so two concurrent `link` calls cannot
+        both pass the check; raising the count before the entry exists also keeps `nlink`
+        from ever being lower than the number of names for the file. (The inode cannot be
+        freed meanwhile in any case: this call still holds the reference [[namei]] gave it,
+        and [[iput]] frees an inode only when the last reference goes.)
+
+      If anything below fails, the `bad:` path takes the increment back.
+
+  - lines: 155-174
+    title: Add the new name to its directory
+    note: |
+      [[nameiparent]] walks `new` down to its last directory and returns that directory's
+      inode unlocked (with a reference), copying the final name element into `name`.
+
+      Three things can make the link impossible:
+
+      - the directory was deleted after the lookup found it (the guard explained by the
+        comment on lines 158–160);
+      - it lives on a different device: a directory entry holds only an
+        [[g:inode-number]], which means nothing on another disk (xv6 has only one file
+        system, so this never happens in practice);
+      - [[dirlink]] fails because `name` already exists or the disk is full.
+
+      On success the directory is unlocked and released, and [[iput]] drops the reference
+      that [[namei]] gave this call. The inode itself stays, now with one more name.
+
+  - lines: 176-183
+    title: Undo the early increment
+    note: |
+      Reached when the new name could not be created. The inode is locked again and `nlink`
+      is decremented and written back, all inside the same transaction, so nothing of the
+      failed attempt reaches the disk as a net change. [[iunlockput]] then drops the
+      reference from [[namei]].
+
+  - lines: 185-199
+    title: "isdirempty(): does a directory hold only . and ..?"
+    note: |
+      Unix refuses to remove a directory that still contains files; otherwise those files
+      would become unreachable. This helper reads every [[g:directory]] entry after the first
+      two and reports whether any is in use.
+
+      A directory is an ordinary file whose content is an array of `struct dirent` (16 bytes
+      each: a 2-byte inode number and a 14-byte name). An entry with `inum == 0` is a free
+      slot. The loop starts at `2 * sizeof(de)` because [[create]] (and `mkfs`) always put
+      `.` and `..` in the first two slots.
+
+      The caller must hold `dp`'s lock, as [[readi]] requires.
+
+  - lines: 201-210
+    title: "sys_unlink(): remove a name"
+    note: |
+      `unlink(path)` removes one directory entry. The file itself is deleted only when its
+      last name is gone *and* no process still has it open; [[iput]] makes that final
+      decision later. This is why a program can keep reading a file that someone else has
+      just removed.
+
+  - lines: 212-226
+    title: Lock the directory, then the entry
+    note: |
+      The whole operation is one [[g:transaction]]. [[nameiparent]] finds the directory `dp`
+      that contains the name; it is locked first, and only then is the entry `ip` looked up
+      and locked. This is xv6's locking order for inodes: **parent before child**. Every
+      path that holds two inode locks at once ([[create]] is the other) takes them in this
+      order, so no two processes can each hold one and wait for the other.
+
+      Holding `dp`'s lock for the whole operation also makes it atomic with respect to the
+      directory: nobody can create, remove or look up names in `dp` between the check and
+      the removal.
+
+      Removing `.` or `..` is refused. The source gives no reason beyond its comment; the two
+      hazards below are this annotation's own analysis of what would go wrong:
+
+      - For `.`, [[dirlookup]] returns `dp` itself, and `ilock(ip)` on line 226 would wait
+        for a [[g:sleeplock]] that this very process already holds, forever.
+      - For `..`, `ip` is the *parent* of `dp`: locking it now would take a parent after its
+        child, the reverse of the order, which can deadlock against a process unlinking
+        `dp` from that parent.
+
+  - lines: 228-233
+    title: Refuse to remove a non-empty directory
+    note: |
+      `dp` contains a name for `ip`, so `ip->nlink` must be at least 1; anything else means
+      the on-disk file system is corrupt, and the kernel stops with [[panic]] rather than
+      making things worse.
+
+      A directory may only be removed when [[isdirempty]] says it has nothing but `.` and
+      `..`. Holding `ip`'s lock here is what makes that check reliable: creating a file in
+      `ip` requires locking `ip` as the parent ([[create]]), so no entry can appear between
+      the check and the removal.
+
+  - lines: 235-250
+    title: Erase the entry and drop the link count
+    note: |
+      Overwriting the entry with zeros ([[memset]]) marks the slot free: `inum == 0` is what
+      [[dirlookup]] and [[dirlink]] treat as an empty slot. The directory does not shrink.
+
+      If the removed entry was a directory, its `..` pointed at `dp`, and that `..` counted
+      as one of `dp`'s links ([[create]] added it, line 311). So `dp->nlink` goes down too.
+
+      Then `ip->nlink` is decremented. Note that `dp` is unlocked first and `ip` last, after
+      both are done; releasing in any order is safe, only *acquiring* needs the fixed order.
+      If this was the last name and no one else holds a reference, the [[iput]] inside
+      [[iunlockput]] truncates and frees the inode. That is why the iput happens before
+      [[end_op]]: freeing writes to the disk and must be part of the transaction.
+
+  - lines: 252-256
+    title: Failure exit
+    note: |
+      Every failure after `dp` was locked comes here: release `dp` (lock and reference), end
+      the transaction, return -1. Nothing on disk was changed on these paths.
+
+  - lines: 258-272
+    title: "create(): make a new file, directory or device node"
+    note: |
+      The shared engine behind `open(..., O_CREATE)`, `mkdir` and `mknod`. It returns the new
+      (or, for `open`, the already existing) inode **locked and referenced**, or 0 on
+      failure. Callers must already be inside a transaction.
+
+      Returning a locked inode lets the caller go on to use it as part of the same atomic
+      step: [[sys_open]] reads `ip->type` and may truncate the file, and these fields may only
+      be read or changed under the inode's [[g:sleeplock]]. Unlocking at the end of `create`
+      would force every caller to lock it again straight away.
+
+      `dp->nlink == 0` means the parent directory has been removed. [[namex]] also checks
+      this, but it unlocks the directory before returning it, so the directory may have been
+      unlinked in between; this re-check under the lock closes that window. Creating a file
+      inside a deleted directory would leave the file unreachable and never freed.
+
+  - lines: 274-278
+    title: Room for one more link in the parent
+    note: |
+      A new subdirectory's `..` entry adds a link to `dp`. If `dp->nlink` were already at
+      [[NLINK_MAX]] (32767, the largest `short`), the increment on line 311 would overflow,
+      so the request is refused here, before anything has been allocated.
+
+  - lines: 280-287
+    title: The name already exists
+    note: |
+      If the name is taken, `create` succeeds only in one case: `open` with `O_CREATE` of an
+      existing file or device (the type requested is `T_FILE`, and the existing inode is a
+      file or device). That matches Unix: `O_CREATE` on an existing file opens it. `mkdir`
+      or `mknod` of an existing name fails, and so does `O_CREATE` on an existing directory.
+
+      Notice that `dp` is unlocked *before* `ip` is locked. The name might be `.` (so `ip`
+      is `dp` itself) or `..` (so `ip` is `dp`'s parent). Locking `ip` while still holding
+      `dp` would then deadlock with itself, or take a parent after its child.
+
+  - lines: 289-298
+    title: Allocate and initialize a fresh inode
+    note: |
+      [[ialloc]] finds a free on-disk inode, marks it allocated with the given type, and
+      returns it unlocked with a reference. `ilock` then reads it in. Here, unlike above, it
+      is safe to lock `ip` while holding `dp`: the order is parent then child, and no other
+      process can know about an inode that has no directory entry yet.
+
+      `major` and `minor` matter only for device nodes (they select the driver in
+      [[devsw]]); files and directories get 0. `nlink = 1` counts the name about to be added
+      in `dp`. [[iupdate]] writes the in-memory changes to the inode's disk block (through
+      the log).
+
+  - lines: 300-317
+    title: Link the new inode into the tree
+    note: |
+      A new directory first gets its two standard entries: `.` naming itself and `..` naming
+      the parent. Then the new name goes into the parent with [[dirlink]].
+
+      The comment on line 301 says "ref count", but the count in question is the
+      [[g:link-count]] (`nlink`), not the in-memory [[g:reference-count]] (`ref`). If `.`
+      counted as a link, a directory would always hold a link to itself and its `nlink`
+      could never fall to 0 when it is removed.
+
+      The parent's `nlink` is bumped for the child's `..` only at the end, "now that success
+      is guaranteed", so the failure path never has to undo it. Finally the parent is
+      released and the child returned, still locked.
+
+  - lines: 319-326
+    title: "Failure: free the half-made inode"
+    note: |
+      Setting `nlink` to 0 and dropping the only reference makes [[iput]] (inside
+      [[iunlockput]]) truncate the inode and mark it free on disk, so the failed attempt
+      does not leak an inode. It all happens in the caller's transaction, so if any `.` or
+      `..` entry had already been written, its blocks are freed in the same commit.
+
+  - lines: 328-339
+    title: "sys_open(): open or create a file"
+    note: |
+      `open(path, omode)` returns a new [[g:file-descriptor]]. `omode` combines flags from
+      [[kernel/fcntl.h]]: an access mode (`O_RDONLY` = 0, `O_WRONLY` = 1, `O_RDWR` = 2) plus
+      optional [[O_CREATE]] and [[O_TRUNC]]. `n`, the path's length, is only used to detect
+      a failed copy.
+
+  - lines: 341-360
+    title: Find (or create) the inode
+    note: |
+      The whole open runs in a [[g:transaction]], even a plain read-only open: [[namei]] and
+      [[iunlockput]] may call [[iput]], and an `iput` can free an inode on disk, which must
+      always happen inside a transaction.
+
+      With `O_CREATE`, [[create]] returns the inode already locked. Without it, [[namei]]
+      looks the path up and the inode is locked here. Either way, from line 362 on `ip` is
+      locked and its fields can be trusted.
+
+      A directory may be opened only for reading (that is how `ls` reads directory entries,
+      [[user/ls.c]]). Writing to a directory through `write` would let a program corrupt the
+      entries that [[dirlink]] and [[dirlookup]] depend on.
+
+  - lines: 362-366
+    title: Reject device nodes with impossible major numbers
+    note: |
+      A device inode's `major` number is later used as an index into the [[devsw]] array of
+      [[NDEV]] (10) driver entries. `mknod` accepts any number, so the value is checked
+      here, before any open file can carry it. [[fileread]] and [[filewrite]] check again
+      before indexing.
+
+  - lines: 368-374
+    title: Get an open-file structure and a descriptor
+    note: |
+      [[filealloc]] takes a free `struct file` from the system-wide table ([[NFILE]] = 100),
+      and [[fdalloc]] gives it a slot in this process's table. Either can run out.
+
+      On failure the `struct file` (if one was taken) is returned with [[fileclose]]. At
+      this point its type is still `FD_NONE`, so `fileclose` only drops the reference and
+      does not touch the inode. The inode's lock and the reference from `namei`/`create`
+      are released separately by [[iunlockput]].
+
+  - lines: 376-389
+    title: Fill in the open file
+    note: |
+      A device node becomes an `FD_DEVICE` file that remembers the driver number; reads and
+      writes will go to [[devsw]]`[major]` (for example [[consoleread]]). Everything else
+      becomes an `FD_INODE` file whose offset starts at 0.
+
+      `f->ip = ip` hands over the inode reference obtained by `namei`/`create`: the open file
+      now owns it, and [[fileclose]] will drop it.
+
+      `O_TRUNC` discards an existing file's content with [[itrunc]], under the inode lock and
+      inside the transaction. It is ignored for devices and directories.
+
+  - lines: 391-395
+    title: Unlock but keep the reference
+    note: |
+      The inode is unlocked, so other processes can use the file, but not released: the open
+      file still holds its reference, which keeps the inode in the in-memory table until the
+      file is closed. Each later `read` or `write` locks it again for just as long as it
+      needs ([[fileread]]).
+
+  - lines: 397-411
+    title: "sys_mkdir(): create a directory"
+    note: |
+      [[create]] with type `T_DIR` does all the work, including the `.` and `..` entries and
+      the parent's link count. `mkdir` has no use for the inode it returns, so it is
+      unlocked and released at once.
+
+      `argstr` runs after [[begin_op]] here; that is harmless, since a failed copy only means
+      an empty transaction.
+
+  - lines: 413-431
+    title: "sys_mknod(): create a device node"
+    note: |
+      `mknod(path, major, minor)` creates an inode of type `T_DEVICE`. It has no data blocks;
+      the major number names the driver. At boot, if `console` cannot be opened, `/init` uses
+      `mknod` to create it with major number [[CONSOLE]] (1) ([[user/init.c]]). The numbers are not validated here;
+      [[sys_open]] checks `major` before using it.
+
+  - lines: 433-456
+    title: "sys_chdir(): change the current directory"
+    note: |
+      Every process has a current directory, `p->cwd`, an inode reference that [[namex]]
+      starts from when a path does not begin with `/`.
+
+      The new directory is looked up and locked only long enough to check that it *is* a
+      directory; then it is unlocked but its reference is kept, because `p->cwd` will hold
+      it. The old directory's reference is dropped with [[iput]], inside the transaction,
+      since it might be the last reference to a directory that has already been removed, and
+      then `iput` frees it on disk.
+
+      Setting `p->cwd` after [[end_op]] is fine: only this process reads its own `cwd`.
+
+  - lines: 458-468
+    title: "sys_exec(): copy the program's path and arguments into the kernel"
+    note: |
+      `exec(path, argv)` replaces the calling process's program. Before [[kexec]] can build
+      the new memory image, every argument string must be copied out of the *old* image,
+      because the old image is about to be destroyed. This function does that copying.
+
+      `argv` here is a kernel array of [[MAXARG]] (32) pointers, one per argument. `uargv`
+      is the user's `argv`: the address, in user memory, of an array of pointers to strings,
+      ended by a null pointer (see [[g:argv]]).
+
+  - lines: 469-486
+    title: Fetch each argument string into its own kernel page
+    note: |
+      [[memset]] fills the array with null pointers, so that the clean-up loops below can
+      stop at the first empty slot.
+
+      Each iteration reads one 8-byte pointer from the user's array with [[fetchaddr]],
+      which checks that the address lies inside the process's memory. A null pointer ends the
+      list. Otherwise one whole [[g:page]] is taken from [[kalloc]] and the string is copied
+      into it with [[fetchstr]], which fails if the string has no terminating zero within
+      [[PGSIZE]] (4096) bytes.
+
+      The `i >= NELEM(argv)` test fires when the user's list has no null terminator within
+      32 entries. Since the terminator needs a slot too, at most 31 arguments get through.
+      [[NELEM]] is the number of elements of an array, `sizeof(x)/sizeof(x[0])`.
+
+  - lines: 488-493
+    title: Run kexec, then free the copies
+    note: |
+      [[kexec]] loads the program and copies the strings onto the new user stack, so the
+      kernel pages are not needed afterwards, whether `kexec` succeeded or not.
+
+      On success, `ret` is `argc`. The return value of a system call ends up in the user's
+      `a0` register ([[kernel/syscall.c:146]]), and for a successful `exec` that register is
+      the first argument of the new program's entry function. On failure `ret` is -1 and the
+      old program, still intact, sees `exec` return -1.
+
+  - lines: 495-499
+    title: Failure while copying arguments
+    note: |
+      Frees whatever pages were already allocated. Because `argv` was zeroed first, and
+      filled from slot 0 upwards with no gaps, stopping at the first null pointer frees
+      exactly the allocated pages.
+
+  - lines: 501-511
+    title: "sys_pipe(): create a pipe and two descriptors"
+    note: |
+      `pipe(fds)` creates a [[g:pipe]] and returns two descriptors through the user's array:
+      `fds[0]` for reading and `fds[1]` for writing. [[pipealloc]] creates the pipe buffer
+      and two [[g:open-file|open files]], `rf` (read-only) and `wf` (write-only).
+
+  - lines: 512-519
+    title: Install both ends in the descriptor table
+    note: |
+      If the second [[fdalloc]] fails, the first one must be undone: the slot is cleared and
+      both open files are closed, which also frees the pipe ([[pipeclose]] frees it once both
+      ends are closed).
+
+      The assignment `fd0 = -1` is defensive only: the condition on the next line always
+      assigns `fd0` before anything reads it.
+
+  - lines: 520-530
+    title: Tell the user which descriptors it got
+    note: |
+      The two descriptor numbers are written into the user's `int` array, 4 bytes each, with
+      [[copyout]], which fails if `fdarray` is not writable memory of this process. If
+      either copy fails, the descriptors are taken back and the pipe is destroyed, so a bad
+      pointer does not leave the process with two descriptors it cannot know about.
+
+lines:
+  27: |
+    Read the raw descriptor number from the saved user registers. [[argint]] cannot fail;
+    the range check is the next line's job.
+  28: |
+    Reject a descriptor that is negative, at least [[NOFILE]], or names an empty slot. The
+    order matters: `fd` is checked against the bounds before it is used as an index. The
+    assignment inside the condition stores the open file in `f` as a side effect.
+  46: |
+    A null pointer marks a free slot.
+  47: |
+    Install `f`. The slot now owns the caller's reference (no `ref++` here).
+  62: |
+    Allocate the new descriptor first; if the table is full, nothing needs undoing.
+  64: |
+    Count the new slot's reference to the shared `struct file` ([[filedup]] increments
+    `f->ref`).
+  79: |
+    Read up to `n` bytes into user memory at `p`, at the open file's current offset;
+    returns the number of bytes read, 0 at end of file, or -1.
+  94: |
+    Write `n` bytes from user memory at `p`. Returns `n`, or -1 on error.
+  105: |
+    Free the slot first, so the descriptor number can be reused.
+  106: |
+    Drop the reference. Only the last close of a shared `struct file` actually closes it.
+  119: |
+    Copy a `struct stat` describing the file to the user address `st`.
+  129: |
+    Copy both path names into kernel buffers; fail if either address is bad or a path is
+    longer than 127 characters.
+  132: |
+    Start the [[g:transaction]]. Every `return` from here on is preceded by [[end_op]].
+  133: |
+    Look up `old`. [[namei]] returns the inode referenced but not locked.
+  138: |
+    Lock the inode, reading it from disk if needed, before looking at `type` or `nlink`.
+  151: |
+    Count the link that is about to be added. Only the in-memory copy changes here.
+  152: |
+    Write the new count to the inode's disk block, through the log.
+  153: |
+    Unlock (keeping the reference) before locking the directory; see the block note.
+  155: |
+    Find the directory that will contain `new`, and the last element of the path.
+  165: |
+    `||` stops at the first true test, so [[dirlink]] runs only if the devices match. It
+    fails if the name already exists or the directory cannot grow.
+  170: |
+    Drop the reference [[namei]] took on line 133. The inode is not locked at this point,
+    so [[iput]] rather than [[iunlockput]].
+  192: |
+    Visit every 16-byte entry after `.` and `..` up to the directory's size.
+  193: |
+    Read one entry into the kernel variable `de` (`0` means `de` is a kernel address).
+    A short read inside the directory's own size means the disk is inconsistent.
+  195: |
+    A used slot means the directory is not empty.
+  213: |
+    Find the containing directory and the final name. It comes back unlocked.
+  221: |
+    [[namecmp]] compares at most [[DIRSIZ]] characters, because directory names need not
+    end in a zero byte.
+  224: |
+    Look the name up in `dp`. `off` receives the byte offset of the entry, needed to erase
+    it below. The inode comes back referenced, not locked.
+  226: |
+    Lock the child while the parent is still locked: parent before child.
+  236: |
+    Write the zeroed entry over the old one, at the offset found by [[dirlookup]]. Failure
+    here should be impossible: the entry already exists, so no block needs allocating.
+  239: |
+    The removed directory's `..` no longer refers to `dp`.
+  244: |
+    One name fewer. If it reaches 0, the inode will be freed once no one holds a reference.
+  246: |
+    Unlock and drop this call's reference; frees the inode if this was the last reference
+    and `nlink` is 0.
+  264: |
+    Find the directory that will hold the new name; `name` receives the last element.
+  280: |
+    Is the name already taken? [[dirlookup]] returns its inode referenced, not locked.
+  283: |
+    Only `open` asks for `T_FILE`, and it accepts an existing file or device.
+  289: |
+    Allocate a free inode on the same device as the parent.
+  302: |
+    `.` names the new directory itself, `..` names the parent. Both entries are written into
+    the new directory's first data block.
+  306: |
+    Add the new name to the parent. Fails if the name appeared meanwhile (it cannot, as
+    `dp` has been locked since the lookup) or the disk is full.
+  311: |
+    The child's `..` is a new link to the parent.
+  338: |
+    Copy the path into the kernel. `argstr` returns its length, or -1.
+  343: |
+    `O_CREATE` is bit 9 (`0x200`).
+  355: |
+    A directory may be opened, but only read-only.
+  362: |
+    `major` must be a valid index into [[devsw]].
+  368: |
+    Take a `struct file` and then a descriptor. `||` stops early, so `fd` is assigned only
+    if the first call succeeded.
+  384: |
+    Readable unless opened write-only. Note that `O_RDWR` is `2`, so `O_RDWR & O_WRONLY` is
+    0 and an `O_RDWR` file is readable.
+  385: |
+    Writable if either write-capable mode bit is set.
+  387: |
+    Truncate only regular files.
+  404: |
+    Copy the path; then create the directory, which comes back locked.
+  423: |
+    Copy the path and create the device inode with the given numbers.
+  441: |
+    Copy the path and look it up; the inode comes back referenced, not locked.
+  452: |
+    Drop the old current directory's reference, inside the transaction.
+  454: |
+    The process now starts relative path lookups from `ip`.
+  465: |
+    The address of the user's `argv` array, the second argument.
+  466: |
+    Copy the program's path into the kernel.
+  474: |
+    Read `argv[i]`, the user's pointer to the i-th string, from user memory. The address
+    arithmetic is done by hand, 8 bytes per pointer, because `uargv` is a plain number.
+  477: |
+    The null pointer that ends the list: record it and stop.
+  481: |
+    One page per argument string.
+  484: |
+    Copy the string (with its terminating zero) into that page.
+  488: |
+    Build the new image. Returns `argc`, or -1 if the old image was left in place.
+  510: |
+    Create the pipe and its two open files: `rf` reads, `wf` writes.
+  513: |
+    Give each end a descriptor. If the first fails, the second is never tried.
+  515: |
+    Undo the first descriptor if the second could not be allocated.
+  520: |
+    Write `fd0` into `fds[0]`; on success, write `fd1` four bytes further on, into
+    `fds[1]`.

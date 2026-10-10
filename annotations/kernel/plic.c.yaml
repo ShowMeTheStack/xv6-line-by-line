@@ -1,0 +1,117 @@
+summary: |
+  The driver for the [[g:plic|PLIC]] (platform-level interrupt controller), the device
+  that sits between the other devices and the harts. The UART and the disk do not
+  interrupt a hart directly: each raises a numbered *interrupt source* at the PLIC, and the
+  PLIC decides which harts to signal, using a supervisor external interrupt.
+
+  The PLIC is programmed entirely through [[g:mmio|memory-mapped registers]] starting at
+  [[PLIC]] = `0x0c000000`, whose addresses are defined in [[kernel/memlayout.h]]. There
+  are four kinds:
+
+  | Register | Address | Meaning |
+  |---|---|---|
+  | priority of source *i* | `PLIC + 4*i` | 0 = never deliver; higher = more urgent |
+  | enable bits for a context | [[PLIC_SENABLE]]`(hart)` | bit *i* = deliver source *i* to this hart's supervisor mode |
+  | threshold for a context | [[PLIC_SPRIORITY]]`(hart)` | deliver only sources whose priority is above this |
+  | claim / complete | [[PLIC_SCLAIM]]`(hart)` | read: which source to serve; write: done with it |
+
+  A *context* is one hart in one privilege mode. On QEMU's `virt` machine, hart *h* has
+  context `2h` for machine mode and `2h+1` for supervisor mode; the `S` macros compute the
+  addresses for context `2h+1`.
+
+  The four functions split into setup ([[plicinit]] once, [[plicinithart]] per hart, from
+  [[main]]) and the per-interrupt pair [[plic_claim]] / [[plic_complete]], called from
+  [[devintr]].
+
+  **Read before:** [[kernel/memlayout.h]]. **Read next:** [[devintr]] in
+  [[kernel/trap.c]].
+
+blocks:
+  - lines: 1-9
+    title: Headers
+    note: |
+      [[kernel/memlayout.h]] provides the PLIC register addresses and the source numbers
+      [[UART0_IRQ]] (10) and [[VIRTIO0_IRQ]] (1), fixed by QEMU's `virt` machine.
+      [[kernel/defs.h]] declares [[cpuid]].
+
+  - lines: 11-17
+    title: "plicinit(): give the two devices a priority"
+    note: |
+      Called once, by hart 0 ([[kernel/main.c:25]]). Every source starts with priority 0,
+      which means "disabled": the PLIC never delivers it, whatever the enable bits say.
+      Setting the UART's and the disk's priority to 1 makes them deliverable. Both get the
+      same priority, so neither is preferred.
+
+      The address arithmetic: priority registers are 32 bits (4 bytes) each, one per
+      source, starting at [[PLIC]], so source *i*'s register is at `PLIC + i*4`:
+      `0x0c000028` for the UART and `0x0c000004` for the disk. The cast to `uint32 *`
+      makes the store write exactly 4 bytes, the register's size.
+
+      These addresses are usable because the kernel page table maps the PLIC's 64 MiB
+      region at the same address ([[kernel/vm.c:36]]).
+
+  - lines: 19-30
+    title: "plicinithart(): accept the two devices on this hart"
+    note: |
+      Called on every hart ([[kernel/main.c:26]] and [[kernel/main.c:41]]), because
+      enable bits and thresholds are per context.
+
+      Line 26 writes this hart's supervisor-mode enable register: one bit per source, so
+      `(1 << 10) | (1 << 1)` = `0x402` enables the UART and the disk. Writing the whole
+      word also disables every other source in the first 32. Every hart enables both, so
+      the PLIC may signal any of them; whichever claims first serves the interrupt.
+
+      Line 29 sets this hart's threshold to 0. The PLIC delivers only sources whose
+      priority is *greater than* the threshold, so with threshold 0 everything of priority
+      1 or more gets through.
+
+      Neither step enables interrupts on the hart itself. That needs `SEIE` in
+      [[g:csr:sie|sie]] (set in [[start]], [[kernel/start.c:33]]) and the global
+      `sstatus.SIE` bit, which the kernel turns on and off at run time.
+
+  - lines: 32-39
+    title: "plic_claim(): which device interrupted?"
+    note: |
+      [[devintr]] calls this after a supervisor external interrupt. Reading this hart's
+      claim register returns the number of the highest-priority source that is pending
+      and enabled for this context, and atomically clears its pending bit, so the same
+      interrupt is not handed to another hart too. It returns 0 if nothing is pending,
+      which happens when another hart claimed the interrupt first.
+
+      The read itself has an effect on the device; that is normal for
+      [[g:mmio|memory-mapped I/O]] and quite unlike ordinary memory.
+
+  - lines: 41-47
+    title: "plic_complete(): the device has been served"
+    note: |
+      Writing the source number back to the same register signals *completion*. Between
+      claim and completion the PLIC does not forward further interrupts from that source;
+      after it, the source can interrupt again. [[devintr]] calls this after the driver's
+      handler ([[uartintr]] or [[virtio_disk_intr]]) has dealt with the device
+      ([[kernel/trap.c:210]]).
+
+      The PLIC ignores a completion written to a context that does not have that source
+      enabled. Using this hart's own register, the one it claimed from, is the natural
+      choice, and `devintr` claims and completes on the same hart without yielding in
+      between.
+
+      The pointer casts here and above are not [[g:volatile]]. That is enough in practice
+      because each function makes a single access whose result is used or whose effect is
+      visible outside the function, so the compiler keeps it; declaring the pointers
+      `volatile` would make the intent explicit.
+
+lines:
+  15: |
+    Priority of source 10 (the UART) = 1.
+  16: |
+    Priority of source 1 (the virtio disk) = 1.
+  22: |
+    This hart's number ([[cpuid]]), to pick its registers.
+  26: |
+    Enable sources 10 and 1 for this hart's supervisor mode ([[PLIC_SENABLE]]).
+  29: |
+    Threshold 0: deliver every enabled source with priority ≥ 1 ([[PLIC_SPRIORITY]]).
+  37: |
+    Claim: read the number of the interrupting source (0 if none) from [[PLIC_SCLAIM]].
+  46: |
+    Complete: write the source number back to the same register.

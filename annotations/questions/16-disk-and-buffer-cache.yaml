@@ -1,0 +1,731 @@
+title: The disk driver and the buffer cache
+summary: How bread and brelse share 30 cached blocks between harts with a spinlock, a sleep-lock and a reference count, and how virtio_disk_rw hands a request to the disk through descriptors, rings and a doorbell, then sleeps until the interrupt.
+questions:
+  - id: disk-01
+    level: 1
+    type: number
+    q: |
+      `cat` needs file-system block 48, so [[virtio_disk_rw]] builds a request for it. Which
+      **sector** number does it put in the request header?
+    code: kernel/virtio_disk.c:215-218
+    answer: 96
+    wrong:
+      48: |
+        You may have assumed the disk counts in file-system blocks. It counts 512-byte sectors,
+        and an xv6 block ([[BSIZE]]) is 1024 bytes, two sectors.
+      24: |
+        You may have divided instead of multiplied. Sectors are *smaller* than blocks, so there
+        are more of them: block 48 starts at sector 48 × 2.
+      49152: |
+        That is the block's *byte* offset in `fs.img` (96 × 512 = 48 × 1024). The header carries
+        a sector number, not a byte offset.
+    why_wrong: Compute blockno * (BSIZE / 512), with BSIZE = 1024.
+    explain: |
+      `sector = b->blockno * (BSIZE / 512)` = 48 × 2 = 96. The device then transfers `BSIZE` =
+      1024 bytes, two sectors, starting at byte 49,152 of the disk image ([[tour:29]]).
+
+  - id: disk-02
+    level: 2
+    type: number
+    q: |
+      The driver has [[NUM]] = 8 descriptors, and every request uses exactly three. At most how
+      many disk requests can be in flight (handed to the device and not yet freed) at once?
+    code: kernel/virtio_disk.c:199-213
+    answer: 2
+    wrong:
+      8: |
+        You may have thought each request needs one descriptor. Every xv6 request is a chain of
+        three: header, data and status.
+      3: |
+        You may have rounded 8 / 3 up. After two requests take six descriptors, only two are
+        free, and a third request needs three, so it sleeps in `virtio_disk_rw` until one of the
+        first two completes.
+      1: |
+        You may have thought `vdisk_lock` serializes whole requests. It is released while a
+        request sleeps, so a second process can issue its own request meanwhile.
+    why_wrong: Divide the 8 descriptors into groups of three and see how many whole groups fit.
+    explain: |
+      Two requests use six descriptors; the remaining two are not enough for a third, which
+      sleeps on `&disk.free[0]` in [[virtio_disk_rw]] until a request completes and
+      [[free_chain]] returns its three ([[tour:29]]).
+
+  - id: disk-03
+    level: 1
+    type: choice
+    q: |
+      In [[bread]], what does it mean when [[bget]] returns a buffer with `valid == 0`?
+    code: kernel/bio.c:90-102
+    options:
+      - text: The buffer's data does not hold the block's contents yet, so bread must read it from the disk.
+        correct: true
+        why: |
+          bget sets `valid = 0` whenever it relabels a recycled buffer for a new block; the old
+          bytes in `data` belong to some other block. bread reads the block and then sets
+          `valid = 1`.
+      - text: The buffer is free, so nobody else is using it.
+        why: |
+          You may have confused `valid` with `refcnt`. Whether a buffer is in use is counted by
+          `refcnt`; `valid` is only about whether `data` is filled in.
+      - text: The buffer has been modified and must be written back to disk before reuse.
+        why: |
+          You may be thinking of a "dirty" bit. xv6 has none: modified buffers are kept from being
+          recycled by the log's pin (`refcnt`), and `valid` says nothing about modifications.
+      - text: The disk currently owns the buffer and is transferring into it.
+        why: |
+          That is the `disk` field, set by [[virtio_disk_rw]] and cleared by the interrupt
+          handler. `valid` is the cache's flag, not the driver's.
+    explain: |
+      `valid` answers "does `data` hold this block?". It is checked and set while the caller
+      holds the buffer's sleep-lock, so exactly one process reads a given block from disk and
+      everyone after it finds `valid == 1` ([[tour:29]], [[tour:30]]).
+
+  - id: disk-04
+    level: 1
+    type: choice
+    q: |
+      Why is each buffer's lock (`b->lock`) a *sleep-lock* rather than a spinlock?
+    code: kernel/buf.h:1-11@6
+    options:
+      - text: Its holder may wait for a disk transfer, and a process must not sleep while holding a spinlock.
+        correct: true
+        why: |
+          bread holds `b->lock` across [[virtio_disk_rw]], which sleeps until the interrupt.
+          Sleeping with a spinlock held would panic in [[sched]], and spinning waiters would burn
+          their harts with interrupts off for the whole transfer.
+      - text: So that the disk interrupt handler can take it when the transfer completes.
+        why: |
+          You may have thought the handler touches the buffer's lock. It must not: a sleep-lock
+          can sleep, and an interrupt handler may not. [[virtio_disk_intr]] touches only
+          `b->disk`, under `disk.vdisk_lock`.
+      - text: Sleep-locks are faster than spinlocks for short critical sections.
+        why: |
+          The opposite: a sleep-lock takes an internal spinlock and may cause a context switch.
+          It is chosen for *long* waits, not speed.
+      - text: So that several processes can read the same buffer at once.
+        why: |
+          You may be thinking of reader-writer locks. A sleep-lock has one holder at a time;
+          a second process that wants the block sleeps until [[brelse]].
+    explain: |
+      Long waits (a disk read) call for a lock whose waiters sleep. That is why both inode and
+      buffer locks are sleep-locks, and why neither is ever taken in an interrupt handler
+      ([[concept:locks#sleep-locks]], [[concept:locks#lock-buf]]).
+
+  - id: disk-05
+    level: 1
+    type: tf
+    q: |
+      True or false: [[virtio_disk_rw]] holds `disk.vdisk_lock` while it sleeps waiting for the
+      disk to finish.
+    code: kernel/virtio_disk.c:286-298
+    answer: false
+    why_tf: |
+      You may have thought the lock must be held to keep the request safe while it waits. It is
+      released before sleeping and re-acquired after.
+    reasons:
+      - text: It releases vdisk_lock between sleep_prepare(b) and sleep(), because the interrupt handler needs that lock to mark the request done, and sched forbids sleeping with a spinlock other than p->lock.
+        correct: true
+        why: |
+          [[virtio_disk_intr]] starts with `acquire(&disk.vdisk_lock)`. If the sleeper kept it,
+          the handler would spin forever and the sleeper would never be woken.
+      - text: It keeps it, so that no other hart can use the descriptors while the device works.
+        why: |
+          The descriptors are protected by `disk.free[]`: a busy descriptor is marked not free.
+          Other harts may take the lock and issue their own requests with other descriptors.
+      - text: It hands it to sleep(), which releases it after marking the process SLEEPING.
+        why: |
+          You may be remembering MIT xv6's `sleep(chan, lk)`. In this tree, [[sleep]] takes no
+          lock argument: the caller registers with [[sleep_prepare]], releases its lock itself,
+          then calls `sleep()`.
+    explain: |
+      `sleep_prepare(b)`, `release(&disk.vdisk_lock)`, `sleep()`: registering first means a
+      completion that arrives between the release and the sleep is not lost; wakeup clears
+      `p->chan` and sleep returns at once ([[tour:29]], [[concept:locks#sleep-wakeup]]).
+
+  - id: disk-06
+    level: 2
+    type: order
+    q: |
+      Put the steps of a disk read in [[virtio_disk_rw]] in order.
+    items:
+      - text: compute the sector and acquire disk.vdisk_lock
+        why: Everything that touches the shared descriptors and rings happens under the lock.
+      - text: get three free descriptors with alloc3_desc
+        why: The request cannot be described before it owns descriptors.
+      - text: fill in the header, data and status descriptors
+        why: The chain must be complete before the device can be told about it.
+      - text: record b in disk.info[idx[0]] and set b->disk = 1
+        why: The interrupt handler needs this record to find the buffer, so it must exist before the device can finish.
+      - text: write idx[0] into the avail ring, fence, then increment avail->idx
+        why: The ring entry must be visible before the index that announces it.
+      - text: store to the QUEUE_NOTIFY register
+        why: The doorbell comes last, after a second fence, so the device sees a complete request.
+      - text: sleep until b->disk == 0, then free the chain
+        why: The descriptors can be freed only after the device has finished with them.
+    why_wrong: Build the request, record it, publish it, ring the doorbell, then wait; each step needs the previous one finished.
+    explain: |
+      Data, then index, then doorbell: the order of writes is part of the protocol between driver
+      and device, and the fences enforce it ([[tour:29]], [[io_fence]]).
+
+  - id: disk-07
+    level: 2
+    type: line
+    q: |
+      Most of the driver talks to the device through ordinary RAM that both share. Click the one
+      line in this excerpt that writes to a **device register** (memory-mapped I/O): the
+      doorbell.
+    code: kernel/virtio_disk.c:270-292
+    answer: 284
+    lines:
+      275: |
+        `disk.avail` is a page of RAM from [[kalloc]] that the device reads by DMA. Writing the
+        ring entry is a plain memory store, not a register access.
+      280: |
+        You may have thought the index lives in the device. `avail->idx` is in the same shared
+        RAM page as the ring; the device reads it when it looks at the queue.
+      277: |
+        A fence orders memory and I/O accesses; it does not write anything.
+      272: |
+        `disk.info[]` is the driver's private bookkeeping in the kernel's `disk` structure; the
+        device never sees it.
+    why_wrong: Look for a store through the R() macro, which points into the virtio MMIO region at VIRTIO0.
+    explain: |
+      Line 284 stores to `R(VIRTIO_MMIO_QUEUE_NOTIFY)`, a register at `VIRTIO0` +
+      `0x050`, telling the device "queue 0 has work". The descriptors and rings it then reads are
+      in RAM ([[g:virtqueue]], [[g:mmio]], [[tour:29]]).
+
+  - id: disk-08
+    level: 2
+    type: bits
+    q: |
+      While a request is in flight, gdb shows one of its three descriptors with `flags = 0x3`.
+      Decode it (`VRING_DESC_F_NEXT` = 1, `VRING_DESC_F_WRITE` = 2).
+    value: "0x3"
+    fields:
+      - label: VRING_DESC_F_NEXT (bit 0)
+        options: ["1 (another descriptor follows)", "0 (last in the chain)"]
+        answer: "1 (another descriptor follows)"
+        why: "0x3 = 0b11: bit 0 is set, so the next field links to another descriptor."
+      - label: VRING_DESC_F_WRITE (bit 1)
+        options: ["1 (the device writes this memory)", "0 (the device only reads it)"]
+        answer: "1 (the device writes this memory)"
+        why: "Bit 1 is set. WRITE is from the device's point of view: it may write into this buffer."
+      - label: Which descriptor of xv6's chain is it?
+        options: ["the data descriptor (b->data)", "the header (type, sector)", "the status byte"]
+        answer: "the data descriptor (b->data)"
+        why: "The header always has flags 1 (NEXT only), the status byte always 2 (WRITE only). Only the data descriptor can have both."
+      - label: Is this request a disk read or a disk write?
+        options: ["read", "write"]
+        answer: "read"
+        why: "For a read the device writes b->data, so the data descriptor gets WRITE. For a write it would be NEXT only (flags 1)."
+    explain: |
+      [[virtio_disk_rw]] sets the data descriptor to `VRING_DESC_F_WRITE` for a read and 0 for a
+      write, then ORs in `VRING_DESC_F_NEXT` because the status descriptor follows
+      ([[kernel/virtio_disk.c:257]], [[tour:29]]).
+
+  - id: disk-09
+    level: 2
+    type: state
+    q: |
+      Hart 1 is idle in its [[scheduler]] loop when the disk interrupt arrives. It traps through
+      [[kernelvec]] and [[kerneltrap]] into [[devintr]], which calls [[virtio_disk_intr]]. What
+      is hart 1's state just after `acquire(&disk.vdisk_lock)` returns?
+    code: kernel/virtio_disk.c:300-311@303
+    state:
+      mode: S
+      stack: scheduler
+      satp: kernel
+      sie: "off"
+      noff: 1
+      intena: 0
+    why:
+      stack: |
+        xv6 has no separate interrupt stack: [[kernelvec]] pushes its frame onto whatever stack
+        the hart is using, here the scheduler's (this is the per-hart `stack0` slice the hart
+        booted on, which the scheduler keeps using). It never uses the stack of the process that
+        is waiting for this disk request.
+      intena: |
+        intena records SIE as it was before the outermost push_off. Taking the trap cleared
+        SIE, so when acquire's push_off ran, interrupts were already off: intena is 0.
+      noff: |
+        The scheduler held no spinlock when it took the interrupt (an interrupt can only arrive
+        when noff is 0), so vdisk_lock is the only one: noff is 1.
+      sie: |
+        The trap itself cleared SIE, and a spinlock is now held; interrupts are off either way.
+    why_wrong: Start from the idle scheduler (no lock held, interrupts briefly on), apply the trap (SIE cleared), then one acquire.
+    explain: |
+      S-mode on the scheduler stack, kernel page table, SIE off, noff 1, intena 0. When the
+      handler releases `vdisk_lock`, pop_off leaves interrupts off (intena 0), and `sret` later
+      restores SIE from SPIE ([[concept:stacks#same]], [[concept:locks#intena]], [[tour:29]]).
+
+  - id: disk-10
+    level: 2
+    type: state
+    q: |
+      `cat`'s `read` system call has reached [[virtio_disk_rw]] (through [[fileread]],
+      [[readi]] and [[bread]]). It holds README's inode lock and the buffer's sleep-lock, and is
+      at line 284, about to ring the doorbell. What is the state of its hart?
+    code: kernel/virtio_disk.c:270-292@284
+    state:
+      mode: S
+      stack: kernel
+      satp: kernel
+      sie: "off"
+      noff: 1
+      intena: 1
+    why:
+      noff: |
+        You may have counted the inode and buffer locks. They are sleep-locks, which are not
+        held as spinlocks after `acquiresleep` returns, so noff does not count them. Only
+        `disk.vdisk_lock` is held: noff is 1.
+      intena: |
+        Interrupts were on (usertrap enabled them for the system call) when acquire's push_off
+        ran, so intena is 1. The release before sleep() or at the end will turn them back on.
+      sie: |
+        A spinlock (`vdisk_lock`) is held, so SIE is off; that is what keeps this hart from
+        taking the disk interrupt while it holds the lock the handler needs.
+      stack: |
+        The request is part of `cat`'s system call, so it runs on `cat`'s kernel stack.
+    why_wrong: Count only spinlocks in noff; sleep-locks are released from the spinlock point of view once acquired.
+    explain: |
+      One spinlock, taken during a system call: noff 1, intena 1, SIE off. The two sleep-locks
+      `cat` holds do not affect the interrupt state at all ([[concept:locks#sleep-locks]],
+      [[tour:29]]).
+
+  - id: disk-11
+    level: 2
+    type: number
+    q: |
+      Right after boot, [[binit]] has built the LRU list and every buffer has `refcnt == 0`. The
+      first [[bget]] miss scans from `bcache.head.prev`. Which index `i` of `bcache.buf[i]` does
+      it recycle?
+    code: kernel/bio.c:35-52
+    answer: 0
+    wrong:
+      29: |
+        You may have thought the last buffer inserted ends up at the tail. Each insertion goes at
+        the *front* (`head.next`), so `buf[29]` is at the front and `buf[0]`, inserted first,
+        has been pushed to the back.
+      1: |
+        You may have counted from 1. Arrays in C start at 0, and `buf[0]` is the first one
+        inserted.
+    why_wrong: "Trace binit: each buffer is inserted right after head. Which one is left next to head on the prev side?"
+    explain: |
+      binit inserts `buf[0]` .. `buf[29]` at the front, so `head.next` is `buf[29]` and
+      `head.prev` is `buf[0]`. The recycling scan starts at `head.prev`, so the first miss takes
+      `buf[0]`, the second `buf[1]`, and so on ([[tour:30]]).
+
+  - id: disk-12
+    level: 2
+    type: multi
+    q: |
+      Which fields of a `struct buf` are protected by `bcache.lock` (the spinlock), rather than
+      by the buffer's own sleep-lock or by the disk lock?
+    code: kernel/buf.h:1-11
+    options:
+      - text: "`refcnt`"
+        correct: true
+        why: It is only changed under `bcache.lock`, in [[bget]], [[brelse]], [[bpin]] and [[bunpin]].
+      - text: "`prev` and `next`"
+        correct: true
+        why: The LRU list is the cache's directory; [[brelse]] relinks buffers under `bcache.lock`.
+      - text: "`dev` and `blockno`"
+        correct: true
+        why: Which block a buffer holds is decided in [[bget]] under `bcache.lock`, so two harts cannot label two buffers with the same block.
+      - text: "`data`"
+        why: |
+          You may have thought the cache lock covers everything in the cache. The 1024 bytes of
+          data are protected by `b->lock`, the sleep-lock, which may be held across a disk read.
+      - text: "`disk`"
+        why: |
+          You may have grouped it with the buffer's other fields. `b->disk` is set by
+          [[virtio_disk_rw]] and cleared by [[virtio_disk_intr]], both under `disk.vdisk_lock`.
+    explain: |
+      `bcache.lock` (short, spinning) guards the bookkeeping: identity, count and list position.
+      `b->lock` (long, sleeping) guards the contents. `disk.vdisk_lock` guards the driver's
+      `disk` flag ([[concept:locks#lock-bcache]], [[tour:30]]).
+
+  - id: disk-13
+    level: 1
+    type: match
+    q: |
+      Match each lock with what it protects.
+    pairs:
+      - left: "`bcache.lock`"
+        right: which buffer holds which block, the reference counts and the LRU list
+        why: It is the one spinlock for the cache's bookkeeping, held only while bget scans the 30-buffer list (twice on a miss) or brelse relinks one buffer.
+      - left: "`b->lock`"
+        right: one buffer's data and valid flag, across a disk read
+        why: It is a sleep-lock, held from bget to brelse by the one thread using the block.
+      - left: "`disk.vdisk_lock`"
+        right: the descriptors, the free flags, the avail and used rings and info[]
+        why: It is taken by every hart that issues a request and by the interrupt handler.
+      - left: "`lk->lk` inside a sleep-lock"
+        right: the sleep-lock's locked flag and holder pid
+        why: acquiresleep and releasesleep take it briefly to test and change `locked`.
+    explain: |
+      Two spinlocks for bookkeeping that is touched briefly, one sleep-lock per buffer for
+      contents held a long time, and a small spinlock inside each sleep-lock
+      ([[concept:locks#inventory]], [[tour:30]]).
+
+  - id: disk-14
+    level: 3
+    type: choice
+    q: |
+      On a cache hit, [[bget]] increments `b->refcnt` *before* releasing `bcache.lock` and
+      calling [[acquiresleep]]. What could go wrong if it released `bcache.lock` first and
+      incremented `refcnt` afterwards?
+    code: kernel/bio.c:57-88@66-69
+    options:
+      - text: In the gap, another hart's bget could see refcnt == 0, relabel the buffer for a different block, and this thread would then use the wrong block's data.
+        correct: true
+        why: |
+          `refcnt` is how the recycler knows a buffer is wanted. A late increment leaves a window
+          in which the buffer looks free; the recycling scan may hand it to another block, and
+          this thread would later lock a buffer whose `blockno` has changed.
+      - text: acquiresleep would deadlock, because it needs bcache.lock to be held.
+        why: |
+          acquiresleep never touches `bcache.lock`; it uses the sleep-lock's own `lk->lk`. In
+          fact bcache.lock *must* be released first, since acquiresleep may sleep.
+      - text: Nothing, because refcnt is protected by b->lock, which this thread is about to take anyway.
+        why: |
+          You may have assigned refcnt to the wrong lock. It is protected by `bcache.lock`; the
+          sleep-lock does not stop the recycler, which never takes it.
+      - text: brelse would move the buffer to the head of the LRU list too early.
+        why: |
+          The list order only affects which free buffer is recycled first. The real danger is
+          being recycled at all while about to be used.
+    explain: |
+      Each thread's share of `refcnt` must cover the whole time it holds *or waits for* the
+      sleep-lock. Incrementing under `bcache.lock` closes the window, so a buffer with
+      `refcnt == 0` is never about to be used ([[tour:30]], [[concept:locks#unusual]]).
+
+  - id: disk-15
+    level: 3
+    type: choice
+    q: |
+      When [[bget]] recycles a buffer, it overwrites `dev`, `blockno` and `valid` without ever
+      writing the old `data` back to disk. Why can't that lose a modification?
+    code: kernel/bio.c:74-88
+    options:
+      - text: Every modified buffer is pinned by log_write (refcnt > 0) until install_trans has written it home and unpinned it, so a buffer with refcnt == 0 is always clean.
+        correct: true
+        why: |
+          [[log_write]] calls [[bpin]] the first time a block joins a transaction, and
+          [[install_trans]] calls [[bunpin]] only after [[bwrite]] has put the block in its home
+          location. Until then the recycler skips it.
+      - text: bget does write it back, inside virtio_disk_rw, before relabeling.
+        why: |
+          You may have expected a write-back cache. bget never calls the driver; only [[bread]]
+          (to read) and [[bwrite]] (called by the log) do.
+      - text: brelse writes every buffer to disk when its refcnt drops to zero.
+        why: |
+          brelse only relinks the buffer at the head of the LRU list; it never does I/O. Writes
+          happen in the log's commit.
+      - text: Modified buffers have valid set to 0, so the recycling scan skips them.
+        why: |
+          You may have read `valid` as "clean". It means only "data holds the block"; the recycler
+          looks at `refcnt`, not `valid`.
+    explain: |
+      In xv6 the log owns all writes: modified blocks stay pinned in the cache until committed
+      and installed. So "nobody holds it" implies "nothing unsaved in it", and recycling is a
+      plain relabel ([[tour:30]], [[tour:31]]).
+
+  - id: disk-16
+    level: 2
+    type: choice
+    q: |
+      [[log_write]] calls [[bpin]] the first time a block joins the current transaction. What is
+      the pin for?
+    code: kernel/log.c:223-244@239-242
+    options:
+      - text: It keeps refcnt above zero so the buffer, which now holds the only up-to-date copy of the block, cannot be recycled before the commit.
+        correct: true
+        why: |
+          The disk still has the old contents until the transaction commits. If the buffer were
+          recycled first, the change would vanish. [[bunpin]] in the commit removes the pin.
+      - text: It locks the buffer so that no other process can read or change it until the commit.
+        why: |
+          You may have confused a pin with a lock. Other processes can still [[bread]] the block
+          and add their own changes (log absorption); only recycling is prevented.
+      - text: It marks the buffer dirty so that bget will write it back before reusing it.
+        why: |
+          xv6 has no dirty bit and bget never writes back. The pin works by making the buffer
+          ineligible for recycling, not by scheduling a write.
+      - text: It stops the disk interrupt handler from touching the buffer while the log writes it.
+        why: |
+          The handler touches only `b->disk` under `disk.vdisk_lock`; pins do not affect it.
+    explain: |
+      A pin is a reference that no process owns. It costs one `refcnt++` under `bcache.lock` and
+      keeps a dirty block in memory until [[install_trans]] has written it to its home location
+      ([[tour:30]]).
+
+  - id: disk-17
+    level: 3
+    type: multi
+    q: |
+      Child A (hart 1) and child B (hart 2) both need block 46 at once. A's [[bget]] misses,
+      relabels a buffer as 46 with `valid = 0`, and releases `bcache.lock`; then B's `bget` runs
+      while A is reading the block from disk. Which statements are true?
+    code: kernel/bio.c:57-102
+    options:
+      - text: B finds the buffer labelled 46 in its first (hit) scan, although its data is not there yet.
+        correct: true
+        why: A relabeled it under `bcache.lock`, so from that moment every scan finds it as block 46, filled or not.
+      - text: B sleeps in acquiresleep until A releases the buffer's sleep-lock.
+        correct: true
+        why: A holds `b->lock` through the disk read and its own use of the block; B waits without using a hart.
+      - text: The disk reads block 46 only once.
+        correct: true
+        why: When B finally gets the lock, A has set `valid = 1`, so B's [[bread]] skips the disk.
+      - text: B gets a second buffer labelled 46, because A's buffer has valid == 0.
+        why: |
+          You may have thought an unfilled buffer does not count as cached. bget matches on
+          `dev` and `blockno` only; one buffer per block is exactly what the cache guarantees.
+      - text: B spins on hart 2 with interrupts off until A's disk read completes.
+        why: |
+          B waits on a *sleep-lock*: acquiresleep releases its small spinlock and sleeps, so hart 2
+          is free to run something else.
+    explain: |
+      One buffer per block (decided under `bcache.lock`) plus one holder at a time (the
+      sleep-lock) plus `valid` checked under that sleep-lock: the block is read once and the two
+      children take turns ([[tour:30]]).
+
+  - id: disk-18
+    level: 3
+    type: choice
+    q: |
+      When [[alloc3_desc]] gets only one or two descriptors, it gives them back before
+      [[virtio_disk_rw]] sleeps. Why not keep them and wait only for the missing ones?
+    code: kernel/virtio_disk.c:199-236@204-211
+    options:
+      - text: Waiters holding partial sets could together own all 8 descriptors while none has 3; with no request in flight, nobody would ever free one.
+        correct: true
+        why: |
+          Four waiters holding two each would own all eight. Since only completed requests free
+          descriptors, all four would sleep forever. Giving back partial sets means every allocated
+          descriptor belongs to a request the device will finish.
+      - text: The device requires the three descriptors of a chain to be contiguous.
+        why: |
+          The comment on alloc3_desc says they "need not be contiguous": the chain is linked by
+          each descriptor's `next` field.
+      - text: free_desc must be called so that wakeup(&disk.free[0]) runs and the waiter is woken.
+        why: |
+          That reverses cause and effect. The waiter is woken by *other* requests freeing
+          descriptors; freeing its own partial set is about not blocking everyone else.
+      - text: Descriptors cannot be held across sleep(), because they are protected by a spinlock.
+        why: |
+          A descriptor is "held" by its `free[i] = 0` mark, not by a lock. In-flight requests keep
+          theirs across sleep all the time.
+    explain: |
+      This is the "hold and wait" condition for deadlock, avoided by holding nothing while
+      waiting. A sleeping request owns no descriptors, so any completion makes progress possible
+      ([[tour:29]], [[g:deadlock]]).
+
+  - id: disk-19
+    level: 1
+    type: choice
+    q: |
+      `cat` issued a request on hart 0 and is asleep. The completion interrupt is taken on
+      hart 1. How does [[virtio_disk_intr]] know which buffer, and so which sleeper, the
+      completion is for?
+    code: kernel/virtio_disk.c:300-333@318-327
+    options:
+      - text: The used ring gives the head descriptor of the finished chain, and disk.info[id].b records the buffer for that chain; it calls wakeup(b).
+        correct: true
+        why: |
+          [[virtio_disk_rw]] stored `info[idx[0]].b = b` when it built the request, and `cat`
+          registered on channel `b` with `sleep_prepare(b)`. The buffer address is the meeting
+          point.
+      - text: It wakes the process that last ran on the hart that issued the request.
+        why: |
+          You may have thought requests are tied to harts. The handler does not know or care
+          which hart issued the request, and `cat` may resume on any hart.
+      - text: The device reports the block number, and the handler searches the buffer cache for it.
+        why: |
+          The device reports only the chain's head index (and a length). The handler never
+          touches `bcache`.
+      - text: It wakes every process sleeping in virtio_disk_rw, and each checks whether its own request is done.
+        why: |
+          wakeup(b) wakes only processes whose channel is this buffer. (Each one still re-checks
+          `b->disk`, but processes waiting for other buffers are not disturbed.)
+    explain: |
+      Descriptor index to `info[]` to `struct buf *` to sleep channel: that chain lets any hart
+      finish a request issued by any other ([[tour:29]]).
+
+  - id: disk-20
+    level: 3
+    type: choice
+    q: |
+      [[virtio_disk_rw]] waits with `while (b->disk == 1) { sleep_prepare(b); release; sleep();
+      acquire; }` instead of sleeping once. When can `sleep()` return while the disk is still
+      working on the request?
+    code: kernel/virtio_disk.c:286-292
+    options:
+      - text: When another process kills this one; kkill makes a SLEEPING process RUNNABLE without any wakeup on b.
+        correct: true
+        why: |
+          [[kkill]] sets `p->killed` and, if the process is SLEEPING, sets it RUNNABLE. It returns
+          from sleep() with `b->disk` still 1, so the loop sends it back to sleep until the disk
+          really finishes.
+      - text: When the interrupt for the first of the two sectors arrives, before the second is done.
+        why: |
+          You may have thought each sector completes separately. The device posts one used-ring
+          entry for the whole chain, and the handler clears `b->disk` only then.
+      - text: When the wakeup arrives between release and sleep(), since that wakeup is lost.
+        why: |
+          That wakeup is *not* lost: sleep_prepare registered first, wakeup clears `p->chan`, and
+          sleep() returns at once. But in that case `b->disk` is already 0, so the loop exits.
+      - text: When the interrupt is handled on a different hart from the one the request was issued on.
+        why: |
+          Which hart takes the interrupt makes no difference: wakeup(b) finds `cat` through the
+          process table, on any hart.
+    explain: |
+      In xv6, sleep is only a hint that the condition may have changed; the condition itself
+      (`b->disk`) is re-checked under `vdisk_lock` every time. A killed process cannot abandon
+      the request, because the device would still DMA into `b->data` ([[tour:29]],
+      [[tour:16]]).
+
+  - id: disk-21
+    level: 1
+    type: choice
+    q: |
+      During a disk read, who copies the 1024 bytes of the block into `b->data`?
+    options:
+      - text: The device itself, by DMA, while no hart runs any instruction for it.
+        correct: true
+        why: |
+          The data descriptor points at `b->data` (a physical address, thanks to the direct map),
+          and the device writes the block there directly ([[g:dma]]).
+      - text: virtio_disk_intr, with a memmove from the device's buffer.
+        why: |
+          You may have thought the handler moves the data. It only checks the status byte, clears
+          `b->disk` and wakes the sleeper; the bytes are already in place.
+      - text: The hart that called virtio_disk_rw, by reading the device's data register in a loop.
+        why: |
+          That is programmed I/O, which xv6's UART uses. The virtio disk uses DMA: the requester
+          sleeps instead of copying.
+      - text: readi, using either_copyout.
+        why: |
+          readi copies from `b->data` to the *user's* buffer afterwards. Filling `b->data` from
+          the disk happened before bread returned.
+    explain: |
+      The driver describes memory (descriptors), the device moves the data (DMA), and the
+      interrupt only says "done". That is why `cat` can sleep through the whole transfer
+      ([[tour:29]]).
+
+  - id: disk-22
+    level: 1
+    type: line
+    q: |
+      Process B is asleep in [[acquiresleep]], waiting for a buffer that process A holds. Click
+      the line of A's [[brelse]] that lets B continue.
+    code: kernel/bio.c:114-137
+    answer: 122
+    lines:
+      125: |
+        You may have thought the reference count is what B waits for. B is waiting for the
+        sleep-lock; `refcnt` only tells the recycler whether the buffer is wanted.
+      124: |
+        `bcache.lock` protects the cache's bookkeeping. B is not waiting for it; B is asleep on
+        the buffer's sleep-lock.
+      126: |
+        This decides whether to move the buffer in the LRU list. With B still waiting, `refcnt`
+        is not 0, so this branch is not even taken.
+      119: |
+        This only checks that A holds the sleep-lock; it changes nothing.
+    why_wrong: Find the call that clears the sleep-lock's locked flag and wakes its waiters.
+    explain: |
+      Line 122 calls [[releasesleep]], which sets `locked = 0` and calls `wakeup(lk)`. Releasing
+      the sleep-lock *before* decrementing `refcnt` keeps the rule that a buffer with `refcnt == 0`
+      is never locked ([[tour:30]]).
+
+  - id: disk-23
+    level: 3
+    type: tf
+    q: |
+      True or false: `panic("bget: no buffers")` can only happen while a log transaction has
+      pinned buffers; with no transaction running, every buffer is eventually free.
+    code: kernel/bio.c:74-88@87
+    answer: false
+    why_tf: |
+      You may have thought only pins keep buffers busy. Every process that holds or waits for a
+      buffer also counts in `refcnt`.
+    reasons:
+      - text: Readers count too; if 30 processes each hold a buffer for a different block while waiting for the disk (or for descriptors), a 31st block finds no buffer with refcnt == 0.
+        correct: true
+        why: |
+          A process inside [[bread]] keeps `refcnt` at 1 until [[brelse]]. Reads need no
+          [[begin_op]], so nothing limits how many are waiting at once, and bget does not wait
+          for a buffer: it panics.
+      - text: Only pinned buffers have refcnt > 0, so without a transaction all 30 buffers are recyclable.
+        why: |
+          `refcnt` counts every bget that has not yet been matched by a brelse, plus pins. A
+          buffer held by a reader is not recyclable.
+      - text: bget sleeps until some buffer is released, so it panics only during a commit, when the log itself needs buffers.
+        why: |
+          bget never sleeps for a free buffer. If the recycling scan reaches `head` again, it
+          panics immediately.
+    explain: |
+      There are 30 buffers ([[NBUF]]) and no waiting for a free one. The kernel relies on margins
+      (few buffers per operation, bounded transactions) rather than enforcing a limit
+      ([[tour:30]]).
+
+  - id: disk-24
+    level: 2
+    type: multi
+    q: |
+      Which of these are done by the hart that takes the disk completion interrupt (in
+      [[devintr]] and [[virtio_disk_intr]]), rather than by the process that issued the request?
+    code: kernel/virtio_disk.c:300-333
+    options:
+      - text: claiming the interrupt from the PLIC
+        correct: true
+        why: "[[devintr]] calls [[plic_claim]], which returns 1 ([[VIRTIO0_IRQ]]), and [[plic_complete]] afterwards."
+      - text: acknowledging the interrupt in the device's INTERRUPT_ACK register
+        correct: true
+        why: Line 311 writes the status bits back, so the device can raise its next interrupt.
+      - text: setting b->disk = 0 and calling wakeup(b)
+        correct: true
+        why: That is how the handler tells the sleeper its request is done.
+      - text: setting b->valid = 1
+        why: |
+          You may have thought "the data arrived" is recorded by the handler. `valid` belongs to
+          the cache, and [[bread]] sets it after virtio_disk_rw returns, in the requester.
+      - text: freeing the request's three descriptors
+        why: |
+          The requester does that with [[free_chain]] after it wakes up. The handler leaves
+          `info[]` and the descriptors alone.
+    explain: |
+      The handler does the minimum: claim, acknowledge, walk the used ring, mark each buffer done
+      and wake its owner. Cleanup and the cache's bookkeeping happen later, in process context
+      ([[tour:29]]).
+
+  - id: disk-25
+    level: 2
+    type: choice
+    q: |
+      Why is there an [[io_fence]] between writing `avail->ring[...]` and incrementing
+      `avail->idx`?
+    code: kernel/virtio_disk.c:274-284@277
+    options:
+      - text: So the device cannot see the new idx before the ring entry and the descriptors are visible in memory.
+        correct: true
+        why: |
+          The device treats a bigger `idx` as "a new request is ready" and then reads the ring and
+          the chain. Without the fence, the hart or compiler could make the index visible first,
+          and the device could read a half-built request.
+      - text: So that other harts cannot take vdisk_lock until the request is published.
+        why: |
+          You may have confused ordering with mutual exclusion. Other harts are kept out by
+          `vdisk_lock` itself, held the whole time; a fence excludes no one.
+      - text: To wait until the device has finished the previous request.
+        why: |
+          A fence only orders this hart's own memory and I/O accesses. It does not wait for the
+          device to do anything.
+      - text: To flush b->data out to the disk before the request starts.
+        why: |
+          A fence does not write anything to disk; for a write, the device itself reads `b->data`
+          by DMA after it sees the request.
+    explain: |
+      Data, then index, then doorbell: two fences make that order visible to the device in the
+      same order it was written ([[tour:29]], [[g:memory-barrier]], [[tour:19]]).

@@ -1,0 +1,924 @@
+title: Exceptions and faults
+group: Traps and system calls
+prerequisites: [5, 7]
+summary: |
+  A system call is a trap the program asks for. An [[g:exception]] is a trap the program did
+  not ask for: it touched memory it has no page for, wrote to its own code, or executed an
+  instruction it is not allowed to execute. The hardware stops the instruction halfway,
+  records what went wrong in three [[g:csr:scause|CSRs]], and jumps into the kernel. The
+  kernel then has exactly three choices: **fix the problem and retry the instruction**,
+  **kill the process**, or, if the faulting code was the kernel itself, **stop the whole
+  machine**.
+
+  This tour shows all three, using real programs and real numbers from runs of this build (scenes 1–2) and of a
+  scratch copy we modified (scenes 3–4):
+
+  1. `usertests lazy_alloc` asks for a gigabyte with `sbrklazy` and then stores into it. Each
+     first touch of a page is a [[g:page-fault]] that [[kernel:vmfault]] quietly repairs.
+  2. `usertests nowrite` stores into its own read-only code page. The fault cannot be
+     repaired, so the kernel prints `usertrap(): unexpected scause 0xf` and kills the child.
+  3. A test program we added to a scratch copy (it is not in xv6) executes `csrr mhartid`,
+     a machine-mode instruction, and is killed for an illegal instruction.
+  4. A bug we deliberately planted in a scratch copy of the kernel (not in xv6's source)
+     makes the kernel itself read address 0. That ends in
+     `panic: kerneltrap`, and we watch what the panic does to the other two harts.
+
+  The trap entry itself (trampoline, trapframe, [[kernel:usertrap]]'s first lines) is covered
+  by [[tour:5]] and [[tour:7]]. Here we go deeper into what happens *after* `scause` says
+  "this was not a system call".
+cast: |
+  The machine has three [[g:hart|harts]]. The four faults come from separate runs; for the
+  first one, in the run we traced with gdb:
+
+  | Hart | What it is doing |
+  |---|---|
+  | 0 | Idle in its [[kernel:scheduler]] (`init` and `sh` are asleep in `wait`), or running whatever is runnable |
+  | 1 | Running pid 4, the child that `usertests` forked to run `lazy_alloc`: the process we follow first |
+  | 2 | Idle in its own scheduler, or running whatever else is runnable |
+
+  `usertests` itself (pid 3) is asleep in [[kernel:kwait]], waiting for pid 4. Later scenes
+  move to hart 2 (the `nowrite` children and the kernel fault) and back to hart 0 (a hart
+  that is caught printing during a panic, in a hypothetical scene).
+steps:
+  - title: lazy_alloc asks for a gigabyte it will barely use
+    file: user/usertests.c
+    lines: 2623-2650
+    focus: 2632-2640
+    state:
+      hart: 1
+      mode: U
+      proc: usertests lazy_alloc (pid 4)
+      intr: on
+      satp: user
+      locks: []
+      stack: [lazy_alloc]
+      sp: user
+    note: |
+      [[user:lazy_alloc]] asks for `REGION_SZ`, 1 GiB, with [[user:sbrklazy]]. That is
+      eight times the machine's whole 128 MiB of RAM. Then it writes one pointer into every
+      64th page, 4096 pages in all (16 MiB), and reads them back.
+
+      `sbrklazy(n)` is a one-line wrapper ([[user/ulib.c:159]]): it calls the `sys_sbrk`
+      system call with a second argument, `SBRK_LAZY` (2), instead of `SBRK_EAGER` (1). The
+      difference is the whole point of this scene:
+
+      - **eager** `sbrk` allocates and maps every page immediately ([[kernel:growproc]] →
+        [[kernel:uvmalloc]]). A gigabyte would fail: there is not that much memory.
+      - **lazy** `sbrk` only *promises* the memory. Pages appear one at a time, when the
+        program first touches them, through page faults.
+
+      In our run `usertests` had size `0x12000` (its code, data, a guard page and one stack
+      page), so `sbrklazy` returns `prev_end = 0x12000`, and the first store on line 2640
+      goes to `prev_end + PGSIZE = 0x13000`.
+
+      The allocation strategy itself is the subject of [[tour:26]]. This tour follows what
+      the *trap* does with it.
+
+  - title: sys_sbrk only moves the size
+    file: kernel/sysproc.c
+    lines: 39-65
+    focus: 54-63
+    state:
+      hart: 1
+      mode: S
+      proc: usertests lazy_alloc (pid 4)
+      intr: on
+      satp: kernel
+      locks: []
+      stack: [usertrap, syscall, sys_sbrk]
+      sp:
+        "on": kernel
+        switched: "`ld sp, 8(a0)` in [[uservec]] ([[kernel/trampoline.S:76]])"
+      irq: 0
+    note: |
+      [[sys_sbrk]] fetches `n = 1073741824` and `t = SBRK_LAZY` from the trapframe
+      ([[argint]], see [[tour:6]]) and records `addr = p->sz = 0x12000`. Because the request
+      is lazy and positive, it takes the `else` branch:
+
+      - `addr + n < addr` rejects a request that would wrap around the 64-bit address space.
+      - `addr + n > TRAPFRAME` rejects a heap that would run into the [[g:trapframe]] page at
+        `0x3fffffe000`.
+      - `myproc()->sz += n`: the size becomes `0x40012000`.
+
+      That is all. No page is allocated, no [[g:pte]] is written. The page table still ends
+      at `0x12000`; above it, every PTE is invalid. `p->sz` is now a *promise*: "any address
+      below this is legitimately mine".
+
+      Remember that number. In a moment the hardware will complain about address `0x13000`,
+      and `p->sz` is the only thing that tells the kernel the complaint is about a page it
+      owes the process, not about a wild pointer.
+    others: |
+      No lock protects `p->sz` here. Only pid 4's own system calls (`sbrk`, `exec`) change
+      pid 4's size, and xv6 processes are single-threaded, so while pid 4 is in `sys_sbrk`
+      nothing else can be growing or shrinking it. Other harts never touch another live
+      process's `sz`; [[freeproc]] resets it only after the process has become a zombie and
+      been reaped.
+
+  - title: The store that the hardware refuses
+    file: user/usertests.c
+    lines: 2637-2649
+    focus: 2639-2640
+    state:
+      hart: 1
+      mode: U
+      proc: usertests lazy_alloc (pid 4)
+      intr: on
+      satp: user
+      locks: []
+      stack: [lazy_alloc]
+      sp:
+        "on": user
+        switched: "`ld sp, 48(a0)` in [[kernel:userret]] ([[kernel/trampoline.S:118]]) and `sret` ([[kernel/trampoline.S:153]]), returning from `sbrk`"
+    note: |
+      Back in user mode, line 2640 compiles to `sd a5,0(a5)` at address `0x495e`
+      (`user/usertests.asm`), with `a5 = 0x13000`. The hart's page-table walker looks up
+      `0x13000` in pid 4's page table and finds an invalid PTE. The store cannot complete,
+      so the hart raises a **store/AMO page fault** instead of executing it:
+
+      | Register | Becomes |
+      |---|---|
+      | `sepc` | `0x495e`, the address of the faulting `sd` itself |
+      | `scause` | 15, "store/AMO page fault" (high bit 0: an exception, not an interrupt) |
+      | `stval` | `0x13000`, the address it tried to store to |
+      | `sstatus.SPP` / `SPIE` / `SIE` | 0 (from user mode) / old `SIE` / interrupts **off** |
+      | `pc` | `stvec`, which points at [[uservec]] in the [[g:trampoline]] |
+
+      The trap goes to supervisor mode only because [[kernel:start]] delegated all exceptions
+      there with [[g:csr:medeleg|medeleg]] at boot ([[kernel/start.c:31]]). Without that,
+      it would go to machine mode, where xv6 has no handler.
+
+      Compare with `ecall` in [[tour:5]]: there `sepc` pointed at an instruction that
+      *finished* its job, so the kernel added 4. Here the `sd` did **not** happen. If the
+      kernel fixes the cause, it must run this very instruction again.
+
+  - title: usertrap, the path not taken by system calls
+    file: kernel/trap.c
+    lines: 37-80
+    focus: 69-74
+    state:
+      hart: 1
+      mode: S
+      proc: usertests lazy_alloc (pid 4)
+      intr: off
+      satp: kernel
+      locks: []
+      stack: [usertrap]
+      sp:
+        "on": kernel
+        switched: "`ld sp, 8(a0)` in [[uservec]] ([[kernel/trampoline.S:76]])"
+        detail: "empty on entry: `usertrap`'s frame is the only one"
+      irq: 0
+    note: |
+      [[uservec]] saves pid 4's 31 registers into its trapframe and calls [[usertrap]] on
+      pid 4's kernel stack, exactly as for a system call ([[tour:7]] covers every
+      instruction). The exception, like any trap, left `sp` alone; `uservec` saved the user
+      `sp` in the trapframe and loaded the top of pid 4's kernel stack, which is empty
+      whenever a process is in user mode ([[concept:stacks]]). The kernel never *runs on*
+      the user's stack: the kernel page table does not map user memory at all, and the
+      user's `sp` could hold any value, even an address in the guard page. `usertrap` saves `sepc` (`0x495e`) into `p->trapframe->epc`, and then
+      asks its three questions in order:
+
+      1. `scause == 8`? A system call. No.
+      2. [[devintr]]? It tests `scause` for the two interrupt codes (high bit set). `15` has
+         the high bit clear, so `devintr` returns 0: not a device.
+      3. `scause` is 15 (store) or 13 (load) **and** [[vmfault]] can supply a page? Lines
+         71–73 call `vmfault(p->pagetable, p->sz, r_stval(), 0)`.
+
+      Notice two things that are *not* here. There is no `epc += 4`: the instruction must be
+      retried. And there is no [[intr_on]]: on this path interrupts stay **off** for the whole
+      time in the kernel. Only the system-call branch turns them on. Repairing a page fault
+      is short work, and nothing in it needs to sleep.
+
+      Only 13 and 15 are candidates. An *instruction* page fault (12) never reaches
+      `vmfault`, so jumping into a lazily promised page kills the process; lazy pages are
+      mapped without execute permission anyway.
+
+  - title: vmfault decides whether the fault is legitimate
+    file: kernel/vm.c
+    lines: 454-478
+    focus: 459-468
+    state:
+      hart: 1
+      mode: S
+      proc: usertests lazy_alloc (pid 4)
+      intr: off
+      satp: kernel
+      locks: []
+      stack: [usertrap, vmfault]
+      sp: kernel
+      irq: 0
+    note: |
+      [[vmfault]] has one job: tell a promised-but-missing page apart from everything else.
+      gdb, stopped here in our run: `va = 0x13000`, `psz = 0x40012000`, `read = 0`.
+
+      - `va >= psz`? No: `0x13000` is below the size `sys_sbrk` recorded. The process owns it.
+      - `PGROUNDDOWN(va)`: `0x13000` is already page-aligned. (A fault at `0x13008` would be
+        rounded to the same page.)
+      - [[ismapped]]? If the page is already mapped, the fault was *not* about a missing
+        page: it was a permission violation, such as a store to read-only memory. That is
+        not `vmfault`'s to fix, so it returns 0. We will hit this case in scene 2.
+
+      The order of the checks matters. `va >= psz` comes first, and `psz` is never above
+      `TRAPFRAME`, so `ismapped` (which calls [[walk]]) only ever sees addresses below
+      `MAXVA`. `walk` would **panic** on an address at or above `MAXVA`; a user pointer like
+      `0xffffffffffffffff` must never get that far.
+
+      The `read` argument (1 for a load fault) is not used by this version of `vmfault`.
+      Loads and stores to a missing page are treated alike.
+
+  - title: ismapped looks without touching
+    file: kernel/vm.c
+    lines: 480-491
+    focus: 483-489
+    state:
+      hart: 1
+      mode: S
+      proc: usertests lazy_alloc (pid 4)
+      intr: off
+      satp: kernel
+      locks: []
+      stack: [usertrap, vmfault, ismapped]
+      sp: kernel
+      irq: 0
+    note: |
+      [[ismapped]] calls `walk(pagetable, va, 0)`. The final `0` means "do not allocate":
+      if an intermediate page-table page is missing, `walk` returns 0 instead of creating
+      one, so looking can never change the page table.
+
+      For `0x13000` the two upper levels exist: top-level entry 0 (covering
+      `0`–`0x3fffffff`) and middle-level entry 0 (covering `0`–`0x1fffff`) exist, and they
+      were created when `exec` mapped the
+      program's text at address 0. So `walk` returns a pointer to the bottom-level PTE for
+      `0x13000`, and that PTE is 0: `PTE_V` clear. `ismapped` returns 0, "not mapped", and
+      `vmfault` goes on to allocate.
+
+      This is the same walk the hardware did a few microseconds ago when it refused the
+      store, now done in software by the kernel, on pid 4's page table, while the hart
+      itself runs on the kernel page table.
+
+  - title: kalloc takes a page from the shared free list
+    file: kernel/kalloc.c
+    lines: 65-82
+    focus: 74-76
+    state:
+      hart: 1
+      mode: S
+      proc: usertests lazy_alloc (pid 4)
+      intr: off
+      satp: kernel
+      locks: [kmem.lock]
+      stack: [usertrap, vmfault, kalloc]
+      sp: kernel
+      irq: {noff: 1, intena: 0, note: "intena 0: a page fault never reaches usertrap's `intr_on`, so SIE was already off at the push_off"}
+    note: |
+      [[kalloc]] pops the first page off `kmem.freelist`. This is the first point on the path
+      that touches state shared by all harts, so it is the first lock: `kmem.lock`.
+
+      [[acquire]] calls [[push_off]] first. Interrupts were already off (we are in
+      `usertrap`'s fault path), so `push_off` records `intena = 0` and the matching
+      [[pop_off]] will leave them off. The pop of the list is a handful of instructions inside
+      the [[g:critical-section]]; the 4096-byte junk fill with `5` happens *after* the
+      release, so the lock is held only for a few instructions.
+
+      In our run the page was physical `0x80039000`. Its old contents (junk, or whatever a
+      freed process left there) are about to be wiped. The allocator itself is
+      [[tour:27]].
+    others: |
+      All three harts allocate from this one list. Without the lock:
+
+      | Time | Hart 1 (pid 4, page fault) | Hart 2 (another process's fork) |
+      |---|---|---|
+      | t1 | `r = kmem.freelist` → page P | |
+      | t2 | | `r = kmem.freelist` → **the same page P** |
+      | t3 | `freelist = r->next` | `freelist = r->next` |
+      | t4 | maps P into pid 4 | maps P into the child |
+
+      Two processes would now share one physical page, each reading the other's data. With
+      the lock, hart 2's `acquire` spins on its `amoswap` until hart 1 has stored the new
+      list head and released; hart 2 then gets the *next* page.
+
+  - title: Zero the page, then map it
+    file: kernel/vm.c
+    lines: 454-478
+    focus: 469-477
+    state:
+      hart: 1
+      mode: S
+      proc: usertests lazy_alloc (pid 4)
+      intr: off
+      satp: kernel
+      locks: []
+      stack: [usertrap, vmfault]
+      sp: kernel
+      irq: 0
+    note: |
+      Back in [[vmfault]]:
+
+      - `kalloc` returned 0? Memory is exhausted. `vmfault` returns 0, `usertrap` treats the
+        fault as unexplained, and the process is killed. A lazy promise can be broken; that
+        is the price of not reserving memory up front.
+      - `memset(mem, 0, PGSIZE)`: the page must start as zeros. It is the kernel writing to
+        it, through the [[g:direct-map]] at `0x80039000`. Without this, pid 4 could read
+        whatever the page's previous owner left behind: another user's file contents, a
+        password typed into a shell.
+      - [[mappages]] installs it at `0x13000` with `PTE_W | PTE_U | PTE_R`: readable and
+        writable by user code, **not** executable.
+      - If `mappages` fails (it may need to allocate a page-table page and find none), the
+        page goes back with [[kfree]], which takes `kmem.lock` again.
+
+      `vmfault` returns the physical address, non-zero, which `usertrap` reads as "handled".
+
+  - title: mappages writes one PTE
+    file: kernel/vm.c
+    lines: 141-175
+    focus: 161-170
+    state:
+      hart: 1
+      mode: S
+      proc: usertests lazy_alloc (pid 4)
+      intr: off
+      satp: kernel
+      locks: []
+      stack: [usertrap, vmfault, mappages]
+      sp: kernel
+      irq: 0
+    note: |
+      [[mappages]] calls `walk(pagetable, 0x13000, 1)`, this time with `alloc = 1`, so a
+      missing middle or bottom page-table page would be created with [[kalloc]]. Here none is
+      missing (see step 6), so `walk` returns the same PTE slot `ismapped` inspected.
+
+      The remap check on line 166 would panic if the slot were already valid: mapping over a
+      live page would leak it, and in xv6 that can only mean a kernel bug.
+
+      Line 168 is the moment the promise becomes real: one 64-bit store,
+      `PA2PTE(0x80039000) | PTE_W | PTE_U | PTE_R | PTE_V`, into pid 4's page table.
+
+      No [[g:insn:sfence.vma|sfence.vma]] is needed *right here*: hart 1 is running on the
+      kernel page table, and no other hart is using pid 4's. One *is* needed before pid 4
+      retries the store: without the optional Svvptc extension, the spec does not promise
+      that a PTE changed from invalid to valid is seen by the page-table walker until an
+      `sfence.vma`, and a stale "invalid" view would fault again, and this time `vmfault`
+      would find the page mapped and kill pid 4. [[userret]] provides the fence: it writes
+      `satp` between two `sfence.vma zero, zero` instructions, ordering the PTE store before
+      later walks and discarding every cached translation on hart 1.
+    others: |
+      No lock protects pid 4's page table. The only code that changes it runs on pid 4's own
+      behalf (its faults, its `sbrk`, its `exec`), and pid 4 is single-threaded and busy
+      right here. Other harts do not read it either: they walk their *own* processes' page
+      tables. The table is freed only after pid 4 exits and its parent reaps it in
+      [[kwait]].
+
+  - title: Return without advancing, and the store runs again
+    file: kernel/trap.c
+    lines: 80-95
+    focus: 81-94
+    state:
+      hart: 1
+      mode: S
+      proc: usertests lazy_alloc (pid 4)
+      intr: off
+      satp: kernel
+      locks: []
+      stack: [usertrap]
+      sp: kernel
+      irq: 0
+    note: |
+      [[usertrap]] continues:
+
+      - [[killed]]: has someone killed pid 4 meanwhile? No.
+      - `which_dev` is 0, so no [[yield]].
+      - [[prepare_return]] writes `p->trapframe->epc`, still `0x495e`, into `sepc`.
+      - It returns the user `satp`; [[userret]] restores all 31 registers and executes
+        [[g:insn:sret|sret]].
+
+      Pid 4 resumes at `0x495e`, the same `sd a5,0(a5)`. This time the walker finds a valid,
+      writable PTE and the store succeeds. From the program's point of view, nothing
+      happened: one instruction took a few microseconds longer than usual.
+
+      This is what makes a fault *restartable*: the hardware guarantees that a faulting
+      instruction has no effect, and `sepc` points at it, so the kernel can fix the world
+      and simply let it try again.
+
+  - title: 4096 faults later
+    file: user/usertests.c
+    lines: 2637-2650
+    focus: 2642-2649
+    state:
+      hart: 1
+      mode: U
+      proc: usertests lazy_alloc (pid 4)
+      intr: on
+      satp: user
+      locks: []
+      stack: [lazy_alloc]
+      sp:
+        "on": user
+        switched: "`ld sp, 48(a0)` in [[kernel:userret]] ([[kernel/trampoline.S:118]]) and `sret` ([[kernel/trampoline.S:153]]), after each fault"
+    note: |
+      The first loop faults once per touched page: 4096 round trips through the trampoline,
+      `usertrap`, `vmfault`, `kalloc` and `mappages`, and 16 MiB of zeroed pages. The second
+      loop only reads pages that now exist, so it runs without a single trap.
+
+      The cost per first touch: two privilege changes, two `satp` writes, four
+      `sfence.vma`s, 31 registers saved and restored, one `fence.i`, one `kmem.lock` acquisition (two on the
+      511 faults that also need a new page-table page), and a 4096-byte `memset` (plus
+      kalloc's own 4096-byte junk fill). Every 8th fault enters a new 2 MiB region, so
+      [[walk]] must also allocate a bottom-level page-table page. The win: 1 GiB promised,
+      16 MiB of data pages plus 511 page-table pages (about 2 MiB) actually used.
+
+      When pid 4 exits, [[uvmfree]] frees only the pages that actually got mapped:
+      [[uvmunmap]] skips the invalid PTEs in the promised range.
+    others: |
+      Throughout this loop, hart 1 kept interrupts off inside each fault, but they were on in
+      user mode between faults, so timer interrupts could still preempt pid 4 and move it to
+      another hart. A page fault taken on hart 1 and the next one taken on hart 0 are
+      handled identically: everything `vmfault` needs is in pid 4's page table and `p->sz`,
+      not in any per-hart state.
+
+  - title: nowrite stores into its own code
+    file: user/usertests.c
+    lines: 2465-2497
+    focus: 2482-2483
+    state:
+      hart: 2
+      mode: U
+      proc: nowrite child (pid 5)
+      intr: on
+      satp: user
+      locks: []
+      stack: [nowrite]
+      sp: user
+    note: |
+      Scene 2, a fresh run of `usertests nowrite`: `usertests` is pid 3, the test runs in pid
+      4, and pid 4 forks one child per forbidden address. The first child, pid 5, executes
+      `*addr = 10` with `addr = 0`: the store `sw` at `0x1ce8`.
+
+      Address 0 *is* mapped: it is the first page of the program's text. [[kexec]] mapped it
+      in pid 3 with the ELF segment's flags, `R E`, which [[kernel:flags2perm]] turned into
+      `PTE_X`, plus `PTE_R | PTE_U` from [[uvmalloc]], and each fork's [[uvmcopy]] copied
+      those flags into pid 4 and pid 5. No `PTE_W`. The walker finds a valid
+      PTE without write permission and raises the same exception as before: `scause = 15`,
+      `stval = 0`.
+
+      All six addresses fault, each for its own reason:
+
+      | Address | Why the hardware refuses |
+      |---|---|
+      | `0` | mapped, but read-only text |
+      | `0x80000000` | not mapped in the user page table at all |
+      | `0x3fffffe000` | `TRAPFRAME`: mapped, but without `PTE_U` |
+      | `0x3ffffff000` | `TRAMPOLINE`: mapped, but without `PTE_U` |
+      | `0x4000000000` | `MAXVA`: bits 63–39 are not copies of bit 38, not a valid Sv39 address |
+      | `0xffffffffffffffff` | a valid Sv39 address, but nothing is mapped there (the 4-byte `sw` is also misaligned there; QEMU reports the page fault) |
+
+  - title: vmfault says no, and usertrap says so
+    file: kernel/trap.c
+    lines: 69-82
+    focus: 71-79
+    state:
+      hart: 2
+      mode: S
+      proc: nowrite child (pid 5)
+      intr: off
+      satp: kernel
+      locks: []
+      stack: [usertrap]
+      sp:
+        "on": kernel
+        switched: "`ld sp, 8(a0)` in [[uservec]] ([[kernel/trampoline.S:76]])"
+      irq: 0
+    note: |
+      [[usertrap]] takes the same branch as in scene 1, but [[vmfault]] returns 0:
+      `0 < p->sz`, so it proceeds to [[ismapped]], which finds the text page **valid**. A
+      valid page that faulted is a permission violation, not a missing page. For the other
+      five addresses `vmfault` stops even earlier, at `va >= psz`.
+
+      So the `else` branch runs. These are the real lines from our run:
+
+      ```
+      usertrap(): unexpected scause 0xf pid=5
+                  sepc=0x1ce8 stval=0x0
+      usertrap(): unexpected scause 0xf pid=6
+                  sepc=0x1ce8 stval=0x80000000
+      ...
+      usertrap(): unexpected scause 0xf pid=10
+                  sepc=0x1ce8 stval=0xffffffffffffffff
+      ```
+
+      `stval` names the culprit address; `sepc` names the instruction (the same `sw` in all
+      six children, which are copies of one program). Running `usertests stacktest` gives a
+      *load* fault instead: `scause 0xd` (13), `stval=0x10e90`, an address in the
+      [[g:guard-page]] below the stack. That page is valid but has `PTE_U` cleared
+      ([[uvmclear]]), so `ismapped` says yes and `vmfault` refuses too. `stacktest` only
+      imitates an overflow: its `sp` is still fine, and one load 4096 bytes below it hits
+      the guard page. In a real overflow `sp` itself would point into the guard page. The
+      kernel would still be unaffected, because `uservec` only saves the user's `sp` and
+      runs `usertrap` on the process's kernel stack.
+
+      Then [[setkilled]], and at line 81 [[killed]] sees the flag and calls [[kexit]]`(-1)`.
+      The kernel does not try to "repair" a bad store. It records why and removes the
+      process.
+
+  - title: printk serializes the two lines, and only per call
+    file: kernel/printk.c
+    lines: 62-78
+    focus: 73-76
+    state:
+      hart: 2
+      mode: S
+      proc: nowrite child (pid 5)
+      intr: off
+      satp: kernel
+      locks: [pr.lock]
+      stack: [usertrap, printk]
+      sp: kernel
+      irq: {noff: 1, intena: 0}
+    note: |
+      [[printk]] takes `pr.lock` (when no panic is in progress) and holds it while it emits
+      every character of one formatted line through [[consputc]] and [[uartputc_sync]],
+      which busy-waits on the UART instead of sleeping. Spinning is acceptable here: these
+      messages are rare, and `printk` must work from places that cannot sleep, such as this
+      fault path with interrupts off.
+
+      The lock is per *call*. `usertrap`'s message is two calls, so another hart's line can
+      land between `usertrap(): unexpected scause...` and `sepc=...`. The lock guarantees
+      lines are not shuffled character by character, not that a two-line message stays
+      together.
+
+      Console output in general, and why user `write`s go a different way, is [[tour:38]].
+    others: |
+      In the `nowrite` run the six children die one after another, but nothing stops two
+      unrelated processes from faulting at the same instant on harts 0 and 2:
+
+      | Time | Hart 0 (pid 7 faults) | Hart 2 (pid 5 faults) |
+      |---|---|---|
+      | t1 | `acquire(&pr.lock)` | `acquire(&pr.lock)`: spins |
+      | t2 | prints `usertrap(): ... pid=7` | still spinning, interrupts off |
+      | t3 | `release` | gets the lock, prints `usertrap(): ... pid=5` |
+      | t4 | `acquire`: spins | `release` |
+      | t5 | prints `sepc=...` for pid 7 | `acquire`: spins |
+
+      The output reads pid 7, pid 5, pid 7's second line, pid 5's second line: every line
+      intact, the pairs interleaved.
+
+  - title: setkilled marks the process, under its lock
+    file: kernel/proc.c
+    lines: 624-641
+    focus: 628
+    state:
+      hart: 2
+      mode: S
+      proc: nowrite child (pid 5)
+      intr: off
+      satp: kernel
+      locks: ["pid 5's p->lock"]
+      stack: [usertrap, setkilled]
+      sp: kernel
+      irq: {noff: 1, intena: 0}
+    note: |
+      [[setkilled]] sets `p->killed = 1` under `p->lock`. The process is not destroyed here;
+      it is only *marked*. Destruction happens at a safe point, which for a process in
+      `usertrap` is a few lines later, when [[killed]] reads the flag (again under `p->lock`)
+      and `usertrap` calls `kexit(-1)`.
+
+      Why go through a flag at all, when `usertrap` could call `kexit` directly? Because the
+      flag is the same mechanism [[kkill]] uses from *another* process ([[tour:23]]). Using it
+      here keeps a single rule: a *killed* process dies only by noticing its own `killed` flag at a
+      point where it holds no locks and has nothing half-done.
+    others: |
+      `p->killed` is shared: at this very moment the shell on hart 0 could be running
+      `kill 5`. [[kkill]] takes the same `p->lock`, sets `killed` and, if pid 5 were
+      `SLEEPING`, makes it `RUNNABLE` so it can notice. With both writers under `p->lock`,
+      and [[killed]] reading under it, `kkill`'s two changes (`killed` and `state`) are
+      seen together, and a kill is never lost.
+
+  - title: kexit, with status -1
+    file: kernel/proc.c
+    lines: 326-365
+    focus: 357-358
+    state:
+      hart: 2
+      mode: S
+      proc: nowrite child (pid 5)
+      intr: off
+      satp: kernel
+      locks: [wait_lock, "pid 5's p->lock"]
+      stack: [usertrap, kexit]
+      sp: kernel
+      irq: {noff: 2, intena: 0}
+    note: |
+      [[kexit]] closes pid 5's files, releases its current directory, takes `wait_lock`, hands
+      any children to `init`, wakes the parent (pid 4, waiting in [[kwait]]), and then, holding
+      both `wait_lock` and its own `p->lock`, stores `xstate = -1` and becomes a `ZOMBIE`.
+      [[sched]] switches away for the last time. Exit and reaping are [[tour:21]].
+
+      Pid 4's `wait` returns 5 and stores -1 in `xstatus`. `nowrite` checks only that the
+      child did *not* exit with 0 (had the store succeeded, the child would have printed
+      `write to ... did not fail!` and called `exit(0)`), and moves on to the next address.
+
+      `kexit` runs to the end on pid 5's own kernel stack, even after pid 5 is a `ZOMBIE`;
+      `sched`'s `swtch` moves hart 2 to its scheduler stack and never comes back. A process
+      cannot free the stack it is standing on, and xv6 never needs to: kernel stacks belong
+      to process-table slots, mapped once at boot. When pid 4 reaps pid 5, [[freeproc]]
+      frees the trapframe and the user page table (with the user stack), and the slot's
+      kernel stack simply waits for its next occupant.
+
+      A detail worth noticing: since this trap was not a system call, interrupts were never
+      turned back on, and the outermost [[push_off]] of every `acquire` along the way records
+      `intena = 0` ([[concept:locks#intena]]). So `kexit` runs with interrupts off from start to finish, except while it sleeps
+      (for example in [[begin_op]]), when another process runs on this hart with its own
+      interrupt state. If `kexit` does sleep, pid 5 may wake on a different hart; in this
+      run nothing it closes needs the disk, so it stays on hart 2.
+
+  - title: An illegal instruction takes the same road
+    file: kernel/trap.c
+    lines: 69-82
+    focus: 75-79
+    state:
+      hart: any
+      mode: S
+      proc: ill (pid 3)
+      intr: off
+      satp: kernel
+      locks: []
+      stack: [usertrap]
+      sp: kernel
+      irq: 0
+    note: |
+      Scene 3. No xv6 program does this, so we wrote a three-line test program, `ill`, and
+      added it to a scratch copy of the source; it is not part of xv6. Its only interesting
+      line is `asm volatile("csrr %0, mhartid" : "=r"(x));`. It assembles to
+      `f14025f3` at address 8. That is the instruction [[r_mhartid]] runs in
+      [[kernel:start]] ([[kernel/start.c:47]]) in machine mode, where it is legal. In user
+      mode, reading a machine-mode CSR is an **illegal-instruction exception**,
+      `scause = 2`.
+
+      Nothing in `usertrap` special-cases 2. It is not 8, [[devintr]] returns 0, and it is
+      neither 13 nor 15, so it falls to the `else` branch. Our run printed:
+
+      ```
+      usertrap(): unexpected scause 0x2 pid=3
+                  sepc=0x8 stval=0xf14025f3
+      ```
+
+      For an illegal instruction, the RISC-V spec lets `stval` hold either 0 or the bits of
+      the offending instruction; QEMU supplies the bits, so `stval` here *is* the instruction.
+      The process is killed exactly as in scene 2.
+
+      The same branch catches the rest of the exception list, such as `ebreak` (3) and
+      instruction page faults (12). xv6's policy for
+      every one of them is "kill the process and keep the kernel running".
+
+  - title: A bug in the kernel reads address 0
+    file: kernel/sysproc.c
+    lines: 101-112
+    focus: 109
+    state:
+      hart: 2
+      mode: S
+      proc: up (pid 3)
+      intr: off
+      satp: kernel
+      locks: [tickslock]
+      stack: [usertrap, syscall, sys_uptime]
+      sp: {"on": kernel, detail: "pid 3's kernel stack: `usertrap` → `syscall` → `sys_uptime`"}
+      irq: {noff: 1, intena: 1}
+    note: |
+      Scene 4 needs a kernel bug, so we planted one in a scratch copy: line 109 became
+      `xticks = *(volatile uint *)0;`, and a two-line program `up`, also only in that scratch copy, called `uptime()`. The
+      planted load compiled to `lw a5,0(zero)` at `0x80002ae6` in that build.
+
+      The kernel page table maps nothing at virtual address 0 (its lowest mapping is the
+      PLIC at `0x0c000000`), so the load raises a **load page fault**, `scause = 13`,
+      `stval = 0`, exactly as a user load would. Exceptions cannot be masked: interrupts are
+      off (the hart holds `tickslock`, a spinlock) but the fault happens anyway. `SIE`
+      controls only *interrupts*.
+
+      The trap came from supervisor mode, so `stvec` points at [[kernelvec]], not the
+      trampoline ([[usertrap]] set it on entry). `kernelvec` pushes the registers on pid 3's
+      kernel stack, right below `sys_uptime`'s frame, and calls [[kerneltrap]]. That entry
+      path is [[tour:8]].
+
+      Note what the hart is holding: `tickslock`. It will never release it.
+
+  - title: kerneltrap has no repair to offer
+    file: kernel/trap.c
+    lines: 134-164
+    focus: 140-153
+    state:
+      hart: 2
+      mode: S
+      proc: up (pid 3)
+      intr: off
+      satp: kernel
+      locks: [tickslock]
+      stack: [usertrap, syscall, sys_uptime, kernelvec, kerneltrap]
+      sp: {"on": kernel, detail: "a 256-byte `kernelvec` frame now sits below `sys_uptime`'s"}
+      irq: {noff: 1, intena: 1, note: "kerneltrap does not touch noff: sys_uptime's tickslock level is still counted"}
+    note: |
+      The fault did not change stacks. [[kernelvec]]'s `addi sp, sp, -256`
+      ([[kernel/kernelvec.S:14]]) pushed its register frame onto the stack that was already
+      in use, pid 3's kernel stack:
+
+      ```text
+      pid 3's kernel stack
+        top ─► usertrap
+               syscall
+               sys_uptime
+               kernelvec    256-byte register frame
+               kerneltrap  ◄─ sp
+      ```
+
+      [[kerneltrap]] reads `sepc`, `sstatus` and `scause`, checks that the trap really came
+      from supervisor mode (`SPP = 1`) and that interrupts are off (the trap turned `SIE` off),
+      and then asks [[devintr]] whether this was a device. `scause = 13` is not an
+      interrupt, so `devintr` returns 0.
+
+      In user mode, that would lead to "kill the process". In the kernel there is no such
+      option. The kernel has no `vmfault` path of its own and no other plan: a fault in
+      kernel code means a kernel bug, and the half-finished operation (here, a critical
+      section holding `tickslock`) cannot be safely abandoned or retried. So it prints the
+      evidence and panics. Our run:
+
+      ```
+      scause=0xd sepc=0x80002ae6 stval=0x0
+      panic: kerneltrap
+      ```
+
+      The first line is an ordinary [[printk]]: no panic is in progress yet, so it takes
+      `pr.lock` like any other line.
+    others: |
+      Hart 2 holds `tickslock` and will never let go. Hart 0 is the only hart that takes
+      `tickslock` in [[clockintr]]. Its next timer interrupt, within about a tenth of a
+      second, calls `acquire(&tickslock)` and spins forever with interrupts off. `ticks`
+      stops; `pause()`ing processes never wake. A panic on one hart quietly takes others
+      down through the locks it held, which is one more reason the only safe response is to
+      stop. In the run we follow, hart 2 took the fault; in other runs it is hart 0 or 1. If
+      hart 0 itself panics, nothing spins on `tickslock`: `ticks` simply stops.
+
+  - title: panic sets two flags and never returns
+    file: kernel/printk.c
+    lines: 137-146
+    focus: 140-145
+    state:
+      hart: 2
+      mode: S
+      proc: up (pid 3)
+      intr: off
+      satp: kernel
+      locks: [tickslock]
+      stack: [usertrap, syscall, sys_uptime, kernelvec, kerneltrap, panic]
+      sp: {"on": kernel, detail: "hart 2 will spin on pid 3's kernel stack forever"}
+      irq: {noff: 1, intena: 1, note: "tickslock is never released: noff stays 1 on this hart for good"}
+    note: |
+      [[panic]] does four things:
+
+      1. `panicking = 1`. From now on, `printk` on **every** hart skips `pr.lock`, and
+         [[uartputc_sync]] skips its [[push_off]]/[[pop_off]] (a `printk` already past that
+         check keeps the lock it took or is waiting for).
+      2. Print `panic: kerneltrap`, in two `printk` calls, without the lock.
+      3. `panicked = 1`: freeze every other hart that tries to print.
+      4. Spin forever. Interrupts are off, so nothing will ever run on hart 2 again.
+
+      Why must the panic message bypass `pr.lock`? Because the panicking hart may already
+      hold it. If the fault had happened inside `printk` itself, or if `printk` were the
+      caller that tripped [[acquire]]'s own `panic("acquire")` check, a panic that called
+      `acquire(&pr.lock)` would find the lock held by its own hart: `acquire` would
+      `panic("acquire")` again, recursively, and never print a word. Another hart holding
+      the lock forever (frozen in the middle of a line) would block it the same way. The one
+      message that matters most must not depend on a lock.
+
+      Both flags are `volatile int`, so each check in `printk` and `uartputc_sync` really
+      reads memory, not a copy the compiler kept in a register.
+
+  - title: Other harts freeze the moment they print
+    file: kernel/uart.c
+    lines: 98-120
+    focus: 105-111
+    state:
+      hart: 0
+      mode: S
+      proc: hypothetical faulting process (pid 7)
+      intr: off
+      satp: kernel
+      locks: [pr.lock]
+      stack: [usertrap, printk, consputc, uartputc_sync]
+      sp: kernel
+      irq: {noff: 1, intena: 0, note: "pr.lock's level, plus one more only if `panicking` flipped in the middle of a uartputc_sync (its pop_off is then skipped); once the flag is seen at line 105, no push_off"}
+    note: |
+      This scene is hypothetical: a second process, pid 7, faults on hart 0 just as hart 2
+      panics. `panic` does not stop the other harts directly. xv6 has no inter-processor interrupt to
+      send them. Instead, every path that prints to the UART synchronously checks the flags:
+
+      - `panicking` set: no `push_off`/`pop_off`. The interrupt bookkeeping is skipped.
+      - `panicked` set: spin forever, right here, before writing the character.
+
+      So a hart keeps running processes after another hart has panicked, until the moment it
+      tries to emit a character through [[uartputc_sync]] (kernel `printk`, or the echo of a
+      typed key in [[consoleintr]]), or until it blocks on a lock the dead hart held. The
+      console usually shows a `panic:` line as the last thing on the screen (possibly mixed
+      with one in-flight line, see below) instead of a mess.
+
+      This is a simplification of "stop the machine", and an honest one: user `write`s go
+      through [[uartwrite]], which does not check `panicked`, so in principle a user program
+      on a still-running hart could print after the panic message.
+    others: |
+      Two harts printing while hart 2 panics:
+
+      | Time | Hart 0 (pid 7 faults) | Hart 2 (kernel fault) |
+      |---|---|---|
+      | t1 | `printk`: takes `pr.lock`, prints `usertrap(): ... pid=7` | `kerneltrap` → `printk`: spins on `pr.lock` |
+      | t2 | releases `pr.lock`; its second `printk` sees `panicking == 0` and spins in `acquire` | takes `pr.lock`, prints `scause=0xd ...` |
+      | t3 | gets `pr.lock` as hart 2 releases it; starts printing `   sepc=...` | releases `pr.lock`, sets `panicking = 1`, prints `panic: ` without the lock |
+      | t4 | still printing `sepc=...`, holding `pr.lock` | still printing `kerneltrap` |
+      | t5 | characters from both harts interleave on the UART | `panicked = 1`, spins forever |
+      | t6 | next `uartputc_sync` sees `panicked`: spins forever; `pr.lock` is never released, because `printk` skips the release once `panicking` is 1 | |
+
+      Between t3 and t5 hart 0 holds `pr.lock`, but hart 2's panic `printk` ignores it, so
+      the two harts' characters can mix. xv6
+      accepts that: a garbled line during a panic is better than a panic that never prints.
+      After t6 both harts are frozen. Hart 1 keeps running until it next prints, or until it
+      needs `tickslock`, which hart 2 will never release.
+
+  - title: Three outcomes of one question
+    file: kernel/trap.c
+    lines: 37-95
+    focus: 69-79
+    state:
+      hart: any
+      mode: S
+      proc: the faulting process
+      intr: off
+      satp: kernel
+      locks: []
+      stack: [usertrap]
+      sp: kernel
+      irq: 0
+    note: |
+      Every exception in this tour reached one question: *can the kernel make this
+      instruction succeed?*
+
+      | Fault | Who answers | Outcome | Cost |
+      |---|---|---|---|
+      | store to a promised page (`lazy_alloc`) | [[vmfault]]: below `p->sz`, not mapped | page allocated, instruction retried | one trap, `kmem.lock`, a zeroed page |
+      | store to read-only text (`nowrite`) | `vmfault`: already mapped | `usertrap(): unexpected scause 0xf`, `kexit(-1)` | two `printk` lines, `p->lock`, `wait_lock` |
+      | illegal instruction (`csrr mhartid`) | nobody: not a page fault | killed, `scause 0x2` | same as above |
+      | kernel load from address 0 | [[kerneltrap]]: nothing to try | `panic: kerneltrap`, machine stops | everything |
+
+      The key ideas: `sepc` points at the faulting instruction, so a repaired fault is
+      invisible; `p->sz` is the kernel's record of what the process is owed, and the PTE
+      bits say how it may be used; a user fault costs the user its process, never the
+      kernel its life; a kernel fault costs everything, and `panic` is written to need no
+      lock because it may already be holding them. And with three harts, even dying is a
+      concurrent operation: the other harts stop only when they next touch the console or
+      a lock the dead hart kept.
+locks:
+  - lock: "kmem.lock (spinlock)"
+    where: "[[kalloc]] from [[vmfault]], and from [[walk]] when [[mappages]] needs a page-table page; [[kfree]] if `mappages` fails"
+    protects: "The free-page list shared by all harts: no two faults get the same page"
+  - lock: "p->sz and the user page table (no lock)"
+    where: "[[sys_sbrk]], [[vmfault]], [[mappages]]"
+    protects: "Changed only on behalf of the process itself, which is single-threaded; other harts never touch them while it is alive"
+  - lock: "pr.lock (spinlock)"
+    where: "[[printk]], only while `panicking == 0`"
+    protects: "One formatted line at a time on the console; not a multi-line message"
+  - lock: "p->lock (spinlock)"
+    where: "[[setkilled]], [[killed]], [[kkill]], [[kexit]]"
+    protects: "`p->killed` and `p->state`: a kill set on one hart is seen on another"
+  - lock: "wait_lock (spinlock)"
+    where: "[[kexit]]"
+    protects: "Parent links while the dying child reparents and wakes its parent"
+  - lock: "ftable.lock (spinlock)"
+    where: "[[fileclose]]"
+    protects: "Taken by [[kexit]]; see [[tour:21]]"
+  - lock: "log.lock (spinlock)"
+    where: "[[begin_op]], [[end_op]]"
+    protects: "Taken by [[kexit]]; see [[tour:21]]"
+  - lock: "itable.lock (spinlock)"
+    where: "[[iput]]"
+    protects: "Taken by [[kexit]]; see [[tour:21]]"
+  - lock: "every other process's p->lock"
+    where: "[[wakeup]] from [[kexit]]"
+    protects: "`p->chan` and `p->state` while waking the parent; see [[tour:21]]"
+  - lock: "tickslock (spinlock)"
+    where: "[[sys_uptime]], [[clockintr]]"
+    protects: "`ticks`; in scene 4 it is held forever by the panicked hart, so hart 0's clock interrupt spins on it"
+  - lock: "panicking, panicked (no lock: volatile flags)"
+    where: "[[panic]], [[printk]], [[uartputc_sync]]"
+    protects: "Written once by the panicking hart and only ever set, never cleared; a lock would deadlock a hart that panics while holding pr.lock"
+  - lock: "sepc, scause, stval (no lock: per-hart CSRs)"
+    where: "[[usertrap]], [[kerneltrap]]"
+    protects: "Each hart has its own trap CSRs, so simultaneous faults on three harts never see each other's values"
+quiz:
+  - q: "After `vmfault` maps the page, why does `usertrap` not add 4 to `p->trapframe->epc`, as it does for a system call?"
+    a: "For `ecall` the instruction has completed and execution must continue after it. A faulting store has *not* happened; `sepc` points at it, and it must run again now that the page exists. Adding 4 would silently skip the store."
+  - q: "`vmfault` returns 0 if the page is already mapped. Which fault in this tour depends on that check, and what would happen without it?"
+    a: "The `nowrite` store to address 0: the text page is valid but read-only. Without the `ismapped` check, `vmfault` would call `mappages` on a valid PTE and hit `panic(\"mappages: remap\")`, so a user program could crash the kernel by writing to its own code."
+  - q: "Why does `vmfault` test `va >= psz` *before* calling `ismapped`?"
+    a: "`ismapped` calls `walk`, which panics for `va >= MAXVA`. A user can make `stval` anything, for example `0xffffffffffffffff`. Since `psz` never exceeds `TRAPFRAME`, the size check rejects every such address before it reaches `walk`."
+  - q: "Two harts take lazy page faults at the same moment, for two different processes. Which data do they share, and what keeps them from interfering?"
+    a: "They share only the free-page list, protected by `kmem.lock` in `kalloc`. Their trapframes, kernel stacks, page tables, `p->sz` and trap CSRs are all separate, so everything else runs without locks."
+  - q: "`panic` sets `panicking = 1` before printing. Describe a situation in which taking `pr.lock` inside `panic` would hang the machine without printing anything."
+    a: "If the panicking hart already holds `pr.lock` (it faulted inside `printk`), `acquire` sees it is already held by this hart and calls `panic(\"acquire\")`, which would try the lock again, forever. If another hart holds it and is frozen, `acquire` would spin forever. Skipping the lock lets the message out in both cases."
+  - q: "In scene 4 the planted bug faults while holding `tickslock` on hart 2. Trace what happens to hart 0 over the next tenth of a second."
+    a: "Hart 0's next timer interrupt enters `clockintr`, which on hart 0 calls `acquire(&tickslock)`. Hart 2 will never release it, so hart 0 spins in `acquire` forever with interrupts off. `ticks` stops advancing, and any process in `pause()` never wakes."

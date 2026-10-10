@@ -1,0 +1,721 @@
+title: "The log: begin_op, commit and group commit"
+group: File system
+prerequisites: [16, 29, 30]
+summary: |
+  Appending to a file changes several disk blocks: the free-block bitmap, the new data
+  blocks, and the inode that points to them. If the power fails after some of those writes
+  and before others, the disk is left inconsistent: a block marked used that no file owns,
+  or worse, an inode pointing to a block still marked free. xv6's answer is a
+  [[g:write-ahead-log]]: changes go first to a log area on disk, a single header write
+  "commits" them all at once, and only then are they copied to their real places.
+
+  This tour watches the log under load. You run `logstress f1 f2 f3`: three children, on
+  three harts, each call `write(fd, buf, 2000)` on their own empty file at the same time.
+  Each `write` is a [[g:transaction|transaction]] that may touch up to 10 blocks. The log
+  holds 30. You will see who gets admitted and who must wait, how 21 calls to
+  [[log_write]] collapse into 8 logged blocks, how the last process to finish commits
+  everyone's changes together (**group commit**), and why that commit runs without holding any
+  spinlock.
+
+  Block numbers are from a fresh `fs.img` of this build: the bitmap is block 46, the three
+  files are inodes 24, 25 and 26 (all in inode block 34), the log header is block 2 and the
+  log blocks are 3–32, and the first free data block is 1006. A trace of `logstress` in
+  this build confirms the admission rule, and that the first write's `log_write` calls hit
+  46, 1006, 1006, 46, 1007, 1007, 34. **The interleaving below is illustrative**: which
+  child is admitted when, which inode each file gets, and the blocks given to B and C
+  (1008–1011) are one possible run, chosen for clarity. (Inodes 24–26 also assume the
+  first run after `make`: inode 23 is `console`, which `init` creates at first boot.)
+cast: |
+  `logstress f1 f2 f3` (pid 3) has forked three children; each has created its file and is
+  about to make its first `write`.
+
+  | Hart | What it is doing |
+  |---|---|
+  | 0 | Child A (pid 4): `write` of 2000 bytes to `f1` (inode 24) |
+  | 1 | Child B (pid 5): `write` of 2000 bytes to `f2` (inode 25) |
+  | 2 | Child C (pid 6): `write` of 2000 bytes to `f3` (inode 26) |
+
+  The log is empty: `log.lh.n = 0`, `log.outstanding = 0`, `log.committing = 0`.
+steps:
+  - title: Three children, three files, three writes
+    file: user/logstress.c
+    lines: 14-40
+    focus: 25-34
+    state:
+      hart: [0, 1, 2]
+      mode: U
+      proc: children A, B, C (pids 4, 5, 6)
+      intr: on
+      satp: user
+      locks: []
+      stack: [main]
+      sp:
+        "on": user
+        detail: "three harts, three user stacks: each child on its own copy of `logstress`'s stack page"
+    note: |
+      `logstress` exists to stress exactly this code. Each child opens its own file and
+      tries to write 2000 bytes 250 times. (It never gets there: the largest xv6 file is
+      [[MAXFILE]] × [[BSIZE]] = 274,432 bytes, so each child's 138th `write` fails and the
+      program prints `write failed -1` three times. The first 137 writes per child are
+      plenty of load for the log.) We follow the first `write` of each child.
+
+      2000 bytes starting at offset 0 of an empty file covers file blocks 0 and 1, so each
+      `write` must allocate two data blocks, fill them, and record them in the inode. On
+      disk, that means changing:
+
+      - the bitmap (block 46), twice;
+      - two new data blocks, each zeroed and then written;
+      - the inode block holding the file's inode (block 34 for all three files).
+
+      None of the three children shares a file or an inode lock with the others. But all
+      three will change block 46 and block 34. The log has to combine their changes
+      correctly and make them durable together.
+
+  - title: filewrite brackets each chunk with begin_op and end_op
+    file: kernel/file.c
+    lines: 148-173
+    focus: 153-160
+    state:
+      hart: 0
+      mode: S
+      proc: child A (pid 4)
+      intr: on
+      satp: kernel
+      locks: []
+      irq: 0
+      stack: [usertrap, syscall, sys_write, filewrite]
+      sp:
+        "on": kernel
+        switched: "`ld sp, 8(a0)` in [[uservec]] ([[kernel/trampoline.S:76]]), after the `ecall`"
+        detail: "child A's kernel stack; B and C are on their own, on harts 1 and 2"
+    note: |
+      For an inode, [[filewrite]] splits the write into chunks of at most
+      `((MAXOPBLOCKS - 1 - 1 - 2) / 2) * BSIZE` = `((10 - 4) / 2) * 1024` = **3072 bytes**.
+      Each chunk is one transaction: [[begin_op]], lock the inode, [[writei]], unlock,
+      [[end_op]].
+
+      The arithmetic is a promise. [[MAXOPBLOCKS]] = 10 is the most blocks one transaction
+      may change. The comment budgets for the inode block, an indirect block, two blocks of
+      slack for unaligned writes, and the rest split between data blocks and bitmap blocks.
+      Our 2000-byte `write` fits in one chunk, so it is one transaction.
+
+      Notice that `begin_op` comes **before** `ilock`. A process waiting in `begin_op`
+      holds no inode lock, so it cannot block anyone who is trying to finish a transaction.
+
+  - title: The log's state
+    file: kernel/log.c
+    lines: 33-49
+    focus: 40-49
+    state:
+      hart: 0
+      mode: S
+      proc: child A (pid 4)
+      intr: on
+      satp: kernel
+      locks: []
+      irq: 0
+      stack: [usertrap, syscall, sys_write, filewrite, begin_op]
+      sp: kernel
+    note: |
+      The in-memory [[log]] structure, protected by `log.lock`:
+
+      | Field | Meaning | Now |
+      |---|---|---|
+      | `start` | first log block on disk (the header) | 2 |
+      | `outstanding` | transactions between `begin_op` and `end_op` | 0 |
+      | `committing` | a commit is in progress | 0 |
+      | `ncommit` | commits completed since boot (for `sync`) | |
+      | `lh.n` | blocks logged in the current transaction | 0 |
+      | `lh.block[]` | their home block numbers, up to [[LOGBLOCKS]] = 30 | |
+
+      `lh` doubles as the on-disk header format ([[logheader]]): when it is written to block
+      2, the disk learns which blocks the log holds.
+
+      The log area is 31 blocks: the header at block 2, then 30 log blocks at 3–32
+      (`sb.nlog = 31` in this image). Log block `i` holds the new contents of
+      `lh.block[i]`.
+
+  - title: Child A is admitted
+    file: kernel/log.c
+    lines: 127-150
+    focus: 138-145
+    state:
+      hart: 0
+      mode: S
+      proc: child A (pid 4)
+      intr: off
+      satp: kernel
+      locks: [log.lock]
+      irq: {noff: 1, intena: 1}
+      stack: [usertrap, syscall, sys_write, filewrite, begin_op]
+      sp: kernel
+    note: |
+      [[begin_op]] takes `log.lock` and checks two things:
+
+      1. **Is a commit in progress?** Then wait: a commit is writing the log area, and a
+         new transaction's blocks must not mix into it.
+      2. **Is there room?** The test is
+         `lh.n + (outstanding + 1) * MAXOPBLOCKS > LOGBLOCKS`. Every running transaction
+         might log up to 10 more blocks, so `begin_op` reserves 10 for each one, plus 10
+         for the newcomer, on top of what is already logged.
+
+      For child A: `0 + (0 + 1) * 10 = 10 ≤ 30`. Admitted: `outstanding = 1`, release the
+      lock, return.
+
+      Child B on hart 1 arrives right after: `0 + (1 + 1) * 10 = 20 ≤ 30`. Admitted,
+      `outstanding = 2`.
+    others: |
+      `log.lock` is a spinlock, held for a handful of instructions. Children B and C may spin
+      on it for a moment while A checks. Without it, two harts could both read
+      `outstanding = 0`, both add 1, and store 1: the log would think one transaction is
+      running when two are, and could start a commit in the middle of the second.
+
+  - title: Child A logs the bitmap
+    file: kernel/log.c
+    lines: 214-244
+    focus: 229-242
+    state:
+      hart: 0
+      mode: S
+      proc: child A (pid 4)
+      intr: off
+      satp: kernel
+      locks: ["f1's ip->lock (sleep-lock)", "bitmap buf 46's lock (sleep-lock)", log.lock]
+      irq: {noff: 1, intena: 1}
+      stack: [usertrap, syscall, sys_write, filewrite, writei, bmap, balloc, log_write]
+      sp: kernel
+    note: |
+      Inside [[writei]], [[balloc]] reads the bitmap, sets the bit for block **1006**, and
+      calls [[log_write]] instead of writing the block to disk.
+
+      `log_write` takes `log.lock`, checks the transaction is not over-full and that the
+      caller is really inside one (`outstanding ≥ 1`), and searches `lh.block[]` for 46. It
+      is not there, so it becomes `lh.block[0] = 46`, `lh.n = 1`, and [[bpin]] pins the
+      buffer in the cache so it cannot be recycled before the commit ([[tour:30]]). For those few instructions hart 0 holds two spinlocks, `log.lock` and then `bcache.lock` (noff 2): one edge of the kernel's lock order ([[concept:locks#order]]).
+
+      Nothing has been written to disk. The change to the bitmap exists only in the cached
+      buffer, and the log header in memory now says "block 46 is part of this transaction".
+      That is the whole idea of `log_write`: **record, don't write**.
+
+  - title: Child C must wait for room
+    file: kernel/log.c
+    lines: 127-150
+    focus: 138-140
+    state:
+      hart: 2
+      mode: S
+      proc: child C (pid 6)
+      intr: off
+      satp: kernel
+      locks: [log.lock]
+      irq: {noff: 1, intena: 1}
+      stack: [usertrap, syscall, sys_write, filewrite, begin_op]
+      sp:
+        "on": kernel
+        detail: "child C's kernel stack; if it sleeps, `usertrap` … `begin_op` stays parked here"
+    note: |
+      Child C reaches [[begin_op]] on hart 2 just after A logged the bitmap:
+      `1 + (2 + 1) * 10 = 31 > 30`. There is not enough guaranteed room, so C registers on
+      channel `&log` with [[sleep_prepare]], releases `log.lock`, and sleeps.
+
+      Three transactions can be admitted together only when the log is completely empty:
+      `0 + 3 * 10 = 30`. (In our illustrative interleaving C arrives just too late. In the
+      traced run, all three children were in fact admitted together while the log was still
+      empty, and after that a third transaction usually waited: 444 waits for room in one
+      `logstress f1 f2 f3`.)
+
+      While it waits, C's `write` is parked on C's kernel stack: `usertrap`, `syscall`,
+      `sys_write`, `filewrite`, `begin_op`, `sleep`, `sched`, with `p->context` saved by
+      [[swtch]] and hart 2 gone to its scheduler stack ([[kernel/swtch.S:26]]). Nothing
+      else is stuck with it: no lock, no inode, no buffer.
+
+      The reservation is pessimistic. A and B will each touch 4 blocks (and B adds only 2 new
+      log slots, since 46 and 34 are already there), not 10. But
+      `begin_op` cannot know that in advance, and running out of log space in the middle of
+      a transaction would have no good recovery (`log_write` simply panics). Waiting at the
+      door is the safe choice.
+    others: |
+      | Time | Hart 0 (A) | Hart 1 (B) | Hart 2 (C) |
+      |---|---|---|---|
+      | t1 | `begin_op`: 0 + 10 ≤ 30, outstanding 1 | | |
+      | t2 | | `begin_op`: 0 + 20 ≤ 30, outstanding 2 | |
+      | t3 | `log_write(46)`: n = 1 | | |
+      | t4 | | | `begin_op`: 1 + 30 > 30 → sleep on `&log` |
+      | t5 | `end_op`: outstanding 1, `wakeup(&log)` | | |
+      | t6 | | | wakes, re-checks: n + 20 ≤ 30 → admitted |
+
+      C's check and its `sleep_prepare` registration both happen while it holds `log.lock`,
+      and `end_op` calls `wakeup` under the same lock. So A's wakeup at t5 comes either
+      before C's check (and C sees the freed room) or after C registered. If it lands
+      between C's `release` and its `sleep()`, it clears C's `p->chan`, and `sleep()`
+      returns at once instead of sleeping ([[tour:16]]).
+
+  - title: Absorption, twenty-one calls become eight blocks
+    file: kernel/log.c
+    lines: 223-244
+    focus: 234-242
+    state:
+      hart: 0
+      mode: S
+      proc: child A (pid 4)
+      intr: off
+      satp: kernel
+      locks: ["f1's ip->lock (sleep-lock)", "data buf 1006's lock (sleep-lock)", log.lock]
+      irq: {noff: 1, intena: 1}
+      stack: [usertrap, syscall, sys_write, filewrite, writei, log_write]
+      sp: kernel
+    note: |
+      Child A keeps going. For its 2000 bytes, it calls `log_write` 7 times:
+
+      | Call | Block | Effect |
+      |---|---|---|
+      | `balloc` for file block 0 | 46 | new: n = 1 |
+      | `bzero(1006)` | 1006 | new: n = 2 |
+      | `writei`, bytes 0–1023 | 1006 | **absorbed** |
+      | `balloc` for file block 1 | 46 | **absorbed** |
+      | `bzero(1007)` | 1007 | new: n = 3 |
+      | `writei`, bytes 1024–1999 | 1007 | **absorbed** |
+      | [[iupdate]] | 34 | new: n = 4 |
+
+      (This sequence of `log_write` *calls*, 46, 1006, 1006, 46, 1007, 1007, 34, is exactly
+      what a trace of `logstress` in this build shows for the first write. The *set* of
+      logged blocks it leaves is 46, 1006, 1007, 34.)
+
+      **Absorption** (lines 234–237): if the block is already in the transaction, nothing is
+      added. The log holds *block numbers*, and the cached buffer always holds the latest
+      contents, so the commit will write whatever the block contains at commit time. Seven
+      calls, four log slots.
+
+      In our illustrative interleaving, B and C repeat the pattern with 1008–1009 and 1010–1011. Their bitmap and inode-block
+      changes land in blocks 46 and 34, which are **already** in the transaction. So all three
+      writes together make 21 `log_write` calls but log only 8 blocks:
+      `46, 1006, 1007, 34, 1008, 1009, 1010, 1011`.
+    others: |
+      Child B on hart 1 may be in `log_write` at the same moment, spinning on `log.lock`.
+      The lock protects `lh.n` and `lh.block[]`: without it, A and B could both see `n = 4`,
+      both write their block into `block[4]`, and both set `n = 5`, losing one block from
+      the transaction. That block's change would never reach the disk.
+
+  - title: One inode block, three files
+    file: kernel/fs.c
+    lines: 225-243
+    focus: 234-242
+    state:
+      hart: 1
+      mode: S
+      proc: child B (pid 5)
+      intr: on
+      satp: kernel
+      locks: ["f2's ip->lock (sleep-lock)", "inode buf 34's lock (sleep-lock)"]
+      irq: 0
+      stack: [usertrap, syscall, sys_write, filewrite, writei, iupdate]
+      sp: kernel
+    note: |
+      At the end of its `writei`, child B calls [[iupdate]] to copy `f2`'s new size (2000)
+      and its block list (1008, 1009) into the on-disk inode. Inodes are 64 bytes, 16 to a
+      block, and inodes 24, 25 and 26 all live in block **34**, in slots 8, 9 and 10 of it
+      (`inum % IPB`, byte offsets 512, 576 and 640).
+
+      So B `bread`s block 34, a cache hit on the buffer A already modified and pinned. It
+      sees A's update to inode 24 already there, writes inode 25 next to it, and calls
+      `log_write`: absorbed. When the transaction commits, one write of block 34 carries
+      both files' new inodes, and C's too.
+
+      This is why the buffer cache's "one copy per block" rule matters to the log. The
+      log can merge three processes' changes to block 34 only because all three made them,
+      one at a time under the buffer's sleep-lock, to the **same** cached copy.
+    others: |
+      If C, once admitted, reaches its own `iupdate` while B still holds block 34's
+      sleep-lock, it sleeps in `bread` until B's `brelse`. The inode locks do not help here, since they are different inodes; the
+      buffer's sleep-lock is what serializes the two children's changes to the shared
+      block.
+
+  - title: end_op, but not the last
+    file: kernel/log.c
+    lines: 152-172
+    focus: 159-171
+    state:
+      hart: 0
+      mode: S
+      proc: child A (pid 4)
+      intr: off
+      satp: kernel
+      locks: [log.lock]
+      irq: {noff: 1, intena: 1}
+      stack: [usertrap, syscall, sys_write, filewrite, end_op]
+      sp: kernel
+    note: |
+      Child A finishes `writei`, unlocks its inode, and calls [[end_op]]. Under `log.lock`,
+      `outstanding` drops from 2 to 1. B is still running, so A must **not** commit: B's
+      half-done changes are mixed into the same buffers (block 34 and 46), and committing
+      now would put a partial transaction on disk.
+
+      So A just calls [[wakeup]]`(&log)`: decreasing `outstanding` freed 10 blocks of
+      reservation, and someone (C) may be waiting for exactly that. Then A returns to user
+      space. Its `write` is done, but its data is **not yet on disk**: it is in the cache,
+      pinned, waiting for the group commit.
+
+      The `panic("log.committing")` check can never fire in correct code: `committing` is set
+      only when `outstanding` reaches 0, and while it is set, `begin_op` admits nobody, so
+      nobody can be between `begin_op` and `end_op` to call this.
+    others: |
+      Child C, woken on hart 2, re-takes `log.lock` and re-checks: with `lh.n = 6` by now
+      (A's 4 plus B's two data blocks) and `outstanding = 1`, `6 + 2 * 10 = 26 ≤ 30`.
+      Admitted. Its changes will join the **same** transaction as A's and B's.
+
+      Child A, meanwhile, comes straight back for its next 2000-byte `write`. Whether it
+      gets in depends on the same arithmetic. This is how, in the traced run, most commits grew to
+      12 to 14 blocks.
+
+  - title: The last end_op commits for everyone
+    file: kernel/log.c
+    lines: 152-184
+    focus: 163-165
+    state:
+      hart: 2
+      mode: S
+      proc: child C (pid 6)
+      intr: off
+      satp: kernel
+      locks: [log.lock]
+      irq: {noff: 1, intena: 1}
+      stack: [usertrap, syscall, sys_write, filewrite, end_op]
+      sp: kernel
+    note: |
+      B ends next (`outstanding` 1), and suppose A has not yet come back. Then C, finishing
+      its own `writei`, calls `end_op` and
+      takes `outstanding` to **0**. C is the last one out, so C commits: it sets
+      `do_commit = 1` and `log.committing = 1` under `log.lock`, releases the lock, and
+      calls [[commit]].
+
+      C will now do the disk work for all three children: 8 blocks, 3 files. That is
+      **group commit**. A and B returned to user space long ago, so their kernel stacks
+      are empty again (a process in user mode has nothing on its kernel stack); all the
+      remaining work happens on **C's** kernel stack. Committing once for several
+      system calls saves disk writes (block 46 and block 34 go through the log once, not
+      three times) and keeps transactions from interleaving on disk.
+
+      The price is fairness: C's `write` takes as long as the whole commit, while A's and
+      B's returned at memory speed. (And until the commit finishes, A's and B's data is in
+      memory only. A crash now would lose it, cleanly: the disk would still show three empty
+      files.)
+
+  - title: Why commit runs without log.lock
+    file: kernel/log.c
+    lines: 172-184
+    focus: 174-177
+    state:
+      hart: 2
+      mode: S
+      proc: child C (pid 6)
+      intr: on
+      satp: kernel
+      locks: []
+      irq: 0
+      stack: [usertrap, syscall, sys_write, filewrite, end_op]
+      sp: kernel
+    note: |
+      The comment says it: `commit` writes to the disk, and every disk write sleeps
+      ([[tour:29]]). Sleeping while holding a spinlock is forbidden, so `log.lock` must be
+      released first. The rule is enforced: [[sched]] panics with `sched locks` unless noff is exactly 1, the process's own `p->lock`. The buffers `commit` holds while it sleeps are sleep-locks, which noff does not count ([[concept:locks#rules]]).
+
+      What protects the log's state during the commit, then? The **`committing` flag**,
+      set under the lock, acts as a lock of its own:
+
+      - [[begin_op]] sees `committing == 1` and sleeps, so no new transaction starts.
+      - `outstanding` is 0, so nobody is between `begin_op` and `end_op`, and therefore
+        nobody can call [[log_write]] and change `lh`.
+
+      So `commit` reads `log.lh.n` and `log.lh.block[]` without the lock, and that is safe:
+      no other code can be writing them. This is a common pattern: a spinlock guards a
+      flag, and the flag guards a long operation that can sleep.
+    others: |
+      | Time | Hart 2 (C, committing) | Hart 0 (A, next write) |
+      |---|---|---|
+      | t1 | `committing = 1`, release `log.lock` | |
+      | t2 | `write_log`: disk writes, sleeps | `begin_op`: `committing == 1` → sleep on `&log` |
+      | t3 | `write_head`, `install_trans`, … | asleep, holding no inode lock |
+      | t4 | `committing = 0`, `wakeup(&log)` | wakes, re-checks, admitted to a new transaction |
+
+      Readers are not blocked. A `read` of `f1` on hart 1 during the commit does not call
+      `begin_op` at all; it waits only if it needs a buffer the commit holds at that moment.
+
+  - title: "Step 1: copy the blocks into the log"
+    file: kernel/log.c
+    lines: 186-212
+    focus: 195-196
+    state:
+      hart: 2
+      mode: S
+      proc: child C (pid 6)
+      intr: on
+      satp: kernel
+      locks: ["log block's lock (sleep-lock)", "home block's lock (sleep-lock)"]
+      irq: 0
+      stack: [usertrap, syscall, sys_write, filewrite, end_op, commit, write_log]
+      sp:
+        "on": kernel
+        detail: "child C's kernel stack carries the commit for all three children"
+    note: |
+      [[write_log]] goes through the 8 logged blocks in order. For `tail = 0..7`:
+
+      - `to = bread(log.dev, 2 + tail + 1)`: log blocks 3, 4, …, 10.
+      - `from = bread(log.dev, lh.block[tail])`: the cached home block (46, 1006, …),
+        a guaranteed cache hit because it is pinned.
+      - Copy 1024 bytes and [[bwrite]] the **log** block. The home locations are not
+        touched yet.
+
+      One inefficiency is visible here: `bread` of a log block reads it from disk first if
+      it is not cached, only to overwrite all of it. The trace in this build shows exactly
+      that for the first commit after boot (read block 3, write block 3, read block 4, …).
+
+      If the machine crashes during this step, nothing is lost or damaged: the header on
+      disk still says `n = 0`, so recovery ignores the half-written log, and the home
+      blocks still hold the old, consistent state.
+
+      Every [[bwrite]] here goes through [[virtio_disk_rw]] and sleeps until the disk
+      finishes ([[tour:29]]), so C normally goes to sleep and wakes up again for each of these 8
+      writes (and for each log-block `bread` that misses). Each time, C's system call is
+      parked on C's kernel stack ([[concept:stacks#kernel]]):
+
+      ```text
+      child C's kernel stack, during one log write
+        top ─► usertrap · syscall · sys_write · filewrite
+               end_op (commit and write_log are inlined into it in this build)
+               bwrite · virtio_disk_rw · sleep · sched   ← p->context.sp
+      ```
+
+      C may wake on a different hart each time; the stack goes with the process, not the
+      hart.
+
+  - title: "Step 2: the commit point"
+    file: kernel/log.c
+    lines: 101-116
+    focus: 108-114
+    state:
+      hart: 2
+      mode: S
+      proc: child C (pid 6)
+      intr: on
+      satp: kernel
+      locks: ["header buf 2's lock (sleep-lock)"]
+      irq: 0
+      stack: [usertrap, syscall, sys_write, filewrite, end_op, commit, write_head]
+      sp: kernel
+    note: |
+      [[write_head]] copies the in-memory header into block 2, `n = 8` and the list
+      `46, 1006, 1007, 34, 1008, 1009, 1010, 1011`, and writes it.
+
+      **This one disk write is the commit.** Before it completes, a crash leaves `n = 0` on
+      disk and the transaction never happened. After it, a crash is repaired at boot:
+      [[recover_from_log]] finds `n = 8` and copies the 8 log blocks to their homes
+      ([[tour:32]]). Either all three files get their data, bitmap bits and inodes, or none
+      do.
+
+      That relies on the header write itself being all-or-nothing. The header is
+      `4 + 30 * 4` = 124 bytes, so it lies entirely within the first 512-byte sector of
+      block 2; xv6 assumes the disk writes a sector atomically.
+    others: |
+      `write_head` reads block 2 through the cache like any other block, so it holds the
+      buffer's sleep-lock while it writes. No other code touches block 2 while
+      `committing` is set.
+
+  - title: "Step 3: install, and unpin"
+    file: kernel/log.c
+    lines: 66-85
+    focus: 78-81
+    state:
+      hart: 2
+      mode: S
+      proc: child C (pid 6)
+      intr: on
+      satp: kernel
+      locks: ["log block's lock (sleep-lock)", "home block's lock (sleep-lock)"]
+      irq: 0
+      stack: [usertrap, syscall, sys_write, filewrite, end_op, commit, install_trans]
+      sp: kernel
+    note: |
+      Now [[install_trans]] writes each block to its **home** location: read log block
+      `3 + tail` (normally a cache hit, since `write_log` just used it), read the home block (also cached), copy, and `bwrite`
+      the home block: 46, then 1006, and so on.
+
+      Strictly, the copy is redundant during a normal commit: the cached home buffer
+      already holds exactly what was copied into the log. The same function is used for
+      crash recovery, where the cache is empty and the log on disk is the only copy.
+
+      With `recovering == 0`, each home buffer is then [[bunpin]]ned: its change is on disk
+      at last, so it may be recycled. After both `brelse`s, its `refcnt` drops to 0 and
+      it moves to the front of the LRU list ([[tour:30]]).
+
+      A crash during this step is harmless: the header still says `n = 8`, so recovery
+      repeats the whole installation. Writing a block twice with the same contents is
+      fine; the log is a redo log, and redoing is idempotent.
+
+  - title: "Step 4: erase the transaction"
+    file: kernel/log.c
+    lines: 202-212
+    focus: 205-211
+    state:
+      hart: 2
+      mode: S
+      proc: child C (pid 6)
+      intr: on
+      satp: kernel
+      locks: []
+      irq: 0
+      stack: [usertrap, syscall, sys_write, filewrite, end_op, commit]
+      sp: kernel
+    note: |
+      Finally [[commit]] sets `lh.n = 0` and calls [[write_head]] again, writing `n = 0` to
+      block 2. The log is empty on disk too; a crash from now on recovers nothing, which is
+      correct, since everything is already home.
+
+      Count the disk writes for this commit: 8 log blocks + 1 header + 8 home blocks + 1
+      header = **18 writes**, plus whatever log blocks had to be read first. Every write is
+      synchronous: C sleeps through each one ([[tour:29]]). Without the log, the same
+      changes would be 8 writes. Without group commit, three separate commits would have
+      sent the bitmap and the inode block through the log three times each.
+
+      `commit` first checks `lh.n > 0`. Many transactions log nothing at all (an `open` of
+      an existing file for reading still calls `begin_op`/`end_op`), and those commits do
+      no I/O. The trace shows several such empty commits during every boot, and one for
+      each `exec` that runs alone (its transaction reads the program but changes nothing;
+      `close` and `exit` are similar).
+
+  - title: Reopening the door
+    file: kernel/log.c
+    lines: 172-184
+    focus: 179-181
+    state:
+      hart: 2
+      mode: S
+      proc: child C (pid 6)
+      intr: off
+      satp: kernel
+      locks: [log.lock]
+      irq: {noff: 1, intena: 1}
+      stack: [usertrap, syscall, sys_write, filewrite, end_op]
+      sp: kernel
+    note: |
+      Back in [[end_op]], C re-takes `log.lock`, clears `committing`, increments
+      `ncommit`, and calls `wakeup(&log)`.
+
+      Everyone sleeping on `&log` wakes: A and B, if they are back with their next writes
+      in [[begin_op]], and any `sync` caller (next step). `logstress`'s parent and the shell
+      are asleep in `wait` on a different channel and are not disturbed. Each re-checks the conditions in the `while` loop
+      under `log.lock`. That is why `begin_op` is a loop: a wakeup means "something
+      changed", not "you may go". The first two or three to re-check get in; the rest go
+      back to sleep.
+
+      Only now does C's `write` return to user space, 2000 bytes written and, unlike A's
+      and B's a moment ago, already durable.
+    others: |
+      `ncommit` is for [[sys_sync]], next. Its increment and the `wakeup` happen under
+      `log.lock`, the same lock `sys_sync` checks it under, so a `sync` caller cannot miss
+      the commit it is waiting for.
+
+  - title: sync waits for the commit in flight
+    file: kernel/log.c
+    lines: 246-261
+    focus: 250-253
+    state:
+      hart: 1
+      mode: S
+      proc: sync
+      intr: off
+      satp: kernel
+      locks: [log.lock]
+      irq: {noff: 1, intena: 1}
+      stack: [usertrap, syscall, sys_sync]
+      sp:
+        "on": kernel
+        detail: "`sync`'s own kernel stack"
+    note: |
+      Suppose you had started `logstress f1 f2 f3 &` in the background, and you type
+      `sync` while it is still running. [[sys_sync]] takes
+      `log.lock`:
+
+      - If nothing is running and nothing is committing, every finished transaction is
+        already on disk (xv6 commits whenever `outstanding` reaches 0), so `sync` returns
+        at once.
+      - Otherwise it records `n = ncommit + 1` and sleeps on `&log` until `ncommit`
+        reaches `n`: until the transaction that is running (or committing) now has been
+        committed.
+
+      So after `sync` returns, every `write` that had *returned* before `sync` was called is
+      durable. In our scenario, A's and B's writes returned before the commit; `sync`
+      guarantees they are on disk.
+
+      It is woken by the same `wakeup(&log)` as `begin_op`, so it re-checks in a loop
+      too.
+
+  - title: What group commit bought
+    file: kernel/log.c
+    lines: 10-31
+    focus: 10-22
+    state:
+      hart: any
+      mode: S
+      proc: any
+      intr: on
+      satp: kernel
+      locks: []
+      irq: 0
+      stack: []
+      sp:
+        "on": kernel
+        detail: "the kernel stack of whichever process makes the last `end_op`"
+    note: |
+      Three `write` calls on three harts, 6,000 bytes of data. The log turned 21
+      `log_write` calls into 8 logged blocks, committed them with one header write, and
+      did all the disk work on one hart, holding no spinlock (only the sleep-locks of the one
+      or two buffers it is copying).
+
+      The key ideas:
+
+      - **Record, don't write.** Inside a transaction, `log_write` only notes the block
+        number and pins the buffer. The cache holds the changes.
+      - **Admission reserves space**: 10 blocks per running transaction. Three can run
+        together only into an empty log; otherwise the newcomer waits.
+      - **Absorption**: a block changed many times, or by many processes, is logged once.
+      - **Group commit**: the last `end_op` commits everyone's changes together; earlier
+        ones return immediately, not yet durable.
+      - **The commit point is one header write.** Before it, nothing happened; after it,
+        recovery will finish the job.
+      - **`committing`, a flag guarded by `log.lock`, does a lock's job** during the
+        commit, so the long, sleeping commit holds no spinlock.
+locks:
+  - lock: "log.lock (spinlock)"
+    where: "[[begin_op]], [[end_op]], [[log_write]], [[sys_sync]]"
+    protects: "`outstanding`, `committing`, `ncommit`, and the in-memory header `lh` while transactions are running"
+  - lock: "log.committing (a flag guarded by log.lock, not a lock itself)"
+    where: "set in [[end_op]], checked in [[begin_op]]"
+    protects: "The log area and `lh` during [[commit]], which sleeps and so cannot hold `log.lock`"
+  - lock: "bcache.lock (spinlock)"
+    where: "[[bread]]/[[brelse]] (every block access), [[bpin]] in [[log_write]], [[bunpin]] in [[install_trans]]"
+    protects: "Buffer reference counts, including the pins that keep logged blocks cached"
+  - lock: "b->lock (sleep-lock)"
+    where: "[[bread]]/[[brelse]] around every block access"
+    protects: "A block's cached contents: serializes the three children's changes to blocks 46 and 34"
+  - lock: "p->lock (spinlock)"
+    where: "[[sleep_prepare]], [[sleep]], [[wakeup]] (from begin_op, end_op, sys_sync)"
+    protects: "`p->chan` and `p->state`, so a wakeup between `release(&log.lock)` and `sleep()` is not lost"
+  - lock: "disk.vdisk_lock (spinlock)"
+    where: "[[virtio_disk_rw]], for every `bwrite` in commit and every `bread` miss"
+    protects: "The virtio descriptor ring; dropped while the committing process sleeps for each disk write"
+  - lock: "ip->lock (sleep-lock)"
+    where: "[[filewrite]], taken after [[begin_op]]"
+    protects: "Each child's own inode; taken after admission so waiters in `begin_op` hold no inode locks"
+quiz:
+  - q: "Why does `begin_op` reserve 10 blocks for every outstanding transaction instead of checking how many blocks are actually logged?"
+    a: "A running transaction may still log up to `MAXOPBLOCKS` more blocks, and `log_write` cannot wait or fail gracefully once the log is full (it panics). Reserving the worst case at admission guarantees every admitted transaction can finish."
+  - q: "Child A's `end_op` sees `outstanding` go from 2 to 1. Why must it not commit, even though its own changes are complete?"
+    a: "Child B is still in the middle of its transaction, and its partial changes are in the same cached buffers (blocks 46 and 34) that would be written. Committing then would make a half-done transaction durable."
+  - q: "`commit` reads `log.lh.n` and `log.lh.block[]` without holding `log.lock`. Why is that safe?"
+    a: "`committing` is 1 and `outstanding` is 0. `begin_op` admits nobody while `committing` is set, so no thread can be inside a transaction to call `log_write`, and nothing else changes `lh`."
+  - q: "The machine loses power after `write_log` finishes but before `write_head` writes the header. What do the three files contain after reboot, and why?"
+    a: "They are empty, as before the writes. The on-disk header still says `n = 0`, so recovery installs nothing, and the home blocks (bitmap, inode block, data blocks) were never touched."
+  - q: "Three children's 21 `log_write` calls produced only 8 logged blocks. Which blocks were absorbed, and why is absorbing them correct?"
+    a: "Repeat writes to the data blocks (from `bzero` then `writei`), the second bitmap update per child, and all three children's updates to blocks 46 and 34. The log records block numbers, and the commit copies each block's cached contents at commit time, which include every change made to it."
+  - q: "Child A's `write` returned to user space before the commit. Is its data safe? What would `sync` do if called right then?"
+    a: "Not yet: the data is only in pinned cache buffers, and a crash would lose it (cleanly, all or nothing). `sync` would see `outstanding > 0` or `committing`, sleep until `ncommit` increases, and return once the commit containing A's data has finished."

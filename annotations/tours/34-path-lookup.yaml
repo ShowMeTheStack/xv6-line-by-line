@@ -1,0 +1,571 @@
+title: Path lookup
+group: File system
+prerequisites: [33]
+summary: |
+  A program says `open("/a/b/c")`. The disk has no idea what `/a/b/c` means. It knows inode
+  numbers and blocks. Somewhere between the two, the kernel must walk from the root
+  directory to `a`, from `a` to `b`, from `b` to `c`, reading one directory at a time, while
+  other harts may be creating, deleting and walking through the very same directories.
+
+  This tour follows that walk, in [[namex]], for a real path on a fresh disk. You will see
+  [[skipelem]] chop the path into names, [[dirlookup]] search each directory, and the
+  rule that makes the walk safe on three harts: **hold one inode lock at a time**. You
+  will see why breaking that rule would deadlock on `..`, how [[nameiparent]] stops one
+  step early for `create` and `unlink`, how relative paths start from the current
+  directory, and a check added in this very version of xv6 that refuses to walk through a
+  deleted directory. Without it, the kernel panicked; we reproduce the panic.
+cast: |
+  The machine has three [[g:hart|harts]]. On a fresh boot the user typed `mkdir a`,
+  `mkdir a/b` and `echo hi > a/b/c` (pids 3, 4, 5), and now `cat /a/b/c` (pid 6). When the
+  tour starts:
+
+  | Hart | What it is doing |
+  |---|---|
+  | 0 | Idle in its [[kernel:scheduler]], or running other users of the same directories |
+  | 1 | Running `cat` (pid 6): the process this tour follows |
+  | 2 | Idle, or running a process that is changing `/a` while `cat` walks through it |
+
+  The shell (pid 2) is asleep in [[kernel:kwait]].
+steps:
+  - title: The tree on the disk
+    file: user/cat.c
+    lines: 24-43
+    focus: 35
+    state:
+      hart: 1
+      mode: U
+      proc: cat (pid 6)
+      intr: on
+      satp: user
+      locks: []
+      stack: [main]
+      sp: user
+    note: |
+      `cat` calls `open("/a/b/c", O_RDONLY)`. Here is what the three commands before it
+      left on the disk, read from the image and from a traced kernel:
+
+      | Directory | Inode | Data block | Entries (inode, name) |
+      |---|---|---|---|
+      | `/` | 1 | 47 | (1, `.`) (1, `..`) (2, `README`) … (23, `console`) (24, `a`) |
+      | `/a` | 24 | 1006 | (24, `.`) (1, `..`) (25, `b`) |
+      | `/a/b` | 25 | 1007 | (25, `.`) (24, `..`) (26, `c`) |
+
+      A [[g:directory]] is a file whose content is an array of 16-byte entries
+      ([[kernel:dirent|struct dirent]]): a 2-byte inode number and a 14-byte name. Nothing
+      else. There is no "path" anywhere on the disk; a path is a recipe for a walk through
+      these tables. `c` itself is inode 26, a 3-byte file holding `hi\n` in block 1008.
+
+  - title: open hands the string to namei
+    file: kernel/fs.c
+    lines: 728-741
+    focus: 730-735
+    state:
+      hart: 1
+      mode: S
+      proc: cat (pid 6)
+      intr: on
+      satp: kernel
+      locks: []
+      irq: 0
+      stack: [usertrap, syscall, sys_open, namei]
+      sp: {"on": kernel, switched: "`ld sp, 8(a0)` in `uservec` ([[kernel/trampoline.S:76]]) when `cat` executed `ecall`", detail: "cat's kernel stack: usertrap, syscall, sys_open, namei"}
+    note: |
+      [[sys_open]] copied the path into a kernel buffer with [[argstr]], started a
+      transaction with [[begin_op]], and, since there is no `O_CREATE`, called
+      [[namei]]`(path)` ([[kernel/sysfile.c:350]]).
+
+      `namei` and [[nameiparent]] are two faces of one function, [[namex]]. `namei` wants
+      the inode the whole path names. `nameiparent` wants the directory that would contain
+      the last element, plus that element's name. `namei` passes a 14-byte `name` buffer in
+      its own frame on `cat`'s kernel stack, because `namex` needs scratch space for each
+      element.
+
+      Why is lookup inside a transaction? Reading never writes the disk. But `namex` drops
+      references with [[iput]], and if one of those turned out to be the last reference to
+      a deleted directory, `iput` would free it, which writes. So every caller that can make
+      `namex` drop a reference runs it between `begin_op` and `end_op` (the comment at line
+      690). The one exception, [[userinit]]'s `namei("/")` ([[kernel/proc.c:226]]), never
+      enters the loop, so it never calls `iput`.
+
+      Every step that follows `cat` runs on `cat`'s **kernel stack** ([[concept:stacks#kernel]]), a
+      single 4 KiB page that was empty when `cat` executed `ecall` ([[kernel/trampoline.S:76]]
+      loaded its top into `sp`). The path itself is there too: [[argstr]] copied `"/a/b/c"`
+      into `sys_open`'s local `path[128]` ([[kernel/sysfile.c:331]]), so `namex` walks a kernel
+      copy that `cat` cannot change halfway through. (The later steps that follow `ls`, `sh`
+      and `rm` run on those processes' own kernel stacks.)
+
+  - title: Where to start, root or cwd
+    file: kernel/fs.c
+    lines: 687-700
+    focus: 696-699
+    state:
+      hart: 1
+      mode: S
+      proc: cat (pid 6)
+      intr: on
+      satp: kernel
+      locks: []
+      irq: 0
+      stack: [usertrap, syscall, sys_open, namei, namex]
+      sp: kernel
+    note: |
+      The path begins with `/`, so the walk starts at the root: [[iget]]`(ROOTDEV,
+      ROOTINO)`, device 1, inode 1. A path without a leading `/` would start at the
+      process's current directory, `myproc()->cwd`, with [[idup]] taking an extra
+      reference to it (step 13).
+
+      Either way `ip` now holds a **reference**, not a lock. The root's in-memory entry
+      never leaves the inode table while any process has `/` as its current directory, so
+      in our trace it was read from disk once, at boot, and never again.
+    others: |
+      Reading `myproc()->cwd` needs no lock: only the process itself changes its own
+      `cwd` ([[sys_chdir]]), and xv6 processes have a single thread. `iget` and `idup`
+      take `itable.lock` for the moment it takes to bump `ref` ([[tour:33]]).
+
+  - title: skipelem cuts off one name at a time
+    file: kernel/fs.c
+    lines: 648-685
+    focus: 662-685
+    state:
+      hart: 1
+      mode: S
+      proc: cat (pid 6)
+      intr: on
+      satp: kernel
+      locks: []
+      irq: 0
+      stack: [usertrap, syscall, sys_open, namei, namex, skipelem]
+      sp: kernel
+    note: |
+      [[skipelem]] skips slashes, copies the next element into `name`, skips the slashes
+      after it, and returns the rest. For our path, the loop at
+      [[kernel/fs.c:701]] calls it four times:
+
+      | Call | `path` in | `name` out | Returns |
+      |---|---|---|---|
+      | 1 | `"/a/b/c"` | `"a"` | `"b/c"` |
+      | 2 | `"b/c"` | `"b"` | `"c"` |
+      | 3 | `"c"` | `"c"` | `""` |
+      | 4 | `""` | (unchanged) | `0`: the walk is over |
+
+      Extra slashes vanish: `"//a///b"` gives the same walk. A returned empty string, as
+      after call 3, tells the caller "that was the last element", which is how
+      [[nameiparent]] knows when to stop.
+
+      Names longer than [[DIRSIZ]] (14) are cut to 14 bytes, without a terminating zero
+      (line 677). That works because names are compared with [[namecmp]], a `strncmp`
+      limited to 14 bytes. So `"abcdefghijklmnop"` and `"abcdefghijklmnXY"` name the same
+      file.
+
+  - title: Lock the directory, and check that it is one
+    file: kernel/fs.c
+    lines: 691-728
+    focus: 702-707
+    state:
+      hart: 1
+      mode: S
+      proc: cat (pid 6)
+      intr: on
+      satp: kernel
+      locks: ["inode 1 lock (sleep-lock)"]
+      irq: 0
+      stack: [usertrap, syscall, sys_open, namei, namex]
+      sp: kernel
+    note: |
+      First element, `a`. [[namex]] locks the current inode, the root, with [[ilock]]. It
+      must: it is about to read the directory's size and content, and the inode's
+      [[g:sleeplock]] is what makes them stable.
+
+      Two checks:
+
+      - `type != T_DIR`: you cannot look up a name in a file. `cat /README/x` fails here,
+        on the second iteration, with `cannot open`.
+      - `nlink == 0`: the directory has been **deleted**, though someone still holds a
+        reference. Step 11 shows why this check exists.
+
+      (Lines 704 and 708, the failure exits, release the lock; the state box shows the
+      path where both checks pass.)
+
+      Both failures use [[iunlockput]]: unlock, and drop the reference. Every exit from
+      `namex` returns or releases exactly the references it took.
+
+  - title: dirlookup scans the root for "a"
+    file: kernel/fs.c
+    lines: 589-615
+    focus: 600-610
+    state:
+      hart: 1
+      mode: S
+      proc: cat (pid 6)
+      intr: on
+      satp: kernel
+      locks: ["inode 1 lock (sleep-lock)"]
+      irq: 0
+      stack: [usertrap, syscall, sys_open, namei, namex, dirlookup]
+      sp: kernel
+    note: |
+      [[dirlookup]] reads the directory 16 bytes at a time with [[readi]], skipping empty
+      slots (`inum == 0`) and comparing names. There is no index and no hashing: a linear
+      scan. For `a`, the 25th entry (offset 384), that is 25 calls to `readi`, each one a
+      [[bread]] and [[brelse]] of block 47 (all hits in the [[g:buffer-cache]]) and a
+      16-byte copy.
+
+      On a match, it returns [[iget]]`(1, 24)`: a referenced, unlocked, possibly not yet
+      valid inode for `a`. It does not lock it. That is the subject of the next step.
+    others: |
+      The root's sleep-lock is held for the whole scan. A process on hart 2 creating
+      `/newfile` must lock the root too ([[create]]), so it waits. Without that lock it
+      could be writing a new entry into block 47 while `cat` reads it, or extending the
+      directory's `size` in the middle of the loop's `off < dp->size` test.
+
+  - title: Let go of the parent before touching the child
+    file: kernel/fs.c
+    lines: 691-728
+    focus: 716-720
+    state:
+      hart: 1
+      mode: S
+      proc: cat (pid 6)
+      intr: on
+      satp: kernel
+      locks: ["inode 1 lock (sleep-lock)"]
+      irq: 0
+      stack: [usertrap, syscall, sys_open, namei, namex]
+      sp: kernel
+    note: |
+      `next` is `a`, referenced but unlocked. Line 720 [[iunlockput|unlocks and puts]] the
+      root, and line 721 moves on: `ip = a`. At the top of the loop, `a` will be locked.
+
+      So between the two locks there is a moment when `cat` holds **no** inode lock, only a
+      reference to `a`. Another process could change `a` in that moment (add or remove an
+      entry, or, if `a` were empty, even unlink `a` from the root; step 11 shows the check
+      that catches that). That is acceptable: the reference keeps `a`'s
+      in-memory entry alive and meaning inode 24, and whatever `a` looks like when `cat`
+      locks it is what the lookup sees.
+
+      What the order buys is that `namex` **never holds two inode locks**. The next step
+      shows what would happen if it did.
+
+  - title: Why not hold both? Two ways to deadlock
+    file: kernel/fs.c
+    lines: 691-728
+    focus: 716-720
+    state:
+      hart: [1, 2]
+      mode: S
+      proc: cat (pid 6), and a process in /a/b
+      intr: on
+      satp: kernel
+      locks: []
+      irq: 0
+      stack: [usertrap, syscall, sys_open, namei, namex]
+      sp: kernel
+    note: |
+      Imagine a version of `namex` that locks `next` first and only then unlocks `ip`
+      ("lock coupling"). Directories are a tree for `/`-paths, but `..` points **up**, so
+      two walks can go in opposite directions:
+
+      | Time | Hart 1: `cat /a/b/c` | Hart 2: `ls ../x`, cwd `/a/b` |
+      |---|---|---|
+      | t1 | holds `a` (inode 24), looks up `b` | holds `b` (inode 25), looks up `..` |
+      | t2 | `ilock(b)`: sleeps, hart 2 holds it | `ilock(a)`: sleeps, hart 1 holds it |
+      | t3 | asleep forever | asleep forever |
+
+      A classic [[g:deadlock]]: each holds what the other wants. It needs no other hart,
+      either. Looking up `.` makes [[dirlookup]] return the same inode (`.` in `a` names
+      inode 24), so `ilock(next)` while holding `ip` would wait for a lock this very
+      process holds. (`cat ./a/./b/c` works in xv6 precisely because `namex` unlocks first.
+      Each `.` makes `dirlookup` return the very same `struct inode`, with `ref` raised by
+      [[iget]]. Line 720 unlocks it and drops one reference, which cannot free it because
+      `next` still holds one, and line 721 sets `ip = next`, the same pointer, so the next
+      `ilock` finds it unlocked. Under lock coupling, [[acquiresleep]] would find
+      `locked == 1` and sleep forever; it does not check who holds the lock, so the kernel
+      would hang, not panic.)
+
+      Holding at most one lock at a time makes both impossible. [[tour:18]] has the general
+      rule; the kernel-wide lock-order graph, in which a second inode lock is only ever taken
+      while a directory is held, on an inode named in it or one `create` has just allocated
+      for it, is in [[concept:locks#order]]. The price is the gap in the previous step: a lookup is not one atomic snapshot
+      of the tree, but a series of atomic steps.
+    others: |
+      A deadlock between sleep-locks costs no hart. Each stuck process's frames would stay on its
+      own kernel stack forever (`… namex`, `ilock`, `acquiresleep`, `sleep`, `sched`), while
+      `swtch` moves harts 1 and 2 to their scheduler stacks to run anything else. Nothing spins,
+      which is also why nothing would ever notice.
+
+  - title: "Down to a, then b: the inode read on the way"
+    file: kernel/fs.c
+    lines: 292-319
+    focus: 307-313
+    state:
+      hart: 1
+      mode: S
+      proc: cat (pid 6)
+      intr: on
+      satp: kernel
+      locks: ["inode 24 lock (sleep-lock)", "buf 34 (sleep-lock)"]
+      irq: 0
+      stack: [usertrap, syscall, sys_open, namei, namex, ilock]
+      sp: kernel
+    note: |
+      Second iteration, name `b`. `ilock(a)` finds `valid == 0`: inode 24's entry is new,
+      since no process kept a reference to it after `echo hi > a/b/c` (pid 5) exited. So [[ilock]] reads
+      block 34 (inodes 16–31) and copies inode 24: a directory, `nlink 2` (its entry in
+      `/` and the `..` in `b`), size 48, data in block 1006. Our trace printed
+      `ilock read inum 24 from block 34 pid 6`.
+
+      [[dirlookup]] scans three entries (`.`, `..`, `b`) of block 1006, finds `b` at offset
+      32, and returns [[iget]]`(1, 25)`. Unlock `a`, put `a`, move on.
+
+      Third iteration, name `c`: the same for inode 25 (also in block 34), whose block 1007
+      holds `.`, `..` and `c`. It returns `iget(1, 26)`.
+    others: |
+      Notice that `cat` reads inode 24 from disk although pid 5, a moment ago, had it in
+      memory. The inode table keeps only inodes someone holds ([[tour:33]]). The block,
+      though, is still in the [[g:buffer-cache]], so this "read" probably costs a copy, not
+      a disk access ([[tour:30]]).
+
+  - title: The walk ends, and c comes back unlocked
+    file: kernel/fs.c
+    lines: 691-728
+    focus: 701
+    state:
+      hart: 1
+      mode: S
+      proc: cat (pid 6)
+      intr: on
+      satp: kernel
+      locks: []
+      irq: 0
+      stack: [usertrap, syscall, sys_open, namei, namex]
+      sp: kernel
+    note: |
+      After the third iteration, `path` is `""`, so the fourth [[skipelem]] returns 0 and
+      the loop ends. `ip` is `c` (inode 26): referenced, unlocked, and never locked by
+      `namex`. Line 727 returns it.
+
+      `namex` never locked `c` because it never needed `c`'s contents. Whether `c` is a
+      file, a directory or a device is the caller's business. [[sys_open]] locks it next
+      ([[kernel/sysfile.c:354]]), checks its type, and keeps the reference in the open file
+      ([[tour:33]]).
+
+      The whole lookup touched four inodes (1, 24, 25, 26) and took three inode locks, one
+      at a time, scanning 25 + 3 + 3 directory entries.
+
+  - title: The deleted directory, and a panic fixed in this version
+    file: kernel/fs.c
+    lines: 691-728
+    focus: 707
+    state:
+      hart: 1
+      mode: S
+      proc: ls (pid 7)
+      intr: on
+      satp: kernel
+      locks: ["inode 25 lock (sleep-lock)"]
+      irq: 0
+      stack: [usertrap, syscall, sys_open, namei, namex]
+      sp: kernel
+    note: |
+      The `nlink == 0` check was added in xv6 commit `9da28f5` (August 2026) after this
+      sequence crashed the kernel. We ran it on a fresh disk, first with this check removed
+      in a scratch copy:
+
+          $ mkdir /a
+          $ mkdir /a/b
+          $ cd /a/b
+          $ /rm /a/b
+          $ /rm /a
+          $ /ls ..
+          panic: ilock: no type
+
+      `rm /a/b` removed `b`'s entry and set `b`'s `nlink` to 0, but the shell's `cwd` still
+      referenced `b`, so `b` was not freed, and its `..` entry still said inode 24. Then
+      `rm /a` freed `a` completely (`type = 0`). `ls ..` started at `b`, found `..` = 24,
+      and [[ilock]] read a free inode: panic.
+
+      With the check, the walk stops at `b`, because a deleted directory is not a place
+      any path can lead through. The same commands print `ls: cannot open ..`. The
+      commit message's version uses `../../rm`, which works only before the fix. It also
+      notes two other symptoms of the same hole: [[create]] could create
+      files in a disconnected directory, and an [[ialloc]] / lookup race could hand out the
+      same inode number twice.
+    others: |
+      The shell's `cwd` reference is what kept the deleted `b` alive. That is fine: `b` will
+      be freed at the shell's next successful `cd` (it must be an absolute path such as
+      `cd /`, since relative ones now fail) or at its exit, by the last [[iput]]. Until then every
+      relative lookup from inside it fails, even `../../rm`: after `rm /a/b`, we could not
+      run `../../rm /a` at all (`exec ../../rm failed`).
+
+  - title: nameiparent stops one step early
+    file: kernel/fs.c
+    lines: 691-728
+    focus: 711-712
+    state:
+      hart: 1
+      mode: S
+      proc: sh (pid 5)
+      intr: on
+      satp: kernel
+      locks: ["inode 25 lock (sleep-lock)"]
+      irq: 0
+      stack: [usertrap, syscall, sys_open, create, nameiparent, namex]
+      sp: kernel
+    note: |
+      Go back to `echo hi > a/b/c`, which created `c`. [[create]] cannot use `namei`: `c`
+      does not exist yet. It needs the directory `a/b` and the name `"c"`, so it calls
+      [[nameiparent]].
+
+      The walk is the same until the last element. On the third iteration `name` is `"c"`
+      and [[skipelem]] returned `""`. So `nameiparent && *path == '\0'` is true: line 713
+      unlocks `b` and returns it, **referenced but unlocked**, with `"c"` left in `name`.
+      `c` is never looked up here; that is the caller's job, under the caller's own lock
+      of `b` ([[tour:35]]).
+
+      Lines 723–726 handle the path with no last element: `nameiparent("/")` walks zero
+      times and fails, since `/` has no parent to return. Deleting or creating `/` is
+      meaningless.
+    others: |
+      Between line 713 and [[create]]'s own `ilock(dp)`, `b` is unlocked. Another hart
+      could delete `b` in that gap. That is why `create` checks `dp->nlink == 0` again
+      after locking ([[kernel/sysfile.c:269]]), and why [[sys_link]] has the same check
+      since commit `a12cd83`.
+
+  - title: Relative paths start from cwd
+    file: kernel/sysfile.c
+    lines: 433-456
+    focus: 451-454
+    state:
+      hart: 1
+      mode: S
+      proc: sh (pid 2)
+      intr: on
+      satp: kernel
+      locks: []
+      irq: 0
+      stack: [usertrap, syscall, sys_chdir]
+      sp: kernel
+    note: |
+      If the user types `cd a` and then `/cat b/c` (the leading `/` matters: the shell
+      passes `cat` to `exec` unchanged, and `exec` would look for `/a/cat`), the walk for
+      `b/c` starts at line 699: [[idup]]`(myproc()->cwd)`. The shell runs `cd` itself, not in a child, because the
+      current directory belongs to the process ([[user/sh.c:167]]).
+
+      [[sys_chdir]] looks up `a` with [[namei]], locks it to check it is a directory,
+      unlocks it, and swaps references: [[iput]] the old `cwd` (the root), keep the new
+      one. The `iput` is inside the transaction for the usual reason: if the old directory
+      had been deleted, this could be its last reference.
+
+      Afterwards, `/cat b/c` forked from the shell inherits `cwd = a` ([[kfork]] calls
+      [[idup]]), so the walk for `b/c` is `idup(a)`, look up `b`, then `c`: two iterations
+      instead of three, and this walk never touches the root (only `exec`'s lookup of
+      `/cat` does).
+    others: |
+      `p->cwd` is assigned on line 454 without a lock. Only this process reads or writes
+      its own `cwd`, and it is single-threaded, so there is nobody to race with. The
+      reference it holds is counted in the inode's `ref`, under `itable.lock`.
+
+  - title: Walking while someone else deletes
+    file: kernel/sysfile.c
+    lines: 201-256
+    focus: 228-241
+    state:
+      hart: 2
+      mode: S
+      proc: rm (pid 7)
+      intr: on
+      satp: kernel
+      locks: ["inode 25 lock (sleep-lock)", "inode 26 lock (sleep-lock)"]
+      irq: 0
+      stack: [usertrap, syscall, sys_unlink]
+      sp: kernel
+    note: |
+      Suppose `rm /a/b/c` runs on hart 2 while `cat /a/b/c` walks on hart 1. [[sys_unlink]]
+      uses [[nameiparent]] to get `b`, then locks `b` and, inside that, `c`: two locks,
+      parent before child.
+
+      Which file `cat` gets depends on who locks `b` first:
+
+      | Time | Hart 1: `cat` walks | Hart 2: `rm` unlinks |
+      |---|---|---|
+      | t1 | `ilock(b)`, finds `c`, `iget(26)`: `ref = 1` | `nameiparent`: waiting to lock `b` |
+      | t2 | `iunlockput(b)` | locks `b`, then `c`; clears the entry; `nlink = 0` |
+      | t3 | opens inode 26 and reads `hi` | `iput(c)`: `ref` 2 → 1, not freed |
+
+      or, the other way round, `rm` locks `b` first, clears the entry, and `cat`'s
+      `dirlookup` finds nothing: `cannot open`. Both are correct outcomes. What can **not**
+      happen is `cat` getting an inode that is being freed: the reference from `iget` is
+      taken under `b`'s lock, before `rm` can clear the entry, and it keeps the inode
+      alive ([[tour:33]]).
+    others: |
+      `rm` holds two inode locks, but always parent then child, and `namex` never holds
+      two. So `rm` and `cat` cannot form the deadlock of step 8: there is no process
+      holding a child while waiting for its parent.
+
+  - title: What a lookup costs, and what it promises
+    file: kernel/fs.c
+    lines: 691-728
+    focus: 701-722
+    state:
+      hart: 1
+      mode: S
+      proc: cat (pid 6)
+      intr: on
+      satp: kernel
+      locks: []
+      irq: 0
+      stack: [usertrap, syscall, sys_open, namei, namex]
+      sp: kernel
+    note: |
+      For `/a/b/c`, `namex` did three iterations. Each took a lock, maybe read an inode,
+      scanned a directory linearly with one [[readi]] per entry, took a reference to the
+      next inode, and released the lock and the old reference. In all: 31 directory entries
+      read, 3 inode locks, 4 references taken and 3 dropped, two inode loads (24 and 25)
+      that hit the buffer cache.
+
+      The ideas worth keeping:
+
+      - A path is a sequence of [[dirlookup]]s; the disk stores only names → numbers, one
+        directory at a time.
+      - References and locks are separate: `namex` carries a **reference** from one step to
+        the next, and holds a **lock** only while reading one directory.
+      - One inode lock at a time rules out deadlock with `..` and `.`. The price is that a
+        lookup is a series of atomic steps, not one atomic snapshot.
+      - A deleted directory may still be referenced (as someone's `cwd`), so `namex` and
+        `create` check `nlink` after locking, not before.
+
+      One more property, about the stack: [[namex]] is a loop, not a recursion. A path with
+      fifty elements uses the same frames on `cat`'s kernel stack as a path with one, which
+      matters on a stack that is a single page with an unmapped guard page below it.
+locks:
+  - lock: "inode sleep-lock of the current directory"
+    where: "[[namex]] (one at a time), [[sys_chdir]]"
+    protects: "The directory's `size`, `type`, `nlink` and content while [[dirlookup]] scans it"
+  - lock: "itable.lock (spinlock)"
+    where: "[[iget]], [[idup]], [[iput]]"
+    protects: "The reference counts that keep each inode on the path alive between locks"
+  - lock: "buffer sleep-locks"
+    where: "[[readi]], [[ilock]] through [[bread]]"
+    protects: "Each directory block or inode block while 16 or 64 bytes are copied out"
+  - lock: "no lock: myproc()->cwd"
+    where: "[[namex]] line 699, [[sys_chdir]] line 454"
+    protects: "Only the owning, single-threaded process reads or writes its `cwd`"
+  - lock: "no second inode lock in namex"
+    where: "[[namex]] lines 720–721"
+    protects: "Deliberately absent: holding parent and child together could deadlock with `..` or `.`"
+  - lock: "log (begin_op / end_op)"
+    where: "callers of [[namei]] and [[nameiparent]]"
+    protects: "Any [[iput]] during the walk that turns out to free a deleted directory"
+quiz:
+  - q: "`namex` unlocks the parent before locking the child. Give an interleaving on two harts that would deadlock if it held the parent's lock while locking the child."
+    a: "Hart 1 walks `/a/b`, holding `a` and waiting for `b`; hart 2, with cwd `/a/b`, walks `..`, holding `b` and waiting for `a`. Each waits for the other's lock forever. With one lock at a time, neither ever holds a lock while waiting for another."
+  - q: "Why does looking up `.` not deadlock a single process, given that `dirlookup(dp, \".\")` returns `dp` itself?"
+    a: "`namex` unlocks `ip` (and drops a reference) before locking `next`. Since `next` is the same inode, the next `ilock` finds it unlocked. If `namex` locked `next` while still holding `ip`, it would wait for its own lock forever."
+  - q: "Between `nameiparent` returning `b` and `create` locking it, what can another hart do, and how does `create` defend against it?"
+    a: "It can unlink `b` (making `nlink` 0) while the reference keeps it in memory. `create` checks `dp->nlink == 0` after `ilock(dp)` and fails rather than creating a file in a directory no path can reach."
+  - q: "Before commit `9da28f5`, `ls ..` from a deleted directory panicked with `ilock: no type`. Explain the chain of events."
+    a: "The deleted directory `b` still existed in memory because the shell's `cwd` referenced it, and its `..` entry still named `a`'s inode number. `a` had since been freed (`type = 0`). Looking up `..` returned that number and `ilock` read a free inode, which it treats as a kernel bug and panics. Now `namex` refuses to search a directory with `nlink == 0`."
+  - q: "Why does `namei` run inside a transaction, though looking up a name writes nothing?"
+    a: "`namex` drops references with `iput`. If one of them is the last reference to a directory that was deleted meanwhile, `iput` truncates and frees it, which writes the disk, and every disk write must belong to a transaction."
+  - q: "A name in a path is 20 characters long. What does xv6 do with it?"
+    a: "`skipelem` copies only the first 14 bytes (DIRSIZ) into `name`, without a terminating zero, and `namecmp` compares at most 14 bytes. So the lookup matches the entry whose first 14 characters are the same; the rest of the name is ignored."

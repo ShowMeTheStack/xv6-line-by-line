@@ -1,0 +1,713 @@
+title: sbrk, eager and lazy, and page faults
+group: Memory
+prerequisites: [5, 10, 25]
+summary: |
+  A program that needs more memory asks the kernel to move the end of its address space
+  up. xv6 offers two ways to do it. `sbrk(n)` is **eager**: the kernel allocates and maps
+  every page right away. `sbrklazy(n)` is **lazy**: the kernel only raises the limit, and
+  allocates a page the first time the program touches it, inside a [[g:page-fault]].
+
+  This tour follows both. First, the shell's child (pid 3) parsing `ls` calls `malloc`,
+  which grows the heap eagerly by 64 KiB: 16 pages allocated in one system call. Then a
+  `usertests` child asks lazily for a whole **gibibyte**, gets it instantly, and touches
+  one page in every 64: 4096 page faults, each turning into one page of real memory, in
+  our gdb run. You will also see the [[g:guard-page]] refuse to be "lazily allocated",
+  memory being given back with `sbrk(-n)`, and why the kernel can free pages without
+  telling any [[g:tlb]].
+
+  Almost nothing here takes a lock, and that absence is the lesson: a process's address
+  space is its own. The one shared thing is the pool of free pages, and its lock,
+  `kmem.lock`, is where the harts meet.
+cast: |
+  The machine has three [[g:hart|harts]]. When the tour starts:
+
+  | Hart | What it is doing |
+  |---|---|
+  | 0 | Idle in its scheduler; the shell (pid 2) sleeps in `wait` |
+  | 1 | Idle, or running whatever else is runnable |
+  | 2 | Running the shell's child (pid 3) in user mode, about to parse `ls` |
+
+  The child's memory is a copy of the shell's five pages ([[tour:25]]): `p->sz = 0x5000`,
+  with an empty heap. Later in the tour, a different scenario runs `usertests lazy_alloc`.
+steps:
+  - title: The parser needs memory
+    file: user/sh.c
+    lines: 201-210
+    focus: 206
+    state:
+      hart: 2
+      mode: U
+      proc: sh (pid 3)
+      intr: on
+      satp: user
+      locks: []
+      stack: [main, parsecmd, parseline, parsepipe, parseexec, execcmd]
+      sp: user
+    note: |
+      The shell's child ([[tour:20]]) calls `parsecmd("ls\n")`. The parser builds a small
+      tree of command structures, and the first is an `execcmd`, allocated with `malloc`.
+
+      This is the child's first `malloc` ever. The shell itself never calls it, so the
+      child's heap, inherited from the shell, is empty: `p->sz` is still `0x5000`, ending
+      right after the stack page. `malloc` has no memory to hand out and must ask the kernel
+      for some.
+
+      Note where we are: in the child, on hart 2. Whatever happens to this address space
+      happens to the child's page table only, not to the shell's on hart 0.
+
+  - title: malloc asks for 64 KiB at a time
+    file: user/umalloc.c
+    lines: 46-61
+    focus: 52-56
+    state:
+      hart: 2
+      mode: U
+      proc: sh (pid 3)
+      intr: on
+      satp: user
+      locks: []
+      stack: [main, parsecmd, parseline, parsepipe, parseexec, execcmd, malloc, morecore]
+      sp: user
+    note: |
+      [[user:malloc]] finds its free list empty and calls [[user:morecore]]. `morecore`
+      never asks the kernel for less than 4096 units of 16 bytes (`sizeof(Header)`):
+      **65536 bytes**, 64 KiB, 16 pages. Asking in big chunks keeps the number of system
+      calls low; `malloc` will carve this chunk up for many later requests.
+
+      [[user:sbrk]] returns the **old** end of memory, which is the start of the new block:
+      `0x5000`. `morecore` writes a header there, at the very start of the new memory, and
+      hands the block to [[user:free]] to put it on the free list.
+
+      `SBRK_ERROR`, `(char *)-1`, means the kernel refused.
+
+  - title: Two flavors of one system call
+    file: user/ulib.c
+    lines: 152-162
+    focus: 153-161
+    state:
+      hart: 2
+      mode: U
+      proc: sh (pid 3)
+      intr: on
+      satp: user
+      locks: []
+      stack: [main, parsecmd, parseline, parsepipe, parseexec, execcmd, malloc, morecore, sbrk]
+      sp: user
+    note: |
+      Both [[user:sbrk]] and [[user:sbrklazy]] are one-line wrappers around the same system
+      call, [[user:sys_sbrk]], with a second argument choosing the policy:
+      [[SBRK_EAGER]] (1) or [[SBRK_LAZY]] (2), from [[kernel/vm.h]].
+
+      `malloc` uses the eager one. The stub puts `SYS_sbrk` (12) in `a7`, `n = 65536` in
+      `a0`, `1` in `a1`, and executes `ecall` ([[tour:5]]).
+
+      Why would anyone choose eager? It fails early and cleanly: if memory is short,
+      `sbrk` returns -1 now, and `malloc` returns 0 for the program to handle. With lazy
+      allocation, running out of memory is discovered later, at some random store
+      instruction, and the only thing the kernel can do then is kill the process.
+
+  - title: sys_sbrk chooses a path
+    file: kernel/sysproc.c
+    lines: 39-65
+    focus: 46-53
+    state:
+      hart: 2
+      mode: S
+      proc: sh (pid 3)
+      intr: on
+      satp: kernel
+      locks: []
+      irq: 0
+      stack: [usertrap, syscall, sys_sbrk]
+      sp:
+        "on": kernel
+        switched: "`ld sp, 8(a0)` in [[uservec]] ([[kernel/trampoline.S:76]]), after the `ecall`"
+        detail: "pid 3's kernel stack: frames `usertrap`, `syscall`, `sys_sbrk`"
+    note: |
+      [[sys_sbrk]] fetches `n` and `t`, and records the current size as the return value:
+      `addr = 0x5000`.
+
+      Then the policy: eager (`t == SBRK_EAGER`), **or any shrink** (`n < 0`), goes through
+      [[growproc]], which really changes the page table. Only lazy growth takes the other
+      branch. Shrinking is always eager, because pages that exist must be freed now; we
+      return to that at the end.
+
+      Our gdb run printed exactly this call: `SBRK hart=… pid=3 name=sh n=65536 t=1
+      addr=0x5000`.
+
+  - title: growproc, with no lock
+    file: kernel/proc.c
+    lines: 233-254
+    focus: 241-253
+    state:
+      hart: 2
+      mode: S
+      proc: sh (pid 3)
+      intr: on
+      satp: kernel
+      locks: []
+      irq: 0
+      stack: [usertrap, syscall, sys_sbrk, growproc]
+      sp: kernel
+    note: |
+      [[growproc]] first checks the ceiling: the new end may not pass [[kernel:TRAPFRAME]]
+      (`0x3fffffe000`), or the heap would run into the trapframe and trampoline pages at the
+      top of the address space ([[tour:25]]). `0x5000 + 0x10000` is far below it.
+
+      Then [[uvmalloc]] maps pages from `0x5000` to `0x15000`, and `p->sz` becomes
+      `0x15000`.
+
+      No lock is taken, not even `p->lock`, though `p->sz` and `p->pagetable` are fields of
+      a `struct proc` in a table shared by all harts. [[kernel/proc.h:95]] explains: these
+      fields are *private to the process*. Only the process itself, in its own system calls,
+      changes them, and an xv6 process has a single thread, so there is never a second
+      writer. No other process reads them while this one is alive: a parent's `wait` frees
+      them only once the child is a zombie ([[tour:21]]).
+    others: |
+      A timer interrupt can arrive anywhere in [[growproc]] (interrupts are on), and the
+      child may be moved to hart 0 or hart 1 halfway through [[uvmalloc]]. Nothing breaks:
+      the page table is in memory, not in any hart's registers, and the hart is translating
+      with the kernel page table, not the one being changed. The only per-hart thing that
+      could be stale is the TLB, and it holds no user translations while the hart is in the
+      kernel (step 17).
+
+  - title: uvmalloc maps 16 zeroed pages
+    file: kernel/vm.c
+    lines: 215-242
+    focus: 226-241
+    state:
+      hart: 2
+      mode: S
+      proc: sh (pid 3)
+      intr: on
+      satp: kernel
+      locks: []
+      irq: 0
+      stack: [usertrap, syscall, sys_sbrk, growproc, uvmalloc]
+      sp: kernel
+    note: |
+      [[uvmalloc]] loops over page addresses `0x5000`, `0x6000`, …, `0x14000`. For each:
+
+      1. [[kalloc]] a physical page;
+      2. `memset` it to zero (more below);
+      3. [[mappages]] it with `PTE_R | PTE_U | PTE_W`.
+
+      All 16 pages fall at level-0 indices 5 to 20, inside the **same** level-0 page-table
+      page that already maps the code, data and stack (one level-0 page covers 2 MiB). So
+      [[walk]] finds every intermediate table already present, and no page-table page is
+      allocated: exactly 16 calls to [[kalloc]].
+
+      If [[kalloc]] runs dry halfway, [[uvmdealloc]] frees the pages added so far and
+      `uvmalloc` returns 0. All or nothing: the process never ends up with a half-grown heap
+      and a `sz` that disagrees with its page table.
+
+      Why zero? A page from [[kalloc]] was last used for something else (as a user page, a
+      page table, a trapframe or a pipe buffer). Handing it over unwiped would leak that data to this program. Zeroing also gives
+      C programs what they expect from fresh memory.
+
+  - title: kmem.lock, where the harts meet
+    file: kernel/kalloc.c
+    lines: 65-82
+    focus: 74-76
+    state:
+      hart: 2
+      mode: S
+      proc: sh (pid 3)
+      intr: off
+      satp: kernel
+      locks: [kmem.lock]
+      irq: {noff: 1, intena: 1}
+      stack: [usertrap, syscall, sys_sbrk, growproc, uvmalloc, kalloc]
+      sp: kernel
+    note: |
+      [[kalloc]] is the one place in this whole path that touches memory shared by all
+      harts: the free list. It takes `kmem.lock`, pops the first page, and releases. Five
+      instructions or so under the lock, with interrupts off on hart 2 for that time.
+
+      The fill with junk (5s) on line 80 is done **after** releasing the lock. Once the page
+      is off the list, it belongs to this caller alone, so there is no reason to make other
+      harts wait while 4096 bytes are written. (And then [[uvmalloc]] overwrites the junk
+      with zeros. The junk fill exists to catch kernel code that uses a page without
+      initializing it.)
+
+      [[tour:27]] covers the allocator in detail.
+    others: |
+      Suppose another hart is freeing a page at that very moment (nothing else is running in
+      this quiet scenario, but during `usertests` it happens constantly):
+
+      | Time | Hart 2 (kalloc) | Hart 1 (kfree) |
+      |---|---|---|
+      | t1 | `acquire(&kmem.lock)` | `acquire(&kmem.lock)`: spins |
+      | t2 | `r = freelist; freelist = r->next` | spinning |
+      | t3 | `release` | gets the lock, pushes its page |
+
+      Without the lock, hart 1 could push a page between hart 2's two reads of the list,
+      and that page would be lost, or two harts popping at once could get the same page and
+      share it between two processes.
+
+  - title: The heap is ready
+    file: kernel/sysproc.c
+    lines: 39-65
+    focus: 64
+    state:
+      hart: 2
+      mode: S
+      proc: sh (pid 3)
+      intr: on
+      satp: kernel
+      locks: []
+      irq: 0
+      stack: [usertrap, syscall, sys_sbrk]
+      sp: kernel
+    note: |
+      [[sys_sbrk]] returns `0x5000`, the start of the new memory. The child's address space
+      now has a 64 KiB heap:
+
+      ```
+      0x15000  sz
+               heap: 16 pages, R W U, all present and zero
+      0x05000  old sz
+      0x04000  stack
+      0x03000  guard page
+      ...
+      ```
+
+      `malloc` carves the `execcmd` out of the top of that block (`morecore` freed the whole
+      block onto the free list, and `malloc` takes from the end of a free chunk) and parsing
+      continues.
+
+      This child will call `exec` a moment later, which frees all 16 pages without the
+      program having used more than about 200 bytes of them ([[tour:22]]). Eager allocation
+      paid for 16 pages, 16 `kalloc`s and 64 KiB of zeroing that nobody needed. That is the
+      case for laziness.
+
+  - title: Asking lazily for a gibibyte
+    file: user/usertests.c
+    lines: 2625-2649
+    focus: 2632-2640
+    state:
+      hart: 0
+      mode: U
+      proc: usertests (pid 4)
+      intr: on
+      satp: user
+      locks: []
+      stack: [main, drivetests, runtests, run, lazy_alloc]
+      sp:
+        "on": user
+        switched: "`ld sp, 48(a0)` in [[userret]] ([[kernel/trampoline.S:118]]) and `sret` ([[kernel/trampoline.S:153]]), the last time pid 4 returned to user mode"
+    note: |
+      A new scenario: you type `usertests lazy_alloc`. `usertests` (pid 3) forks a child
+      (pid 4) to run the test, and waits for it. (This is after a fresh boot, so the shell's
+      child running `usertests` is pid 3.) In our gdb run the child ran on hart 0.
+
+      The test calls `sbrklazy(1 << 30)`: one GiB, on a machine that has 128 MiB of RAM.
+      Eagerly, that would fail. Lazily, it succeeds. Then the loop stores into one 8-byte
+      word every 64 pages (every 256 KiB), starting one page above the old end. That touches
+      4096 of the 262,144 pages in the region, and checks that the values read back.
+
+      The interesting question is what happens at each of those stores.
+
+  - title: Lazy growth only moves a number
+    file: kernel/sysproc.c
+    lines: 39-65
+    focus: 54-63
+    state:
+      hart: 0
+      mode: S
+      proc: usertests (pid 4)
+      intr: on
+      satp: kernel
+      locks: []
+      irq: 0
+      stack: [usertrap, syscall, sys_sbrk]
+      sp:
+        "on": kernel
+        switched: "`ld sp, 8(a0)` in [[uservec]] ([[kernel/trampoline.S:76]]), after the `ecall`"
+    note: |
+      With `t = SBRK_LAZY` and `n > 0`, [[sys_sbrk]] takes the second branch. Two checks, and
+      then the entire "allocation":
+
+      - `addr + n < addr`: the sum wrapped around 2^64 (it cannot while `sz` stays below
+        `TRAPFRAME` and `n` is an `int`, but it is cheap insurance);
+      - `addr + n > TRAPFRAME`: the same ceiling as [[growproc]];
+      - `myproc()->sz += n`.
+
+      gdb printed `n=1073741824 t=2 addr=0x12000`: `usertests` had `0x12000` bytes, and now
+      `p->sz = 0x40012000`. No page was allocated, and the page table did not change.
+
+      From now on, `sz` and the page table **disagree**: addresses below `sz` are legal, but
+      most of them are not mapped. The kernel has promised memory it has not provided. That
+      promise is kept by [[vmfault]], called from [[usertrap]] for a user access, and from
+      [[copyin]], [[copyinstr]] and [[copyout]] when the kernel itself touches user memory on
+      the program's behalf ([[tour:28]]).
+
+  - title: A store to a page that is not there
+    file: user/usertests.c
+    lines: 2625-2649
+    focus: 2639-2640
+    state:
+      hart: 0
+      mode: U
+      proc: usertests (pid 4)
+      intr: on
+      satp: user
+      locks: []
+      stack: [main, drivetests, runtests, run, lazy_alloc]
+      sp:
+        "on": user
+        switched: "`ld sp, 48(a0)` in [[userret]] ([[kernel/trampoline.S:118]]) and `sret` ([[kernel/trampoline.S:153]])"
+        detail: "the store's target is the heap; the stack itself is fully mapped"
+    note: |
+      The first iteration stores `i` at `i = 0x13000`. The compiler made this one
+      instruction, `sd a5,0(a5)` at `0x495e` in `user/usertests.asm`.
+
+      The hardware walks the page table for `0x13000` ([[tour:25]]): level 2 and level 1
+      are there (they also map the program), but the level-0 entry for page `0x13` is zero,
+      `V = 0`. The store cannot complete. The CPU raises a **store/AMO page fault** (it is
+      handled in S-mode, not M-mode, only because [[start]] delegated all exceptions with
+      `medeleg` at [[kernel/start.c:31]]):
+
+      | Register | Value |
+      |---|---|
+      | `scause` | 15 (store/AMO page fault) |
+      | `stval` | `0x13000`, the faulting address |
+      | `sepc` | `0x495e`, the store itself |
+
+      These are the values gdb printed. As for a system call, `sepc` points at the trapping
+      instruction; the difference is that this store did **not** complete, so the kernel
+      will not add 4, and `sret` will retry it. The trap goes through
+      [[uservec]] into [[usertrap]] exactly as in [[tour:5]] ([[tour:10]] surveys the other
+      exceptions).
+
+  - title: usertrap recognizes a lazy page
+    file: kernel/trap.c
+    lines: 49-79
+    focus: 71-74
+    state:
+      hart: 0
+      mode: S
+      proc: usertests (pid 4)
+      intr: off
+      satp: kernel
+      locks: []
+      irq: 0
+      stack: [usertrap]
+      sp:
+        "on": kernel
+        switched: "`ld sp, 8(a0)` in [[uservec]] ([[kernel/trampoline.S:76]]), after the page fault"
+        detail: "was empty; now holds only `usertrap`'s frame"
+    note: |
+      [[usertrap]] saves `sepc` into the trapframe, as for any trap. `scause` is not 8, so
+      it is not a system call; [[devintr]] says it is not a device interrupt. The third
+      branch tests for a page fault: `scause` 15 (store) or 13 (load), **and** [[vmfault]]
+      agrees to fix it.
+
+      Note what is not in the list: 12, the instruction page fault. Jumping into lazily
+      allocated memory is not supported; it falls to the last branch and the process is
+      killed.
+
+      Note also the interrupt state. Only the system-call branch calls [[intr_on]]. For a
+      page fault, interrupts stay **off** for the whole of [[vmfault]], including the
+      [[kalloc]] and the `memset` of a page. That is fine: the work is short and never
+      sleeps. (When [[copyin]] or [[copyout]] calls [[vmfault]] during a system call,
+      interrupts are on unless the caller holds a spinlock, as `consoleread` and
+      `piperead` do.)
+
+      No `epc += 4` here. When [[usertrap]] returns, `sret` goes back to `0x495e`, and the
+      `sd` runs again, this time successfully.
+
+      Which stack is all this on? The same one as a system call. The hardware pushes
+      nothing when it takes the fault. [[uservec]] saved the user's `sp` into the trapframe
+      ([[kernel/trampoline.S:41]]) and loaded the top of pid 4's **kernel** stack
+      ([[kernel/trampoline.S:76]]), which is empty every time a process enters from user
+      mode. The only difference from a system call is how little gets pushed:
+
+      ```text
+      pid 4's kernel stack, during the fault
+        top ─► usertrap
+               vmfault
+               kalloc / mappages …   (while they run)
+      ```
+
+      The faulting store was to the **heap**. The user stack page was not involved, and is
+      untouched until `sret` puts the saved `sp` back.
+
+  - title: vmfault keeps the promise
+    file: kernel/vm.c
+    lines: 454-478
+    focus: 463-477
+    state:
+      hart: 0
+      mode: S
+      proc: usertests (pid 4)
+      intr: off
+      satp: kernel
+      locks: []
+      irq: 0
+      stack: [usertrap, vmfault]
+      sp: kernel
+    note: |
+      [[vmfault]] decides whether this fault is a lazy page:
+
+      1. `va >= psz`: beyond the process size, a genuinely bad address. Refuse.
+      2. Round down to the page, `0x13000`.
+      3. [[ismapped]]: if the page is already mapped, this is not a missing page but a
+         **permission** problem (more in step 15). Refuse.
+      4. [[kalloc]] a page, zero it, and [[mappages]] it with R W U. Return its physical
+         address.
+
+      `0x13000 < 0x40012000`, and it is not mapped, so a page appears. Since the level-0
+      page for `0x0`–`0x1fffff` already existed, no page-table page was needed. The next
+      seven faults (`0x53000`, gdb's second hit, then `0x93000` … `0x1d3000`) land in the
+      same 2 MiB region, so they don't need one either. The ninth, at `0x213000`, is the
+      first in a new 2 MiB region: there [[walk]], called inside [[mappages]], allocates a
+      level-0 page-table page (another [[kalloc]]), and the same happens every 8 faults
+      after that. By the end of the test, 4096 data pages and 511 level-0 pages, about
+      18 MiB, have been allocated: about 1.8% of the GiB that was "allocated" by the system
+      call.
+
+      The `read` parameter is not used: loads and stores are treated the same.
+    others: |
+      [[kalloc]] takes `kmem.lock`, the same lock every other hart's allocations take. The
+      page table itself needs no lock, as before: only this process changes it. One difference from the `sbrk` path: a page fault never reaches [[usertrap]]'s `intr_on`, so interrupts are still off when `kalloc` calls `acquire`; `push_off` records intena 0, and the `release` leaves them off ([[concept:locks#intena]]).
+
+      What if memory runs out? [[kalloc]] returns 0, [[vmfault]] returns 0, and
+      [[usertrap]] prints `unexpected scause` and kills the process. That is the price of
+      laziness: the failure arrives at an arbitrary instruction, with no way to report it
+      to the program.
+
+  - title: Retry, 4096 times
+    file: kernel/trap.c
+    lines: 80-95
+    focus: 81-94
+    state:
+      hart: 0
+      mode: S
+      proc: usertests (pid 4)
+      intr: off
+      satp: kernel
+      locks: []
+      irq: 0
+      stack: [usertrap]
+      sp: kernel
+    note: |
+      [[vmfault]] returned a non-zero physical address, so the branch is satisfied. The
+      process is not killed, `which_dev` is 0 so there is no [[yield]], and [[usertrap]]
+      returns to user mode through [[prepare_return]] and [[userret]], with `sepc = 0x495e`.
+
+      The `sd` executes again. On the way out, [[userret]] ran `sfence.vma` after installing
+      the user page table; the RISC-V spec requires that fence before a hart is guaranteed to
+      see a PTE that just changed from invalid to valid. So the hardware walks the page
+      table afresh, finds the new PTE, and the 8 bytes land in a fresh, zeroed page.
+      (Without that fence the store could fault a second time, and [[vmfault]] would refuse
+      it because the page is now mapped.)
+
+      The loop continues to `0x53000`, which faults the same way, and so on. Our gdb counter
+      on [[vmfault]]'s allocation counted **4096** hits during the test, one per touched page,
+      exactly as predicted. The second loop reads the same 4096 words; they are all mapped
+      by now, so it runs without a single fault.
+
+      From the program's point of view, nothing happened: a store took a few microseconds
+      longer than usual. That invisibility is what makes lazy allocation a policy the kernel
+      can choose without the program's cooperation, apart from asking for it with
+      `sbrklazy`.
+
+  - title: The guard page refuses
+    file: kernel/vm.c
+    lines: 454-491
+    focus: 466-468
+    state:
+      hart: 2
+      mode: S
+      proc: ls (pid 3)
+      intr: off
+      satp: kernel
+      locks: []
+      irq: 0
+      stack: [usertrap, vmfault]
+      sp:
+        "on": kernel
+        detail: "`ls`'s kernel stack, fine; only the *user* stack overflowed"
+    note: |
+      Now a fault that must **not** be fixed. Take `ls` from [[tour:22]], with `sz = 0x4000`,
+      its stack at `0x3000`–`0x3fff` and its [[g:guard-page]] at `0x2000`. Suppose (as a
+      thought experiment; `ls` does not do this) a deep recursion pushed `sp` below `0x3000`
+      and stored to `0x2ff8`.
+
+      The hardware finds the PTE for `0x2000`: valid, R W, but **no U**. A user-mode store
+      fails the U check: `scause` 15, `stval = 0x2ff8`, the same exception as a lazy page.
+
+      [[vmfault]]: `0x2ff8 < sz`, so the first check passes. But [[ismapped]] finds the page
+      mapped (V is set) and returns 1, so [[vmfault]] returns 0. In [[usertrap]] the branch
+      fails, and the last one runs: it prints
+
+      ```
+      usertrap(): unexpected scause 0xf pid=3
+                  sepc=… stval=0x2ff8
+      ```
+
+      calls [[setkilled]], and line 81 sends the process to [[kexit]] with status -1.
+
+      With lazy allocation, it matters that the guard page is *mapped without U* rather than
+      unmapped: an unmapped
+      page below `sz` would look exactly like a lazy page, and [[vmfault]] would cheerfully
+      give the runaway stack a fresh page.
+
+      Compare the two kinds of fault ([[concept:stacks#user]]):
+
+      | | lazy heap page (steps 11–14) | stack overflow (this step) |
+      |---|---|---|
+      | faulting page | inside `sz`, **no PTE** | inside `sz`, PTE valid, **no U** |
+      | [[vmfault]] | allocates and maps a page | refuses ([[ismapped]]) |
+      | outcome | `sret` retries the store | process killed |
+
+      The user stack itself never faults lazily: [[kexec]] maps its one page eagerly
+      ([[kernel/exec.c:91]]), and it cannot grow, because the heap begins right above it.
+      So a stack that creeps downward off its page, a frame smaller than a page at a time,
+      faults at the guard. That is never a missing page to supply. (A single frame larger
+      than 4 KiB could jump over the one guard page into the data below; xv6 does not
+      catch that.)
+
+      One more thing makes this fault survivable: `ls`'s `sp` now points into a page it
+      may not touch, yet the kernel never needs it. [[uservec]] stores `sp` into the
+      trapframe without using it and switches to `ls`'s kernel stack, so [[usertrap]],
+      [[vmfault]] and [[kexit]] all run on a stack that is fine. The broken user stack is
+      simply freed with the rest of `ls`'s memory when its parent reaps it.
+
+  - title: Giving memory back
+    file: kernel/vm.c
+    lines: 244-260
+    focus: 251-259
+    state:
+      hart: 0
+      mode: S
+      proc: usertests (lazy_unmap's child)
+      intr: on
+      satp: kernel
+      locks: []
+      irq: 0
+      stack: [usertrap, syscall, sys_sbrk, growproc, uvmdealloc]
+      sp: kernel
+    note: |
+      `usertests`'s `lazy_unmap` test does the reverse: after a lazy GiB with some pages
+      touched, a child calls `sbrklazy(-(1 << 30))`. A negative `n` always goes to
+      [[growproc]] (step 4), which calls [[uvmdealloc]]`(pagetable, sz, sz + n)`.
+
+      [[uvmdealloc]] works in whole pages: it unmaps from `PGROUNDUP(newsz)` up to
+      `PGROUNDUP(oldsz)`, with `do_free = 1`, so [[uvmunmap]] gives every present page back
+      to [[kfree]]. Pages that were never touched have no PTE, and [[uvmunmap]] skips them
+      (its comment at [[kernel/vm.c:191]] says *"It's OK if the mappings don't exist"*; the
+      skips are at [[kernel/vm.c:203]] and [[kernel/vm.c:205]]). That tolerance is what
+      makes lazy regions shrinkable. It still visits all 262,144 page addresses, calling
+      [[walk]] for each.
+
+      What is *not* freed: the level-0 page-table pages that are now empty. They stay until
+      the process exits and [[freewalk]] frees the whole table.
+
+      Then `p->sz` drops, and the test's child stores to an address in the freed region.
+      That address is now `>= sz`, [[vmfault]] refuses, and the child is killed, which is
+      what the test expects (it treats exit status 0 as "memory not unmapped").
+
+  - title: No TLB flush needed
+    file: kernel/trampoline.S
+    lines: 84-115
+    focus: 94-95
+    state:
+      hart: 0
+      mode: S
+      proc: usertests (lazy_unmap's child)
+      intr: off
+      satp: kernel
+      locks: []
+      irq: 0
+      stack: [uservec]
+      sp:
+        "on": kernel
+        switched: "`ld sp, 8(a0)` at [[kernel/trampoline.S:76]], a few lines above the focus"
+        detail: "empty: `sp` = `p->kstack + PGSIZE`, nothing pushed yet"
+    note: |
+      The hart's [[g:tlb]] caches translations. If it still held "page `0x13000` → physical
+      page X" after X was freed and reused by another process, this process could read and
+      write someone else's memory. Real kernels must carefully flush TLB entries when
+      unmapping. [[uvmdealloc]] doesn't flush anything. Why is that safe?
+
+      Because on xv6 a user translation can only be in a TLB while the hart is in user
+      mode or in the trampoline. Look at [[uservec]]: on **every** trap from user mode, right after `csrw satp`
+      installs the kernel page table, `sfence.vma zero, zero` (line 95) discards all cached
+      translations. So by the time any kernel code runs, including [[uvmdealloc]], this
+      hart's TLB holds no user translations at all. On the way back, [[userret]] switches to
+      the user table between two more `sfence.vma`s (lines 110–112), so translations are
+      reloaded fresh from the page table, without the freed pages.
+
+      (Simplified: xv6 pays for this with a full flush on every trap and return. Kernels
+      that keep TLB entries across traps use address-space IDs and targeted flushes.)
+    others: |
+      What about **other** harts? A process runs on only one hart at a time, and its page
+      table is in `satp` only while it is in user mode there (or in the trampoline code just
+      before or after). Any hart that ran it earlier
+      flushed its TLB when the process trapped into the kernel. So no other hart can hold a
+      translation from this page table either, and no cross-hart "TLB shootdown" is needed.
+      In kernels whose processes can have several threads running on different harts at
+      once, all sharing one page table, this is one of the hardest problems; xv6's single-threaded processes avoid it entirely.
+
+  - title: What growth costs
+    file: kernel/sysproc.c
+    lines: 39-65
+    focus: 50-63
+    state:
+      hart: 2
+      mode: S
+      proc: sh (pid 3)
+      intr: on
+      satp: kernel
+      locks: []
+      irq: 0
+      stack: [usertrap, syscall, sys_sbrk]
+      sp: kernel
+    note: |
+      The two policies side by side, for the runs in this tour:
+
+      | | eager `sbrk(64 KiB)` | lazy `sbrklazy(1 GiB)` |
+      |---|---|---|
+      | work in the system call | 16 `kalloc`s, 64 KiB zeroed | one addition |
+      | pages actually used | about 200 bytes' worth | 4096 |
+      | page faults | 0 | 4096 |
+      | when out-of-memory shows | at `sbrk`, as -1 | at some store, as a kill |
+
+      And the locks: none for the address space itself, ever. `p->sz` and the page table
+      belong to one single-threaded process, and the hart runs on the kernel page table
+      while they change. The only shared state is the free-page list, guarded by
+      `kmem.lock` for a handful of instructions per page. Even the TLB, the per-hart cache
+      that is a nightmare in other kernels, is handled by the trampoline's flushes without
+      any coordination between harts.
+
+      The ideas to keep: `sz` is a promise and the page table is what has been delivered;
+      a page fault is a chance to deliver late; and a guard page works only because it is
+      *present* and forbidden, not absent.
+locks:
+  - lock: kmem.lock
+    where: "[[kalloc]] (from [[uvmalloc]], [[vmfault]], [[walk]]); [[kfree]] (from [[uvmunmap]])"
+    protects: "The free-page list shared by all harts"
+  - lock: "(no lock) p->sz and p->pagetable"
+    where: "[[sys_sbrk]], [[growproc]], [[uvmalloc]], [[uvmdealloc]], [[vmfault]]"
+    protects: "Nothing needed: private to a single-threaded process; no other process reads them while it lives"
+  - lock: p->lock
+    where: "[[killed]] (from [[usertrap]] at [[kernel/trap.c:57]] and [[kernel/trap.c:81]]); [[setkilled]]"
+    protects: "`p->killed`"
+  - lock: "(no lock, no IPI) the TLB"
+    where: "[[uservec]] and [[userret]] in the trampoline"
+    protects: "Stale user translations: flushed with `sfence.vma` on every entry to and exit from the kernel"
+quiz:
+  - q: "`sys_sbrk` sends every negative `n` through `growproc`, even when the caller used `sbrklazy`. Why can't shrinking be lazy?"
+    a: "Shrinking must give back pages that exist and remove their mappings now, or the program could keep using memory beyond its new `sz` and the pages could never be reused. There is nothing to defer."
+  - q: "Why doesn't `vmfault` simply allocate a page whenever `va < sz`? What would break?"
+    a: "The guard page lies below `sz`. A stack overflow there faults because the page lacks `PTE_U`; if `vmfault` ignored that the page is mapped, `mappages` would panic on a remap, or, if the guard were unmapped, the overflow would silently get a fresh page. The `ismapped` check makes permission faults fatal."
+  - q: "`growproc` modifies `p->sz` and the page table with no lock, and a timer interrupt may move the process to another hart in the middle. Why is that safe?"
+    a: "Only the process itself changes these fields, and it has a single thread, so there is no second writer. The page table lives in memory, not in a hart's registers, and while in the kernel the hart translates with the kernel page table, so moving harts mid-update changes nothing."
+  - q: "After `sbrk(-8192)` frees two pages, could a stale TLB entry on this hart let the program still reach them?"
+    a: "No. The hart has been on the kernel page table since the trap, and `uservec` flushed the TLB right after switching. `userret` flushes again around installing the user table, so the next user access walks the updated page table and faults."
+  - q: "In `usertrap`, a lazy page fault is handled with interrupts off, while a system call turns them on. Why is that acceptable here?"
+    a: "`vmfault` does a short, bounded amount of work (one `kalloc`, one `memset`, one `mappages`) and never sleeps. Interrupts are delayed by microseconds at most, and nothing in the path needs them."
+  - q: "`lazy_alloc` touches 4096 pages spread over 1 GiB. Why does the kernel allocate about 4600 pages and not 4096?"
+    a: "One level-0 page-table page maps a 2 MiB region, and the test touches a page every 256 KiB, so every 8 touches enter a new region. The touches cover 512 regions, one of which already had a level-0 page, so `walk` allocates 511 extra pages."

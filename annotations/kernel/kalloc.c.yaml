@@ -1,0 +1,152 @@
+summary: |
+  The kernel's [[g:page-allocator]]. All memory the kernel hands out at run time comes from
+  here, one 4096-byte [[g:page]] at a time: page-table pages, user memory, kernel stacks,
+  trapframes, pipe buffers, the virtio disk's rings and the buffers that hold `exec`
+  arguments. There is no `malloc` for smaller objects; everything else in the kernel is a
+  fixed-size global array.
+
+  The design is the simplest possible one: a linked list of free pages, where each free
+  page itself stores the pointer to the next one. [[kalloc]] pops a page off the list,
+  [[kfree]] pushes one on, and a [[g:spinlock]] keeps harts from doing so at the same time.
+
+  The pages are the RAM between the end of the kernel image ([[end]]) and [[PHYSTOP]]; see
+  the map in [[kernel/memlayout.h]]. [[kalloc]] returns a *physical* address. The kernel
+  can use it as an ordinary pointer because physical memory is either untranslated (before
+  paging is turned on, when [[kinit]] runs) or covered by the [[g:direct-map]] (after).
+
+  **Read before:** [[kernel/memlayout.h]]. **Read next:** [[kernel/vm.c]], the main user of
+  these pages.
+
+blocks:
+  - lines: 1-10
+    title: Headers
+    note: |
+      The comment states the allocator's whole contract: whole pages only. The headers
+      provide [[PGSIZE]] and [[PGROUNDUP]] ([[kernel/riscv.h]]), [[PHYSTOP]]
+      ([[kernel/memlayout.h]]), and `struct spinlock` with its functions
+      ([[kernel/spinlock.h]], [[kernel/defs.h]]).
+
+  - lines: 12-15
+    title: Declarations
+    note: |
+      [[freerange]] is used by [[kinit]] before its definition, hence the prototype.
+      [[end]] is not a variable in any C file: the linker script defines the symbol at the
+      first address after the kernel's `.bss` ([[kernel/kernel.ld]]). Declaring it as a
+      `char` array means that writing `end` gives its *address*, which is the only thing
+      that matters about it; there is no data there to read.
+
+  - lines: 17-19
+    title: A free page holds the list link
+    note: |
+      [[run]] describes what is stored in a *free* page: only a pointer to the next free
+      page. The allocator needs no memory of its own for bookkeeping, because the first 8
+      bytes of each free page hold the list link. Once [[kalloc]] hands a page out, the
+      caller owns all 4096 bytes and the `run` interpretation no longer applies.
+
+  - lines: 21-24
+    title: The allocator's state
+    note: |
+      [[kmem]] is the only global state: the head of the free list and the
+      [[g:spinlock]] that protects it. Every hart can call [[kalloc]] and [[kfree]] at any
+      moment, and each one reads the head and then writes a new head; without the lock,
+      two harts could both read the same head and hand out the same page twice, or one
+      hart's push could overwrite the other's. The struct type has no name because only
+      this one variable of it exists.
+
+  - lines: 26-31
+    title: "kinit(): fill the free list at boot"
+    note: |
+      [[main]] calls this once, on hart 0, before paging is on. It initializes the lock (the
+      name `"kmem"` is stored in it, for someone inspecting the lock in a debugger) and frees every page between [[end]] and
+      [[PHYSTOP]], which is how the free list gets its initial contents. In this build
+      `end` is `0x80020bb0` (see `kernel/kernel.sym`), so the free pages run from
+      `0x80021000` to `0x87fff000`: 32,735 pages, almost 128 MiB.
+
+  - lines: 33-40
+    title: "freerange(): free every whole page in a range"
+    note: |
+      Rounds the start up to a page boundary, since `end` is usually not page-aligned and
+      the part of a page that the kernel image occupies must not be handed out. Then it
+      calls [[kfree]] on each page that fits *entirely* below `pa_end`: the test
+      `p + PGSIZE <= pa_end` stops before a final partial page.
+
+      [[kfree]] pushes each page on the front of the list, so after the loop the list runs
+      from the highest page down: the first [[kalloc]] returns `0x87fff000`.
+
+  - lines: 42-63
+    title: "kfree(): give a page back"
+    note: |
+      Called when a page is no longer needed (by [[uvmunmap]], [[freewalk]], [[freeproc]],
+      [[pipeclose]], ...) and at boot by [[freerange]].
+
+      1. **Check the address** (line 51). The page must be page-aligned and lie between
+         [[end]] and [[PHYSTOP]]. A misaligned pointer would make the "page" straddle two
+         real pages, and a later [[kalloc]] would hand out memory that partly belongs to
+         someone else; a pointer into the kernel image or past the end of RAM would let
+         the allocator hand out the kernel's own code or memory that does not exist. Such
+         a call is always a kernel bug, so it panics at once rather than corrupting memory
+         later. The check does *not* catch freeing the same page twice, which would put it
+         on the list twice (and make the list loop back on itself).
+      2. **Fill with junk** (line 55). Every byte becomes `0x01`. Code that wrongly keeps
+         using the page after freeing it ("a dangling reference") then reads garbage such
+         as the pointer `0x0101010101010101`, and is likely to crash soon, close to the bug,
+         instead of quietly reading old data that looks valid.
+      3. **Push it on the list** (lines 57–62), under the lock.
+
+      The junk fill must come before line 60: it would otherwise overwrite the `next`
+      pointer just stored in the page.
+
+  - lines: 65-82
+    title: "kalloc(): take a page"
+    note: |
+      Pops the first page off the free list under the lock and returns it, or returns 0
+      when the list is empty: out of memory. Every caller must check for 0; most pass the
+      failure up as an error (for example [[uvmalloc]] makes `sbrk` fail), while the boot-time
+      callers [[proc_mapstacks]] and [[virtio_disk_init]] panic, and [[kvmmake]] does not
+      check at all (at boot, memory cannot have run out).
+
+      The fill with `0x05` bytes happens after the lock is released: the page is already
+      off the list, so no other hart can reach it. It overwrites the stale `next` pointer
+      in the first 8 bytes and any old contents, so a caller that forgets to initialize
+      the page sees obvious junk rather than plausible leftovers of a previous user (and
+      the different value, 5 instead of 1, lets you tell "allocated but never
+      initialized" from "freed" in a debugger). Callers that need zeros, such as page
+      tables and user pages, must `memset` the page to 0 themselves.
+
+lines:
+  14: |
+    The first address after the kernel image, defined by [[kernel/kernel.ld]]. Only its
+    address is used.
+  18: |
+    The link: the address of the next free page, or 0 at the end of the list.
+  23: |
+    Head of the list: the most recently freed page, or 0 when no memory is left.
+  29: |
+    Initialize the lock that protects [[kmem]].
+  30: |
+    Hand every page from [[end]] to [[PHYSTOP]] to the allocator.
+  37: |
+    Start at the first page boundary at or after `pa_start`.
+  38: |
+    Stop when the next whole page would extend past `pa_end`.
+  51: |
+    Reject a pointer that is not page-aligned, lies inside the kernel image, or lies at
+    or beyond the end of RAM. `pa % PGSIZE` is the offset within a page, which must be 0.
+  55: |
+    Overwrite the whole page with `0x01` bytes, to make use-after-free bugs show up.
+  57: |
+    View the start of the page as a [[run]] so it can hold the list link.
+  59: |
+    Take [[kmem]]'s lock: the next two lines read and update the shared list head.
+  60: |
+    Link the page in front of the current first free page.
+  61: |
+    Make it the new head. The push is complete.
+  74: |
+    Take the first free page (0 if the list is empty).
+  75-76: |
+    If there was one, unlink it by advancing the head to the following page.
+  80: |
+    Fill the page with `0x05` bytes so that stale contents never look valid.
+  81: |
+    Return the page's address (a physical address, usable directly as a pointer), or 0.

@@ -1,0 +1,206 @@
+summary: |
+  The system call dispatcher, and the helpers every system call uses to read its
+  arguments.
+
+  When a user program executes `ecall`, [[usertrap]] recognizes a [[g:system-call]] and
+  calls [[syscall]] here. By then [[uservec]] has saved all of the program's registers in
+  its [[g:trapframe]], so the kernel finds there what the program left in its registers:
+  the [[g:syscall-number]] in `a7` and up to six [[g:syscall-arguments]] in `a0`–`a5`.
+  `syscall` uses the number to pick a function from the table [[syscalls]], calls it, and
+  writes its return value into the trapframe's `a0`, which [[userret]] loads into the
+  program's `a0` on the way back.
+
+  The first half of the file is the argument helpers: [[argint]], [[argaddr]] and
+  [[argstr]] read argument *n*; [[fetchaddr]] and [[fetchstr]] read a value or a string
+  from a user address. They exist because arguments come from an untrusted program: an
+  "address" may point anywhere, so the kernel never dereferences it directly, and copies
+  through the process's page table instead.
+
+  **Read before:** [[kernel/trap.c]]. **Read next:** [[kernel/sysproc.c]] and
+  [[kernel/sysfile.c]], where the `sys_*` functions live.
+
+blocks:
+  - lines: 1-8
+    title: Headers
+    note: |
+      [[kernel/syscall.h]] provides the `SYS_*` numbers used as table indices below;
+      [[kernel/proc.h]] provides `struct proc` and the trapframe layout.
+
+  - lines: 10-21
+    title: "fetchaddr(): read 8 bytes from user memory"
+    note: |
+      Reads one `uint64` at user virtual address `addr` into `*ip`, returning 0 on success
+      and -1 if the address is not valid memory of the current process. Its one caller is
+      [[sys_exec]], which uses it to read the user's `argv` array, one pointer at a time
+      ([[kernel/sysfile.c:474]]).
+
+      The range check comes first. A process owns the addresses from 0 up to `p->sz`, so
+      all 8 bytes must lie below `p->sz`. Line 16 alone would check that, except for
+      overflow: if `addr` were close to 2⁶⁴, `addr + 8` would wrap around to a small
+      number and pass. Line 15 rejects such an `addr`, so, as the comment says, both are
+      needed.
+
+      [[copyin]] then does the copy. It translates the address through the *process's*
+      page table, refuses pages without `PTE_U` (such as the trapframe and trampoline
+      pages), and, if the page is a lazily allocated one not yet mapped, maps it first via
+      [[vmfault]]. A direct `*(uint64 *)addr` would be wrong: the kernel runs with its own
+      page table, in which `addr` means something else entirely.
+
+  - lines: 23-32
+    title: "fetchstr(): copy a string from user memory"
+    note: |
+      Copies the NUL-terminated string at user address `addr` into the kernel buffer
+      `buf`, at most `max` bytes including the NUL. Callers: [[argstr]] (path names for
+      `open`, `mkdir` and friends) and [[sys_exec]] (each `argv` string,
+      [[kernel/sysfile.c:484]]).
+
+      There is no explicit range check here: [[copyinstr]] does it page by page, failing
+      for any page that is not valid user memory below `p->sz`. It also fails if no NUL
+      appears within `max` bytes, so `buf` is always properly terminated on success,
+      which makes the [[strlen]] on line 31 safe.
+
+  - lines: 34-54
+    title: "argraw(): the nth argument register, as saved"
+    note: |
+      Returns the raw 64-bit value the user program had in register `a`*n* at the moment
+      of `ecall`. The [[g:calling-convention]] passes a C function's first arguments in
+      `a0`, `a1`, ...; a user program calls a system call stub like any C function, and
+      the stub ([[user/usys.pl]]) does not touch them, so they are still there when
+      [[uservec]] saves them into the [[g:trapframe]].
+
+      Only six registers are supported, which is enough for every xv6 system call. `n` is
+      always a constant chosen by kernel code, never by the user, so an out-of-range `n`
+      is a kernel bug: [[panic]]. The `return -1` after it is never reached (`panic` is
+      declared `noreturn`) and only keeps the function's shape conventional.
+
+      `static`: used only by the helpers below.
+
+  - lines: 56-61
+    title: "argint(): an integer argument"
+    note: |
+      Stores argument *n* in `*ip` as an `int`. The assignment converts the 64-bit
+      register value to 32 bits, keeping the low half, which is how a C `int` argument is
+      passed in a 64-bit register.
+
+      Nothing is checked, and nothing can be: any integer is a possible argument. Each
+      system call validates the values it receives (a file descriptor in range, a size
+      not negative...). So `argint` returns nothing.
+
+  - lines: 63-70
+    title: "argaddr(): a pointer argument"
+    note: |
+      Stores argument *n* in `*ip` as a 64-bit user address. As the comment says, it is
+      not checked here, because the address is only ever used through [[copyin]],
+      [[copyout]] or [[copyinstr]], which check it on every access. A check here would be
+      redundant.
+
+  - lines: 72-81
+    title: "argstr(): a string argument"
+    note: |
+      Combines the two steps for a string argument: read the pointer with [[argaddr]],
+      then copy the string with [[fetchstr]]. Returns the string length, or -1 if the
+      pointer was bad or the string too long. Used for every path name, for example in
+      [[sys_open]] ([[kernel/sysfile.c:338]]).
+
+  - lines: 83-105
+    title: The system call functions
+    note: |
+      Declarations of the 22 handler functions, so the table below can name them. They are
+      defined in three files: [[kernel/sysproc.c]] (`exit`, `getpid`, `fork`, `wait`,
+      `sbrk`, `pause`, `kill`, `uptime`), [[kernel/sysfile.c]] (the file system calls and
+      `pipe`), and [[kernel/log.c]] ([[sys_sync]]).
+
+      Every handler has the same type, `uint64 (void)`: no parameters (each fetches its own
+      arguments with [[argint]] and friends) and a 64-bit result that goes back to the user
+      in `a0`. Giving them all the same type is what lets one table hold them all. (The
+      `extern` is redundant on function declarations.)
+
+  - lines: 107-134
+    title: The dispatch table
+    note: |
+      `syscalls` is an array of [[g:function-pointer|function pointers]]. Read the
+      declaration from the name outwards: `syscalls[]` is an array, `(*...)` of pointers,
+      `(void)` to functions taking no arguments, `uint64` and returning a `uint64`.
+
+      It is filled with [[g:designated-initializer|designated initializers]]:
+      `[SYS_fork] = sys_fork` puts `sys_fork` at index `SYS_fork` (1). The table therefore
+      lines up with [[kernel/syscall.h]] whatever order the lines are in. The highest index
+      is `SYS_sync` (22), so the array has 23 entries; entry 0 is not named, so it is a null
+      pointer, and [[syscall]] rejects number 0.
+
+      `static`: only [[syscall]] uses it. The `clang-format off/on` comments tell the
+      code formatter to leave the aligned columns alone.
+
+  - lines: 136-141
+    title: "syscall(): run the requested system call"
+    note: |
+      Called by [[usertrap]] ([[kernel/trap.c:68]]) with interrupts enabled, on the
+      process's kernel stack. The process is the one that executed `ecall`.
+
+  - lines: 142-146
+    title: Look up and call the handler
+    note: |
+      The number comes from the saved `a7`, where the user stub put it
+      (`li a7, SYS_...`). It is untrusted, so it is checked before being used as an index:
+      it must be positive, less than the table size ([[NELEM]] gives the number of
+      elements), and the entry must not be null. Without these checks a bad number would
+      make the kernel read a "function pointer" from outside the array and jump to it.
+
+      Line 146 calls the handler through the table and stores its result in the
+      trapframe's `a0`. That is how every system call returns its value: [[userret]]
+      reloads the user's `a0` from this slot ([[kernel/trampoline.S:149]]), and the user
+      stub's `ret` hands it to the C caller as the return value.
+
+      For [[sys_exec]] the saved `a0` slot has a second use: on success it holds `argc`,
+      which becomes the first argument of the new program's `main`.
+
+  - lines: 147-151
+    title: Unknown system call
+    note: |
+      Print the process ID, its name and the bad number, and return -1 to the program. The
+      process is not killed. `a0` is a `uint64`, so -1 is stored as `0xffffffffffffffff`;
+      most user stubs are declared to return `int` ([[user/user.h]]), and the low 32 bits read as -1.
+
+lines:
+  14: |
+    The current process ([[myproc]]); its `sz` and page table describe the memory it owns.
+  15-16: |
+    Reject unless all 8 bytes `[addr, addr+8)` lie inside the process's memory
+    `[0, p->sz)`. See the block note for why both tests.
+  18: |
+    Copy 8 bytes from user address `addr` into `*ip`, through the process's page table
+    ([[copyin]]).
+  29: |
+    Copy at most `max` bytes, stopping after the NUL; fails on a bad address or a missing
+    NUL ([[copyinstr]]).
+  31: |
+    Success: return the length, not counting the NUL.
+  40: |
+    The saved `a0`: argument 0, as stored by [[kernel/trampoline.S:73]].
+  52: |
+    Kernel code asked for an argument beyond `a5`.
+  60: |
+    Truncate the saved 64-bit register to an `int`.
+  69: |
+    Store the raw 64-bit value; checked later, on use.
+  79: |
+    Read argument *n* as a user address.
+  80: |
+    Copy the string from that address into `buf`.
+  109: |
+    Declare the table: an array of pointers to functions `uint64 f(void)`, size taken from
+    the initializers.
+  111: |
+    Index 1 ([[SYS_fork]]) holds [[sys_fork]]. Each following line pairs a number from
+    [[kernel/syscall.h]] with its handler.
+  142: |
+    The [[g:syscall-number]], from the user's `a7`. Converting the `uint64` to `int` keeps
+    the low 32 bits.
+  143: |
+    Validate the untrusted number before indexing the table.
+  146: |
+    Call the handler and make its result the user's `a0`.
+  148: |
+    [[printk]] the complaint.
+  149: |
+    Return -1 to the program.

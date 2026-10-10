@@ -1,0 +1,772 @@
+title: Files, pipes, the console and the UART
+summary: How one read or write is routed by struct file, how a pipe's two counters and two channels move bytes between processes, and how the console and the UART share one wire between processes, interrupt handlers and printk.
+questions:
+  - id: fpc-01
+    level: 1
+    type: choice
+    q: |
+      `wc` calls `read(0, buf, 512)`. Inside the kernel, [[fileread]] must decide whether this
+      read goes to a pipe, the console driver or a file on disk. What does it look at?
+    code: kernel/file.c:104-130@114-124
+    options:
+      - text: "The `type` field of the `struct file` that descriptor 0 points to"
+        correct: true
+        why: |
+          `FD_PIPE` goes to [[piperead]], `FD_DEVICE` to `devsw[f->major].read`, `FD_INODE` to
+          [[readi]]. The type was fixed when the file was created, by [[pipealloc]] or
+          [[sys_open]].
+      - text: "The descriptor number: 0 always means the console"
+        why: |
+          You may have thought descriptor 0 is wired to the keyboard. It is only the slot
+          number in `p->ofile`; in `ls | wc` the shell made `wc`'s descriptor 0 point at the
+          pipe's read end, and [[fileread]] never looks at the number at all.
+      - text: "The name of the program that opened the file"
+        why: |
+          You may have thought the kernel remembers who opened what. A `struct file` has no
+          owner field; it carries only its type, reference count, permissions and a pointer
+          to the pipe or inode.
+      - text: "Whether the user buffer address is in the kernel or user half of memory"
+        why: |
+          You may have confused this with the `user_dst` flag the device functions take. That
+          flag says where the *destination* is (always 1 from [[fileread]]); it does not pick
+          the kind of file.
+    explain: |
+      A descriptor is an index into `p->ofile`, which holds a pointer to a shared
+      [[g:open-file]]. The `type` field of that struct is all that separates a pipe, a device
+      and a disk file, which is why programs like `wc` work unchanged on all three
+      ([[tour:36]], [[tour:39]]).
+
+  - id: fpc-02
+    level: 1
+    type: number
+    q: |
+      A process creates a pipe and writes to it, and nobody ever reads. How many bytes can
+      it write into the empty pipe before [[pipewrite]] puts it to sleep?
+    code: kernel/pipe.c:11-20
+    answer: 512
+    wrong:
+      511: |
+        You may have remembered that many ring buffers waste one slot to tell "full" from
+        "empty". This one doesn't: `nread` and `nwrite` count every byte ever moved, so full
+        is `nwrite == nread + 512` and empty is `nread == nwrite`, and all 512 slots are used.
+      4096: |
+        You may have thought the pipe can use the whole page [[kalloc]] gave it. The page
+        holds a `struct pipe`, whose buffer `data` is only `PIPESIZE` = 512 bytes; the rest
+        of the page is unused.
+      552: |
+        552 is the size of the whole `struct pipe` (lock, data, counters, flags). Only the
+        512-byte `data` array holds bytes in transit.
+    why_wrong: Look at PIPESIZE and at the full test on line 88 of pipe.c.
+    explain: |
+      `data[PIPESIZE]` is 512 bytes and the full test is `nwrite == nread + PIPESIZE`
+      ([[kernel/pipe.c:88]]). With nothing read, `nread` is 0, so the 513th byte finds the
+      pipe full: the writer calls `wakeup(&pi->nread)` and sleeps on `&pi->nwrite`
+      ([[tour:39]]).
+
+  - id: fpc-03
+    level: 1
+    type: tf
+    q: |
+      True or false: after [[kfork]], the parent and the child each have their **own**
+      `struct file` for the console, so the child moving a file offset or closing its copy
+      cannot affect the parent's.
+    answer: false
+    why_tf: |
+      You may have thought fork copies everything. It copies the descriptor *table*
+      (`p->ofile`), but each slot is a pointer, and both tables point at the same
+      `struct file` in the global `ftable`.
+    reasons:
+      - text: "fork copies only the pointers in `ofile[]` and calls [[filedup]] on each, so both processes share one `struct file` whose `ref` goes up by one."
+        correct: true
+        why: |
+          That is [[kernel/proc.c:287]]. Sharing is why `close` in one process only drops
+          `ref` and leaves the file open for the other, and why a shared file offset moves for
+          both.
+      - text: "The console is the only exception: device files are shared, but every regular file gets a fresh copy at fork."
+        why: |
+          You may have thought files on disk are treated differently. [[kfork]] calls
+          [[filedup]] for every open descriptor, whatever its type.
+      - text: "fork never copies descriptors at all; the child must reopen the console."
+        why: |
+          That would break every pipeline: the shell's children inherit their pipe ends
+          through fork. The child gets the parent's whole descriptor table.
+    explain: |
+      Two levels: per-process descriptor tables, and global [[g:open-file|open files]] with a
+      reference count. fork duplicates the first level and shares the second. On a freshly
+      booted machine the console's single `struct file` has `ref` 6: descriptors 0, 1, 2 of
+      `init` and of the shell ([[tour:4]]).
+
+  - id: fpc-04
+    level: 1
+    type: choice
+    q: |
+      `wc` is reading from a pipe. The pipe is empty, and the last write end has been
+      closed (`writeopen == 0`). What does [[piperead]] do?
+    code: kernel/pipe.c:111-143
+    options:
+      - text: "Returns 0 at once; `wc` treats that as end of file"
+        correct: true
+        why: |
+          The `while` on line 119 only waits while the pipe is empty *and* the write end is
+          open. With `writeopen == 0` it is skipped, the copy loop breaks with `i = 0`, and
+          `read` returns 0.
+      - text: "Sleeps on `&pi->nread` until a writer appears"
+        why: |
+          That would be true if the write end were still open. Once `writeopen` is 0 no
+          writer can ever appear, so sleeping would hang `wc` forever; line 119 checks for
+          exactly this.
+      - text: "Returns -1, because reading a closed pipe is an error"
+        why: |
+          You may be thinking of the other direction: [[pipewrite]] returns -1 when the
+          *read* end is closed. A reader of a finished pipe gets an ordinary end of file.
+      - text: "Panics, because the pipe page has already been freed"
+        why: |
+          You may have thought closing the write end frees the pipe. [[pipeclose]] frees the
+          page only when *both* `readopen` and `writeopen` are 0, and `wc` still holds the
+          read end.
+    explain: |
+      End of file on a pipe means "empty, and no writer left". Any bytes still in the
+      buffer come out first; only then does `read` return 0, which ends loops like
+      `while ((n = read(fd, buf, sizeof(buf))) > 0)` in [[user:wc]] ([[tour:39]]).
+
+  - id: fpc-05
+    level: 1
+    type: line
+    q: |
+      In [[piperead]], click the line that checks whether any writer is still left on the
+      pipe.
+    code: kernel/pipe.c:111-143
+    answer: 119
+    lines:
+      120: |
+        This checks whether *this reader* has been killed, not whether a writer exists. A
+        killed reader gives up with -1.
+      130: |
+        This line tests only "empty" (`nread == nwrite`), to stop copying. It cannot tell
+        whether more data may come; the writer test is on the `while` above.
+      140: |
+        This wakes writers that may be waiting for room. It does not check anything about
+        them.
+    why_wrong: Look for the line that mentions writeopen.
+    explain: |
+      Line 119, `while (pi->nread == pi->nwrite && pi->writeopen)`, waits only while the
+      pipe is empty and a writer may still add bytes. When the last write end is closed,
+      [[pipeclose]] sets `writeopen = 0` and wakes the reader, which leaves this loop and
+      returns 0 ([[tour:39]]).
+
+  - id: fpc-06
+    level: 1
+    type: match
+    q: |
+      [[consoleintr]] treats some typed characters specially. Match each key with what the
+      kernel does when it arrives.
+    code: kernel/console.c:146-190
+    pairs:
+      - left: "Control-H or Delete"
+        right: erases the last uncommitted character and prints backspace, space, backspace
+        why: "Lines 162-168: `cons.e--` and `consputc(BACKSPACE)`, but only if `cons.e != cons.w`, so committed text cannot be erased."
+      - left: "Control-U"
+        right: erases the whole uncommitted line
+        why: "Lines 155-161 loop, erasing characters back to the last newline or the commit point."
+      - left: "Control-D"
+        right: is stored and commits the line at once, without a newline
+        why: "It goes through the default case and line 179 commits on `C('D')`; [[consoleread]] later turns it into end of file."
+      - left: "Control-P"
+        right: prints the process list
+        why: "Line 153 calls [[procdump]]; the character is not stored."
+      - left: "Enter (the terminal sends `\\r`)"
+        right: is turned into a newline, echoed, stored, and commits the line
+        why: "Line 171 converts `\\r` to `\\n`; line 179 then commits and wakes the reader."
+    explain: |
+      Line editing happens in the kernel, inside the interrupt handler, before any program
+      sees the bytes ([[g:line-editing]]). Only committed characters (up to `cons.w`) can be
+      read; `cons.e` marks the end of what you are still editing ([[tour:37]]).
+
+  - id: fpc-07
+    level: 1
+    type: choice
+    q: |
+      When you type a key, [[consoleintr]] echoes it with [[consputc]], which calls
+      [[uartputc_sync]] and spins on the UART. Why does it not send the echo through
+      [[uartwrite]], like a process's `write` does?
+    code: kernel/console.c:28-45
+    options:
+      - text: "consoleintr runs in an interrupt handler holding `cons.lock`, and uartwrite may sleep; sleeping there is forbidden"
+        correct: true
+        why: |
+          [[uartwrite]] takes the sleep-lock `tx_lock` and may call [[sleep]] waiting for the
+          transmitter. An interrupt handler must never sleep (it may have interrupted the
+          scheduler, or any process at any point), and sleeping while holding a spinlock is
+          never allowed. Spinning works everywhere.
+      - text: "uartwrite only accepts user addresses, and the echoed character is in the kernel"
+        why: |
+          You may be thinking of [[consolewrite]]'s `user_src` flag. [[uartwrite]] takes a
+          kernel buffer (consolewrite copies the bytes in first), so addresses are not the
+          problem.
+      - text: "Echoes must be faster, and uartwrite buffers bytes in a ring buffer that is drained later"
+        why: |
+          You may remember a ring buffer from older xv6. This version has no transmit
+          buffer: [[uartwrite]] writes the `THR` register directly, byte by byte.
+      - text: "uartwrite can only run on hart 0"
+        why: |
+          Nothing ties the UART to one hart. Any hart can write its registers; what
+          matters is whether the caller may sleep.
+    explain: |
+      There are two roads to the same 16550: a polite one that sleeps and takes turns
+      ([[uartwrite]], for processes) and a blunt one that spins with interrupts off
+      ([[uartputc_sync]], for interrupt handlers and [[printk]]). Each exists because the
+      other cannot work everywhere ([[tour:38]], [[concept:locks#lock-uart]]).
+
+  - id: fpc-08
+    level: 1
+    type: multi
+    q: |
+      A process with only descriptors 0, 1 and 2 open calls `pipe(p)`, which succeeds.
+      Which statements are true right afterwards?
+    code: kernel/pipe.c:22-46
+    options:
+      - text: "`p[0]` is 3 and `p[1]` is 4"
+        correct: true
+        why: "[[fdalloc]] picks the lowest free slot: 3 for the read end, then 4 for the write end ([[kernel/sysfile.c:513]])."
+      - text: "Both `struct file`s point to the same `struct pipe`"
+        correct: true
+        why: "Lines 41 and 45 store the same `pi` in both. One pipe object, two faces."
+      - text: "`read(p[1], ...)` returns -1"
+        correct: true
+        why: "The write end has `readable = 0` (line 43), and [[fileread]] rejects it on its first check."
+      - text: "The 512-byte buffer is inside one of the two `struct file`s"
+        why: |
+          You may have thought the open file holds the data. A `struct file` has only a
+          pointer; the buffer lives in the `struct pipe`, in its own page from [[kalloc]].
+      - text: "Each end has its own spinlock, so a reader and a writer never contend"
+        why: |
+          There is one lock, `pi->lock`, inside the pipe, shared by both ends. Reader and
+          writer must both take it, because they share `nread` and `nwrite`.
+    explain: |
+      [[pipealloc]] claims two [[g:open-file|open files]] from `ftable` and one page for the
+      `struct pipe`; [[sys_pipe]] gives them descriptors and copies the two numbers to the
+      user's array. Permissions are per `struct file`, the data and the lock are per pipe
+      ([[tour:39]], [[concept:locks#lock-pipe]]).
+
+  - id: fpc-09
+    level: 2
+    type: number
+    q: |
+      `cat` makes one `write(1, buf, 512)` to the console. How many times does
+      [[consolewrite]] call [[uartwrite]] for it?
+    code: kernel/console.c:58-79
+    answer: 16
+    wrong:
+      1: |
+        You may have thought one `write` is passed down whole. [[consolewrite]] copies the
+        user's bytes into a 32-byte stack buffer and calls [[uartwrite]] once per buffer
+        load.
+      512: |
+        You may have thought each byte gets its own call. [[uartwrite]] does send one byte
+        at a time to the chip, but it is called with up to 32 bytes per call.
+      17: |
+        512 is an exact multiple of 32, so there is no short final batch: 16 full batches.
+    why_wrong: Divide the write into batches of sizeof(buf) bytes.
+    explain: |
+      `buf` is 32 bytes, so 512 bytes go out as 16 batches of 32. Each batch takes and
+      releases `tx_lock`, which is why another process's output can appear between batches
+      but never inside one ([[tour:38]]).
+
+  - id: fpc-10
+    level: 2
+    type: choice
+    q: |
+      When the last reference to a file goes away, [[fileclose]] copies `*f` into the local
+      `ff`, frees the slot and releases `ftable.lock`, and *only then* calls [[pipeclose]]
+      or [[iput]]. Why not do the cleanup while still holding `ftable.lock`?
+    code: kernel/file.c:58-83@71-82
+    options:
+      - text: "The cleanup can sleep (iput inside a log transaction may wait for the disk), and a spinlock must not be held while sleeping"
+        correct: true
+        why: |
+          [[begin_op]] can sleep waiting for the log, and [[iput]] may read and write the
+          disk. Sleeping with `ftable.lock` held would leave interrupts off and block every
+          other `open`, `dup` and `close` in the system. The local copy `ff` keeps the needed
+          fields valid after the slot is released.
+      - text: "Because pipeclose and iput take ftable.lock themselves, and acquiring it twice would panic"
+        why: |
+          You may have guessed a double acquire. Neither function touches `ftable.lock`;
+          [[pipeclose]] takes `pi->lock` and [[iput]] takes `itable.lock` and inode
+          sleep-locks.
+      - text: "To let other harts read the file's data while it is being closed"
+        why: |
+          Once `ref` reaches 0 nobody else holds this file, so nobody can read through it.
+          The reason is about what the cleanup does (sleep), not about sharing.
+      - text: "The copy is only an optimization; doing the cleanup under the lock would also be correct"
+        why: |
+          It would not be correct. Holding a spinlock across a sleep breaks the rule that
+          [[sched]] enforces (`panic: sched locks`).
+    explain: |
+      Short critical section, then slow work outside it: take the lock only to update
+      `ref` and claim the slot's contents, and do anything that might sleep after the
+      release. The copy `ff` exists because the slot can be reused by another hart's
+      [[filealloc]] the moment the lock is released ([[tour:39]], [[concept:locks#lock-ftable]]).
+
+  - id: fpc-11
+    level: 2
+    type: order
+    q: |
+      In `ls | wc`, `wc` is asleep in [[piperead]] on an empty pipe. `ls` has written all
+      its output and now exits. Put the events that end `wc`'s reading in order.
+    items:
+      - text: "`ls` calls `exit(0)`; [[kexit]] starts closing its open descriptors"
+        why: Nothing happens to the pipe until the last write end is closed, and ls never closed descriptor 1 itself.
+      - text: "[[fileclose]] drops the write end's `ref` to 0 and frees the ftable slot"
+        why: Only a reference count reaching 0 leads to pipeclose; that is the step that turns an exit into a closed pipe end.
+      - text: "[[pipeclose]] sets `writeopen = 0` and calls `wakeup(&pi->nread)`"
+        why: The flag must be cleared before (or together with) the wakeup, under pi->lock, so the woken reader sees it.
+      - text: "`wc` returns from [[sleep]], retakes `pi->lock` and re-checks the loop condition on line 119"
+        why: A woken sleeper always re-checks its condition; the wakeup itself only made it RUNNABLE.
+      - text: "The copy loop breaks at once with `i = 0`, and `read` returns 0 to `wc`"
+        why: The pipe is empty and writeopen is 0, so there is nothing to copy and no reason to wait.
+      - text: "`wc`'s read loop ends and it prints its counts"
+        why: User code only learns about end of file from the 0 that read returned.
+    why_wrong: Follow the chain from the reference count down to the flag, then to the sleeper.
+    explain: |
+      End of file on a pipe is a reference count reaching zero, turned into a flag
+      (`writeopen`), turned into a wakeup, turned into a 0 from `read`. If any process still
+      held a copy of the write end, the chain would stop at the second step and `wc` would
+      sleep forever ([[tour:39]], [[tour:40]]).
+
+  - id: fpc-12
+    level: 2
+    type: choice
+    q: |
+      `nread` and `nwrite` are never reset; they only count up, and positions are found with
+      `% PIPESIZE`. What does this design buy compared with two indices that wrap back to 0
+      at 512?
+    code: kernel/pipe.c:11-20
+    options:
+      - text: "Full and empty become different tests (`nwrite == nread + 512` vs `nread == nwrite`) without wasting a slot or adding a flag"
+        correct: true
+        why: |
+          With wrapping indices, a full and an empty buffer both look like "indices equal".
+          Free-running counters keep the difference `nwrite - nread`, which is exactly the
+          number of bytes waiting.
+      - text: "They make the pipe lock unnecessary, because counters can be updated atomically"
+        why: |
+          You may have thought counters are naturally atomic. Every test and update of them
+          in [[pipewrite]] and [[piperead]] happens under `pi->lock`; nothing here is
+          lock-free.
+      - text: "They let the pipe hold more than 512 bytes once the counters grow"
+        why: |
+          The buffer is always 512 bytes. The counters grow, but `% PIPESIZE` maps them back
+          into the same 512 slots, and the full test stops the writer at 512 waiting bytes.
+      - text: "They avoid overflow, because a 32-bit counter can never wrap in practice"
+        why: |
+          They can wrap, after 4 GiB through one pipe. That is harmless because 512 divides
+          2^32, so `nwrite - nread` and `% 512` stay correct across the overflow, but the
+          design does not depend on avoiding it.
+    explain: |
+      Counting bytes instead of tracking positions keeps every test simple:
+      empty is `nread == nwrite`, full is `nwrite == nread + PIPESIZE`, and the next byte is
+      `data[nread % PIPESIZE]` ([[kernel/pipe.c:88]], [[kernel/pipe.c:119]], [[tour:39]]).
+
+  - id: fpc-13
+    level: 2
+    type: tf
+    q: |
+      True or false: [[pipewrite]] calls [[copyin]] while holding the spinlock `pi->lock`, and
+      this is safe in this kernel.
+    code: kernel/pipe.c:76-109@82-103
+    answer: true
+    why_tf: |
+      You may have thought touching user memory always risks sleeping (as reading a file
+      does). Here [[copyin]] only walks the page table in software and copies; nothing on
+      its path sleeps.
+    reasons:
+      - text: "copyin never sleeps: it walks the page table and, at worst, allocates a zeroed page with kalloc, which only spins briefly on kmem.lock."
+        correct: true
+        why: |
+          A spinlock may be held across code that takes other spinlocks or runs for a while,
+          as long as it never sleeps or yields. [[vmfault]] uses [[kalloc]], which takes
+          `kmem.lock`, a spinlock, so `noff` rises to 2 for a moment and falls back.
+      - text: "It is safe because copyin turns interrupts back on while it copies."
+        why: |
+          Nothing in [[copyin]] touches SIE. Interrupts stay off for the whole time
+          `pi->lock` is held, as for every spinlock.
+      - text: "It is safe because a user page fault inside copyin is handled by usertrap, which sleeps until the page is loaded."
+        why: |
+          [[copyin]] runs in the kernel and translates addresses itself with [[walkaddr]];
+          the hardware never faults on the user address here, and xv6 has no paging from disk.
+    explain: |
+      The rule is "never sleep holding a spinlock", not "never do work holding one".
+      Copying one byte at a time under `pi->lock` keeps the check of `readopen`, the full
+      test and the store into `data` one atomic step ([[tour:39]], [[concept:locks#lock-pipe]]).
+
+  - id: fpc-14
+    level: 2
+    type: choice
+    q: |
+      `cat` with no arguments is in `read(0, buf, 512)` on the console. You type `h`, `i`,
+      then Control-D (no Enter). What does that `read` return?
+    code: kernel/console.c:87-138@112-119
+    options:
+      - text: "2: the bytes `hi`; the Control-D is left in the buffer for the next read"
+        correct: true
+        why: |
+          Control-D committed the line, so [[consoleread]] wakes, copies `h` and `i`, then
+          meets Control-D with `n < target`. Line 116 (`cons.r--`) puts it back, and the
+          loop breaks, returning 2.
+      - text: "3: the bytes `h`, `i` and the Control-D character"
+        why: |
+          You may have thought Control-D is copied like any other byte. [[consoleread]]
+          checks for `C('D')` before the copy and breaks out without copying it.
+      - text: "0: Control-D means end of file"
+        why: |
+          That is what the *next* read returns. This one already has two characters to hand
+          back, and the code keeps them rather than dropping them.
+      - text: "Nothing yet: read keeps waiting until you press Enter"
+        why: |
+          You may have thought only a newline wakes the reader. Line 179 commits the line
+          on `\n`, on Control-D, or on a full buffer, so Control-D wakes `cat` without Enter.
+    explain: |
+      Control-D both commits the line and marks end of file. If there are bytes before it,
+      `read` returns them and the `cons.r--` saves the Control-D, so the *following* read
+      returns 0 and `cat`'s loop ends ([[kernel/console.c:112-119]], [[tour:37]]).
+
+  - id: fpc-15
+    level: 2
+    type: state
+    q: |
+      Hart 2 is idle in its [[scheduler]] (between `intr_on` and `intr_off`) when a UART
+      interrupt arrives. [[uartintr]] calls [[consoleintr]], which takes `cons.lock` and
+      echoes the key. Hart 2 is now inside [[uartputc_sync]], just after its `push_off()`.
+      What is its state?
+    code: kernel/uart.c:98-120@105-106
+    state:
+      mode: S
+      stack: scheduler
+      satp: kernel
+      sie: "off"
+      noff: 2
+      intena: 0
+    why:
+      stack: |
+        xv6 has no separate interrupt stack: `kernelvec` pushed its frame onto whatever
+        stack the hart was using, and an idle hart is on its scheduler stack.
+      noff: |
+        Two push_offs are outstanding: one from `acquire(&cons.lock)` and one from
+        [[uartputc_sync]] itself.
+      intena: |
+        intena records SIE before the *outermost* push_off. That was the acquire inside
+        the trap handler, where the hardware had already cleared SIE, so it is 0. The
+        inner push_off does not change it.
+      sie: |
+        Taking the trap cleared SIE, and every push_off keeps it off.
+    why_wrong: Trace it from the trap - kernelvec, kerneltrap, devintr, uartintr, consoleintr (acquire), consputc, uartputc_sync (push_off) - and track each field.
+    explain: |
+      Supervisor mode, kernel page table, on hart 2's scheduler stack, interrupts off with
+      `noff` 2 and `intena` 0. When the echo and the handler finish, the pop_offs bring
+      `noff` back to 0 but leave SIE off, and `sret` in `kernelvec` restores the
+      scheduler's SIE ([[concept:locks#intena]], [[tour:38]]).
+
+  - id: fpc-16
+    level: 2
+    type: choice
+    q: |
+      [[uartwrite]] serializes writers with `tx_lock`, a **sleep-lock**. Why would an
+      ordinary spinlock not work here?
+    code: kernel/uart.c:76-96
+    options:
+      - text: "The holder may call sleep() in the middle of a batch, waiting for the transmitter, and nobody may sleep holding a spinlock"
+        correct: true
+        why: |
+          Line 91 sleeps on `&tx_chan` while `tx_lock` is held. A [[g:sleeplock]] allows
+          that. With a spinlock held, [[sched]] would find `noff` above 1 and stop the
+          kernel with `panic: sched locks`.
+      - text: "Spinlocks cannot protect memory-mapped device registers"
+        why: |
+          A spinlock protects whatever the code agrees it protects; [[uartputc_sync]]
+          writes the same registers with interrupts off. The problem is sleeping, not the
+          registers.
+      - text: "A sleep-lock is faster when there is no contention"
+        why: |
+          It is slower: [[acquiresleep]] takes an internal spinlock just to set `locked`.
+          It is chosen because the holder must be able to sleep.
+      - text: "Interrupt handlers also take tx_lock, and they need it to be a sleep-lock"
+        why: |
+          Interrupt handlers never take `tx_lock`: [[uartintr]] only calls
+          `wakeup(&tx_chan)`, and echoes go through [[uartputc_sync]]. A handler could not
+          wait for a sleep-lock anyway.
+    explain: |
+      Pick the lock by what the holder does: if it may wait for something slow (a device,
+      the disk), it needs a [[g:sleeplock]]. Holding one leaves interrupts on, which is
+      exactly what lets the UART's transmit interrupt wake the writer ([[tour:38]],
+      [[concept:locks#lock-uart]]).
+
+  - id: fpc-17
+    level: 2
+    type: line
+    q: |
+      Three harts call [[printk]] at the same moment. Click the line that keeps their
+      messages from interleaving character by character.
+    code: kernel/printk.c:62-78
+    answer: 71
+    lines:
+      70: |
+        This line only tests the `panicking` flag. The serialization comes from the
+        `acquire` it guards, on the next line.
+      74: |
+        This loop walks the format string. Without a lock, three harts running it at once
+        would mix their characters.
+      76: |
+        [[consputc]] sends a single character; it protects nothing beyond that one byte.
+    why_wrong: Look for the call that makes the other harts wait.
+    explain: |
+      Line 71 takes `pr.lock`, a spinlock held for the whole call, so a second hart spins
+      until the first has printed its last character. It protects calls, not lines: a
+      message printed with two `printk` calls can still be split, and during a panic the
+      lock is skipped ([[tour:38]], [[concept:locks#lock-pr]]).
+
+  - id: fpc-18
+    level: 2
+    type: bits
+    q: |
+      A program calls `open("README", omode)` with `omode = 0x401`. Using
+      [[kernel/fcntl.h]] and [[sys_open]], decode it and predict the result.
+    code: kernel/sysfile.c:376-389
+    value: "0x401"
+    fields:
+      - label: "O_WRONLY (0x001)"
+        options: ["set", "clear"]
+        answer: "set"
+        why: "0x401 = 0x400 + 0x001: bit 0 is set."
+      - label: "O_CREATE (0x200)"
+        options: ["set", "clear"]
+        answer: "clear"
+        why: "0x401 has nothing in 0x200. Without it, sys_open uses namei and fails if the file does not exist."
+      - label: "O_TRUNC (0x400)"
+        options: ["set", "clear"]
+        answer: "set"
+        why: "0x400 is bit 10, and it is set."
+      - label: "f->readable after a successful open"
+        options: ["0", "1"]
+        answer: "0"
+        why: "Line 384: `readable = !(omode & O_WRONLY)`. O_WRONLY is set, so readable is 0 and a read on this descriptor returns -1."
+      - label: "README is an existing 2441-byte regular file. Its size after the open"
+        options: ["0", "2441"]
+        answer: "0"
+        why: "Lines 387-388: O_TRUNC on a T_FILE calls itrunc, which frees its blocks and sets the size to 0."
+    explain: |
+      0x401 is `O_WRONLY | O_TRUNC`: open an existing file for writing only and empty it.
+      `readable` and `writable` are computed once, at open, and stored in the
+      [[g:open-file]]; [[fileread]] and [[filewrite]] check them on every call
+      ([[tour:36]]).
+
+  - id: fpc-19
+    level: 2
+    type: multi
+    q: |
+      A process's `write` to the console goes [[consolewrite]] → [[uartwrite]]. Which of
+      these can happen on that path in this kernel?
+    code: kernel/uart.c:76-96
+    options:
+      - text: "The process sleeps waiting for another process to release `tx_lock`"
+        correct: true
+        why: "[[acquiresleep]] sleeps on the lock's channel when `tx_lock` is held by someone else."
+      - text: "The process sleeps on `&tx_chan` until the UART's transmit interrupt"
+        correct: true
+        why: "Lines 86-91: if `LSR_TX_IDLE` is clear, it calls [[sleep]]; [[uartintr]] wakes `&tx_chan`."
+      - text: "The bytes are copied from user memory into a 32-byte buffer on the kernel stack"
+        correct: true
+        why: "[[consolewrite]]'s `buf[32]` is a local variable; [[either_copyin]] fills it."
+      - text: "The bytes are queued in a transmit ring buffer that the interrupt handler drains later"
+        why: |
+          You may remember `uart_tx_buf` from older xv6. This version has no transmit buffer:
+          the writing process itself puts each byte into `THR`.
+      - text: "The process takes `cons.lock` for the whole write"
+        why: |
+          `cons.lock` guards the *input* buffer (`cons.buf`, `r`, `w`, `e`). Output never
+          takes it.
+    explain: |
+      Output from processes is serialized by one sleep-lock per 32-byte batch and paced by
+      the transmitter: write a byte if `THR` is free, otherwise sleep until the interrupt
+      says it is. No queue, no `cons.lock` ([[tour:38]], [[concept:locks#lock-uart]]).
+
+  - id: fpc-20
+    level: 3
+    type: number
+    q: |
+      A long program runs that never reads the console, so nobody calls [[consoleread]].
+      Before it started, the console input buffer was empty (`r == w == e`). You now type
+      200 ordinary letters without pressing Enter. How many of them are echoed on the
+      screen?
+    code: kernel/console.c:169-186
+    answer: 128
+    wrong:
+      200: |
+        You may have thought every key is echoed. The echo on line 174 is inside the
+        `if` on line 170: a character that does not fit in the buffer is neither stored nor
+        echoed, it is silently dropped.
+      127: |
+        You may have expected a ring buffer that wastes one slot. The test is
+        `cons.e - cons.r < INPUT_BUF_SIZE` with free-running indices, so all 128 slots are
+        used.
+      0: |
+        You may have thought echo waits for a reader. [[consoleintr]] echoes from the
+        interrupt handler as each key arrives, whether or not anyone is reading.
+    why_wrong: Find the condition that guards both the echo and the store, and count how many characters pass it while r stays at 0.
+    explain: |
+      `r` stays at its old value because nobody reads, so each stored key raises
+      `e - r` by one. After 128 keys the buffer is full: line 179 commits it (`w = e`) and
+      wakes any reader, and from then on line 170 rejects every key until someone reads.
+      `INPUT_BUF_SIZE` is 128 ([[kernel/console.c:51]], [[tour:37]]).
+
+  - id: fpc-21
+    level: 3
+    type: multi
+    q: |
+      On hart 0, `cat` is in [[uartwrite]] holding `tx_lock`, halfway through a 32-byte
+      batch. On harts 1 and 2 other things are happening. Which of these can put bytes on
+      the screen **between two bytes of `cat`'s batch**?
+    options:
+      - text: "The echo of a key you type, handled on hart 2"
+        correct: true
+        why: "[[consoleintr]] echoes through [[uartputc_sync]], which never looks at `tx_lock`."
+      - text: "A kernel message printed with printk on hart 1"
+        correct: true
+        why: "[[printk]] takes `pr.lock`, not `tx_lock`, and writes through [[uartputc_sync]]."
+      - text: "`wc` on hart 1 calling `printf` (one `write` per character)"
+        why: |
+          You may have thought single-byte writes slip through. Each one still goes through
+          [[uartwrite]] and must take `tx_lock`, which `cat` holds until its batch is done.
+      - text: "Another process's `write(1, buf, 32)` on hart 2"
+        why: |
+          It waits in [[acquiresleep]] for `tx_lock`. Batches never mix with other batches;
+          they can only alternate.
+    explain: |
+      `tx_lock` orders process writes against each other, batch by batch. The spinning
+      path ([[consputc]] → [[uartputc_sync]]) used by echoes and [[printk]] ignores it, so
+      those bytes can land anywhere, even inside a batch ([[tour:38]]).
+
+  - id: fpc-22
+    level: 3
+    type: tf
+    q: |
+      True or false: [[uartwrite]] calls [[sleep_prepare]] without holding any spinlock, so
+      if the transmit-done interrupt arrives between the `LSR` check on line 87 and the
+      [[sleep]] on line 91, the wakeup is lost and the process can sleep forever.
+    code: kernel/uart.c:79-96
+    answer: false
+    why_tf: |
+      You may have learned the classic rule "hold the condition's lock across the check and
+      the sleep". This kernel's [[sleep_prepare]]/[[sleep]] split makes that unnecessary
+      here: the registration itself catches an early wakeup.
+    reasons:
+      - text: "sleep_prepare already set `p->chan`; the interrupt's wakeup(&tx_chan) clears it, and sleep() sees `p->chan == 0` and returns without sleeping."
+        correct: true
+        why: |
+          That is [[kernel/proc.c:567]]: `sleep` only sleeps if `p->chan` is still set, and
+          both it and [[wakeup]] look at `p->chan` under `p->lock`. A wakeup any time after
+          registration is remembered.
+      - text: "It is safe because interrupts are off between line 86 and line 91."
+        why: |
+          They are on: `tx_lock` is a sleep-lock, and holding one does not disable
+          interrupts. The interrupt can arrive in the gap; it just does no harm.
+      - text: "It is safe because the UART raises its interrupt again every few microseconds until someone writes THR."
+        why: |
+          Nothing in the code relies on a repeated interrupt. The correctness argument is
+          entirely in `p->chan`.
+    explain: |
+      The device register `LSR` cannot be protected by a lock, so [[uartwrite]] relies on
+      register-then-check: once [[sleep_prepare]] has run, any later wakeup on that channel
+      cancels the coming sleep ([[g:lost-wakeup]], [[concept:locks#sleep-wakeup]],
+      [[tour:38]]).
+
+  - id: fpc-23
+    level: 3
+    type: number
+    q: |
+      A program calls `write(fd, buf, 10000)` on a regular file, and every [[writei]]
+      succeeds. How many file-system transactions ([[begin_op]] … [[end_op]] pairs) does
+      [[filewrite]] run? (`MAXOPBLOCKS` is 10, `BSIZE` is 1024.)
+    code: kernel/file.c:148-173
+    answer: 4
+    wrong:
+      1: |
+        You may have thought one system call is one transaction. A large write would then
+        dirty more blocks than the log can hold; [[filewrite]] splits it into chunks of
+        `max` bytes, each in its own transaction.
+      10: |
+        You may have thought each 1024-byte block gets its own transaction. Each chunk is
+        `max` = 3072 bytes (three blocks), not one.
+      3: |
+        3 × 3072 = 9216 bytes, which leaves 784 bytes for a fourth, shorter chunk.
+    why_wrong: Compute max on line 153, then divide 10000 by it and round up.
+    explain: |
+      `max = ((10 - 1 - 1 - 2) / 2) * 1024 = 3 * 1024 = 3072`: room for the inode, an
+      indirect block, two blocks of slop, and data and bitmap blocks within one
+      transaction's budget. 10000 bytes go as 3072 + 3072 + 3072 + 784: four transactions
+      ([[tour:36]], [[tour:31]]).
+
+  - id: fpc-24
+    level: 3
+    type: choice
+    q: |
+      Continue from `cat` reading `h`, `i`, Control-D: the first `read` returned 2. `cat`
+      writes `hi` and calls `read(0, buf, 512)` again. Why does this second read return 0
+      immediately instead of sleeping?
+    code: kernel/console.c:87-138@110-119
+    options:
+      - text: "Line 116 left the Control-D in the buffer; the second read finds it as its first character (`n == target`), so it does not put it back and returns 0"
+        correct: true
+        why: |
+          `cons.r == cons.w` is false because the saved Control-D is still committed input.
+          It is consumed this time, and with nothing copied, `target - n` is 0.
+      - text: "consoleread remembers in a flag that end of file was reached"
+        why: |
+          There is no such flag in `cons`. The "memory" is the Control-D byte itself, kept
+          in the buffer by `cons.r--`.
+      - text: "The second read sleeps, and Control-D's wakeup returns it with 0"
+        why: |
+          Nothing sleeps: the `while (cons.r == cons.w)` loop is skipped, because the
+          Control-D is still unread committed input.
+      - text: "fileread returns 0 for any device once a read returned less than requested"
+        why: |
+          [[fileread]] has no such rule; it passes each read to `devsw[1].read` and returns
+          what [[consoleread]] returns.
+    explain: |
+      Control-D is an in-band marker. If it ends a non-empty line, `cons.r--` pushes it
+      back so the caller first gets its bytes and then, on the next `read`, a 0. If it is
+      the first character a read sees, the read returns 0 at once. A `cat` reading the
+      console therefore stops after Control-D ([[tour:37]]).
+
+  - id: fpc-25
+    level: 3
+    type: choice
+    q: |
+      When both ends of a pipe are closed, [[pipeclose]] runs `release(&pi->lock)` on line
+      70 and only then `kfree((char *)pi)` on line 71. What would go wrong if the two lines
+      were swapped?
+    code: kernel/pipe.c:58-74@69-73
+    options:
+      - text: "The lock lives inside the page being freed; release would act on memory that kfree has already filled with junk and handed back for reuse"
+        correct: true
+        why: |
+          [[kfree]] fills the page with 1s and puts it on the free list, where another
+          hart's [[kalloc]] can claim it at once. [[release]] checks `holding()` first:
+          `locked` is nonzero but `cpu` is now 0x0101…, not this hart, so it stops with
+          `panic: release`. Without that check it would be clearing a lock inside someone
+          else's data.
+      - text: "Nothing: kfree never touches the contents of the page"
+        why: |
+          [[kfree]] deliberately fills the page with junk (`memset(pa, 1, PGSIZE)`) to catch
+          exactly this kind of use-after-free, and it links the page into the free list.
+      - text: "kfree takes pi->lock itself, so it would deadlock"
+        why: |
+          [[kfree]] takes `kmem.lock`, not the pipe's lock. Taking `kmem.lock` while holding
+          `pi->lock` is legal; [[pipewrite]]'s copyin can do it through [[kalloc]].
+      - text: "Another process might still be asleep on the pipe and would miss its wakeup"
+        why: |
+          Both `readopen` and `writeopen` are 0, so no `struct file` refers to the pipe and
+          no process can be in [[piperead]] or [[pipewrite]] on it.
+    explain: |
+      An object that contains its own lock can only be freed after the lock is released,
+      and only when nobody else can reach it. Both flags at 0 guarantee the second; the
+      line order guarantees the first ([[tour:39]], [[concept:locks#lock-pipe]]).

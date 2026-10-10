@@ -1,0 +1,232 @@
+summary: |
+  The handlers for the system calls about processes, memory and time: `exit`, `getpid`,
+  `fork`, `wait`, `sbrk`, `pause`, `kill` and `uptime`. (The file system calls are in
+  [[kernel/sysfile.c]].)
+
+  Each `sys_*` function is reached through the table in [[kernel/syscall.c]] and has the
+  same shape: no C parameters, a `uint64` result. It fetches its
+  [[g:syscall-arguments|arguments]] from the saved user registers with [[argint]] or
+  [[argaddr]], does the work, usually by calling a function in [[kernel/proc.c]], and
+  returns a value that [[syscall]] puts in the user's `a0`. By convention -1 means
+  failure.
+
+  Most handlers are thin wrappers. The two with real logic are [[sys_sbrk]], which grows
+  memory either eagerly or lazily, and [[sys_pause]], which sleeps on the clock.
+
+  **Read before:** [[kernel/syscall.c]]. **Read next:** [[kernel/proc.c]] for
+  [[kfork]], [[kexit]], [[kwait]] and [[kkill]].
+
+blocks:
+  - lines: 1-8
+    title: Headers
+    note: |
+      [[kernel/vm.h]] is included for [[SBRK_EAGER]] and [[SBRK_LAZY]], the two modes of
+      `sbrk`; [[kernel/memlayout.h]] for [[TRAPFRAME]], the upper limit on user memory;
+      [[kernel/proc.h]] for `struct proc`.
+
+  - lines: 10-17
+    title: "sys_exit(): end the calling process"
+    note: |
+      `exit(status)`: argument 0 is the exit status, which the parent can collect with
+      `wait`. [[kexit]] closes the process's files, makes it a [[g:zombie]], wakes the
+      parent, and switches to the scheduler for the last time. It never returns, so the
+      `return 0` is never executed; it is there because the function must return a value
+      as far as the compiler knows.
+
+  - lines: 19-23
+    title: "sys_getpid(): the caller's process ID"
+    note: |
+      Returns the [[g:pid]] of the current process. [[kernel/proc.h]] says `p->pid` should
+      be read with `p->lock` held, but a running process's own PID never changes while it
+      is running (it is only reset by [[freeproc]], after the process has exited), so
+      reading it without the lock is safe here.
+
+  - lines: 25-29
+    title: "sys_fork(): duplicate the caller"
+    note: |
+      [[kfork]] creates a child with a copy of the caller's memory, open files and
+      [[g:trapframe]]. It returns the child's PID, which becomes the parent's result. The
+      child returns from the same `fork` call with 0, because `kfork` sets the child's
+      saved `a0` to 0 ([[kernel/proc.c:282]]) and the child starts by returning to user
+      mode with that trapframe. Returns -1 if no process slot or memory is available.
+
+  - lines: 31-37
+    title: "sys_wait(): wait for a child to exit"
+    note: |
+      `wait(int *status)`: argument 0 is a *user* address where the child's exit status
+      should be stored, or 0 if the caller does not want it. [[argaddr]] does not check
+      the address; [[kwait]] writes through it with [[copyout]], which does, and returns
+      -1 if the address is bad. Otherwise `kwait` sleeps until a child exits and returns
+      its PID, or -1 at once if the caller has no children.
+
+  - lines: 39-44
+    title: "sys_sbrk(): change the size of user memory"
+    note: |
+      `sbrk` moves the process's "break", the end of its memory, which is `p->sz`. The
+      user's `malloc` ([[user/umalloc.c]]) calls it to get more heap. This version takes
+      two arguments: `n`, the number of bytes to add (negative to shrink), and `t`, how to
+      add them. The user library passes [[SBRK_EAGER]] (1) from `sbrk()` and
+      [[SBRK_LAZY]] (2) from `sbrklazy()` ([[user/ulib.c:153]]).
+
+      It returns the *old* size, which is the address of the first new byte, or -1 on
+      failure. User code sees -1 as `SBRK_ERROR`, `(char *)-1`. `sbrk(0)` returns the
+      current size without changing anything.
+
+  - lines: 46-48
+    title: Fetch the arguments and the current size
+    note: |
+      `n` and `t` come from the saved `a0` and `a1`. `addr` records the current size
+      before any change; it is the return value on success.
+
+  - lines: 50-53
+    title: Eager growth, or any shrink
+    note: |
+      With `SBRK_EAGER`, or whenever `n` is negative, the change is made immediately by
+      [[growproc]]. To grow, it checks that the new size stays at or below [[TRAPFRAME]]
+      (user memory must not reach the trapframe and trampoline pages at the top), then
+      [[uvmalloc]] allocates zeroed physical pages and maps them; if memory runs out, the
+      call fails with -1. To shrink, [[uvmdealloc]] unmaps and frees the pages beyond the
+      new size; pages that were never allocated (lazy ones never touched) are skipped.
+
+      Shrinking is always done this way, because freeing must happen now: a lazy shrink
+      would leave mapped pages above `p->sz`.
+
+      One quirk: if `n` is more negative than the current size, `sz + n` wraps around to a
+      huge unsigned number, [[uvmdealloc]] treats that as "not smaller" and does nothing,
+      and `sbrk` reports success without changing the size.
+
+  - lines: 54-63
+    title: Lazy growth
+    note: |
+      With `SBRK_LAZY` (in fact with any `t` other than `SBRK_EAGER`) and `n` ≥ 0, the
+      kernel only raises `p->sz` and allocates nothing. The process now *owns* the
+      addresses up to the new size, but no pages are mapped there.
+
+      The first load or store to such an address causes a [[g:page-fault]]. [[usertrap]]
+      sees `scause` 13 or 15 and calls [[vmfault]] ([[kernel/trap.c:71]]), which checks the
+      address is below `p->sz`, allocates a zeroed page, and maps it; the instruction is
+      then retried. If the kernel itself touches such an address, in [[copyin]] or
+      [[copyout]] during a system call, those functions call `vmfault` too. So a program
+      that reserves a large region but uses little of it pays only for the pages it
+      touches.
+
+      The two checks reject a size that would wrap around past 2⁶⁴ (not reachable in
+      practice, since `n` is at most about 2³¹, but cheap to rule out) and a size that
+      would reach [[TRAPFRAME]], the same limit [[growproc]] enforces.
+
+      Unlike the eager path, lazy growth cannot fail for lack of memory at this point; if
+      memory is short when a page is finally touched, `vmfault` fails. If user code
+      touches the page, the process is killed; if a system call touches it first (through
+      `copyin`/`copyout`), that call returns -1 instead.
+
+  - lines: 64-65
+    title: Return the old break
+    note: |
+      The start of the newly added region (or, after a shrink, the old end). The `uint64`
+      result goes to the user's `a0`.
+
+  - lines: 67-75
+    title: "sys_pause(): sleep for n clock ticks"
+    note: |
+      `pause(n)` suspends the caller for `n` timer ticks of about 0.1 s each (older
+      versions of xv6 called this system call `sleep`). A negative `n` is treated as 0.
+      Time is measured with [[ticks]], which [[clockintr]] increments on hart 0.
+
+  - lines: 76-90
+    title: Sleep until enough ticks have passed
+    note: |
+      [[tickslock]] protects [[ticks]]. The loop records the starting value `ticks0` and
+      sleeps until `ticks - ticks0` reaches `n`. The subtraction is done on unsigned
+      numbers, so it gives the right answer even if `ticks` wraps around.
+
+      Each round uses xv6's [[g:sleep-wakeup]] protocol, which is designed to avoid a *lost
+      wakeup*:
+
+      1. [[sleep_prepare]] registers `&ticks` as the channel this process waits on, while
+         `tickslock` is still held. [[clockintr]] calls [[wakeup]] only while holding
+         `tickslock`, so no tick can slip in between the check of `ticks` and the
+         registration.
+      2. Release `tickslock`, so that the clock interrupt can take it.
+      3. [[sleep]] actually suspends the process, but only if no wakeup has happened since
+         step 1. A wakeup clears `p->chan`, and `sleep` returns at once if it finds it
+         clear.
+      4. Re-acquire the lock and re-check: a wakeup only means "a tick happened", not
+         "enough ticks have happened".
+
+      The [[killed]] check lets `kill` interrupt a long pause: [[kkill]] makes a sleeping
+      process runnable, the loop sees the flag, and the call returns -1. The process then
+      exits on its way back to user mode ([[kernel/trap.c:81]]).
+
+  - lines: 92-99
+    title: "sys_kill(): kill another process"
+    note: |
+      `kill(pid)`: [[kkill]] finds the process, sets its `killed` flag, and wakes it if it
+      is sleeping. Returns 0, or -1 if no process has that PID. The victim does not die
+      immediately: it exits the next time it is about to return to user mode
+      ([[kernel/trap.c:81]]), or when a sleeping loop that checks [[killed]] notices the
+      flag.
+
+  - lines: 101-112
+    title: "sys_uptime(): ticks since boot"
+    note: |
+      Returns [[ticks]], read under [[tickslock]] like every other access to it. At about
+      10 ticks per second, divide by 10 for seconds. The value is copied to a local
+      variable so that the lock can be released before returning.
+
+lines:
+  14: |
+    The exit status, from the saved `a0`.
+  15: |
+    End the process ([[kexit]]). Never returns.
+  22: |
+    The current process's [[g:pid]].
+  28: |
+    Child PID to the parent; the child sees 0.
+  35: |
+    The user address for the exit status (or 0).
+  36: |
+    Wait for a child, copy its status to `p`, return its PID ([[kwait]]).
+  46: |
+    `n`: bytes to add (negative to remove).
+  47: |
+    `t`: [[SBRK_EAGER]] or [[SBRK_LAZY]].
+  48: |
+    The current size, which is also the address where new memory will start.
+  50: |
+    Eager growth, or any shrink.
+  51: |
+    Allocate or free now ([[growproc]]); fail if that fails.
+  58: |
+    Reject if the new size would overflow a 64-bit number.
+  60: |
+    Reject if user memory would reach the trapframe page.
+  62: |
+    Claim the address range without allocating; [[vmfault]] fills it in on first use.
+  64: |
+    Return the old size: the start of the new region.
+  73: |
+    The number of ticks to wait.
+  74-75: |
+    Treat a negative count as "do not wait".
+  76: |
+    Take [[tickslock]] before reading [[ticks]].
+  77: |
+    The starting time.
+  78: |
+    Loop until `n` ticks have passed (unsigned difference).
+  79-82: |
+    Give up if the process has been killed; release the lock first.
+  83: |
+    Register for the next wakeup on `&ticks` ([[sleep_prepare]]), still under the lock.
+  84: |
+    Let [[clockintr]] take the lock.
+  85: |
+    Sleep, unless a tick already woke us ([[sleep]]).
+  86: |
+    Re-take the lock to re-check `ticks`.
+  97: |
+    The target's PID.
+  98: |
+    Mark it killed ([[kkill]]).
+  109: |
+    Read [[ticks]] under the lock.

@@ -1,0 +1,710 @@
+title: Breaking the invariants
+group: The dance of privilege
+prerequisites: [13, 41, 44, 45, 47]
+summary: |
+  The transitions of this group work because a handful of rules hold at every instant: a lock
+  here, interrupts off there, a page mapped twice, a register copied before it can be lost.
+  The code states some of them as `panic` checks and leaves others implicit. Each is
+  *load-bearing*: remove it, and something specific breaks.
+
+  This tour does not ask you to take that on faith. For each rule we show the code that keeps
+  it, then **break it** in a scratch copy of xv6, boot that copy in QEMU on three harts, run
+  `usertests` (or a single test), and report exactly what happened: the console output, and
+  where gdb found each hart afterwards. Some breaks crash at once, some corrupt silently, and
+  one did not reproduce at all. All results are from our runs of this build; a rerun may land
+  differently where we say so.
+
+  The last steps turn to beliefs rather than code: common misconceptions about this dance,
+  each checked against the source and the measurements of earlier tours.
+cast: |
+  Every experiment starts from the same place: a fresh copy of the source tree and a fresh
+  disk image, one change, three harts.
+
+  | Hart | What it is doing |
+  |---|---|
+  | 0 | Booting, then running whatever the scheduler gives it |
+  | 1 | The same |
+  | 2 | The same |
+
+  The unmodified kernel is the control: in our run it passed `usertests -q` on three harts
+  (`ALL TESTS PASSED`).
+steps:
+  - title: "Invariant 1: interrupts are off across swtch"
+    file: kernel/proc.c
+    lines: 479-497
+    focus: 485-495
+    state:
+      hart: any
+      mode: S
+      proc: the process giving up the hart
+      intr: off
+      satp: kernel
+      locks: ["p->lock"]
+      irq: {noff: 1, intena: 0, note: "a `yield`: `p->lock` was acquired with SIE off. noff > 0 means SIE is 0, which is what `intr_get()` checks"}
+      stack: [yield, sched]
+      sp: {"on": kernel}
+    note: |
+      [[sched]] refuses to switch unless four things are true. Two concern locks (next
+      invariant). One is the subject here: `intr_get()` must be 0. In normal code this check
+      never fires, because the caller holds `p->lock`, and [[acquire]] turned interrupts off
+      with [[push_off]]: whenever `noff > 0`, SIE is 0 ([[concept:locks#invariant]]). The
+      check guards against a future change that turns them back on.
+
+      Why does it matter? Not because `swtch` itself would be damaged. An interrupt in the
+      middle of `swtch` would push a [[kernelvec]] frame below the current `sp` (old stack or
+      new, both are valid stacks at every instruction), and `kerneltrap` saves and restores
+      what it uses, so the interrupted `swtch` would continue correctly.
+
+      The danger is what the **handler** does. At this moment the hart holds `p->lock`, and
+      `cpus[hart].proc` still names `p`. A timer handler calls [[yield]], which acquires
+      `p->lock`; on hart 0 it first calls `wakeup(&ticks)`, which acquires every process's
+      lock. A device handler calls [[wakeup]], which acquires **every** process's lock,
+      `p`'s included. Both would try to acquire a lock this same hart already holds.
+
+  - title: Break 1, and the panic it produces
+    file: kernel/proc.c
+    lines: 479-497
+    focus: 494-495
+    state:
+      hart: 0
+      mode: S
+      proc: init (pid 1)
+      intr: off
+      satp: kernel
+      locks: ["p->lock"]
+      irq: {noff: 1, intena: 0, note: "the broken kernel's added `intr_on()` sets SIE at noff 1, breaking [[concept:locks#invariant]]; at the panic gdb read noff 3: `p->lock`, `disk.vdisk_lock` and the failing `acquire`'s `push_off`"}
+      stack: [forkret, fsinit, sleep, sched]
+      sp: {"on": kernel, detail: "KSTACK(0); the interrupt is taken right after intr_on()"}
+    note: |
+      The change: in `sched`, delete the `intr_get()` check and call `intr_on()` just before
+      `swtch`. In the scheduler, call `intr_off()` right after its `swtch` returns, so that
+      [[pop_off]]'s own sanity check (`pop_off - interruptible`) does not fire first.
+
+      The result, on the first boot:
+
+      ```text
+      hart 2 starting
+      hart 1 starting
+      panic: acquire
+      ```
+
+      gdb at `panic`, on hart 0:
+
+      ```text
+      #1 acquire (lk=&proc[0].lock)
+      #2 wakeup (chan=a buffer in bcache)
+      #3 virtio_disk_intr
+      #4 devintr
+      #5 kerneltrap
+      #6 kernelvec
+      cpus[0].proc->pid = 1, noff = 3
+      ```
+
+      Pid 1, still setting up the file system before its `exec`, went to sleep on a disk
+      block. In the window we opened, the disk's completion interrupt arrived. Its handler
+      woke the sleepers, starting with `proc[0]`, whose lock hart 0 was already holding on
+      pid 1's behalf. [[acquire]] detected the self-deadlock and panicked. Two variants (a
+      busy-wait between `intr_on` and `swtch`; no `intr_off` in the scheduler) ended the same
+      way: `panic: acquire` during boot.
+
+      In a rerun, gdb found `sepc` at the instruction just after
+      `intr_on()` in `sched`: the disk interrupt was already pending and was taken
+      immediately, on pid 1's kernel stack.
+    others: |
+      Without `holding()` in [[acquire]], hart 0 would spin forever on a lock it holds itself,
+      with interrupts off. The other harts would then pile up behind `proc[0].lock` in their
+      own scans and wakeups. The panic is the merciful outcome.
+
+  - title: "Invariant 2: exactly one lock across swtch"
+    file: kernel/sysproc.c
+    lines: 66-90
+    focus: 77-83
+    state:
+      hart: any
+      mode: S
+      proc: a process calling pause()
+      intr: off
+      satp: kernel
+      locks: [tickslock]
+      irq: {noff: 1, intena: 1, note: "`tickslock` taken inside a system call with SIE on: intena 1"}
+      stack: [usertrap, syscall, sys_pause]
+      sp: {"on": kernel}
+    note: |
+      `sched` also checks `mycpu()->noff == 1`: the hart holds exactly one spinlock, which
+      must be `p->lock`. Any other spinlock taken into `swtch` would stay "held" by a thread
+      that is not running, while recording a *hart* as its owner.
+
+      [[sys_pause]] shows the discipline. It needs `tickslock` to read `ticks`, then must
+      sleep until `ticks` changes. So it registers ([[sleep_prepare]]), **releases**
+      `tickslock`, and only then calls [[sleep]], re-acquiring the lock afterwards. Older xv6
+      passed the lock into `sleep`; this commit releases it before ([[tour:16]]).
+
+      The break: delete the `release` and the re-`acquire` around `sleep()`, so `pause`
+      sleeps holding `tickslock`. `usertests openiput` calls `pause(1)`:
+
+      ```text
+      test openiput: panic: sched locks
+      ```
+
+      gdb: hart 2, pid 4, `noff = 2`, called from `sched ← sleep ← sys_pause ← syscall ←
+      usertrap`. The check did its job: it stopped the kernel at the first bad `swtch`,
+      with a message naming the rule.
+
+  - title: Break 2b, with the check removed too
+    file: kernel/trap.c
+    lines: 166-180
+    focus: 169-171
+    state:
+      hart: 0
+      mode: S
+      proc: "none (hart 0's scheduler)"
+      intr: off
+      satp: kernel
+      locks: []
+      irq: {noff: 2, intena: 0, note: "worked out from the code, not measured: one level is the sleeper's `tickslock` push, never popped on this hart; the other is this `acquire`'s own `push_off`"}
+      stack: [main, scheduler, kerneltrap, devintr, clockintr, acquire]
+      sp: {"on": scheduler, detail: "hart 0's scheduler stack, with a kernelvec frame on it (sp = 0x80008660 at the panic)"}
+    note: |
+      Now also delete the `noff` check, so the bad `swtch` goes through. In seven runs that
+      reached `openiput`, three ended in `panic: acquire` and four in a **silent hang**
+      after `test openiput:`. gdb explained both:
+
+      - **The sleeper had been on hart 0.** `tickslock.cpu` was `&cpus[0]`. Hart 0's next
+        tick, taken in its scheduler's interrupt window, ran [[clockintr]], which calls
+        `acquire(&tickslock)`. [[holding]] compared the owner with *this hart* and said yes:
+        `panic: acquire`. (gdb found hart 0 with `sp = 0x80008660`, a `kernelvec` frame on its
+        scheduler stack.)
+      - **The sleeper had been on hart 1 or 2.** Hart 0's `clockintr` spun in `acquire`
+        forever, with interrupts off. `ticks` stopped. Harts 1 and 2 sat idle in their
+        schedulers. No message at all.
+
+      Spinlocks identify their owner by **hart**, because a spinlock holder is supposed to
+      stay on its hart with interrupts off until it releases. A thread that sleeps while
+      holding one breaks that assumption, and the lock now names a hart that is doing
+      something else entirely. `p->lock` is the single exception the design allows, because
+      the scheduler on the *same hart* releases it right after `swtch` ([[tour:13]]).
+
+      The sleeper also leaves its hart's `noff` wrong. Its `push_off` for `tickslock` is never
+      matched by a `pop_off` on that hart, so after the scheduler releases `p->lock`, `noff`
+      stays at 1 instead of 0. The scheduler's `intr_on()` (line 441) doesn't look at `noff`,
+      so the hart takes interrupts with `noff` 1, a second invariant broken as a side effect
+      ([[concept:locks#invariant]]).
+
+  - title: "Invariant 3: the trampoline at one address in both page tables"
+    file: kernel/vm.c
+    lines: 40-50
+    focus: 45-47
+    state:
+      hart: 0
+      mode: S
+      proc: none
+      intr: off
+      satp: bare
+      locks: []
+      irq: 0
+      stack: [main, kvminit, kvmmake]
+      sp: {"on": boot}
+    note: |
+      [[kvmmake]] maps the trampoline page at `TRAMPOLINE` (`0x3ffffff000`) in the kernel page
+      table, and [[proc_pagetable]] maps the same physical page at the same address in every
+      user page table ([[kernel/proc.c:189]]). The `csrw satp` in [[uservec]] and in
+      [[userret]] changes the page table **under the running code**: the next instruction is
+      fetched through the *new* table, at the next address. Only a page mapped identically in
+      both makes that fetch land on the next instruction.
+
+      The break: delete line 47, so the kernel page table has no trampoline. Result, on every
+      boot (three of ours):
+
+      ```text
+      hart 1 starting
+      hart 2 starting
+      ```
+
+      and nothing more: no `init: starting sh`, no panic. gdb found one hart here:
+
+      | Register | Value |
+      |---|---|
+      | `pc` | `0x3ffffff000` |
+      | `scause` | `0xc`: instruction page fault |
+      | `sepc`, `stval` | `0x3ffffff000` |
+      | `stvec` | `0x3ffffff000` |
+      | `satp` | the kernel page table |
+
+  - title: Why that fault can never be handled
+    file: kernel/proc.c
+    lines: 536-543
+    focus: 539-542
+    state:
+      hart: 0
+      mode: S
+      proc: init (pid 1)
+      intr: off
+      satp: kernel
+      locks: []
+      irq: 0
+      stack: [forkret]
+      sp: {"on": kernel, detail: "KSTACK(0), 0x3fffffdfd0 in our run"}
+    note: |
+      The failure came earlier than the classic thought experiment predicts. The first code
+      to use the trampoline from the kernel side is not `uservec`: it is [[forkret]], line
+      542, calling [[userret]] at its `TRAMPOLINE` address, while still on the kernel page
+      table, for the very first process. That fetch faulted.
+
+      A fault is handled at `stvec`. But [[prepare_return]], just before, had set `stvec` to
+      the trampoline's `uservec`, which is also unmapped. So the handler's first fetch faults
+      too, at `0x3ffffff000`, and traps to `stvec`, which is `0x3ffffff000`. Each trap
+      overwrites `sepc`, `scause` and `stval` with the same values. Nothing is ever pushed;
+      the hart is stuck in a loop of zero instructions, with `sp` still on init's kernel
+      stack.
+
+      Had the kernel somehow reached user mode first, the same loop would start at the
+      instruction after `csrw satp` in `uservec`: the next fetch, through the kernel page
+      table, at an address it does not map. Either way: no message, no panic, a hart lost
+      silently. That is why the rule is in a comment at the top of `trampoline.S` and not in
+      a `panic`: no code could ever run to check it.
+
+  - title: "Invariant 4: sepc is saved before interrupts come back on"
+    file: kernel/trap.c
+    lines: 37-68
+    focus: 51-65
+    state:
+      hart: any
+      mode: S
+      proc: a process making a system call
+      intr: off
+      satp: kernel
+      locks: []
+      irq: 0
+      stack: [usertrap]
+      sp: {"on": kernel}
+    note: |
+      `sepc` is one register per hart, and every trap overwrites it. [[usertrap]] copies it
+      into the trapframe at line 52, the first thing after finding the process, and turns
+      interrupts on only at line 66, after the system-call case has read everything it needs.
+      The comment on lines 64–65 states the rule.
+
+      The break: for system calls, read `sepc` *after* `intr_on()`:
+
+      ```c
+      intr_on();
+      p->trapframe->epc = r_sepc() + 4;   // BROKEN
+      ```
+
+      Three runs of `usertests -q`, three identical results:
+
+      ```text
+      usertests starting
+      usertrap(): unexpected scause 0xc pid=3
+                  sepc=0x80002668 stval=0x80002668
+      $
+      ```
+
+      `usertests` itself was killed, but not at once. Its `write` calls and hundreds to
+      thousands of `sbrk` calls in `countfree` got through first; one `sbrk` landed in the
+      window (gdb: `a7 = 12`). The shell survived and printed its prompt.
+
+  - title: How a one-instruction window was hit every time
+    file: kernel/trap.c
+    lines: 134-164
+    focus: 140-163
+    state:
+      hart: any
+      mode: S
+      proc: a process making a system call
+      intr: off
+      satp: kernel
+      locks: []
+      irq: 0
+      stack: [usertrap, kerneltrap]
+      sp: {"on": kernel, detail: "a kernelvec frame on top of usertrap's"}
+    note: |
+      In the broken kernel, `intr_on()` is at `0x80002660` and the `csrr a5, sepc` is the
+      very next instruction, `0x80002664`. A window of one instruction. It was hit in every
+      run, though not on every system call: most calls found nothing pending. But
+      `countfree` makes thousands of system calls back to back, and sooner or later a timer
+      interrupt becomes pending while the hart has interrupts off between the `ecall` and
+      `intr_on()`. Pending interrupts are not lost: the hart takes it at the first
+      instruction after `intr_on`, which is exactly the `csrr`. In our runs gdb saw
+      `scause = 0x8000000000000005` (timer) each time. Because the window is one fixed
+      address, the message is identical every time.
+
+      The nested trap went through [[kernelvec]], and [[kerneltrap]] did everything right: it
+      saved *its* `sepc` (`0x80002664`) in a local and restored it before `sret`. So when
+      `usertrap` finally read `sepc`, it got `0x80002664`, a kernel address, added 4, and
+      stored `0x80002668` as the user's return address. `sret` sent `usertests` to that
+      address in U-mode. The user page table does not map kernel text, so the fetch raised an
+      instruction page fault (`scause = 0xc`) with `stval = 0x80002668`, and [[usertrap]]'s
+      catch-all killed the process.
+
+      `kerneltrap` obeys the same rule as `usertrap`, more strictly: it reads `sepc`,
+      `sstatus` and `scause` into locals on lines 140–142, before anything can trap again
+      ([[tour:47]] showed where those locals end up).
+
+  - title: "Invariant 5: stvec matches what the hart is doing"
+    file: kernel/trap.c
+    lines: 97-132
+    focus: 108-112
+    state:
+      hart: any
+      mode: S
+      proc: a process about to return to user mode
+      intr: off
+      satp: kernel
+      locks: []
+      irq: 0
+      stack: [usertrap, prepare_return]
+      sp: {"on": kernel}
+    note: |
+      While the kernel runs, `stvec` must point at [[kernelvec]]; while user code runs, at
+      [[uservec]]. The switch to `kernelvec` happens in [[usertrap]] with interrupts still off
+      from the trap. The switch back happens in [[prepare_return]] at line 112, and from that
+      moment until `sret`, the hart is in S-mode with the **user** handler installed. Line 108
+      turns interrupts off first, so no trap can arrive in that stretch.
+
+      After a system call, interrupts are on when `prepare_return` starts (line 66 turned
+      them on, and the system call's last `release` turned them back on because `intena` was
+      1), so this `intr_off()` is not redundant. It runs at `noff` 0, and no lock is taken
+      after it ([[concept:locks#sie]]).
+
+      The break: delete line 108. Three runs of `usertests -q`. Two hung after `usertests
+      starting`, with one hart frozen like this:
+
+      | Register | Value | Meaning |
+      |---|---|---|
+      | `pc` | `0x3ffffff004` | inside `uservec`, looping |
+      | `scause` | `0xf` | store page fault |
+      | `stval` | `0x3fffffe028` | `TRAPFRAME + 40`: `sd ra, 40(a0)` |
+      | `satp` | kernel page table | |
+      | `sstatus.SPP` | 1 | trapped from S-mode |
+
+  - title: Two ways to die in the wrong handler
+    file: kernel/trampoline.S
+    lines: 22-41
+    focus: 32-40
+    state:
+      hart: any
+      mode: S
+      proc: a process about to return to user mode
+      intr: off
+      satp: kernel
+      locks: []
+      irq: 0
+      stack: [uservec]
+      sp: {"on": kernel, detail: "the kernel stack, which uservec ignores"}
+    note: |
+      **The hang.** A kernel interrupt arrived after line 112 but before `userret` changed
+      `satp`. It went to `uservec`, which assumes it was entered from user mode with the user
+      page table: it stores registers to `TRAPFRAME`. Under the *kernel* page table that
+      address is not mapped (the trapframe is mapped only in user page tables), so the first
+      store faulted. The fault went to `stvec`, still `uservec`, which faulted again at the
+      same store. Like invariant 3: a loop with no exit and no message.
+
+      Which one you get depends on timing. **The panic.** In our third run (and in two later
+      reruns), the interrupt arrived *after* `userret`'s `csrw satp`:
+
+      ```text
+      usertests starting
+      panic: usertrap: not from user mode
+      ```
+
+      gdb: `sepc = 0x3ffffff0a8`, the `sfence.vma` right after `userret`'s `csrw satp`. Now
+      the user page table was installed, so `uservec` worked: it saved the *kernel's*
+      registers over the process's user registers in its trapframe, switched to the kernel
+      page table, and called [[usertrap]]. Line 42 checks `SPP`, finds 1 (the trap came from
+      S-mode), and panics. That check exists precisely to catch this case. The one-line
+      `intr_off()` is what keeps it from ever firing.
+
+  - title: "Invariant 6: the scheduler stands on a stack no process owns"
+    file: kernel/main.c
+    lines: 31-45
+    focus: 44
+    state:
+      hart: [0, 1, 2]
+      mode: S
+      proc: none
+      intr: off
+      satp: kernel
+      locks: []
+      irq: 0
+      stack: [main]
+      sp: {"on": boot, detail: "each hart's slice of stack0, about to become its scheduler stack"}
+    note: |
+      Each hart's [[scheduler]] runs on that hart's slice of [[stack0]], the boot stack that
+      `main` never returns from ([[concept:stacks#scheduler]]). Why not run the scheduler on
+      whatever stack the hart happens to be on, the kernel stack of the process that just
+      yielded? The scheduler must keep running in exactly the moments when **no** process is
+      running on this hart, including after it has made the previous process available to
+      every other hart. So it needs a stack that no process owns.
+
+      To test it, we made the scheduler run on the process's own kernel stack. In [[sched]],
+      instead of switching to `cpus[i].context`, our change switches to a fresh context whose
+      `sp` is 256 bytes below `sched`'s frame, on the same page, and whose `ra` is a small
+      function that clears `c->proc`, releases `p->lock`, and calls `scheduler()`. Everything
+      else is unchanged: the same scan, the same locks.
+
+  - title: Break 6, and three harts on one stack
+    file: kernel/proc.c
+    lines: 472-497
+    focus: 494-496
+    state:
+      hart: any
+      mode: S
+      proc: the process giving up the hart
+      intr: off
+      satp: kernel
+      locks: ["p->lock"]
+      irq: {noff: 1, intena: 0}
+      stack: [yield, sched]
+      sp: {"on": kernel}
+    note: |
+      Four boots on three harts, four panics during boot (in two of them another hart still
+      got as far as printing the shell prompt afterwards):
+
+      ```text
+      scause=0xd sepc=0x80000c3c stval=0x78        load page fault in pop_off
+      scause=0xc sepc=0x80020a70 stval=0x80020a70  fetch from disk, the driver data
+      scause=0xc sepc=0x80015668 stval=0x80015668  fetch from inside the process table
+      scause=0xc sepc=0x8000fdd0 stval=0x8000fdd0  fetch from proc[0]
+      panic: kerneltrap
+      ```
+
+      (Symbol names are from that build's `kernel.sym`; one run also printed a line of
+      pure garbage first.)
+
+      Three of the four tried to *execute data*: return addresses read back from stack
+      frames that had been overwritten. gdb found all three harts with `sp` inside one or two
+      process stacks, `KSTACK(0)` (`0x3fffffd000`–`0x3fffffe000`) or `KSTACK(1)`, at the same
+      time.
+
+      The mechanism is the moment our function releases `p->lock`. From then on, another
+      hart's scheduler may pick `p` and resume it, on `p`'s kernel stack, while this hart's
+      scheduler is **still executing on that same page**, 256 bytes lower. As `p` makes
+      calls, its frames grow down over the scheduler's. On one hart (`CPUS=1`) the hack passed
+      the first 21 `usertests -q` tests and then stalled in `preempt`, an artifact of our
+      hack (each new scheduler restarts its scan at `proc[0]` and keeps choosing the same
+      spinner), not of the stack. The corruption needs a second hart.
+    others: |
+      A second, simpler experiment broke the *per-hart* half of the rule: `entry.S` gave every
+      hart hart 0's slice of `stack0`. The boot printed `panic: release` from hart 0's
+      scheduler, and gdb found hart 2 at `pc = 0`, `stvec = 0`, `satp = 0`: its frames in
+      `main` had been overwritten before it even installed a trap handler. `stack0` has no
+      guard pages, so nothing caught the overlap until it was too late.
+
+  - title: "Invariant 7: started publishes the kernel with release and acquire"
+    file: kernel/main.c
+    lines: 13-45
+    focus: 35-36
+    state:
+      hart: [1, 2]
+      mode: S
+      proc: none
+      intr: off
+      satp: bare
+      locks: []
+      irq: 0
+      stack: [main]
+      sp: {"on": boot}
+    note: |
+      Hart 0 builds the kernel page table, the process table, the allocator and more, then
+      stores `started = 1` with **release** order. Harts 1 and 2 spin on `started` with
+      **acquire** loads, and then immediately use what hart 0 built: [[kvminithart]] loads
+      `kernel_pagetable` into `satp`. The compiler turns these into fences
+      (`kernel/kernel.asm`):
+
+      ```text
+      hart 0:     fence rw,w ;  sw   a4,0(a5)       # started = 1
+      harts 1-2:  lw   a5,0(a4) ;  fence r,rw       # read started
+      ```
+
+      Under RISC-V's weak memory model (RVWMO), without the first fence another hart could
+      see `started = 1` before it sees hart 0's earlier stores, such as the pointer in
+      `kernel_pagetable`, and load a stale value into `satp` ([[tour:19]]).
+
+      The break: plain `started = 1` and a plain `while (started == 0)`. The generated code
+      has no fence at all (`started` is still `volatile`, so the loop still re-reads it).
+
+  - title: "Break 7: fifty boots, no failure"
+    file: kernel/main.c
+    lines: 31-45
+    focus: 35-38
+    state:
+      hart: [1, 2]
+      mode: S
+      proc: none
+      intr: off
+      satp: bare
+      locks: []
+      irq: 0
+      stack: [main]
+      sp: {"on": boot}
+    note: |
+      We booted the fence-less kernel **50 times** on three harts. All 50 reached the shell.
+      (One console read `init: starting hart 1 starting` and then `sh` on the next line: two
+      harts printing at once, which is normal and unrelated.)
+
+      This one did not reproduce, and in this build it cannot. On hart 0, every [[release]]
+      after `kvminit` already emits `fence rw,w`, which orders the store to
+      `kernel_pagetable` before the store to `started`. On harts 1 and 2, `printk` takes its
+      lock (`amoswap.w.aq`) before `kvminithart` reads `kernel_pagetable`. The memory model
+      orders that atomic after the loop's last read of `started`, because a store that
+      depends on a branch cannot be performed early. So the fences on `started` were already
+      provided, by accident. The experiment tested nothing, on QEMU or on any real
+      RISC-V chip.
+
+      The fences on `started` are still required: the memory model is the contract, and
+      "it worked fifty times" is not a proof. This is the kind of bug that appears on new
+      hardware, years later. Delete the `printk`, or move work in `main`, and the accident
+      disappears.
+
+  - title: "Myth: the hardware switches the page table, or the stack"
+    file: kernel/trampoline.S
+    lines: 16-38
+    focus: 22-37
+    state:
+      hart: any
+      mode: S
+      proc: any process trapping from user mode
+      intr: off
+      satp: user
+      locks: []
+      irq: 0
+      stack: [uservec]
+      sp: {"on": none, detail: "the user's sp"}
+    note: |
+      A trap changes the mode, the `pc` and a few CSR bits ([[tour:43]] measured exactly
+      which). It never changes `satp` or `sp`. In [[tour:45]] row 2, gdb shows `uservec`
+      running in S-mode with the **user** page table and the user's `sp`. Everything else is
+      software, and the trampoline exists only because of that.
+
+      Two related beliefs, both false at this commit:
+
+      - **"`sscratch` holds the trapframe address."** Older xv6 kept `TRAPFRAME` in
+        `sscratch`. Here `uservec` *stores* the user's `a0` into `sscratch` (line 32) and
+        loads `TRAPFRAME` as a constant (line 37).
+      - **"The trapframe is on the kernel stack."** It is a separate page from [[kalloc]],
+        mapped at `TRAPFRAME` in the user page table only. `uservec` writes it before any
+        kernel stack is usable.
+
+  - title: "Myth: swtch is a big, privileged operation"
+    file: kernel/swtch.S
+    lines: 1-41
+    focus: 10-23
+    state:
+      hart: any
+      mode: S
+      proc: any
+      intr: off
+      satp: kernel
+      locks: ["p->lock"]
+      irq: {noff: 1, intena: 0, note: "intena is the switching thread's own: 0 after `yield` from a trap, 1 after `sleep` in a system call"}
+      stack: [sched, swtch]
+      sp: {"on": kernel}
+    note: |
+      `swtch` is 14 stores, 14 loads and a `ret`. It contains no CSR instruction at all, so it
+      cannot change the mode, the page table or the interrupt state:
+
+      - **"A context switch saves all 32 registers."** It saves 14 ([[tour:47]] shows why that
+        is enough). The user's registers were saved long before, by `uservec`.
+      - **"The scheduler's stack lives in `struct cpu`."** `struct cpu` holds `context`, 14
+        saved registers, one of which is a *pointer* into the hart's slice of [[stack0]]
+        (`0x8000a810` on hart 2).
+      - **"swtch goes from one process to another."** Always process → scheduler or scheduler
+        → process. A direct switch would leave the hart nowhere to stand when nothing else is
+        runnable, and break 6 showed what happens when the scheduler stands on a process's
+        stack.
+      - **"Interrupts are off so swtch never sees a half-saved register set."** Break 1 showed
+        the real reason: the handler would want `p->lock`.
+
+  - title: "Myth: each process has its own kernel page table and allocates its kernel stack"
+    file: kernel/proc.c
+    lines: 29-44
+    focus: 37-43
+    state:
+      hart: 0
+      mode: S
+      proc: none
+      intr: off
+      satp: bare
+      locks: []
+      irq: 0
+      stack: [main, kvminit, kvmmake, proc_mapstacks]
+      sp: {"on": boot}
+    note: |
+      There is **one** kernel page table, built once by hart 0 ([[kvmmake]]) and shared by
+      every hart and every process. In every trapframe gdb dumped in [[tour:47]], for pids 3,
+      4, 5, 6 and 7, `kernel_satp` was the same value, `0x8000000000087fff`.
+
+      What each process has of its own is a **user** page table and a **kernel stack**. The
+      kernel stacks are not allocated by [[allocproc]]: all 64 are allocated and mapped here,
+      at boot, by [[proc_mapstacks]], one per slot of the process table, each followed by an
+      unmapped guard page. `allocproc` only points the new context at the top of its slot's
+      stack. That is also why `exit` never has to free a kernel stack ([[tour:47]]).
+
+      And two numbers often counted wrong: the valid combinations of mode, stack and page
+      table are more than five, because the trampoline's stack-less moments and the boot
+      stack count too ([[concept:mode-stack-page-table#table]]); and M-mode is entered once
+      per hart, at power-on, never again ([[tour:46]]).
+
+  - title: What broke, and how loudly
+    file: kernel/proc.c
+    lines: 479-497
+    focus: 485-492
+    state:
+      hart: any
+      mode: S
+      proc: the process giving up the hart
+      intr: off
+      satp: kernel
+      locks: ["p->lock"]
+      irq: {noff: 1, intena: 0}
+      stack: [yield, sched]
+      sp: {"on": kernel}
+    note: |
+      | Invariant | Our change | What happened (our runs) |
+      |---|---|---|
+      | interrupts off across `swtch` | `intr_on()` before `swtch` | `panic: acquire` at boot, 3 of 3 variants |
+      | one lock across `swtch` | `pause` sleeps holding `tickslock` | `panic: sched locks` |
+      | ... with the check removed | also delete the `noff` check | `panic: acquire` 3 of 7, silent hang 4 of 7 |
+      | trampoline in both page tables | unmap it from the kernel | silent hang at boot, every boot |
+      | `sepc` saved before `intr_on` | read `sepc` after | `usertests` killed, `scause 0xc`, 3 of 3 |
+      | `stvec` right for the context | delete `intr_off()` | hang or `panic: usertrap: not from user mode`, depending on where the interrupt lands (our runs: 2 hangs, 3 panics in 5) |
+      | scheduler on its own stack | run it on the process's stack | `panic: kerneltrap`, 4 of 4 |
+      | ... per hart | all harts on one `stack0` slice | `panic: release`, a hart at `pc 0` |
+      | release/acquire on `started` | plain store and load | no failure in 50 boots; other fences cover it by accident |
+
+      Three lessons. The **checks** in `sched`, [[acquire]] and [[usertrap]] turn several
+      silent disasters into one-line panics that name the rule; they are cheap and they earn
+      their keep. The **unguarded** invariants (the trampoline mapping, `stvec`) fail as
+      silent infinite traps, because the code that would report the problem cannot run.
+      And **not reproducing** is not a pass: the memory-ordering rule held in every boot we
+      tried only because other code happened to supply the fences, and it is required
+      anyway.
+locks:
+  - lock: "p->lock"
+    where: "[[yield]], [[sleep]], [[kexit]] → [[sched]] → released by the [[scheduler]]"
+    protects: "The only spinlock allowed across `swtch`; break 1 shows a handler re-taking it"
+  - lock: "tickslock"
+    where: "[[sys_pause]], [[clockintr]]"
+    protects: "`ticks`; break 2 tries to hold it across `swtch` (caught by `sched`); 2b succeeds and either panics or freezes the clock"
+  - lock: "every p->lock, in turn"
+    where: "[[wakeup]] (from any device interrupt)"
+    protects: "Each process's `chan` and `state`; the reason a device interrupt during `swtch` deadlocks"
+  - lock: "(no lock) stvec, sepc"
+    where: "[[usertrap]], [[prepare_return]], [[kerneltrap]]"
+    protects: "Per-hart registers, protected instead by interrupts being off at the right moments"
+  - lock: "started (release/acquire, not a lock)"
+    where: "[[kernel/main.c:33]], [[kernel/main.c:35]]"
+    protects: "Publication of hart 0's boot-time setup to the other harts"
+quiz:
+  - q: "Break 1 crashed with a *disk* interrupt, not a timer. Why is any device interrupt dangerous while a hart holds `p->lock` in `sched`?"
+    a: "Device handlers end in [[wakeup]] (here from [[virtio_disk_intr]]), and `wakeup` acquires every process's `p->lock`, including the one this hart already holds. [[acquire]] panics when a hart re-acquires a lock it holds. A timer is dangerous by two routes to the same lock: `yield`, and on hart 0 `clockintr`'s `wakeup(&ticks)`."
+  - q: "In break 2b, why did the outcome depend on which hart the sleeping process had been running on?"
+    a: "A spinlock records the *hart* that holds it. If the sleeper had been on hart 0, hart 0's own `clockintr` saw itself as the holder and panicked in `acquire`. If it had been on hart 1 or 2, hart 0's `clockintr` simply spun forever waiting for a release that no running code would ever perform."
+  - q: "Both the missing trampoline mapping and the missing `intr_off()` produced a hart stuck forever without any message. What do the two loops have in common?"
+    a: "In both, the trap handler that `stvec` names cannot execute its own first instructions: the fetch (break 3) or the first store (break 5) faults, and the fault is delivered to the same handler. No kernel code ever runs to print anything."
+  - q: "The window was one instruction. Why did every run die there, and always with the same message?"
+    a: "Interrupts that arrive while `SIE = 0` stay pending and are taken at the first instruction after `intr_on()`, which is where the broken code read `sepc`. Most system calls had nothing pending, but `countfree`'s thousands of `sbrk` calls made a timer tick inside the interrupts-off stretch certain. The address is fixed, so `sepc` was always `0x80002668`."
+  - q: "Why must the scheduler's stack belong to no process, even if every process stack were big enough?"
+    a: "Once the scheduler releases a process's lock, another hart may resume that process on its own kernel stack. If this hart's scheduler were still running on that stack, two harts would push frames onto one page. A stack that no process owns is never resumed by anyone else."
+  - q: "Fifty boots without fences all worked. Give two reasons not to conclude the fences are unnecessary."
+    a: "The memory model allows the reordering, so no number of passing runs proves correctness on other hardware. And in this build the ordering happens to be supplied by unrelated code: on hart 0 by the `fence rw,w` of every `release` before `started = 1`, and on harts 1–2 by `printk`'s `acquire`. A change to `main` could remove either."

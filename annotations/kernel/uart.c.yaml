@@ -1,0 +1,397 @@
+summary: |
+  The driver for xv6's only character device, a [[g:uart|UART]] of the 16550 family. QEMU
+  connects this UART to the terminal you started it from, so every byte xv6 prints leaves
+  through here and every key you type arrives here.
+
+  The file talks to the chip through a handful of [[g:uart-registers|byte-wide registers]]
+  at physical address [[UART0]] (`0x10000000`), using [[g:mmio|memory-mapped I/O]]. It
+  offers three ways to use them:
+
+  - [[uartwrite]] sends a buffer for a `write()` system call. When the chip is busy it puts
+    the calling process to sleep until the UART raises a "transmitter empty" interrupt.
+  - [[uartputc_sync]] sends one byte by spinning until the chip is ready. Kernel messages
+    ([[printk]]) and the echo of typed characters use it, because they may run where
+    sleeping is not allowed.
+  - [[uartintr]] is the interrupt handler. It wakes a waiting writer and hands every
+    received byte to [[consoleintr]] in [[kernel/console.c]].
+
+  This file knows nothing about lines, backspace or processes reading input; that is the
+  job of [[kernel/console.c]], the layer above it.
+
+  **Read before:** [[kernel/memlayout.h]] (where the UART lives). **Read next:**
+  [[kernel/console.c]], then [[kernel/printk.c]].
+
+blocks:
+  - lines: 1-3
+    title: What this file drives
+    note: |
+      The "16550a" is a serial-port chip first made in the 1980s and still emulated by
+      almost every virtual machine. QEMU's `virt` machine provides one, and its programming
+      interface is what the register definitions below describe.
+
+  - lines: 5-12
+    title: Headers
+    note: |
+      [[kernel/memlayout.h]] provides [[UART0]], the chip's address. [[kernel/sleeplock.h]]
+      and [[kernel/spinlock.h]] are needed for the transmit lock, and [[kernel/proc.h]] is
+      included because [[kernel/defs.h]] and the sleep functions refer to process
+      structures. [[kernel/riscv.h]] is part of the standard set every kernel file includes.
+
+  - lines: 14-20
+    title: Turn a register number into a memory access
+    note: |
+      The UART's registers appear as consecutive bytes in the physical address space,
+      starting at [[UART0]] = `0x10000000`. Register *n* is the byte at `UART0 + n`. These
+      three macros hide the pointer arithmetic: `ReadReg(LSR)` loads the byte at
+      `0x10000005` and `WriteReg(THR, c)` stores `c` at `0x10000000`.
+
+      The address is used as-is both before and after paging is turned on, because
+      [[kvminit]] maps the UART's page at the same virtual address
+      ([[kernel/vm.c:30]]).
+
+  - lines: 22-39
+    title: The 16550 registers and bits xv6 uses
+    note: |
+      These names follow the 16550 datasheet; see [[g:uart-registers]] for the whole map.
+      Each register is one byte. The comment's warning matters: the chip decodes the
+      *direction* of the access as well as the address. Offset 0 is the receive holding
+      register when read and the transmit holding register when written, so `RHR` and `THR`
+      are both `0`. Offset 2 is likewise the interrupt status register (read) and the FIFO
+      control register (write).
+
+      A second twist, used only in [[uartinit]]: while bit 7 of `LCR` is 1, offsets 0 and 1
+      stop meaning `RHR`/`THR` and `IER` and instead reach the two bytes of the baud-rate
+      divisor.
+
+      Only the bits xv6 actually uses get names. Each is explained on its own line.
+
+  - lines: 41-43
+    title: Transmit lock and wait channel
+    note: |
+      [[tx_lock]] makes writers take turns: only one process at a time runs the transmit
+      loop in [[uartwrite]]. It is a [[g:sleeplock]], not a [[g:spinlock]], because its
+      holder goes to sleep while waiting for the UART, and a process must never sleep while
+      holding a spinlock.
+
+      [[tx_chan]] is never read or written. Only its *address* is used, as the "channel"
+      that [[uartwrite]] sleeps on and [[uartintr]] wakes up (see [[g:sleep-wakeup]]). Any
+      unique address would do; a dedicated variable guarantees no one else uses the same
+      one.
+
+  - lines: 45-46
+    title: The panic flags
+    note: |
+      Both flags live in [[kernel/printk.c]]. [[uartputc_sync]] checks them: while
+      `panicking` is set it avoids the interrupt bookkeeping, and once `panicked` is set
+      it freezes any CPU that tries to print. They are [[g:volatile]] because another
+      CPU may set them at any time, and the compiler must re-read them from memory on
+      every check instead of reusing an old value.
+
+  - lines: 48-50
+    title: "uartinit(): configure the chip"
+    note: |
+      Called once, on hart 0, by [[consoleinit]] at the very start of [[main]]
+      ([[kernel/main.c:14]]), before paging, before the first [[printk]]. It puts the chip
+      into a known state: interrupts off, a fixed speed and character format, FIFOs on and
+      empty, then interrupts on. The order matters: the chip should not raise an interrupt
+      while it is half configured, so interrupts are disabled first and enabled last.
+
+      Enabling interrupts here only lets the *UART* signal them. They reach a CPU later,
+      once [[plicinit]] and [[plicinithart]] have configured the [[g:plic|PLIC]] and the
+      CPU has turned interrupts on.
+
+  - lines: 51-61
+    title: Set the speed
+    note: |
+      A UART sends each bit for a fixed time, and both ends of the wire must agree on it.
+      The 16550 derives its bit rate by dividing its input clock by 16 × *divisor*. With
+      the 1.8432 MHz crystal of a classic PC serial card, divisor 3 gives 1,843,200 / 48 =
+      38,400 bits per second, which is where the comments' "38.4K" comes from. The actual
+      rate depends on the clock feeding the chip.
+
+      The divisor is 16 bits wide but there is no register for it in the normal map. Setting
+      the divisor latch access bit ([[LCR_BAUD_LATCH]], bit 7 of `LCR`) temporarily
+      redirects offset 0 to the divisor's low byte (DLL) and offset 1 to its high byte (DLM).
+      That is why lines 58 and 61 write to "registers" 0 and 1, which would otherwise be
+      `THR` and `IER`.
+
+      (On QEMU the setting has no visible effect: QEMU's model computes a nominal rate of
+      about 133,000 baud from this divisor, but hands each byte to your terminal
+      immediately rather than timing it.)
+
+  - lines: 63-71
+    title: Character format, FIFOs, interrupts
+    note: |
+      Line 65 writes `LCR` = `0x03`. Bits 1–0 = `11` select 8 data bits; bit 2 = 0 selects
+      one stop bit; bit 3 = 0 means no parity bit; and bit 7 = 0 leaves divisor-latch mode,
+      so offsets 0 and 1 are `RHR`/`THR` and `IER` again.
+
+      Line 68 writes `FCR` = `0x07`. Bit 0 turns on the two 16-byte FIFOs (queues inside the
+      chip for received and outgoing bytes); bits 1 and 2 empty the receive and transmit
+      FIFOs (the chip clears these two bits by itself). Bits 7–6 are left 0, which sets the
+      receive FIFO's interrupt threshold to 1 byte: the chip asks for attention as soon as
+      one byte has arrived, so typed keys are handled immediately.
+
+      Line 71 writes `IER` = `0x03`: bit 0 requests an interrupt when received data is
+      available, bit 1 requests one when the transmit holding register becomes empty.
+      [[uartintr]] handles both.
+
+  - lines: 73-74
+    title: Initialize the transmit lock
+    note: |
+      Gives [[tx_lock]] its name ("uart", shown in debugging output) and marks it unlocked.
+      It has to be ready before the first `write()` system call reaches [[uartwrite]].
+
+  - lines: 76-83
+    title: "uartwrite(): send a buffer, sleeping while the UART is busy"
+    note: |
+      The output path for `write()` on the console: [[consolewrite]] copies at most 32 bytes
+      from the user program into a kernel buffer and calls this function. It sends the bytes
+      one at a time. If the UART cannot take another byte yet, the process sleeps until the
+      UART's transmit interrupt says it can, so the CPU is free to run other processes in
+      the meantime.
+
+      There is no software output buffer in this version of xv6. The only place bytes wait
+      is the caller's buffer, and the caller waits with them: `uartwrite` returns only when
+      the last byte has been handed to the chip.
+
+      The source comment is right that this cannot run in an interrupt handler: it sleeps,
+      and both [[acquiresleep]] and [[sleep]] need a current process ([[myproc]]).
+
+      Taking [[tx_lock]] for the whole buffer keeps the bytes of one call together. Since
+      [[consolewrite]] calls `uartwrite` once per 32-byte batch, two processes writing long
+      strings at the same time can still interleave in 32-byte pieces. Kernel output from
+      [[uartputc_sync]] ignores the lock entirely and can land between any two bytes.
+
+  - lines: 84-96
+    title: The transmit loop
+    note: |
+      Each pass either sends one byte or sleeps once. It relies on this version's two-step
+      sleep ([[g:sleep-wakeup]]): [[sleep_prepare]] records "this process is waiting on
+      `&tx_chan`" *before* the UART is checked, and [[sleep]] then blocks only if no
+      [[wakeup]] on that channel has happened since. A `wakeup(&tx_chan)` clears the record,
+      and `sleep()` then returns at once.
+
+      That order is what prevents a lost wakeup. Suppose the check on line 87 finds the UART
+      busy, and the transmit interrupt arrives on another CPU before line 91 runs. Because
+      the process registered first, [[uartintr]]'s `wakeup(&tx_chan)` clears the
+      registration and `sleep()` does not block. If the registration came after the check,
+      the wakeup would find nobody waiting; with the UART now idle and no more bytes being
+      sent, no further transmit interrupt would come, and the writer would sleep forever.
+
+      After a wakeup the loop goes round again and re-checks `LSR`, so a wakeup that was
+      really caused by received input (which also calls `wakeup` if the transmitter is
+      idle) does no harm.
+
+      (Simplified: in FIFO mode the "transmitter empty" bit means the whole 16-byte transmit
+      FIFO is empty, so this loop puts only one byte into the FIFO at a time and does not
+      use its full depth.)
+
+  - lines: 98-104
+    title: "uartputc_sync(): send one byte by busy-waiting"
+    note: |
+      The output path for everything that cannot sleep: [[printk]] (which may run with
+      locks held or inside an interrupt handler) and the echo of typed characters, which
+      [[consoleintr]] does from the UART interrupt handler. Both reach it through
+      [[consputc]].
+
+      Instead of sleeping, it spins, re-reading `LSR` until the chip can accept a byte. At
+      38,400 bits per second one byte takes about a quarter of a millisecond on a real
+      line, so the wait per byte is short. It does not take [[tx_lock]]: a sleeplock may
+      not be taken where sleeping is forbidden, and kernel messages must get out even if
+      a writer is stuck.
+
+  - lines: 105-106
+    title: Turn off interrupts on this CPU
+    note: |
+      [[push_off]] disables interrupts on this CPU (remembering whether they were on), and
+      the matching [[pop_off]] on line 119 restores them. The effect is that nothing else
+      can run on this CPU between the readiness check and the write of the byte.
+
+      The pair is skipped while a panic message is printed (`panicking` is set, by any
+      CPU): the commit that introduced this says it makes the panic message more robust
+      "if mycpu()->noff or locks are broken". The interrupt-nesting bookkeeping that
+      `push_off`/`pop_off` maintain may itself be what went wrong. Note that `panicking` is a single global flag,
+      so this also changes behavior on the *other* CPUs while one CPU is panicking.
+
+  - lines: 108-111
+    title: Freeze after a panic
+    note: |
+      Once [[panic]] has finished printing its message it sets `panicked`. From then on,
+      any thread that tries to print spins here forever, so the panic message stays the
+      last thing on the screen and is not buried by later output.
+
+      Because `panicking` is already set by then, `push_off` was skipped above, so
+      interrupts stay off only if the caller had already disabled them. Otherwise a timer
+      interrupt can still move this CPU on to another process ([[kernel/trap.c:157]]),
+      which will itself freeze when it next prints. What freezes is the printing thread,
+      not necessarily the CPU; code that never prints is not affected.
+
+  - lines: 113-120
+    title: Wait, write, restore
+    note: |
+      Line 114 polls bit 5 of `LSR`. Each pass of the loop really reads the device,
+      because `ReadReg` goes through a [[g:volatile]] pointer; without `volatile` the
+      compiler could read the register once and spin forever on a stale value. Line 116
+      writes the byte to `THR`, and the chip takes it from there.
+
+  - lines: 122-133
+    title: "uartgetc(): take one received byte, if any"
+    note: |
+      Bit 0 of `LSR` (data ready) is 1 while the receive FIFO holds at least one byte.
+      Reading `RHR` removes the oldest byte from the FIFO. The function returns that byte
+      as an `int` in 0–255, or -1 if nothing is waiting. -1 can never be a real byte value,
+      which is why the return type is `int`, not `char`. `static`: only [[uartintr]] uses
+      it.
+
+  - lines: 135-140
+    title: "uartintr(): the UART interrupt handler"
+    note: |
+      The UART is wired to interrupt line [[UART0_IRQ]] (10) of the [[g:plic|PLIC]]. When it
+      raises that line, the CPU takes a supervisor external interrupt, and [[devintr]] asks
+      the PLIC which device it was and calls this function ([[kernel/trap.c:199]]); after
+      it returns, [[devintr]] tells the PLIC the interrupt is complete. It may run on any
+      CPU, in the middle of whatever was running there, so it must not sleep.
+
+      The chip raises the interrupt for either reason enabled in [[uartinit]] (a byte
+      received, the transmitter empty), or both, and the handler does not try to tell which.
+      It checks for both conditions.
+
+  - lines: 141
+    title: Acknowledge
+    note: |
+      Reads the interrupt status register and throws the value away. In the 16550, reading
+      this register clears a pending "transmitter empty" interrupt, if that is the
+      interrupt it reports (received data has higher priority and is reported first). A
+      pending
+      "received data" interrupt is cleared differently: by reading bytes from `RHR` until the
+      FIFO is below the threshold, which the loop below does. `ReadReg` uses a
+      [[g:volatile]] pointer, so the compiler keeps this read even though its result is
+      unused (it compiles to a single `lbu` from `0x10000002` in `kernel/kernel.asm`).
+
+  - lines: 143-146
+    title: Wake a waiting writer
+    note: |
+      If the transmitter is empty, any process sleeping in [[uartwrite]] can send its next
+      byte, so wake it. `wakeup` on a channel nobody waits on does nothing, so a wakeup
+      sent when no one is writing is harmless.
+
+  - lines: 148-155
+    title: Pass every received byte up to the console
+    note: |
+      Several bytes may have arrived since the last interrupt (pasted text, for example),
+      and they are waiting in the receive FIFO. The loop drains it, passing each byte to
+      [[consoleintr]], which does echo and line editing ([[kernel/console.c]]). Draining
+      until [[uartgetc]] returns -1 also clears the receive interrupt condition, so the
+      UART does not immediately interrupt again for the same bytes.
+
+lines:
+  17: |
+    Turns a register offset into a pointer to that register. `UART0 + (reg)` is a plain
+    integer; the cast makes it a pointer to an `unsigned char` (registers are one byte
+    wide). [[g:volatile]] is essential: it forces the compiler to perform every read and
+    write exactly as written, because reading a device register can have effects (reading
+    `RHR` removes a byte) and its value can change on its own (bits in `LSR`).
+  19: |
+    Read one register: dereference the pointer.
+  20: |
+    Write one register: assign through the pointer.
+  25: |
+    Offset 0, read: the receive holding register. Reading it returns the oldest byte that
+    arrived on the serial line and removes it from the receive FIFO.
+  26: |
+    Offset 0, write: the transmit holding register. A byte written here is queued for
+    sending.
+  27: |
+    Offset 1: the interrupt enable register. Each bit allows one kind of interrupt.
+  28: |
+    IER bit 0: interrupt when received data is available (in FIFO mode, also when bytes have
+    sat in the FIFO for a while without reaching the threshold).
+  29: |
+    IER bit 1: interrupt when the transmit holding register (in FIFO mode, the transmit
+    FIFO) becomes empty.
+  30: |
+    Offset 2, write: the FIFO control register.
+  31: |
+    FCR bit 0: enable the transmit and receive FIFOs.
+  32: |
+    FCR bits 1 and 2 (`3 << 1` = `0x06`): reset the receive FIFO and the transmit FIFO,
+    discarding anything in them.
+  33: |
+    Offset 2, read: the interrupt status register (called IIR, "interrupt identification",
+    in many datasheets). It reports which interrupt is pending; reading it also clears a
+    pending "transmitter empty" interrupt, if that is the interrupt it reports (received
+    data has higher priority and is reported first).
+  34: |
+    Offset 3: the line control register, which sets the character format and holds the
+    divisor-latch switch.
+  35: |
+    LCR bits 1–0 = `11`: 8 data bits per character.
+  36: |
+    LCR bit 7, the divisor latch access bit (DLAB). While it is 1, offsets 0 and 1 reach
+    the baud-rate divisor instead of `RHR`/`THR` and `IER`.
+  37: |
+    Offset 5: the line status register, read-only status bits.
+  38: |
+    LSR bit 0, "data ready": at least one received byte is waiting in `RHR`.
+  39: |
+    LSR bit 5, "transmit holding register empty" (THRE). In FIFO mode it is 1 when the whole
+    transmit FIFO is empty. The name `TX_IDLE` is xv6's; the chip may still be shifting the
+    last byte out onto the wire (that is a different bit, bit 6).
+  42: |
+    `static`: private to this file. Only [[uartwrite]] uses it.
+  43: |
+    A variable used only for its address, the wait channel; see the block note.
+  52: |
+    `IER = 0`: no UART interrupts while the chip is being configured.
+  55: |
+    Set DLAB (LCR bit 7) so that the next two writes reach the divisor. Writing the whole
+    register also clears the other LCR bits; line 65 sets the real format.
+  58: |
+    Divisor low byte (DLL, at offset 0 while DLAB is set) = 3.
+  61: |
+    Divisor high byte (DLM, at offset 1 while DLAB is set) = 0. Divisor = `0x0003`.
+  65: |
+    `LCR = 0x03`: 8 data bits, 1 stop bit, no parity, DLAB off. See the block note.
+  68: |
+    `FCR = 0x07`: FIFOs on, both FIFOs emptied, receive threshold 1 byte.
+  71: |
+    `IER = 0x03`: interrupt on received data and on transmitter empty.
+  73: |
+    Set up [[tx_lock]] with [[initsleeplock]].
+  82: |
+    Wait (sleeping if necessary) until no other process is in the transmit loop, then
+    claim it with [[acquiresleep]].
+  86: |
+    Register as waiting on `&tx_chan` with [[sleep_prepare]], *before* looking at the UART.
+    This order is what makes the check-then-sleep below safe; see the block note.
+  87: |
+    Can the chip accept a byte now? Reads `LSR` and tests bit 5.
+  88: |
+    Hand the byte to the transmitter. Writing `THR` also clears a pending
+    "transmitter empty" interrupt in the chip.
+  91: |
+    Block until [[uartintr]] calls `wakeup(&tx_chan)`, or return at once if it already did
+    after line 86.
+  95: |
+    Let the next writer in with [[releasesleep]].
+  114: |
+    Spin until `LSR` bit 5 says the transmitter can take a byte.
+  116: |
+    Send the byte.
+  128: |
+    Is at least one received byte waiting (LSR bit 0)?
+  129: |
+    Read and remove it from the receive FIFO. The `unsigned char` read is converted to an
+    `int` in 0–255.
+  141: |
+    Read the interrupt status register only for its side effect: it clears a pending
+    "transmitter empty" interrupt, if that is the one it reports. See the block note.
+  143: |
+    Is the transmitter empty (LSR bit 5)?
+  145: |
+    Wake any process sleeping in [[uartwrite]]'s loop with [[wakeup]].
+  150: |
+    Take the next byte from the receive FIFO, or -1 if it is empty.
+  153: |
+    Hand the byte to the console layer: [[consoleintr]].

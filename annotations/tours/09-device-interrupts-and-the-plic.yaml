@@ -1,0 +1,925 @@
+title: Device interrupts and the PLIC
+group: Traps and system calls
+prerequisites: [5, 8]
+summary: |
+  You type `cat README`. To print the first line, `cat` needs the file's first data block,
+  block 48 of the disk, and nobody has read it since boot. The kernel hands the request to
+  the disk and puts `cat` to sleep. Some time later the disk finishes, and a wire goes high.
+  This tour follows that wire.
+
+  The signal does not go to `cat`, which is not running anywhere. It goes to the
+  [[g:plic|PLIC]], a small interrupt router that decides which [[g:hart|harts]] to bother.
+  It bothers all three. Whichever hart gets there first claims the interrupt; a hart that
+  arrives later (if it traps at all) gets "nothing" and goes back to what it was doing. The winner runs the disk driver's
+  interrupt handler, marks the block as done and wakes `cat`, which then continues on
+  whichever hart picks it up, possibly a third one. At the same moment a keystroke arrives
+  from the [[g:uart|UART]], and another hart handles that.
+
+  Along the way you will see the one rule that makes interrupt handlers and ordinary kernel
+  code able to share data: a spinlock that an interrupt handler takes must be held with
+  interrupts **off**, everywhere ([[g:interrupts-and-locks]]). Break it and a hart can
+  deadlock against itself.
+
+  The general system-call path is in [[tour:5]], and the mechanics of `kernelvec` and
+  `kerneltrap` are in [[tour:8]]. This tour starts where those leave off: at the device.
+cast: |
+  The machine has three [[g:hart|harts]]. When the tour starts:
+
+  | Hart | What it is doing |
+  |---|---|
+  | 0 | Running `cat` (pid 3), which has just called `read` on `README`: the process this tour follows |
+  | 1 | Idle: its [[kernel:scheduler]] finds nothing runnable |
+  | 2 | Idle in its own scheduler |
+
+  The shell (pid 2) is asleep in [[kernel:kwait]], waiting for `cat`; `init` (pid 1) is
+  asleep waiting for the shell. The concrete numbers in this tour (inode 2, block 48, which
+  hart claims what) come from this build's `fs.img` and from one run of the kernel under
+  gdb with three harts.
+steps:
+  - title: cat asks for 512 bytes
+    file: user/cat.c
+    lines: 7-22
+    focus: 12
+    state:
+      hart: 0
+      mode: U
+      proc: cat (pid 3)
+      intr: on
+      satp: user
+      locks: []
+      stack: [main, cat, read]
+      sp: user
+    note: |
+      `cat` has opened `README` and now calls `read(fd, buf, 512)`. The trip into the kernel
+      is the one in [[tour:5]]: [[g:insn:ecall|ecall]], the trampoline, [[kernel:usertrap]],
+      [[kernel:syscall]], [[kernel:sys_read]], [[kernel:fileread]].
+
+      What matters here is what the kernel will need: the first 512 bytes of `README`.
+      `README` is inode 2 in this build's `fs.img`, 2441 bytes long, and its first data
+      block is **block 48**. (These numbers come from reading the image's superblock and
+      root directory; `mkfs` placed the blocks in the order it copied the files.)
+
+      Opening the file read the root directory (block 47) and the inode block (block 33)
+      into the [[g:buffer-cache]], so those are already in memory. Block 48 is not: nobody
+      has read `README` since boot. So this `read` will go to the disk, and that means the
+      process will have to wait for a device.
+    others: |
+      Harts 1 and 2 are executing [[kernel:scheduler]] loops with nothing to run, mostly
+      parked in [[g:insn:wfi|wfi]]. Keep them in mind: in a moment the disk's interrupt
+      will be offered to all three harts, and an idle hart is a perfectly good place to
+      handle it.
+
+  - title: readi needs block 48
+    file: kernel/fs.c
+    lines: 510-534
+    focus: 520-523
+    state:
+      hart: 0
+      mode: S
+      proc: cat (pid 3)
+      intr: on
+      satp: kernel
+      locks: ["README's ip->lock (sleep-lock)"]
+      stack: [usertrap, syscall, sys_read, fileread, readi]
+      sp:
+        "on": kernel
+        switched: "`ld sp, 8(a0)` in [[uservec]] ([[kernel/trampoline.S:76]])"
+        detail: "empty when `cat` trapped; now `usertrap` → … → `readi`"
+      irq: 0
+    note: |
+      [[fileread]] took the inode's [[g:sleeplock|sleep-lock]] with [[ilock]]
+      ([[kernel/file.c:121]]) and called [[readi]] with `off = 0`, `n = 512`.
+
+      `readi` works one block at a time. [[bmap]] turns "block 0 of this file" into a disk
+      block number: `addrs[0]` of inode 2, which is 48. Then [[bread]] is asked for block 48
+      of device 1.
+
+      Notice the lock being held: a *sleep-lock*, not a spinlock. Interrupts are still
+      **on**. This matters, because what follows can take milliseconds on real hardware,
+      and `cat` is about to sleep while holding this lock. Sleep-locks exist for exactly
+      that ([[tour:17]]).
+    others: |
+      Another process reading `README` on hart 1 would block in `ilock` until `cat` is done
+      with the inode. A process reading a *different* file is not affected at all: it
+      holds a different inode's lock and may well be submitting its own disk request at
+      the same time.
+
+  - title: bread misses the cache
+    file: kernel/bio.c
+    lines: 90-102
+    focus: 96-98
+    state:
+      hart: 0
+      mode: S
+      proc: cat (pid 3)
+      intr: on
+      satp: kernel
+      locks: ["README's ip->lock (sleep-lock)", "block 48's b->lock (sleep-lock)"]
+      stack: [usertrap, syscall, sys_read, fileread, readi, bread]
+      sp: kernel
+      irq: 0
+    note: |
+      [[bget]] searched the cache under `bcache.lock`, did not find block 48, recycled the
+      least recently used free buffer, released `bcache.lock` and returned the buffer
+      locked with its own sleep-lock ([[kernel/bio.c:83]]). The details are in [[tour:30]].
+
+      The buffer's `valid` flag is 0: its `data` array holds some other block's old bytes.
+      So line 98 calls [[virtio_disk_rw]]`(b, 0)`, "read", and will not return until
+      `b->data` holds block 48.
+
+      From here on, two fields of this `struct buf` carry the story. `b->blockno` (48) says
+      what to read. `b->disk` will say who owns the buffer right now: 1 while the disk is
+      working on it, 0 when it is done ([[kernel/buf.h]]).
+    others: |
+      `bcache.lock` is a spinlock, and it is already released: it protects the cache's
+      list, not the buffer's contents. Holding `b->lock` is what guarantees that no other
+      thread will read or reuse this buffer while the disk is filling it.
+
+  - title: Taking vdisk_lock, which turns interrupts off
+    file: kernel/virtio_disk.c
+    lines: 215-237
+    focus: 220
+    state:
+      hart: 0
+      mode: S
+      proc: cat (pid 3)
+      intr: off
+      satp: kernel
+      locks: ["README's ip->lock (sleep-lock)", "block 48's b->lock (sleep-lock)", disk.vdisk_lock]
+      stack: [usertrap, syscall, sys_read, fileread, readi, bread, virtio_disk_rw]
+      sp: kernel
+      irq: {noff: 1, intena: 1}
+    note: |
+      The disk counts in 512-byte sectors and xv6 in 1024-byte blocks, so block 48 is
+      sector `48 * 2 = 96`, byte offset `0xC000` in `fs.img`.
+
+      Line 220 takes `disk.vdisk_lock`, the [[g:spinlock]] that protects the driver's
+      state: the descriptor table, the `free[]` flags, `info[]`, and the rings it shares with
+      the device. [[acquire]] begins with [[push_off]], so **interrupts are now off on
+      hart 0** until the lock is released.
+      SIE was on (this is a system call), so `push_off` records `intena = 1` and `noff`
+      becomes 1 ([[concept:locks#intena]]).
+
+      That is not a side detail. This same lock is taken by [[virtio_disk_intr]], which runs
+      in *interrupt context*, on whatever hart happens to take the disk interrupt. If hart 0
+      held `vdisk_lock` with interrupts on, and the disk interrupt arrived on hart 0, the
+      handler would try to acquire a lock that its own hart holds. The holder cannot run
+      again until the handler returns, and the handler cannot return until it gets the lock:
+      a hart [[g:deadlock|deadlocked]] against itself. xv6's [[holding]] check would turn this
+      into `panic("acquire")` instead of a silent hang, but the rule is what prevents it.
+
+      Then [[alloc3_desc]] grabs three free descriptors. If fewer than three are free (other
+      requests in flight), the loop sleeps on `&disk.free[0]` until [[free_desc]] wakes it.
+    others: |
+      While hart 0 holds `vdisk_lock`, a disk interrupt can still be taken by hart 1 or
+      hart 2. Their [[virtio_disk_intr]] simply spins in `acquire` until hart 0 lets go.
+      That wait is short, because nobody holds `vdisk_lock` for long, and nobody sleeps
+      holding it.
+
+  - title: Describing the request and ringing the doorbell
+    file: kernel/virtio_disk.c
+    lines: 241-284
+    focus: 270-284
+    state:
+      hart: 0
+      mode: S
+      proc: cat (pid 3)
+      intr: off
+      satp: kernel
+      locks: ["README's ip->lock (sleep-lock)", "block 48's b->lock (sleep-lock)", disk.vdisk_lock]
+      stack: [usertrap, syscall, sys_read, fileread, readi, bread, virtio_disk_rw]
+      sp: kernel
+      irq: {noff: 1, intena: 1}
+    note: |
+      The three descriptors form a chain the device will follow: a header ("read, sector
+      96"), the 1024-byte `b->data` (marked device-writable), and a one-byte status that the
+      device sets to 0 on success. How the [[g:virtqueue]] works is the subject of
+      [[tour:29]]. Here we care about the hand-off:
+
+      - Line 271: `b->disk = 1`. The disk now owns this buffer.
+      - Line 272: `info[idx[0]].b = b`, so that the interrupt handler, which only learns a
+        descriptor number, can find the buffer again.
+      - Lines 275–280: put the chain's head in the *available* ring and bump its index,
+        with [[g:insn:fence|fences]] so the device never sees the new index before the
+        entry.
+      - Line 284: write the queue number to `QUEUE_NOTIFY`, a [[g:mmio|memory-mapped]]
+        register at `0x10001050`. This is the doorbell.
+
+      After the doorbell, QEMU reads sector 96 of `fs.img` and copies it straight into
+      `b->data` by [[g:dma|DMA]]: no CPU instruction moves those bytes. When it is done it
+      writes the status byte, puts the chain's head in the *used* ring, and raises its
+      interrupt line, interrupt source 1 at the PLIC ([[VIRTIO0_IRQ]]).
+    others: |
+      The device may finish very quickly, even before hart 0 reaches the next line. Then
+      the interrupt is raised while hart 0 still holds `vdisk_lock` with interrupts off.
+      Hart 0 cannot take it. Hart 1 or 2 can, and its handler waits in `acquire` for hart 0
+      to release the lock. Keep this case in mind for the next step: it is exactly the
+      case the code must not lose.
+
+  - title: Register, then release, then sleep
+    file: kernel/virtio_disk.c
+    lines: 286-298
+    focus: 287-288
+    state:
+      hart: 0
+      mode: S
+      proc: cat (pid 3)
+      intr: off
+      satp: kernel
+      locks: ["README's ip->lock (sleep-lock)", "block 48's b->lock (sleep-lock)", disk.vdisk_lock]
+      stack: [usertrap, syscall, sys_read, fileread, readi, bread, virtio_disk_rw]
+      sp: kernel
+      irq: {noff: 1, intena: 1}
+    note: |
+      `cat` must now wait for `b->disk` to become 0. It cannot sleep holding `vdisk_lock`
+      (a spinlock), because the interrupt handler needs that lock to clear `b->disk`. So it
+      must let go of the lock and go to sleep, and the danger is the gap between the two.
+
+      The order is the whole trick ([[g:sleep-wakeup]], [[tour:16]]):
+
+      1. `b->disk == 1` is checked **under** `vdisk_lock`, so it is the true state.
+      2. [[sleep_prepare]]`(b)` sets `p->chan = b`: "I am waiting on this buffer". It does so
+         while still holding `vdisk_lock`, so no handler can have run in between.
+      3. Only then `release(&disk.vdisk_lock)`. Interrupts come back on (the `intena` saved
+         at step 4 says they were on before).
+      4. [[sleep]]`()`.
+
+      Taking `p->lock` inside `sleep_prepare` while holding `vdisk_lock` sets a lock order:
+      `vdisk_lock` before `p->lock`. The interrupt handler uses the same order, so the two
+      cannot deadlock.
+    others: |
+      Suppose the order were "release, then register":
+
+      | Time | Hart 0 (cat) | Hart 2 |
+      |---|---|---|
+      | t1 | sees `b->disk == 1` | spinning in `acquire(&vdisk_lock)` |
+      | t2 | `release(&vdisk_lock)` | gets the lock |
+      | t3 | | `b->disk = 0`, `wakeup(b)`: **nobody is registered on `b`** |
+      | t4 | `sleep_prepare(b)`, `sleep()` | |
+      | t5 | asleep forever: block 48 already arrived | |
+
+      With xv6's order, at t3 `cat` is already registered, so [[wakeup]] clears its
+      `p->chan`, and `sleep()` at t4 sees `chan == 0` and returns at once. The loop then
+      re-checks `b->disk`, finds 0, and carries on.
+
+  - title: cat leaves hart 0
+    file: kernel/proc.c
+    lines: 558-572
+    focus: 566-570
+    state:
+      hart: 0
+      mode: S
+      proc: cat (pid 3)
+      intr: off
+      satp: kernel
+      locks: ["README's ip->lock (sleep-lock)", "block 48's b->lock (sleep-lock)", "cat's p->lock"]
+      stack: [usertrap, syscall, sys_read, fileread, readi, bread, virtio_disk_rw, sleep]
+      sp: kernel
+      irq: {noff: 1, intena: 1, note: "sleep's acquire found SIE on (vdisk_lock's release had turned it back on), so intena is 1 again"}
+    note: |
+      [[sleep]] takes `cat`'s `p->lock` and finds `p->chan` still set (the disk has not
+      finished), so it marks `cat` `SLEEPING` and calls [[sched]], which switches to hart
+      0's scheduler thread ([[tour:13]]). The `ld sp` inside [[swtch]]
+      ([[kernel/swtch.S:26]]) moves hart 0 off `cat`'s kernel stack and onto its scheduler
+      stack, its slice of `stack0` ([[concept:stacks]]). `cat`'s kernel stack stays behind in
+      memory, frozen, with the whole read in progress on it:
+
+      ```text
+      cat's kernel stack, while cat sleeps
+        top ─► usertrap
+               syscall
+               sys_read
+               fileread
+               readi
+               bread
+               virtio_disk_rw
+               sleep
+               sched     ◄─ cat->context.sp
+      ```
+
+      Look at what `cat` holds as it goes to sleep: two sleep-locks (the inode and the
+      buffer) and one spinlock, `p->lock`, which the scheduler releases on its behalf.
+      [[sched]] checks that `p->lock` is the *only* spinlock held (`noff == 1`,
+      [[kernel/proc.c:487]]). Had `virtio_disk_rw` forgotten to release `vdisk_lock`,
+      this check would panic rather than let `cat` sleep with the disk driver locked.
+      `sleep`'s `acquire` found interrupts on (the `release(&disk.vdisk_lock)` just
+      before had turned them back on), so `intena` is 1, and `sched` carries that 1
+      across the switch in a callee-saved register ([[concept:locks#sched-intena]]).
+
+      Hart 0 is now free. Its scheduler finds nothing runnable (the shell and `init` are
+      asleep too) and settles into [[g:insn:wfi|wfi]]. All three harts are now idle, and
+      the machine is waiting for one device.
+    others: |
+      `p->lock` protects `p->state` and `p->chan`. Any hart that runs [[wakeup]] reads and
+      writes those fields under the same lock, so it sees `cat` either before it is
+      `SLEEPING` (and clears `chan`, which `sleep` notices) or after it has fully left
+      hart 0. Never halfway.
+
+  - title: "Flashback: the PLIC's registers"
+    file: kernel/memlayout.h
+    lines: 28-38
+    focus: 32-38
+    state:
+      hart: 0
+      mode: S
+      proc: none (booting)
+      intr: off
+      satp: kernel
+      locks: []
+      stack: [main]
+      sp: {"on": boot, detail: "a flashback: the slice of `stack0` that later becomes hart 0's scheduler stack"}
+      irq: 0
+    note: |
+      Before following the disk's signal, go back to boot and see how the PLIC was
+      programmed. It is a memory-mapped device at `0x0c000000`. Its registers come in four
+      kinds:
+
+      | Register | Address | Meaning |
+      |---|---|---|
+      | priority of source *i* | `PLIC + 4*i` | 0 = never deliver |
+      | pending bits | `PLIC + 0x1000` | bit *i* = source *i* is waiting |
+      | enable bits of a context | `PLIC + 0x2000 + 0x80*ctx` | bit *i* = deliver source *i* to this context |
+      | threshold / claim of a context | `PLIC + 0x200000 + 0x1000*ctx` (+4 for claim) | deliver only priorities above the threshold |
+
+      A *context* is one hart in one privilege mode. On QEMU's `virt` machine each hart has
+      two: context `2h` is hart *h*'s machine mode, `2h+1` its supervisor mode. Substitute
+      `ctx = 2h+1` and you get the macros here: [[PLIC_SENABLE]]`(h) = PLIC + 0x2080 + h*0x100`
+      and [[PLIC_SPRIORITY]]`(h) = PLIC + 0x201000 + h*0x2000`, with [[PLIC_SCLAIM]] four bytes
+      above. For our three harts:
+
+      | Hart | Enable | Threshold | Claim/complete |
+      |---|---|---|---|
+      | 0 | `0x0c002080` | `0x0c201000` | `0x0c201004` |
+      | 1 | `0x0c002180` | `0x0c203000` | `0x0c203004` |
+      | 2 | `0x0c002280` | `0x0c205000` | `0x0c205004` |
+
+      Every hart has its *own* claim register. That is what lets three harts talk to the
+      PLIC at once without a kernel lock.
+
+  - title: plicinit and plicinithart
+    file: kernel/plic.c
+    lines: 11-30
+    focus: 22-29
+    state:
+      hart: 0
+      mode: S
+      proc: none (booting)
+      intr: off
+      satp: kernel
+      locks: []
+      stack: [main, plicinithart]
+      sp: boot
+      irq: 0
+    note: |
+      [[plicinit]] runs once, on hart 0. It gives sources 1 (disk) and 10 (UART) priority 1.
+      Every source starts at priority 0, which the PLIC treats as "disabled".
+
+      [[plicinithart]] runs on **every** hart, because enable bits and thresholds belong to a
+      context. It writes `(1 << 10) | (1 << 1)` = `0x402` into this hart's S-mode enable
+      register, and 0 into its threshold, so any enabled source of priority 1 or more gets
+      through.
+
+      Both devices are enabled on all three harts. xv6 does not pin the disk to one CPU.
+      The consequence, which we will see in a moment, is that the PLIC signals every hart,
+      and the PLIC's claim mechanism decides which one serves the interrupt.
+
+      Neither function takes a lock. `plicinit` runs before the other harts are released
+      from their wait in [[main]]. `plicinithart` writes only this hart's own registers.
+    others: |
+      Harts 1 and 2 run `plicinithart` later, each at its own pace, and each writes a
+      different context's registers. Even if all three ran it at the same instant, they
+      would not touch the same word.
+
+  - title: The order of setup in main
+    file: kernel/main.c
+    lines: 9-45
+    focus: 25-30
+    state:
+      hart: 0
+      mode: S
+      proc: none (booting)
+      intr: off
+      satp: kernel
+      locks: []
+      stack: [main]
+      sp: boot
+      irq: 0
+    note: |
+      Hart 0 programs the PLIC (lines 25–26) before it initializes the disk driver
+      (line 30), and the other harts call [[plicinithart]] (line 41) only after `started`
+      is set. None of this is risky, because interrupts are **off** on every hart during all
+      of `main`: a pending interrupt simply waits.
+
+      Interrupts are first turned on in [[scheduler]] (the last line here), on each hart
+      separately ([[tour:3]]). From then on, a hart takes device interrupts whenever its
+      `sstatus.SIE` bit is set.
+
+      Notice what `main` does *not* do: it never tells the PLIC "send the disk to hart 0".
+      There is no routing table. Enabling the same sources in every context is the routing.
+    others: |
+      The release store to `started` (line 33) guarantees that harts 1 and 2 see everything
+      hart 0 wrote, including the PLIC priorities and `disk` structures, before they enter
+      their schedulers and can take a disk interrupt ([[tour:19]]).
+
+  - title: Three switches between a device and a hart
+    file: kernel/start.c
+    lines: 14-52
+    focus: 30-33
+    state:
+      hart: any
+      mode: M
+      proc: none (booting)
+      intr: off
+      satp: bare
+      locks: []
+      stack: [start]
+      sp: boot
+    note: |
+      The PLIC only raises a signal. Whether a hart acts on it depends on three switches,
+      and it is worth having all three in view:
+
+      1. **Delegation.** `w_mideleg(0xffff)` hands interrupts to supervisor mode, so the
+         supervisor external interrupt traps to the kernel's `stvec`, not to machine mode.
+      2. **`sie.SEIE`.** Line 33, in [[start]], sets the "supervisor external interrupt
+         enable" bit in [[g:csr:sie|sie]] (together with `STIE` for the timer). It is set
+         once and never cleared.
+      3. **`sstatus.SIE`.** The global on/off switch that [[intr_on]], [[intr_off]],
+         [[push_off]] and [[pop_off]] flip all the time.
+
+      When the PLIC signals hart 2, the hardware sets `SEIP` in that hart's
+      [[g:csr:sip|sip]]. The trap is taken if `SEIE` is set and either the hart is in
+      supervisor mode with `SIE = 1`, or it is in user mode (supervisor interrupts are
+      always enabled while user code runs). Every "interrupts off" in this tour means
+      `SIE = 0`: the request stays pending in `sip` until interrupts are turned back on,
+      unless another hart claims it first and the PLIC lowers `SEIP`.
+
+  - title: The disk finishes; every idle hart wakes
+    file: kernel/proc.c
+    lines: 428-470
+    focus: 441
+    state:
+      hart: 2
+      mode: S
+      proc: none (scheduler)
+      intr: on
+      satp: kernel
+      locks: []
+      stack: [scheduler]
+      sp: scheduler
+      irq: 0
+    note: |
+      Back to the present. QEMU has filled `b->data` with block 48 and raised source 1. The
+      PLIC sets bit 1 in its pending register and, since source 1 is enabled with priority
+      1 > threshold 0 in contexts 1, 3 and 5, asserts `SEIP` on **all three harts**.
+
+      Hart 2 was parked in [[g:insn:wfi|wfi]] at line 467, with `SIE` off. `wfi` resumes
+      when an interrupt that is enabled in `sie` is pending, even if the global `SIE` bit is
+      off, so hart 2 falls through, goes around the loop, and at line 441 executes
+      [[intr_on]]. The pending interrupt is taken immediately, before the next instruction
+      (`intr_off`) runs.
+
+      This is why the loop turns interrupts on and straight back off: `wfi` must be
+      executed with interrupts off, or an interrupt arriving between the check and the
+      `wfi` could be handled and then leave the hart asleep with work to do. The brief
+      `intr_on` is the window where pending interrupts are actually taken.
+      It is safe because the scheduler holds no spinlock here: an interrupt is only ever
+      taken at `noff` 0 ([[concept:locks#invariant]]).
+
+      This scenario fixes which stack the trap will land on. Hart 2 is running no process,
+      so `sp` points into its **scheduler stack**: its 4 KiB slice of `stack0` (top
+      `0x8000a890` in this build), the same memory it booted on.
+    others: |
+      Harts 0 and 1 got the same signal and may be doing the same thing. If they reach
+      `intr_on` before hart 2's claim lowers `SEIP`, they trap too; if not, they never
+      notice. Only one hart will find anything to do. Each hart has its own `sp`, so a hart
+      that traps pushes its frame onto *its own* scheduler stack; the three never share one.
+
+  - title: kerneltrap, on the scheduler's stack
+    file: kernel/trap.c
+    lines: 134-164
+    focus: 140-149
+    state:
+      hart: 2
+      mode: S
+      proc: none (scheduler)
+      intr: off
+      satp: kernel
+      locks: []
+      stack: [scheduler, kernelvec, kerneltrap]
+      sp: {"on": scheduler, detail: "with a 256-byte `kernelvec` frame on top"}
+      irq: 0
+    note: |
+      The trap sets `scause` to `0x8000000000000009` (top bit: interrupt; 9: supervisor
+      external interrupt), saves the PC in `sepc`, turns `SIE` off, and jumps to `stvec`,
+      which in the kernel is [[kernelvec]]. The trap does not change `sp`. `kernelvec`
+      makes room with `addi sp, sp, -256` ([[kernel/kernelvec.S:14]]), saves registers in
+      that frame on the current stack, which here is hart 2's scheduler stack (its boot
+      stack, reused), and calls [[kerneltrap]]. All of this is the subject of [[tour:8]].
+
+      ```text
+      hart 2's scheduler stack (stack0 slice, top 0x8000a890)
+        start         16 bytes, never popped (start left by mret)
+        main
+        scheduler
+        kernelvec    256-byte register frame
+        kerneltrap   ◄─ sp
+      ```
+
+      The device does not choose the stack; the hart's situation does. xv6 has no separate
+      interrupt stack. Had hart 2 been running a process *in the kernel* with interrupts on,
+      the same `kernelvec` frame would have gone onto that process's kernel stack, on top
+      of its system call's frames. Had it been in *user* mode, the trap would have gone
+      through [[uservec]] instead, onto the process's empty kernel stack.
+
+      What matters for us: the handler runs with interrupts **off** and on behalf of no
+      process. `myproc()` is 0 on hart 2. A device interrupt is the machine's business, not
+      any process's; the process it concerns, `cat`, is not running anywhere.
+
+      [[kerneltrap]] calls [[devintr]] to identify and handle the interrupt. Afterwards,
+      since `which_dev` will be 1 (a device, not the timer), it will not yield.
+
+  - title: devintr asks the PLIC who it was
+    file: kernel/trap.c
+    lines: 182-219
+    focus: 190-201
+    state:
+      hart: 2
+      mode: S
+      proc: none (scheduler)
+      intr: off
+      satp: kernel
+      locks: []
+      stack: [scheduler, kernelvec, kerneltrap, devintr]
+      sp: {"on": scheduler, detail: "with a `kernelvec` frame on top"}
+      irq: 0
+    note: |
+      `scause` matches the supervisor-external value, so this is "some device, via the
+      PLIC". `scause` does not say which device. Only the PLIC knows, so [[devintr]] asks
+      it with [[plic_claim]].
+
+      Then a two-way dispatch: [[UART0_IRQ]] (10) goes to [[uartintr]], [[VIRTIO0_IRQ]] (1)
+      to [[virtio_disk_intr]]. Any other non-zero number is a surprise and gets a message.
+      An `irq` of 0 falls through both tests and the `if (irq)` before
+      [[plic_complete]], and `devintr` still returns 1: it was a device interrupt, it just
+      was not ours to serve.
+
+      Compare the timer interrupt branch at line 213: the timer does not go through the
+      PLIC at all. It has its own `scause` value (5), so it needs no claim.
+
+  - title: Claiming the interrupt, and the harts that lose
+    file: kernel/plic.c
+    lines: 32-39
+    focus: 36-38
+    state:
+      hart: 2
+      mode: S
+      proc: none (scheduler)
+      intr: off
+      satp: kernel
+      locks: []
+      stack: [scheduler, kernelvec, kerneltrap, devintr, plic_claim]
+      sp: {"on": scheduler, detail: "with a `kernelvec` frame on top"}
+      irq: 0
+    note: |
+      Hart 2 reads its claim register, `0x0c205004`. That one load does three things in the
+      PLIC, atomically: it picks the highest-priority pending source enabled for context 5,
+      returns its number (1), and clears its pending bit. With nothing left pending, the
+      PLIC drops `SEIP` on the other harts.
+
+      A read with side effects is normal for [[g:mmio|memory-mapped I/O]], and the side
+      effect is what makes the claim safe. In one run under gdb, the read of block 48 went
+      exactly like this: hart 2's claim returned 1, and hart 1's claim, a moment later,
+      returned 0. Over the whole run, about one claim in five returned 0 (most of those were UART interrupts; for disk completions an empty claim is much rarer).
+
+      [[cpuid]] reads `tp`, and that is reliable here: interrupts are off, so the handler
+      cannot be moved to another hart between reading the hart number and using its claim
+      register.
+    others: |
+      | Time | Hart 0 | Hart 1 | Hart 2 |
+      |---|---|---|---|
+      | t0 | wakes from `wfi` | wakes from `wfi` | wakes from `wfi` |
+      | t1 | wakes; `SEIP` already dropped before its `intr_on`: no trap | `intr_on`: trap | `intr_on`: trap |
+      | t2 | | | reads `0x0c205004`: **1** |
+      | t3 | scanning, nothing to run | reads `0x0c203004`: **0** | `virtio_disk_intr()` |
+      | t4 | back to the scheduler | back to the scheduler | |
+
+      There is no kernel lock around the claim. The PLIC serializes claims in hardware: a
+      source's pending bit can be cleared only once, so exactly one claimer gets each
+      interrupt. A hart that traps on a stale `SEIP` gets 0 and returns. The cost is a few
+      wasted traps; the benefit is that whichever hart is free first serves the device.
+
+  - title: virtio_disk_intr takes vdisk_lock and acknowledges the device
+    file: kernel/virtio_disk.c
+    lines: 300-313
+    focus: 303-311
+    state:
+      hart: 2
+      mode: S
+      proc: none (scheduler)
+      intr: off
+      satp: kernel
+      locks: [disk.vdisk_lock]
+      stack: [scheduler, kernelvec, kerneltrap, devintr, virtio_disk_intr]
+      sp: {"on": scheduler, detail: "with a `kernelvec` frame on top"}
+      irq: {noff: 1, intena: 0}
+    note: |
+      [[virtio_disk_intr]] takes `vdisk_lock`, the same lock `cat` held in
+      [[virtio_disk_rw]]. Interrupts are already off (a trap turns them off), so [[acquire]]'s
+      [[push_off]] finds `noff` 0 and records `intena = 0`: the matching release will leave
+      them off. Compare step 4, where `cat` took the same lock with interrupts on
+      (`intena = 1`). And this handler could only start because hart 2 held no spinlock:
+      an interrupt never lands inside a critical section on its own hart
+      ([[concept:locks#invariant]]).
+
+      Line 311 is a conversation with the device, not with the PLIC. It reads the device's
+      `INTERRUPT_STATUS` register (bit 0: "I used some buffers"; bit 1: "my configuration
+      changed") and writes the same bits back to `INTERRUPT_ACK`. That tells the virtio
+      device to lower its interrupt line.
+
+      There are two acknowledgements in this tour, and they are different: this one quiets
+      the *device*; [[plic_complete]], later, re-opens the *PLIC* for this source. The
+      device must be quieted first. If the PLIC were re-opened while the device still held
+      its line high, the PLIC would see a new request at once and interrupt again for work
+      already done.
+    others: |
+      Suppose hart 0 were in `virtio_disk_rw` right now, holding `vdisk_lock` while
+      submitting another request (for instance, another process reading a block of a different file). Hart 2 spins here until hart 0 releases it. That is fine: hart 0 has
+      interrupts off while it holds the lock, never sleeps holding it, and releases it in a
+      few hundred instructions.
+
+      What would *not* be fine is the same situation on one hart:
+
+      | Time | Hart 0, interrupts on (hypothetical) |
+      |---|---|
+      | t1 | `virtio_disk_rw`: holds `vdisk_lock` |
+      | t2 | disk interrupt taken on hart 0 → `virtio_disk_intr` |
+      | t3 | `acquire(&vdisk_lock)`: the holder is this very hart, suspended below the handler |
+      | t4 | stuck forever (xv6's [[holding]] check panics instead) |
+
+      Because `acquire` turns interrupts off, t2 cannot happen.
+
+  - title: Walking the used ring; block 48 is done
+    file: kernel/virtio_disk.c
+    lines: 315-333
+    focus: 318-330
+    state:
+      hart: 2
+      mode: S
+      proc: none (scheduler)
+      intr: off
+      satp: kernel
+      locks: [disk.vdisk_lock]
+      stack: [scheduler, kernelvec, kerneltrap, devintr, virtio_disk_intr]
+      sp: {"on": scheduler, detail: "with a `kernelvec` frame on top"}
+      irq: {noff: 1, intena: 0}
+    note: |
+      The device reports completions in the *used* ring: it writes the head descriptor
+      number of each finished chain and increments `used->idx`. The driver remembers how far
+      it has looked in `disk.used_idx`. Every entry between the two is a finished request.
+
+      For block 48 there is one entry. Its `id` leads to `info[id]`: status 0 (success; a
+      non-zero status means the disk failed, and xv6 panics) and `b`, the buffer recorded at
+      step 5. Then:
+
+      - `b->disk = 0`: the disk is done with this buffer. `b->data` now holds block 48.
+      - [[wakeup]]`(b)`: wake whoever waits on this buffer.
+
+      One interrupt may cover several completions, and a completion may be found by an
+      interrupt that arrives "too early". The source comment on lines 305–310 calls the
+      resulting empty interrupt harmless, and it is: the loop condition is all that matters.
+
+      Note that the handler never touches `b->data`, never copies anything, and does not
+      know which process asked. It only changes ownership and wakes the channel.
+    others: |
+      `b->disk` is written here, on hart 2, and read by `cat`'s loop in `virtio_disk_rw`,
+      which may run on any hart (hart 0 in this run, but hart 2 itself is possible). Both accesses happen under `vdisk_lock`, so
+      `cat` sees the 0 together with everything the device and this handler wrote before
+      it. The lock's acquire and release are also the [[g:memory-barrier|memory barriers]]
+      that make that true across harts ([[tour:19]]).
+
+  - title: wakeup makes cat runnable, from interrupt context
+    file: kernel/proc.c
+    lines: 574-595
+    focus: 580-594
+    state:
+      hart: 2
+      mode: S
+      proc: none (scheduler)
+      intr: off
+      satp: kernel
+      locks: [disk.vdisk_lock, "each p->lock in turn"]
+      stack: [scheduler, kernelvec, kerneltrap, devintr, virtio_disk_intr, wakeup]
+      sp: {"on": scheduler, detail: "with a `kernelvec` frame on top"}
+      irq: {noff: 2, intena: 0}
+    note: |
+      [[wakeup]] walks the process table, taking each `p->lock` in turn. At `cat`'s entry
+      it finds `p->chan == b`, clears it, sees `SLEEPING`, and sets `RUNNABLE`.
+
+      The locks held here follow the order set at step 6: `vdisk_lock` first, then a
+      `p->lock`. `cat` took them in the same order in [[sleep_prepare]]. Two code paths
+      that take the same two locks in the same order cannot deadlock against each other
+      ([[tour:18]]).
+
+      `wakeup` is safe to call from an interrupt handler because it never sleeps and takes
+      only spinlocks, and interrupts are already off. A handler that called [[sleep]] would
+      be a disaster: there is no process to put to sleep.
+    others: |
+      `cat` is `RUNNABLE`, but no hart is told. xv6 sends no inter-processor interrupt.
+      Each idle hart finds `cat` the next time its scheduler scans the table: hart 0 and
+      hart 1 are already looping after their empty claims, so one of them will get there
+      first. They compete for `cat`'s `p->lock`, and the scheduler that wins and sees
+      `RUNNABLE` runs it. The other sees `RUNNING` and moves on.
+
+  - title: Meanwhile, a keystroke on hart 1
+    file: kernel/uart.c
+    lines: 135-155
+    focus: 139-154
+    state:
+      hart: 1
+      mode: S
+      proc: none (scheduler)
+      intr: off
+      satp: kernel
+      locks: []
+      stack: [scheduler, kernelvec, kerneltrap, devintr, uartintr]
+      sp: {"on": scheduler, detail: "with a `kernelvec` frame on top"}
+      irq: 0
+    note: |
+      Suppose instead that you press a key just as the disk finishes (a variation on the gdb
+      run, not what happened there). The UART raises source 10. Now two
+      sources are pending at once, both with priority 1. The PLIC breaks the tie by number:
+      the lower ID wins, so the first claim returns 1 (the disk) and the next returns 10.
+
+      | Time | Hart 0 | Hart 1 | Hart 2 |
+      |---|---|---|---|
+      | t1 | trap | trap | trap |
+      | t2 | | | claim → **1** |
+      | t3 | | claim → **10** | `virtio_disk_intr` |
+      | t4 | claim → 0 | `uartintr` | `wakeup(b)` |
+      | t5 | scheduler: finds `cat` | `consoleintr` takes `cons.lock` | `plic_complete(1)` |
+
+      [[uartintr]] reads the UART's `ISR` to acknowledge it (the device-side ack again),
+      wakes any writer waiting for the transmitter, and passes each received byte to
+      [[consoleintr]], which takes `cons.lock` to update the line buffer and echo it. The
+      keystroke's full story is [[tour:37]].
+
+      The two handlers share nothing: different devices, different locks, different claim
+      registers. They can run truly in parallel on harts 1 and 2.
+    others: |
+      They might meet in one place: both may call [[wakeup]], which locks every process in
+      turn. If hart 1 and hart 2 reach the same `p->lock` together, one spins for a few
+      instructions. Neither holds one `p->lock` while waiting for another, so there is no
+      cycle and no deadlock.
+
+  - title: plic_complete re-opens source 1
+    file: kernel/plic.c
+    lines: 41-47
+    focus: 43-46
+    state:
+      hart: 2
+      mode: S
+      proc: none (scheduler)
+      intr: off
+      satp: kernel
+      locks: []
+      stack: [scheduler, kernelvec, kerneltrap, devintr, plic_complete]
+      sp: {"on": scheduler, detail: "with a `kernelvec` frame on top"}
+      irq: 0
+    note: |
+      [[virtio_disk_intr]] has released `vdisk_lock` and returned. Back in [[devintr]],
+      [[plic_complete]] writes `1` to hart 2's claim/complete register, `0x0c205004`.
+
+      Between claim and completion the PLIC will not forward another interrupt from source
+      1, even if the device raises its line again. Completion re-arms it. Since the
+      device's line was lowered at step 16, nothing new is pending, and the next disk
+      interrupt will come with the next completed request.
+
+      It is written to the *same* context that claimed it, so the claim and complete
+      happen on one hart with interrupts off the whole time. Nothing between them could
+      move this code to another hart.
+
+      Then [[kerneltrap]] restores `sepc` and `sstatus`, `kernelvec` restores the
+      registers and pops its 256-byte frame, and [[g:insn:sret|sret]] returns hart 2 to its
+      scheduler, on the same stack, with `sp` back where it was, just after the
+      `intr_on` where the interrupt struck. With `SIE` restored from `SPIE`, interrupts are
+      on again for an instant; then `intr_off()`, the scan, and perhaps `wfi` once more.
+    others: |
+      Hart 1's [[plic_complete]]`(10)` writes `0x0c203004`, a different register, for a
+      different source, at the same time. Per-context claim registers mean the PLIC never
+      needs the kernel to serialize these writes.
+
+  - title: cat wakes on hart 0 and re-checks
+    file: kernel/virtio_disk.c
+    lines: 286-298
+    focus: 291-296
+    state:
+      hart: 0
+      mode: S
+      proc: cat (pid 3)
+      intr: off
+      satp: kernel
+      locks: ["README's ip->lock (sleep-lock)", "block 48's b->lock (sleep-lock)", disk.vdisk_lock]
+      stack: [usertrap, syscall, sys_read, fileread, readi, bread, virtio_disk_rw]
+      sp:
+        "on": kernel
+        switched: "`ld sp, 8(a1)` in [[swtch]] ([[kernel/swtch.S:26]]), called by hart 0's scheduler"
+        detail: "the frames `cat` left at step 7, untouched"
+      irq: {noff: 1, intena: 1, note: "sleep returned with SIE on (sched restored cat's intena 1), so this re-acquire records intena 1"}
+    note: |
+      Hart 0's scheduler found `cat` `RUNNABLE` and switched to it, from its scheduler stack
+      back onto `cat`'s kernel stack, where the frames from `usertrap` down to `sched` had
+      waited unchanged. In the gdb run, too, the
+      request went out on hart 0, the interrupt was served on hart 2, and `cat` resumed on
+      hart 0; it could just as well have been hart 1. `cat` returns out of [[sleep]] (which
+      releases its `p->lock`), then line 291 re-acquires `vdisk_lock`, and interrupts go off
+      again.
+
+      Why loop and re-check `b->disk`, instead of trusting the wakeup? Because `sleep` can
+      return while `b->disk` is still 1: [[kkill]] sets `killed` and makes a `SLEEPING`
+      process `RUNNABLE` without any wakeup on `b`; the loop simply registers and sleeps
+      again (the disk still owns the buffer, so `cat` must not abandon it). `sleep` also
+      returns at once when the wakeup came between `sleep_prepare` and `sleep`; in that case
+      the re-check finds 0.
+
+      `b->disk` is 0, so the loop ends. Line 294 forgets the buffer, [[free_chain]] returns
+      the three descriptors (each [[free_desc]] calls `wakeup(&disk.free[0])`, in case a
+      request is waiting for descriptors), and line 297 releases `vdisk_lock`.
+    others: |
+      Hart 2, where the interrupt was handled, is idle again. Three harts took part in this
+      one disk read: hart 0 issued it and is finishing it, hart 2 served its interrupt, and
+      hart 1 took a trap for it and found nothing to do (or, in step 19's variation, served
+      the keystroke instead).
+
+  - title: The data reaches cat, and what it cost
+    file: kernel/fs.c
+    lines: 510-534
+    focus: 525-526
+    state:
+      hart: 0
+      mode: S
+      proc: cat (pid 3)
+      intr: on
+      satp: kernel
+      locks: ["README's ip->lock (sleep-lock)", "block 48's b->lock (sleep-lock)"]
+      stack: [usertrap, syscall, sys_read, fileread, readi]
+      sp: kernel
+      irq: 0
+    note: |
+      [[bread]] marks the buffer `valid` and returns it. [[readi]] copies the first 512
+      bytes of block 48 into `cat`'s `buf` with [[either_copyout]] and releases the buffer
+      with [[brelse]]. [[fileread]] unlocks the inode and returns 512, and `cat` heads back
+      to user mode as in [[tour:5]]. The next `read` of `README` finds block 48 in the
+      cache and never touches the disk.
+
+      What one disk interrupt took:
+
+      - one doorbell write and one DMA transfer, during which no CPU touched the data;
+      - one PLIC signal to three harts; in this run two harts trapped and claimed, and one
+        claim returned 0 (often only one hart traps at all);
+      - two acknowledgements: the device's (`INTERRUPT_ACK`) and the PLIC's
+        (`plic_complete`);
+      - one spinlock, `vdisk_lock`, shared between a process and an interrupt handler, and
+        held with interrupts off on both sides;
+      - one sleep and one wakeup, ordered so the wakeup cannot be lost.
+
+      The ideas generalize to every driver: the device tells the PLIC, the PLIC tells the
+      harts, the hardware arbitrates the claim, the handler changes ownership and wakes a
+      channel, and the sleeping thread re-checks its condition under the lock.
+locks:
+  - lock: "README's ip->lock (sleep-lock)"
+    where: "[[ilock]] in [[fileread]]"
+    protects: "The inode's contents and the file's read position while `cat` reads; held across the sleep"
+  - lock: "bcache.lock (spinlock)"
+    where: "[[bget]]"
+    protects: "The buffer cache's list and reference counts; released before the disk is involved"
+  - lock: "b->lock (sleep-lock)"
+    where: "[[bget]], released by [[brelse]]"
+    protects: "Block 48's buffer: no one else reads or reuses it while the disk fills it; held across the sleep"
+  - lock: "disk.vdisk_lock (spinlock)"
+    where: "[[virtio_disk_rw]] (process context) and [[virtio_disk_intr]] (interrupt context)"
+    protects: "Descriptors, `free[]`, `info[]`, the rings, `used_idx`, and `b->disk`; interrupts must be off while it is held"
+  - lock: "p->lock (spinlock)"
+    where: "[[sleep_prepare]], [[sleep]], [[wakeup]], the schedulers"
+    protects: "`p->chan` and `p->state`; when both are held, `vdisk_lock` is taken first (never acquire `vdisk_lock` while holding a `p->lock`)"
+  - lock: "cons.lock (spinlock)"
+    where: "[[consoleintr]], on hart 1"
+    protects: "The console's input line buffer; unrelated to the disk, so the two handlers run in parallel"
+  - lock: "PLIC claim register (no lock: hardware)"
+    where: "[[plic_claim]], [[plic_complete]]"
+    protects: "Each pending source is handed to exactly one claimer by the PLIC itself; each hart has its own register"
+  - lock: "PLIC setup (no lock: per-context registers)"
+    where: "[[plicinit]], [[plicinithart]]"
+    protects: "`plicinit` runs before other harts start; `plicinithart` writes only its own hart's context"
+quiz:
+  - q: "Why must `virtio_disk_rw` hold `vdisk_lock` with interrupts off, even though the disk interrupt might well be handled by a *different* hart?"
+    a: "Because it might also arrive on the *same* hart. If hart 0 held `vdisk_lock` with interrupts on and took the disk interrupt, `virtio_disk_intr` would try to acquire a lock its own hart holds, and the holder could never run again to release it. `acquire` turns interrupts off precisely to rule this out."
+  - q: "In `virtio_disk_rw`, what goes wrong if `sleep_prepare(b)` is moved to after `release(&disk.vdisk_lock)`?"
+    a: "The interrupt handler on another hart could take the lock in the gap, set `b->disk = 0` and call `wakeup(b)` while nobody is registered on `b`. `cat` would then register and sleep, and no second wakeup would ever come: a lost wakeup."
+  - q: "The disk completes once, but up to three harts may trap. Why does only one of them call `virtio_disk_intr`, and why is no kernel lock needed for that?"
+    a: "Reading a claim register atomically returns and clears the highest pending source, so only the first claimer gets 1; later claims return 0 and `devintr` does nothing. The PLIC arbitrates in hardware, and each hart reads its own claim register."
+  - q: "`virtio_disk_intr` writes `INTERRUPT_ACK` to the device, and `devintr` later calls `plic_complete`. What would happen if xv6 called `plic_complete` without acknowledging the device first?"
+    a: "The virtio device would keep its interrupt line raised, so as soon as the PLIC was re-armed it would see source 1 pending again and interrupt a hart for work that was already done. The device-side ack lowers the line; the PLIC completion re-opens the gateway."
+  - q: "When `cat` wakes up, why does it loop and re-check `b->disk` under `vdisk_lock` instead of assuming the read is done?"
+    a: "`sleep` can return while the condition is false: kill makes a sleeping process RUNNABLE without a wakeup on `b`, and `b->disk` may still be 1. Re-checking under `vdisk_lock` sends it back to sleep in that case, and lets it proceed when the disk really is done."
+  - q: "A UART interrupt and a disk interrupt are pending at the same moment, both priority 1. Which does the first claim return, and can the two handlers run at the same time?"
+    a: "The PLIC breaks priority ties by the lower source number, so the first claim returns 1 (the disk) and the next returns 10. Yes, they can run in parallel on two harts: they use different devices, different claim registers and different locks (`vdisk_lock` and `cons.lock`); they can only briefly contend for a `p->lock` inside `wakeup`."

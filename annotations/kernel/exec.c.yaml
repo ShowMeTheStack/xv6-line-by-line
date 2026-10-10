@@ -1,0 +1,383 @@
+summary: |
+  The kernel side of [[g:exec]]: replace the calling process's memory with a new program read
+  from an [[g:elf]] file, and arrange for it to start running at the program's
+  [[g:entry-point]] with `argc` and `argv` as arguments. The process keeps its identity: its
+  PID, its open files, its current directory and its parent all stay the same. Only the
+  user memory, the registers and the name change.
+
+  [[kexec]] is called from two places: [[sys_exec]] ([[kernel/sysfile.c:488]]), after it has
+  copied the arguments into the kernel, and [[forkret]] ([[kernel/proc.c:532]]), which uses
+  it to start `/init`, the first user program.
+
+  The function is built around one rule: **nothing about the old program is touched until the
+  new one is completely ready.** It builds a fresh [[g:page-table]], loads every segment,
+  sets up the stack and pushes the arguments, and only then swaps the new page table in and
+  frees the old one. Any failure before that point leaves the old program intact, so `exec`
+  can return -1 to it like any other failed system call.
+
+  The steps:
+
+  1. read the ELF header and check it ([[kernel/elf.h]]);
+  2. for each loadable [[g:program-header]], allocate memory and copy the segment in with
+     [[loadseg]];
+  3. allocate a [[g:guard-page]] and the [[g:user-stack]] above the program;
+  4. copy the argument strings and the [[g:argv]] array onto the stack;
+  5. commit: install the new page table, size, entry point and stack pointer; free the old
+     image.
+
+  **Read before:** [[kernel/elf.h]], [[kernel/vm.c]] ([[uvmalloc]], [[copyout]]). **Read
+  next:** [[user/ulib.c]], whose [[user:start]] is where every program begins (except
+  `_forktest`, which the Makefile links with `-e main`, so it starts directly in `main`).
+
+blocks:
+  - lines: 1-10
+    title: Headers and a forward declaration
+    note: |
+      [[kernel/elf.h]] describes the ELF file layout. [[kernel/memlayout.h]] and
+      [[kernel/riscv.h]] supply page sizes and page-table bits; [[kernel/proc.h]] the
+      `struct proc` whose memory is being replaced. [[loadseg]] is defined at the bottom of
+      the file, so it is declared here; `static` keeps it private to this file.
+
+  - lines: 12-22
+    title: "flags2perm(): from ELF permissions to page-table permissions"
+    note: |
+      Each program segment says whether it may be executed and written (the `flags` field of
+      a [[g:program-header]]: bit 0 = execute, bit 1 = write, bit 2 = read; see
+      [[ELF_PROG_FLAG_EXEC]]). This function turns those bits into the matching
+      [[g:pte|page-table entry]] bits, [[PTE_X]] and [[PTE_W]], for [[uvmalloc]] to use.
+
+      The read bit is ignored: [[uvmalloc]] always adds [[PTE_R]] and [[PTE_U]] itself. So
+      the program's code segment (flags `R E`) becomes readable and executable but not
+      writable, and the data segment (`RW`) readable and writable but not executable. A
+      stray write into the code then causes a page fault instead of silently changing the
+      program.
+
+      The function uses the literal values 0x1 and 0x2 instead of the names
+      [[ELF_PROG_FLAG_EXEC]] and [[ELF_PROG_FLAG_WRITE]] from [[kernel/elf.h]]; the values
+      are the same.
+
+  - lines: 24-38
+    title: "kexec(): the variables"
+    note: |
+      `path` and `argv` are kernel copies: `path` a string, `argv` a null-terminated array
+      of pointers to strings in kernel pages ([[sys_exec]] made them).
+
+      - `sz` tracks the size of the new user memory as it grows from 0.
+      - `sp` is the new program's stack pointer while arguments are pushed; `stackbase` is
+        the lowest address the pushes may reach.
+      - `ustack` collects the user addresses of the argument strings; it becomes the
+        program's `argv` array. [[MAXARG]] entries suffice, since [[sys_exec]] passes at
+        most 31 strings plus the terminating null.
+      - `elf` and `ph` hold the file header and one program header at a time.
+      - `pagetable` is the new image's page table; `oldpagetable` will hold the old one at
+        the commit point. Initializing `pagetable` to 0 lets the failure path tell whether
+        there is anything to free.
+
+  - lines: 39-46
+    title: Open the program file
+    note: |
+      Reading the file means looking up its [[g:path-name]] and taking inode references,
+      and releasing those can write to the disk, so this part runs inside a
+      [[g:transaction]] ([[begin_op]]). [[namei]] returns the file's [[g:inode]]
+      referenced but unlocked; [[ilock]] locks it so that [[readi]] can read it.
+
+  - lines: 48-57
+    title: Check the ELF header and make an empty page table
+    note: |
+      The first 64 bytes of the file are read into `elf` ([[elfhdr]]). The only check is the
+      4-byte magic number at the very start, `\x7fELF`. xv6 does not check the other header
+      fields (32- or 64-bit class, machine type), so a 64-bit ELF file for another
+      architecture would be loaded, and its first instruction would most likely cause an
+      exception that kills the process. (A 32-bit ELF file has a different header layout,
+      so xv6 would misread it.)
+
+      [[proc_pagetable]] creates the new address space with no user memory yet, only the two
+      pages every process has at the top of its [[g:address-space]]: the
+      [[g:trampoline]] and the process's [[g:trapframe]]. The trapframe mapped there is the
+      same physical page the old page table maps, so the registers saved there survive the
+      switch.
+
+  - lines: 59-78
+    title: Load every segment
+    note: |
+      The program headers form an array at file offset `elf.phoff`, `elf.phnum` entries of 56
+      bytes (`sizeof(ph)`). Each describes one segment. Only `LOAD` segments are loaded; the
+      others carry information for other tools, and xv6 user programs have two that are
+      skipped (`RISCV_ATTRIBUTES` and `GNU_STACK`, as `${TOOLPREFIX}readelf -l user/_cat`
+      shows; `TOOLPREFIX` is your RISC-V toolchain's prefix; see [[tour:1]]).
+
+      For each `LOAD` segment:
+
+      - three sanity checks protect the kernel from a malformed or malicious file (see the
+        line notes);
+      - [[uvmalloc]] allocates zero-filled pages and maps them in the new page table from the
+        current `sz` up to the segment's end `vaddr + memsz`, with the segment's permissions;
+      - [[loadseg]] copies `filesz` bytes from the file into those pages.
+
+      The bytes between `filesz` and `memsz` are the segment's uninitialized data
+      ([[g:bss|.bss]]): they are not in the file, and they read as zero because the pages
+      were zero-filled. For example `user/_cat` has a code segment at address 0 (`0xa11`
+      bytes, all from the file) and a data segment at `0x1000` with `filesz` 0 and `memsz`
+      `0x220`: all bss.
+
+      (Simplified: [[uvmalloc]] maps every page from the current `sz` to the segment's end,
+      so a gap before a segment, including below the first, is filled with zeroed pages with
+      that segment's permissions, and a segment lying below `sz` keeps whatever permissions
+      the earlier mapping gave it. [[user/user.ld]] places code at 0 and data at the next
+      page, so neither case arises for xv6's programs.)
+
+  - lines: 79-81
+    title: Done with the file
+    note: |
+      The file is no longer needed: unlock it, drop the reference, and end the
+      transaction. Setting `ip = 0` tells the failure path below that it must not release
+      the inode a second time.
+
+  - lines: 83-97
+    title: Allocate the guard page and the stack
+    note: |
+      `p = myproc()` repeats line 37 and has no effect. `oldsz` records the size of the old
+      image, which [[proc_freepagetable]] will need to free it.
+
+      The stack goes right above the program, starting at the next page boundary.
+      [[uvmalloc]] allocates `USERSTACK + 1` pages; with [[USERSTACK]] = 1 that is 2 pages,
+      writable ([[PTE_W]], plus the [[PTE_R]] and [[PTE_U]] that `uvmalloc` always adds).
+
+      [[uvmclear]] then clears [[PTE_U]] on the lower of the two pages. That page becomes a
+      [[g:guard-page]]: it stays mapped, but any user-mode access to it causes a
+      [[g:page-fault]]. A program whose stack grows past its one page hits the guard and is
+      killed ([[usertrap]] calls [[vmfault]], which refuses an address that is already
+      mapped), instead of silently overwriting its own data below. (The guard is only one
+      page: a single stack frame larger than 4 KiB can jump over it and land in the
+      program's data.) The kernel's [[copyout]] refuses the guard page too, because
+      [[walkaddr]] ignores pages without `PTE_U`, and the fallback [[vmfault]] refuses a page
+      that is already mapped.
+
+      The stack grows down, so `sp` starts at the top, `sz`, and may go down to
+      `stackbase`, the bottom of the stack page. Both the guard and the stack are inside
+      `sz`, so the process size counts them; the heap that `sbrk` adds later starts above
+      the stack.
+
+  - lines: 99-110
+    title: Push the argument strings
+    note: |
+      Each string is copied, with its terminating zero, to the top of the stack, highest
+      address first. [[copyout]] writes through the *new* page table, which is not yet in
+      use. The user address of each string is remembered in `ustack`, and `ustack[argc] = 0`
+      adds the null pointer that ends every `argv` array.
+
+      After each string `sp` is rounded down to a multiple of 16. The comment explains the
+      rule: the RISC-V [[g:calling-convention]] requires `sp` to be 16-byte aligned. Only the
+      final `sp`, the one handed to the program, strictly needs it; aligning after every
+      string wastes a few bytes but keeps every intermediate value valid.
+
+      If the strings do not fit in the one stack page, `sp` drops below `stackbase` and
+      `exec` fails cleanly instead of writing into the guard page.
+
+  - lines: 112-119
+    title: Push the argv array
+    note: |
+      The `ustack` array (argc pointers plus the null) is copied below the strings, again
+      16-byte aligned. Its address becomes the new program's `argv`. The resulting stack,
+      for example after `exec("echo", ...)` with arguments `echo` and `hi`, where the program
+      itself ends below `0x2000`:
+
+      ```
+      address           contents
+      0x4000            sz: one past the top of the stack page; initial sp
+      0x3ff5..0x3fff    unused (alignment padding)
+      0x3ff0..0x3ff4    "echo\0"          <- ustack[0]
+      0x3fe3..0x3fef    unused
+      0x3fe0..0x3fe2    "hi\0"            <- ustack[1]
+      0x3fd8..0x3fdf    unused
+      0x3fd0            0                 argv[2], the terminator
+      0x3fc8            0x3fe0            argv[1]
+      0x3fc0            0x3ff0            argv[0]   <- final sp = a1 = argv
+         ...            free stack for main() and its callees
+      0x3000            stackbase: bottom of the stack page
+      0x2000..0x2fff    guard page (mapped, PTE_U cleared)
+      0x1000..0x1fff    data and bss
+      0x0000..0x0fff    code and read-only data
+      ```
+
+      The new program's `main` will push its own stack frames below `0x3fc0`, toward
+      `stackbase`.
+
+  - lines: 121-124
+    title: Pass argv in a1
+    note: |
+      The program's entry function [[user:start]] is declared `start(int argc, char **argv)`.
+      By the RISC-V [[g:calling-convention]] its first two arguments arrive in registers `a0`
+      and `a1`. When the kernel returns to user mode, all user registers are reloaded from
+      the [[g:trapframe]], so writing `a1` there sets `argv`.
+
+      `a0` is not written here, as the comment says: [[kexec]] returns `argc`, and the code
+      that called it puts the return value in `a0` ([[syscall]] at
+      [[kernel/syscall.c:146]], or [[forkret]] for `/init`). Every other register keeps
+      whatever value the old program left in it; `start` does not depend on them.
+
+  - lines: 126-130
+    title: Name the process after the program
+    note: |
+      `p->name` is shown by the process listing that `Ctrl-P` prints on the console
+      ([[procdump]]) and in the "unknown sys call" message ([[kernel/syscall.c:148]]). It gets the last element of the path:
+      for `/usr/bin/ls` the loop leaves `last` pointing at `ls`. [[safestrcpy]] copies at
+      most `sizeof(p->name) - 1` (15) characters and always adds a terminating zero.
+
+  - lines: 132-140
+    title: "Commit: switch to the new image"
+    note: |
+      From here on nothing can fail. The new page table and size are installed in the
+      process, and the [[g:trapframe]] is edited so that the return to user mode lands in
+      the new program:
+
+      - `epc` becomes the ELF [[g:entry-point]]. For xv6's programs this is
+        [[user:start]] in [[user/ulib.c]], as the comment says. [[user/user.ld]] names no
+        entry symbol; GNU `ld` then uses the address of a symbol named `start` if one exists
+        (`${TOOLPREFIX}readelf -h user/_cat` shows entry point `0xf6`, the address of
+        `start` in `user/cat.sym`). The exception is `_forktest`, which the Makefile links
+        with `-e main` ([[Makefile:120]]), so it starts directly in `main`.
+      - `sp` becomes the stack pointer computed above.
+
+      Only then is the old image freed: [[proc_freepagetable]] unmaps the trampoline and
+      trapframe pages (without freeing them, since they are shared or still in use) and frees
+      every user page below `oldsz` and the page-table pages themselves.
+
+      The return value, `argc`, becomes `a0`, the first argument of `start`. The process
+      now returns to user mode through the normal system-call exit path, but into a
+      different program; the `exec` call that started all this never returns to its caller.
+
+  - lines: 142-150
+    title: "Failure: discard the half-built image"
+    note: |
+      Every `goto bad` above lands here, at a moment when the old image is still in place.
+      The new page table, if one was made, is freed together with whatever user pages were
+      allocated so far (`sz` counts them). If the failure happened while the file was still
+      open (`ip` not yet cleared on line 81), it is unlocked and released and the transaction
+      ended.
+
+      The calling program then sees `exec` return -1 and continues as if nothing happened.
+      The only exception is `/init`: for it, [[forkret]] treats -1 as fatal and panics.
+
+  - lines: 152-176
+    title: "loadseg(): copy one segment from the file into memory"
+    note: |
+      Copies `sz` bytes from the file, starting at file offset `offset`, into the user pages
+      that start at virtual address `va` in `pagetable`. The pages were already allocated and
+      mapped by [[uvmalloc]], as the comment requires.
+
+      The new page table is not the one the hardware is using, so the kernel cannot write to
+      `va` directly. Instead, for each page it looks up the physical address with
+      [[walkaddr]] and has [[readi]] write there. This works because the kernel maps all of
+      physical memory at addresses equal to the physical ones ([[g:direct-map]]), so a
+      physical address is also a valid kernel address. That is why `readi` is called with
+      `user_dst = 0`: the destination is a kernel address.
+
+      The loop moves one page at a time because consecutive virtual pages need not be
+      consecutive in physical memory. The last chunk may be shorter than a page. `va` must
+      be page-aligned (checked by [[kexec]] on line 69), otherwise the first chunk would cross
+      a page boundary.
+
+      A missing mapping can only be a kernel bug, hence the [[panic]]; a short read (a
+      truncated file) is the program file's fault and makes `exec` fail.
+
+lines:
+  17: |
+    ELF "execute" bit (`PF_X`) set: the pages may hold instructions.
+  19: |
+    ELF "write" bit (`PF_W`) set: the program may store to these pages.
+  42: |
+    Look the program up by path. A missing file makes `exec` fail before anything has been
+    allocated.
+  49: |
+    Read `sizeof(elf)` = 64 bytes from offset 0 of the file into the kernel variable `elf`
+    (`0` = destination is a kernel address). A shorter file cannot be an executable.
+  53: |
+    Compare the first 4 bytes, read as a little-endian number, with [[ELF_MAGIC]].
+  56: |
+    A new, empty user address space with only the trampoline and trapframe mapped.
+  60: |
+    Walk the program-header table: `off` starts at `phoff` and advances 56 bytes per entry.
+  61: |
+    Read one program header from the file.
+  63: |
+    Skip anything that is not a loadable segment ([[ELF_PROG_LOAD]]).
+  65: |
+    A segment cannot occupy less memory than the bytes it brings from the file; otherwise
+    [[loadseg]] would write beyond the pages [[uvmalloc]] mapped.
+  67: |
+    Reject a segment whose end address wraps around past 2^64. Without this, a huge `memsz`
+    could make `vaddr + memsz` small and slip past the size checks.
+  69: |
+    The segment must start on a page boundary, as [[loadseg]] requires.
+  72: |
+    Grow the new image from `sz` to the end of this segment, with the segment's permissions.
+    Returns the new size, or 0 if memory ran out.
+  76: |
+    Copy the segment's file bytes (`filesz` of them, from file offset `ph.off`) into memory
+    at `ph.vaddr`.
+  89: |
+    The stack starts on a fresh page above the program.
+  91: |
+    Allocate two pages (guard + stack), writable, above `sz`. They go into the *new* page
+    table only; the hart keeps running on this process's kernel stack throughout `kexec`
+    ([[concept:stacks#user]]).
+  95: |
+    Turn the lower of the two pages into the guard page by clearing [[PTE_U]].
+  96: |
+    The stack starts empty: `sp` is one past its highest byte.
+
+    This `sp` is a local variable of [[kexec]], not the register: it tracks the new user
+    stack's top while the arguments are copied onto it. The hart's `sp` stays on the kernel
+    stack.
+  97: |
+    The lowest address the stack may use: `USERSTACK` pages below the top.
+  102: |
+    Make room for the string and its terminating zero.
+  103: |
+    Round down to a multiple of 16 (`sp % 16` is the excess over the last multiple).
+  104: |
+    The strings overflowed the stack page: fail rather than touch the guard page.
+  106: |
+    Copy the string into the new image. `sz` is passed so that [[copyout]] knows the image's
+    size.
+  108: |
+    Remember where `argv[argc]` will point.
+  113: |
+    Make room for `argc + 1` pointers of 8 bytes each.
+  117: |
+    Copy the pointer array to the stack. This block of memory is the program's `argv`.
+  124: |
+    `argv` for `start(argc, argv)`, delivered in register `a1`.
+  127: |
+    Scan the path; after every `/`, move `last` to the character that follows it.
+  130: |
+    Copy the last path element into the process name, truncating if needed.
+  133: |
+    Keep the old page table, to free it below.
+  134: |
+    From now on, this process's user memory is the new image. It takes effect on the
+    return to user mode, when the trampoline loads this page table into `satp`.
+  135: |
+    The new size: program, guard page and stack.
+  136: |
+    Return to user mode at the program's entry point.
+  137: |
+    Start with `sp` pointing at the `argv` array.
+
+    This writes the *saved* user `sp` in the trapframe; the hart is still on the kernel
+    stack. The register receives this value at [[kernel/trampoline.S:118]] on the way back to
+    user mode, and the process starts using its new [[g:user-stack]] when the `sret` at
+    [[kernel/trampoline.S:153]] puts the hart in user mode.
+  138: |
+    Free the old image's user pages and page-table pages.
+  140: |
+    Becomes `a0`, the first argument of the new program's `start`.
+  144: |
+    Free the new page table and its pages up to `sz`.
+  164: |
+    Find the physical page behind this virtual page in the new page table.
+  167: |
+    Copy a whole page, or only the remainder for the last chunk.
+  171: |
+    Read `n` bytes of the file directly into that physical page.

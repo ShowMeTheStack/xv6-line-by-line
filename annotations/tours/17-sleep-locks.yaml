@@ -1,0 +1,925 @@
+title: Sleep-locks
+group: Concurrency primitives
+prerequisites: [15, 16]
+summary: |
+  You type `ls | grep README`. The shell's child forks two processes, and a moment later both
+  call `exec` at almost the same instant, on two different [[g:hart|harts]]: `ls` (pid 4)
+  on hart 1 and `grep` (pid 5) on hart 2. To load a program, [[kernel:kexec]] must first
+  read the program file's [[g:inode]] from disk. In this build `ls` is inode 10 and `grep`
+  is inode 6, and with 16 inodes per 1024-byte block, both on-disk inodes live in the
+  **same disk block, block 33** (checked against `fs.img`: the inode area starts at block
+  33).
+
+  So two processes on two harts want the same disk block at the same time, and (we will
+  suppose) the block is not in memory yet. One of them must read it from the disk, which takes a long time by CPU
+  standards, while the other waits. The waiting must not burn a CPU, and the reader must be
+  allowed to go to sleep in the middle of holding the block. A [[g:spinlock]] can do neither.
+  This tour is about the lock that can: the [[g:sleeplock]].
+
+  You will see a sleep-lock built out of a spinlock, a flag and [[g:sleep-wakeup]]; a
+  process holding **two** sleep-locks while it sleeps; an interrupt on a third hart ending
+  the wait; and the second process getting the block without touching the disk at all.
+cast: |
+  The machine has three [[g:hart|harts]]. When the tour starts:
+
+  | Hart | What it is doing |
+  |---|---|
+  | 0 | Idle in its [[kernel:scheduler]], with nothing to run |
+  | 1 | Running `ls` (pid 4), which has just entered `exec("ls", ...)` |
+  | 2 | Running `grep` (pid 5), which has just entered `exec("grep", ...)` |
+
+  The shell (pid 2) waits for its child (pid 3), which runs the pipeline and waits for pids
+  4 and 5 ([[user/sh.c:121]]). The pids assume this is the first command since boot.
+
+  **A supposition for this tour:** block 33 is not in the 30-buffer [[g:buffer-cache]] right
+  now. In this build it usually is (an instrumented run of `ls | grep README` as the first
+  command after boot finds block 33 already cached for both processes), so suppose other
+  file activity has evicted it. That makes the interesting case happen: a real disk read
+  while the other process waits. (If the block were cached, the two would still take turns
+  on its sleep-lock, but nobody would touch the disk.)
+steps:
+  - title: Two programs start loading at once
+    file: kernel/exec.c
+    lines: 27-50
+    focus: 39-46
+    state:
+      hart: 1
+      mode: S
+      proc: ls (pid 4)
+      intr: on
+      satp: kernel
+      locks: []
+      irq: 0
+      stack: [usertrap, syscall, sys_exec, kexec]
+      sp: {"on": kernel, detail: "pid 4's kernel stack, KSTACK(3): 0x3fffff7000–0x3fffff8000"}
+    note: |
+      [[kexec]] is about to replace pid 4's memory with the program `ls`. Before it can read
+      a single byte of the program, it needs three things:
+
+      1. [[begin_op]] (line 39): join the file-system [[g:transaction]]. This is not a lock,
+         but it can make the caller wait; [[tour:31]] covers it.
+      2. [[namei]] (line 42): turn the path `"ls"` into an in-memory inode, inode 10. This
+         returns a *referenced* but **unlocked** inode.
+      3. [[ilock]] (line 46): lock the inode and, if its contents have not been read from
+         disk yet, read them.
+
+      Step 3 is where the disk comes in. An inode's fields (type, size, block addresses) live
+      on disk in a [[g:dinode]], and the in-memory copy is only filled in on first use.
+
+      On hart 2, `grep` (pid 5) is running the very same lines for path `"grep"`. Both
+      are running kernel code on behalf of their own process, with interrupts on, and
+      nothing yet links them. They are
+      about to collide twice: once on the root directory, and once on block 33.
+    others: |
+      Hart 2 runs these same instructions on behalf of pid 5. No lock is needed for that:
+      each hart has its own `sp`, and each process its own kernel stack (pid 4's is the page
+      at `KSTACK(3)`, pid 5's the page at `KSTACK(4)`, two pages lower;
+      [[concept:stacks]]), so `ip`, `elf` and the rest, which are locals, are private. The
+      shared things are the inode table, the buffer cache and the disk, and each of those has
+      its own lock, which we will meet one by one.
+
+  - title: First collision, on the root directory
+    file: kernel/fs.c
+    lines: 691-728
+    focus: 716
+    state:
+      hart: 1
+      mode: S
+      proc: ls (pid 4)
+      intr: on
+      satp: kernel
+      locks: ["root inode ip->lock (sleep-lock)"]
+      irq: 0
+      stack: [usertrap, syscall, sys_exec, kexec, namei, namex]
+      sp: kernel
+    note: |
+      The path `"ls"` is relative, so [[namex]] starts at the current directory, the root
+      (inode 1). It locks the root with [[ilock]] (line 702) and calls [[dirlookup]] on line
+      716, which scans the root directory's entries with [[readi]] until it finds `ls`. That
+      scan reads disk block 47, the root directory's data, through the buffer cache.
+
+      Look at the lock display: pid 4 holds the root inode's **sleep-lock** during the scan,
+      and interrupts are **on**. That is the first difference from a spinlock you can see:
+      holding a sleep-lock does not turn interrupts off.
+
+      When `dirlookup` finds the entry, it calls [[iget]] for inode 10 and returns it
+      unlocked. Line 720 unlocks the root, and the loop ends. `namex` returns inode 10 with
+      a reference but no lock. ([[tour:34]] walks through path lookup in full.)
+    others: |
+      `grep` on hart 2 also starts at the root and calls `ilock(root)`. It finds the
+      sleep-lock taken and goes to sleep until pid 4 unlocks the root on line 720.
+
+      | Time | Hart 1 (ls, pid 4) | Hart 2 (grep, pid 5) |
+      |---|---|---|
+      | t1 | `ilock(root)`: gets it | |
+      | t2 | `dirlookup(root, "ls")` | `ilock(root)`: held, sleeps |
+      | t3 | `iunlockput(root)` → wakes pid 5 | |
+      | t4 | returns inode 10, unlocked | wakes, gets root, `dirlookup(root, "grep")` |
+
+      Lookups in the same directory take turns. The serialization is short, and it is what
+      lets the next collision happen: both processes now reach their own `ilock` within
+      moments of each other.
+
+  - title: Locking inode 10, which nobody has read yet
+    file: kernel/fs.c
+    lines: 292-319
+    focus: 305-306
+    state:
+      hart: 1
+      mode: S
+      proc: ls (pid 4)
+      intr: on
+      satp: kernel
+      locks: ["inode 10 ip->lock (sleep-lock)"]
+      irq: 0
+      stack: [usertrap, syscall, sys_exec, kexec, ilock]
+      sp: kernel
+    note: |
+      [[ilock]] first takes inode 10's own sleep-lock (line 303). The comment above
+      `itable` ([[kernel/fs.c:174]]) says what that lock protects: every field of the inode
+      except `ref`, `dev` and `inum`. Here that means `valid`, and the fields that will be
+      filled in from disk.
+
+      `valid` is 0: [[iget]] set it to 0 when it gave this table slot to inode 10
+      ([[kernel/fs.c:275]]). So line 306 asks the buffer cache for the disk block that holds
+      dinode 10: `IBLOCK(10, sb)` is `10 / 16 + 33` = **block 33**.
+
+      Notice the nesting that starts here. Pid 4 holds the inode's sleep-lock and is about to
+      take the *buffer's* sleep-lock, and it will keep both while it waits for the disk.
+      Sleep-locks may nest like this, and may be held across a sleep. That is their whole
+      reason to exist.
+    others: |
+      On hart 2, `grep` is at the same line with inode 6: its own inode, its own sleep-lock,
+      so no contention there. `IBLOCK(6, sb)` is also 6 / 16 + 33 = **block 33**. The two
+      processes are about to ask the buffer cache for the same block.
+
+  - title: bread, the buffer cache's front door
+    file: kernel/bio.c
+    lines: 90-102
+    focus: 96
+    state:
+      hart: 1
+      mode: S
+      proc: ls (pid 4)
+      intr: on
+      satp: kernel
+      locks: ["inode 10 ip->lock (sleep-lock)"]
+      irq: 0
+      stack: [usertrap, syscall, sys_exec, kexec, ilock, bread]
+      sp: kernel
+    note: |
+      [[bread]] has two jobs, and its four lines show the plan of the whole tour:
+
+      1. [[bget]] finds or makes the cache entry for block 33 and returns it **locked**: the
+         caller holds the buffer's sleep-lock `b->lock` from then until [[brelse]].
+      2. If the buffer's data is not valid, read it from disk with [[virtio_disk_rw]] and
+         mark it valid.
+
+      The lock from step 1 is what makes step 2 safe. Only the lock holder may look at
+      `b->valid` or read and write `b->data`. If two processes could both see
+      `valid == 0`, both would start a disk read into the same 1024 bytes. If one could read
+      `b->data` while the other's disk read was still filling it, it would see half a block.
+
+      Holding `b->lock` across the disk read rules out both. And because the read takes
+      a long time, the lock has to be one that can be held while its owner sleeps.
+      ([[tour:30]] covers the buffer cache as a whole, [[tour:29]] the disk read.)
+
+  - title: bget searches under bcache.lock
+    file: kernel/bio.c
+    lines: 54-88
+    focus: 62-66
+    state:
+      hart: 1
+      mode: S
+      proc: ls (pid 4)
+      intr: off
+      satp: kernel
+      locks: ["inode 10 ip->lock (sleep-lock)", bcache.lock]
+      irq: {noff: 1, intena: 1, note: "noff 1 is `bcache.lock`; intena 1: when noff last went from 0 to 1 (this acquire), interrupts were on, because this is a system call after `usertrap`'s `intr_on`"}
+      stack: [usertrap, syscall, sys_exec, kexec, ilock, bread, bget]
+      sp: kernel
+    note: |
+      [[bget]] takes `bcache.lock`, a **spinlock**, so interrupts on hart 1 go off
+      ([[tour:15]]). This lock protects the cache's *bookkeeping*: which block each of the 30
+      buffers holds (`dev`, `blockno`), how many users each has (`refcnt`), and the
+      most-recently-used list. It does **not** protect the data inside a buffer; that is the
+      job of each buffer's sleep-lock.
+
+      The first loop walks the list looking for block 33 on device 1. Our supposition is that
+      it is not there, so the loop finds nothing.
+
+      This search has to be under a lock, and the lock has to stay held until the buffer is
+      claimed (next step). If the search and the claim were separate, `ls` and `grep` could
+      both search, both miss, and both recycle a buffer for block 33. There would then be two
+      copies of the block in the cache, and an update to one would be invisible in the other.
+    others: |
+      `grep` on hart 2 calls [[bget]] for block 33 at nearly the same moment. It spins in
+      [[acquire]] for `bcache.lock`, with interrupts off, for the few dozen instructions hart
+      1 needs to finish searching and claiming. Short waits like this are what a spinlock is
+      for.
+
+  - title: Claiming a buffer, then letting go of bcache.lock
+    file: kernel/bio.c
+    lines: 74-88
+    focus: 76-82
+    state:
+      hart: 1
+      mode: S
+      proc: ls (pid 4)
+      intr: off
+      satp: kernel
+      locks: ["inode 10 ip->lock (sleep-lock)", bcache.lock]
+      irq: {noff: 1, intena: 1}
+      stack: [usertrap, syscall, sys_exec, kexec, ilock, bread, bget]
+      sp: kernel
+    note: |
+      The second loop walks the list from the *least* recently used end and takes the first
+      buffer with `refcnt == 0`, one that nobody is using. It relabels it: device 1, block
+      33, `valid = 0` (its old contents belong to some other block), `refcnt = 1`.
+      Buffers that hold uncommitted changes are never chosen, because the log keeps their
+      `refcnt` above zero ([[bpin]], [[tour:31]]).
+
+      Then the key ordering, lines 82–83: **release `bcache.lock` first, then
+      [[acquiresleep]]**. Never both at once. Why?
+
+      - `acquiresleep` may sleep, and a thread must not sleep holding a spinlock: [[sched]]
+        would panic with `sched locks` (we will see that check later).
+      - Even without the panic, every other hart that wanted *any* buffer would spin on
+        `bcache.lock`, interrupts off, for as long as the buffer's holder took over its disk
+        read.
+
+      Is the gap between the two lines dangerous? No. `refcnt` is already 1, so no other
+      process can recycle this buffer for a different block, and anyone else who wants
+      block 33 will find it and queue up on `b->lock`.
+    others: |
+      As soon as hart 1 releases `bcache.lock`, hart 2 gets it. It is now possible for hart 2
+      to reach the buffer's sleep-lock **before** hart 1 does, since nothing orders lines 83
+      and 69 on two harts. In that case `grep` would do the disk read and `ls` would wait.
+      The tour follows the order where hart 1 gets there first; the code is correct either
+      way, and that is the point of the lock.
+
+  - title: What a sleep-lock is made of
+    file: kernel/sleeplock.h
+    lines: 1-9
+    state:
+      hart: 1
+      mode: S
+      proc: ls (pid 4)
+      intr: on
+      satp: kernel
+      locks: ["inode 10 ip->lock (sleep-lock)"]
+      irq: 0
+      stack: [usertrap, syscall, sys_exec, kexec, ilock, bread, bget]
+      sp: kernel
+    note: |
+      Block 33's buffer has a `struct sleeplock lock` inside it ([[kernel/buf.h:6]]). A
+      sleep-lock is not a new hardware mechanism. It is three ordinary things combined:
+
+      - `locked`: a plain flag. 1 means some process owns the sleep-lock.
+      - `lk`: a [[g:spinlock]] that protects `locked` and `pid`. It is held only for the
+        few instructions that read or change them, never while waiting.
+      - `pid`: which process owns it. Only [[holdingsleep]] uses it, plus you in a debugger.
+
+      And the waiting itself uses [[g:sleep-wakeup]]: a process that finds `locked == 1`
+      registers on a channel, the address of the sleep-lock, and gives up its CPU.
+
+      Compare with the spinlock's `cpu` field ([[kernel/spinlock.h:7]]): a spinlock is owned
+      by a **CPU**, a sleep-lock by a **process**. That difference follows from the design.
+      A spinlock holder never leaves its CPU until it releases. A sleep-lock holder may sleep
+      on hart 1 and wake on hart 0, still holding the lock, so "which CPU" would be
+      meaningless.
+
+  - title: Hart 1 takes block 33's sleep-lock
+    file: kernel/sleeplock.c
+    lines: 21-34
+    focus: 24-25
+    state:
+      hart: 1
+      mode: S
+      proc: ls (pid 4)
+      intr: off
+      satp: kernel
+      locks: ["inode 10 ip->lock (sleep-lock)", "block 33 b->lock.lk (spinlock)"]
+      irq: {noff: 1, intena: 1, note: "noff 1 is `lk->lk`. The `myproc()` on line 32 does its own push_off/pop_off, so noff touches 2 for a moment"}
+      stack: [usertrap, syscall, sys_exec, kexec, ilock, bread, bget, acquiresleep]
+      sp: kernel
+    note: |
+      [[acquiresleep]] takes the inner spinlock `lk->lk`, so interrupts are off for these
+      few lines. `locked` is 0, so the `while` loop does not run at all; then lines 31–33
+      finish the job. Line 31 sets
+      `locked = 1`, line 32 records pid 4, and line 33 releases the inner spinlock.
+
+      Only *now*, after line 33, does pid 4 own block 33's sleep-lock, and interrupts are on
+      again. That is the state the next steps show. During lines 24–33 the display lists
+      `b->lock.lk`, the inner spinlock, because that is what hart 1 really holds at that
+      moment.
+
+      The strip shows `noff` 1, but line 32 briefly makes it 2: [[myproc]] wraps its read of
+      `c->proc` in its own push_off/pop_off ([[concept:locks#noff]]). [[iput]] calls
+      `acquiresleep` while already holding `itable.lock`, and there this same moment
+      reaches `noff` 3, one of the deepest nestings measured in this kernel
+      ([[concept:locks#nesting]], [[concept:locks#unusual]]).
+
+      Why does checking and setting `locked` need the inner spinlock? For the same reason a
+      spinlock needs an atomic swap ([[tour:15]]): if two harts could both read
+      `locked == 0` before either wrote 1, both would think they owned the buffer. The inner
+      spinlock makes "test, then set" one indivisible step, and it is held so briefly that
+      spinning on it costs almost nothing.
+    others: |
+      If hart 2 arrives during these lines, it spins on `lk->lk` for a few instructions,
+      then sees `locked == 1`. The spinlock is the short-term lock that guards the
+      long-term one.
+
+  - title: Meanwhile, grep finds block 33 already claimed
+    file: kernel/bio.c
+    lines: 57-72
+    focus: 66-67
+    state:
+      hart: 2
+      mode: S
+      proc: grep (pid 5)
+      intr: off
+      satp: kernel
+      locks: ["inode 6 ip->lock (sleep-lock)", bcache.lock]
+      irq: {noff: 1, intena: 1}
+      stack: [usertrap, syscall, sys_exec, kexec, ilock, bread, bget]
+      sp: kernel
+    note: |
+      Now switch to hart 2. `grep`'s [[bget]] gets `bcache.lock` and searches. This time
+      the first loop **finds** a buffer with `dev == 1` and `blockno == 33`: the one `ls`
+      just claimed. Its data is not valid yet, but `bget` does not care. It increments
+      `refcnt` to 2, releases `bcache.lock`, and calls [[acquiresleep]] on line 69.
+
+      This is the design working as intended. The cache entry exists the moment hart 1
+      labelled it, even before any data has arrived, so there is exactly one buffer for
+      block 33 and every process that wants the block meets at its sleep-lock. Whoever gets
+      the lock second will find out from `valid` whether the data has arrived.
+
+      `refcnt == 2` also protects `ls`'s buffer: while it is above zero, the recycling loop
+      will never hand this buffer to a different block.
+    others: |
+      | Time | Hart 1 (ls, pid 4) | Hart 2 (grep, pid 5) |
+      |---|---|---|
+      | t1 | `bget`: miss, claims a buffer for block 33, `refcnt = 1` | spins on `bcache.lock` |
+      | t2 | releases `bcache.lock` | gets it; search **hits** block 33, `refcnt = 2` |
+      | t3 | `acquiresleep`: `locked = 1`, pid 4 | releases `bcache.lock` |
+      | t4 | owns block 33's sleep-lock | `acquiresleep`: sees `locked == 1` |
+
+  - title: grep registers and lets go of the inner spinlock
+    file: kernel/sleeplock.c
+    lines: 21-34
+    focus: 25-26
+    state:
+      hart: 2
+      mode: S
+      proc: grep (pid 5)
+      intr: off
+      satp: kernel
+      locks: ["inode 6 ip->lock (sleep-lock)", "block 33 b->lock.lk (spinlock)"]
+      irq: {noff: 1, intena: 1}
+      stack: [usertrap, syscall, sys_exec, kexec, ilock, bread, bget, acquiresleep]
+      sp: kernel
+    note: |
+      `grep` holds the inner spinlock and sees `locked == 1`. It enters the loop, and does
+      the three things in the order [[tour:16]] explains:
+
+      1. [[sleep_prepare]]`(lk)`: record in pid 5's `p->chan` that it waits on the channel
+         `lk`, the address of block 33's sleep-lock. This happens **while the inner spinlock
+         is still held**.
+      2. `release(&lk->lk)`: let others at `locked`, in particular the owner, who will need
+         it to release.
+      3. [[sleep]]`()`: give up hart 2 (next step).
+
+      Registering before releasing is what prevents a lost wakeup. `ls` can only clear
+      `locked` and call `wakeup(lk)` while holding the same inner spinlock. So either that
+      happens before `grep` checked (and `grep` saw `locked == 0`), or after `grep`
+      registered (and the wakeup clears `grep`'s `p->chan`). There is no moment in between.
+    others: |
+      The channel is the sleep-lock's address. In [[kernel/buf.h]], `lock` sits after four
+      4-byte fields, so `&b->lock` is 16 bytes past `b` itself. Remember that: the disk
+      driver will soon wake processes on channel `b`, a *different* address, and that
+      wakeup will not disturb `grep`.
+
+  - title: grep goes to sleep, holding a sleep-lock of its own
+    file: kernel/proc.c
+    lines: 558-572
+    focus: 566-569
+    state:
+      hart: 2
+      mode: S
+      proc: grep (pid 5)
+      intr: off
+      satp: kernel
+      locks: ["inode 6 ip->lock (sleep-lock)", "pid 5's p->lock"]
+      irq: {noff: 1, intena: 1, note: "noff 1 is pid 5's `p->lock`, as `sched` demands; sleep-locks add nothing"}
+      stack: [usertrap, syscall, sys_exec, kexec, ilock, bread, bget, acquiresleep, sleep]
+      sp: kernel
+    note: |
+      [[sleep]] takes pid 5's `p->lock`. `p->chan` is still set (nobody has woken it), so
+      it marks the process `SLEEPING` and calls [[sched]], which switches to hart 2's
+      scheduler. Hart 2 is now free to run anything else.
+
+      Look at what `grep` holds while it sleeps: the inode 6 sleep-lock. That is allowed.
+      What matters to [[sched]] is the count of **spinlocks**, and the only one held is
+      `p->lock`, which the scheduler releases on the sleeper's behalf ([[tour:13]]). A
+      sleep-lock is not counted at all. Its inner spinlock was released on line 27 of `acquiresleep`, just before the call to
+      `sleep`, and
+      `locked = 1` is just a value in memory, not a state of any CPU.
+
+      This is the essential property: a sleep-lock's holder or waiter can sleep, be switched
+      out, and later run on a different hart. Pid 5 waits without using any CPU at all.
+
+      What does a sleeping process leave behind? Its kernel stack, frozen exactly as it was
+      when [[sched]] called [[swtch]]. `swtch` saves `sp` (pointing at the deepest frame) and
+      `ra` into `p->context` and moves hart 2 to its scheduler stack
+      ([[kernel/swtch.S:26]]). The frames stay in place on pid 5's page:
+
+      ```text
+      grep's kernel stack (KSTACK(4), one page, top 0x3fffff6000)
+        top ─► usertrap        32 bytes
+               syscall         32
+               sys_exec       480   path[128] and argv[32] live here
+               kexec          544
+               ilock           32
+               bread           48   (bget is inlined into it)
+               acquiresleep    32
+               sleep           32
+               sched           48
+               ◄─ p->context.sp, 1280 bytes below the top
+      ```
+
+      (Frame sizes are the `addi sp,sp,-N` at each function's start in
+      `kernel/kernel.asm`.) No lock is recorded on that stack: the sleep-locks are flags in
+      memory, and the one spinlock count that matters, `noff`, belongs to the hart, which is
+      why [[sched]] checks it before leaving.
+    others: |
+      Anyone else who wants inode 6 now (say, another `exec` of `grep`) will sleep on inode
+      6's sleep-lock in turn, while pid 5 sleeps on block 33's. Waiting chains like this are
+      normal. They are only dangerous if they form a cycle; [[tour:18]] shows how xv6's lock
+      ordering prevents that.
+
+  - title: ls starts the disk read
+    file: kernel/virtio_disk.c
+    lines: 270-298
+    focus: 271-284
+    state:
+      hart: 1
+      mode: S
+      proc: ls (pid 4)
+      intr: off
+      satp: kernel
+      locks: ["inode 10 ip->lock (sleep-lock)", "block 33 b->lock (sleep-lock)", disk.vdisk_lock]
+      irq: {noff: 1, intena: 1}
+      stack: [usertrap, syscall, sys_exec, kexec, ilock, bread, virtio_disk_rw]
+      sp: kernel
+    note: |
+      Back on hart 1. `ls` owns block 33's buffer, `valid` is 0, so [[bread]] calls
+      [[virtio_disk_rw]]`(b, 0)`: read 1024 bytes from the disk into `b->data`. The driver
+      takes `disk.vdisk_lock`, a spinlock that protects the [[g:virtqueue]], fills in three
+      descriptors ("read sector 66, put the data at `b->data`, put the status here"; block
+      33 × 2 sectors per block = sector 66), and then:
+
+      - records `b` in `disk.info[]` so the interrupt handler can find it, and sets
+        `b->disk = 1`, meaning "the device owns this buffer";
+      - publishes the request in the available ring, with fences in between
+        ([[tour:19]] explains why they are needed);
+      - writes the notify register: the device may start.
+
+      Now the request is out of the CPU's hands. The device will write `b->data` directly
+      in memory ([[g:dma]]), and the CPU has nothing to do until it finishes. On a real disk
+      that is milliseconds, millions of instructions. [[tour:29]] follows the request through
+      the device.
+    others: |
+      `disk.vdisk_lock` is a spinlock because the interrupt handler needs it too, and an
+      interrupt handler can never take a sleep-lock (step 15). It is held only while the
+      driver edits the rings, not during the disk's work.
+
+  - title: ls sleeps, holding two sleep-locks
+    file: kernel/virtio_disk.c
+    lines: 286-298
+    focus: 287-288
+    state:
+      hart: 1
+      mode: S
+      proc: ls (pid 4)
+      intr: off
+      satp: kernel
+      locks: ["inode 10 ip->lock (sleep-lock)", "block 33 b->lock (sleep-lock)", disk.vdisk_lock]
+      irq: {noff: 1, intena: 1}
+      stack: [usertrap, syscall, sys_exec, kexec, ilock, bread, virtio_disk_rw]
+      sp: kernel
+    note: |
+      The driver waits for `b->disk` to become 0 with the usual pattern: register on channel
+      `b` while holding `disk.vdisk_lock`, release it, [[sleep]]. After the release on line
+      289, hart 1 holds no spinlocks, so interrupts are back on. Then `sleep` takes pid 4's
+      `p->lock` and switches away.
+
+      Now take stock. `ls` is asleep and owns **two sleep-locks**: inode 10's and block 33's.
+      `grep` is asleep and owns inode 6's and waits for block 33's. Neither uses a CPU.
+      Harts 1 and 2 are both free. Each sleeper is just a frozen kernel stack plus a saved
+      `p->context`: `ls`'s page at `KSTACK(3)` holds `usertrap → syscall → sys_exec → kexec
+      → ilock → bread → virtio_disk_rw → sleep → sched`, about 1.3 KiB, and hart 1 has gone
+      back to its own scheduler stack.
+
+      Imagine the same with spinlocks instead. `ls` would have to wait for the disk with
+      interrupts off, spinning on `b->disk`. But `b->disk` is cleared by the disk interrupt
+      handler, and a hart with interrupts off cannot take an interrupt. If the PLIC sent the
+      interrupt to another hart, that hart could clear it, but meanwhile `grep` would be
+      spinning on hart 2 with interrupts off too. Two of three CPUs would do nothing for
+      milliseconds. And `ls` could not sleep at all.
+    others: |
+      | Time | Hart 0 | Hart 1 | Hart 2 |
+      |---|---|---|---|
+      | t5 | scheduler, idle | `ls`: notifies the disk | `grep`: asleep on `&b->lock` |
+      | t6 | idle | `ls`: `sleep_prepare(b)`, sleeps | runs its scheduler: anything runnable |
+      | t7 | idle | runs its scheduler | idle or busy with other work |
+      | t8 | the disk finishes… | | |
+
+  - title: Why a spinlock holder may not sleep
+    file: kernel/proc.c
+    lines: 479-497
+    focus: 485-492
+    state:
+      hart: 1
+      mode: S
+      proc: ls (pid 4)
+      intr: off
+      satp: kernel
+      locks: ["inode 10 ip->lock (sleep-lock)", "block 33 b->lock (sleep-lock)", "pid 4's p->lock"]
+      irq: {noff: 1, intena: 1, note: "`sched` copies intena (1, from the system call) into a local before `swtch` and puts it back when pid 4 runs again ([[concept:locks#sched-intena]])"}
+      stack: [usertrap, syscall, sys_exec, kexec, ilock, bread, virtio_disk_rw, sleep, sched]
+      sp: kernel
+    note: |
+      [[sched]] is the one place every sleeping process passes through, and its checks are
+      the rules of this tour written as code:
+
+      - Line 485: the caller holds its own `p->lock`.
+      - Line 487: `noff`, this hart's push_off depth, which here is its count of held
+        **spinlocks** ([[tour:15]], [[concept:locks#noff]]), is exactly 1. That one is
+        `p->lock`. Any other spinlock held here would panic with `sched locks`.
+      - Line 491: interrupts are off.
+
+      Line 487 passes for `ls`, even though it holds two sleep-locks, because acquiring a
+      sleep-lock leaves `noff` unchanged once [[acquiresleep]] returns.
+
+      Why forbid spinlocks here? A sleeping holder might not run again for a long time. Any
+      hart that wanted that spinlock would spin with interrupts off the whole while. Its own
+      timer could not interrupt it, so its scheduler could never run the sleeper either.
+      With three harts spinning on the lock, nothing would ever release it. The
+      `sched locks` panic turns that slow disaster into an immediate, explained crash.
+    others: |
+      This is the deep reason xv6 has two kinds of lock. Spinlocks are cheap and can be used
+      by interrupt handlers, but must be held briefly. Sleep-locks can be held for as long
+      as you like, across sleeps and disk I/O, but only by processes.
+
+  - title: The disk interrupt, on hart 0
+    file: kernel/virtio_disk.c
+    lines: 300-333
+    focus: 318-330
+    state:
+      hart: 0
+      mode: S
+      proc: none (hart 0's scheduler)
+      intr: off
+      satp: kernel
+      locks: [disk.vdisk_lock]
+      irq: {noff: 1, intena: 0, note: "an interrupt handler: SIE was already off at the first push_off, so intena is 0 and the release on line 332 leaves interrupts off ([[concept:locks#intena]])"}
+      stack: [main, scheduler, kernelvec, kerneltrap, devintr, virtio_disk_intr]
+      sp: {"on": scheduler, detail: "hart 0's slice of stack0 (top 0x80008890), with a kernelvec frame on top"}
+    note: |
+      The device has written block 33 into `b->data` and raised its interrupt. Hart 0
+      was idle in its [[scheduler]], waiting in `wfi`; when the interrupt arrives, the loop's
+      `intr_on()` ([[kernel/proc.c:441]]) lets the trap happen. Any idle hart could claim the
+      interrupt from the [[g:plic|PLIC]]; here hart 0 does. It arrives in [[devintr]] via
+      [[kernelvec]] and [[kerneltrap]], which calls [[virtio_disk_intr]].
+
+      The handler takes `disk.vdisk_lock`, finds the finished request in the used ring, sets
+      `b->disk = 0` ("the device is done with this buffer") and calls `wakeup(b)`, which
+      makes `ls` (pid 4) `RUNNABLE`.
+
+      Which stack is this running on? xv6 has no separate interrupt stack. [[kernelvec]]
+      pushed its 256-byte register frame ([[kernel/kernelvec.S:14]]) onto whatever stack
+      was current, and hart 0 was idle, so that is hart 0's **scheduler stack**, its slice of
+      [[stack0]]. `kerneltrap`, `devintr` and `virtio_disk_intr` stack up above it.
+
+      Notice what the handler does **not** touch: block 33's sleep-lock. It could not take
+      it. An interrupt handler is not a process: here `myproc()` is 0, because hart 0 was
+      in its scheduler, and the stack it borrows belongs to the hart, not to any process. If it had interrupted a process instead, sleeping would put that
+      unrelated process to sleep. So the handler only changes `b->disk` under a spinlock and
+      wakes the owner. The sleep-lock stays with `ls`, which will release it itself.
+    others: |
+      `wakeup(b)` visits every process. `grep` (pid 5) is sleeping on `&b->lock`, which is
+      `b + 16`, not `b`, so it stays asleep. That is correct: the disk being done does not
+      mean block 33's lock is free. Only `ls` can free it, after it has used the data.
+
+  - title: ls resumes, on a different hart
+    file: kernel/virtio_disk.c
+    lines: 286-298
+    focus: 294-296
+    state:
+      hart: 0
+      mode: S
+      proc: ls (pid 4)
+      intr: off
+      satp: kernel
+      locks: ["inode 10 ip->lock (sleep-lock)", "block 33 b->lock (sleep-lock)", disk.vdisk_lock]
+      irq: {noff: 1, intena: 1, note: "hart 0's intena is now pid 4's: `sched` restored the 1 that pid 4 saved on hart 1"}
+      stack: [usertrap, syscall, sys_exec, kexec, ilock, bread, virtio_disk_rw]
+      sp: {"on": kernel, switched: "`ld sp, 8(a1)` in [[swtch]] ([[kernel/swtch.S:26]]), called by hart 0's scheduler", detail: "pid 4's kernel stack, KSTACK(3): the same frames it slept on"}
+    note: |
+      Hart 0 returns from the interrupt to its scheduler loop (`kernelvec` pops its frame off
+      the scheduler stack), finds pid 4 `RUNNABLE`, and runs it. [[swtch]] loads `ls`'s saved
+      `sp` from `p->context`, so hart 0 now stands on the frozen stack from step 13, every
+      frame intact. `ls` comes out of [[sleep]] on **hart 0**, though it went to sleep on
+      hart 1. A kernel stack is just memory in the kernel page table, which every hart
+      uses, so any hart can pick it up.
+      It re-takes `disk.vdisk_lock` (line 291), sees `b->disk == 0`, leaves the loop, frees
+      the three descriptors and releases the lock.
+
+      Watch `intena`. Hart 0 got here from its scheduler, where it was 0, yet the strip
+      shows 1. [[sched]] kept pid 4's intena (1, recorded on hart 1 during the system call)
+      in a local across [[swtch]] and wrote it back into hart 0's `struct cpu`, so the
+      release of `p->lock` at the end of [[sleep]] turned interrupts on. intena belongs to
+      the thread, not the hart ([[concept:locks#sched-intena]]).
+
+      It still owns both sleep-locks. Nothing about them changed while it slept, or when it
+      moved to another hart. That is exactly why a sleep-lock records a **pid** and not a
+      CPU: ownership belongs to the thread of execution, which is free to migrate.
+
+      Back in [[bread]], line 99 sets `b->valid = 1`. Only the owner of `b->lock` may write
+      that, and `ls` is the owner.
+    others: |
+      Hart 1, where `ls` started, may by now be running something else entirely. Hart 2
+      may still be idle: `grep` is asleep and will stay asleep until block 33's sleep-lock is
+      released, which is the next thing `ls` does.
+
+  - title: ls copies its inode out of the buffer
+    file: kernel/fs.c
+    lines: 292-319
+    focus: 307-313
+    state:
+      hart: 0
+      mode: S
+      proc: ls (pid 4)
+      intr: on
+      satp: kernel
+      locks: ["inode 10 ip->lock (sleep-lock)", "block 33 b->lock (sleep-lock)"]
+      irq: 0
+      stack: [usertrap, syscall, sys_exec, kexec, ilock]
+      sp: kernel
+    note: |
+      [[ilock]] now has block 33 in memory. Dinode 10 is entry `10 % 16 = 10` in the block,
+      64 bytes starting at byte 640. Lines 308–313 copy its type, device numbers, link
+      count, size and block addresses into the in-memory inode. Then [[brelse]] on line 314
+      gives the buffer back, and line 315 marks inode 10 valid.
+
+      Two sleep-locks are held for these lines, each guarding its own data: `b->lock` makes
+      it safe to read `b->data`, and inode 10's lock makes it safe to write `ip->type` and
+      friends. The order they were taken in, inode first, then buffer, is the same
+      everywhere in the file system. That consistency is part of what keeps the file system
+      free of deadlock ([[tour:18]]).
+
+      The buffer is held only for the copy. Pid 4 keeps inode 10's lock until `exec` has
+      read the program, but it does not need block 33 for that.
+
+  - title: brelse checks that the caller really owns the buffer
+    file: kernel/sleeplock.c
+    lines: 46-55
+    focus: 51-52
+    state:
+      hart: 0
+      mode: S
+      proc: ls (pid 4)
+      intr: off
+      satp: kernel
+      locks: ["inode 10 ip->lock (sleep-lock)", "block 33 b->lock (sleep-lock)", "block 33 b->lock.lk (spinlock)"]
+      irq: {noff: 1, intena: 1, note: "noff 1 is `lk->lk`; the `myproc()` on line 52 adds a second level for a moment"}
+      stack: [usertrap, syscall, sys_exec, kexec, ilock, brelse, holdingsleep]
+      sp: kernel
+    note: |
+      [[brelse]] begins with `if (!holdingsleep(&b->lock)) panic("brelse")`. [[holdingsleep]]
+      asks: is the lock taken, and is the owner **this process**? It answers under the inner
+      spinlock, so it reads `locked` and `pid` as a consistent pair.
+
+      The same check guards [[bwrite]] ([[kernel/bio.c:109]]) and [[iunlock]]
+      ([[kernel/fs.c:325]]). Each is a function that only makes sense for the lock's owner.
+      Releasing a buffer you do not own would let a second process into it while the first
+      is still using it, and writing a buffer you do not own could send half-modified data to
+      disk. Both would be silent corruption; the check turns them into an immediate panic.
+
+      Compare with the spinlock's [[holding]], which compares `lk->cpu` with this CPU. Here
+      the comparison is `lk->pid == myproc()->pid`, for the reason the last step showed:
+      `ls` took the lock on hart 1 and is releasing it on hart 0.
+
+  - title: releasesleep wakes grep
+    file: kernel/sleeplock.c
+    lines: 36-44
+    focus: 40-42
+    state:
+      hart: 0
+      mode: S
+      proc: ls (pid 4)
+      intr: off
+      satp: kernel
+      locks: ["inode 10 ip->lock (sleep-lock)", "block 33 b->lock.lk (spinlock)"]
+      irq: {noff: 1, intena: 1, note: "noff 1 is `lk->lk`; inside `wakeup` each `p->lock` makes it 2 for a moment"}
+      stack: [usertrap, syscall, sys_exec, kexec, ilock, brelse, releasesleep]
+      sp: kernel
+    note: |
+      [[releasesleep]] takes the inner spinlock, clears `locked` and `pid`, and calls
+      [[wakeup]]`(lk)` on the channel `grep` registered on. Then it releases the inner
+      spinlock. From line 40 on, `ls` no longer owns block 33's sleep-lock; the display lists
+      only the inner spinlock it still holds.
+
+      `wakeup` walks the process table, taking each `p->lock` in turn. It finds pid 5 with
+      `p->chan == lk` and `SLEEPING`, clears `p->chan`, and marks it `RUNNABLE`. Any number
+      of waiters would all be woken this way, though only one can win the lock.
+
+      Calling `wakeup` while holding the inner spinlock is the other half of the lost-wakeup
+      argument from step 10. A waiter registers under the inner spinlock, and the owner
+      clears `locked` and wakes under it. Whichever comes first, the waiter either sees
+      `locked == 0` or is already registered when the wakeup runs.
+    others: |
+      `wakeup` is called with `lk->lk` held and takes `p->lock`s, so the order here is
+      "sleep-lock's inner spinlock, then `p->lock`". [[acquiresleep]] follows the same order
+      when it calls [[sleep_prepare]]. No code takes them in the opposite order, so they
+      cannot deadlock ([[tour:18]]).
+
+  - title: brelse puts the buffer back in the list
+    file: kernel/bio.c
+    lines: 114-137
+    focus: 124-134
+    state:
+      hart: 0
+      mode: S
+      proc: ls (pid 4)
+      intr: off
+      satp: kernel
+      locks: ["inode 10 ip->lock (sleep-lock)", bcache.lock]
+      irq: {noff: 1, intena: 1}
+      stack: [usertrap, syscall, sys_exec, kexec, ilock, brelse]
+      sp: kernel
+    note: |
+      With the sleep-lock released, [[brelse]] takes `bcache.lock` to update the
+      bookkeeping. `refcnt` drops from 2 to 1, because `grep` still holds a reference from
+      its own [[bget]]. Since it is not 0, the buffer is not moved to the front of the
+      most-recently-used list yet. That happens when the last user lets go.
+
+      Look at the order: `releasesleep` on line 122, **then** `acquire(&bcache.lock)` on
+      line 124. Just like [[bget]], `brelse` never holds both locks at once. A thread holding
+      `bcache.lock` must never wait for a buffer's sleep-lock, and here we see the other
+      side: a thread holding a buffer's sleep-lock may take `bcache.lock`, but there is no
+      need to, so `brelse` lets the sleep-lock go first and keeps the spinlock section as
+      short as possible.
+    others: |
+      | Time | Hart 0 | Hart 1 | Hart 2 |
+      |---|---|---|---|
+      | t8 | disk interrupt: `b->disk = 0`, `wakeup(b)` | other work | idle |
+      | t9 | runs `ls`: `valid = 1`, copies dinode 10 | | |
+      | t10 | `releasesleep`: `locked = 0`, `wakeup(lk)` | | scheduler finds `grep` `RUNNABLE` |
+      | t11 | `brelse`: `refcnt = 1` | | runs `grep`, back in `acquiresleep` |
+
+  - title: grep wakes and checks again
+    file: kernel/sleeplock.c
+    lines: 21-34
+    focus: 29-32
+    state:
+      hart: 2
+      mode: S
+      proc: grep (pid 5)
+      intr: off
+      satp: kernel
+      locks: ["inode 6 ip->lock (sleep-lock)", "block 33 b->lock.lk (spinlock)"]
+      irq: {noff: 1, intena: 1, note: "the acquire on line 29 is the first push_off since `sleep`'s release of `p->lock` turned interrupts back on, so intena is 1; line 32's `myproc()` adds a level for a moment"}
+      stack: [usertrap, syscall, sys_exec, kexec, ilock, bread, bget, acquiresleep]
+      sp: {"on": kernel, switched: "`ld sp, 8(a1)` in [[swtch]] ([[kernel/swtch.S:26]]), called by hart 2's scheduler", detail: "pid 5's kernel stack, KSTACK(4), as it was left in step 11"}
+    note: |
+      Hart 2's scheduler picks up `grep`, and [[swtch]] moves hart 2 from its scheduler
+      stack back onto `grep`'s frozen kernel stack. It returns from [[sleep]] on line 28, re-takes the
+      inner spinlock on line 29, and goes back to the top of the `while`.
+
+      Being woken does not mean the lock is now `grep`'s. It means only "the lock was
+      released at some point". Between `ls`'s release and this check, a third process might
+      have called [[acquiresleep]] on block 33 and taken it; [[wakeup]] wakes every waiter,
+      and only one can win. That is why the test is a `while`, not an `if`, as in every
+      sleep loop in xv6 ([[tour:16]]).
+
+      This time `locked` is 0. The loop ends, line 31 sets `locked = 1`, line 32 records pid
+      5, line 33 releases the inner spinlock, and `grep` owns block 33's sleep-lock.
+
+      Note there is no fairness here. A newcomer arriving at line 24 just as `grep` was
+      being woken could take the lock first, and `grep` would sleep again.
+    others: |
+      Even with three waiters, [[wakeup]] would wake all three and they would line up on the
+      inner spinlock. One would win, and the other two would see `locked == 1` and sleep
+      again. That costs some CPU, but nothing breaks.
+
+  - title: grep gets the block without touching the disk
+    file: kernel/bio.c
+    lines: 90-102
+    focus: 97
+    state:
+      hart: 2
+      mode: S
+      proc: grep (pid 5)
+      intr: on
+      satp: kernel
+      locks: ["inode 6 ip->lock (sleep-lock)", "block 33 b->lock (sleep-lock)"]
+      irq: 0
+      stack: [usertrap, syscall, sys_exec, kexec, ilock, bread]
+      sp: kernel
+    note: |
+      [[bget]] returns the locked buffer to [[bread]], which checks `b->valid`. `ls` set it
+      to 1, so there is **no disk read**. `grep`'s [[ilock]] copies dinode 6 (entry 6, bytes
+      384–447 of the same block), calls [[brelse]], and this time `refcnt` drops to 0, so the
+      buffer moves to the front of the recently-used list.
+
+      This is the payoff of waiting on a lock instead of reading independently. `grep`
+      slept through `ls`'s disk read and then used its result. One read served two
+      processes, and the buffer cache never held two copies of block 33.
+
+      What if `grep` had won the race in step 6 instead? Then `grep` would have seen
+      `valid == 0` and done the read, and `ls` would have waited and found `valid == 1`. The
+      lock does not care who comes first; it only makes sure the reader and the data never
+      collide.
+    others: |
+      Both processes now hold their own inode's sleep-lock and continue `exec` in parallel:
+      `ls` on hart 0, `grep` on hart 2, each reading its own program's data blocks, which
+      are different blocks with different buffers and sleep-locks. The only sleep-lock
+      contention between them was the root directory (its inode and block 47) and block 33;
+      they still meet briefly on spinlocks such as `bcache.lock` and `itable.lock`.
+
+  - title: Two kinds of lock, side by side
+    file: kernel/sleeplock.h
+    lines: 1-9
+    state:
+      hart: 2
+      mode: S
+      proc: grep (pid 5)
+      intr: on
+      satp: kernel
+      locks: ["inode 6 ip->lock (sleep-lock)"]
+      irq: 0
+      stack: [usertrap, syscall, sys_exec, kexec]
+      sp: kernel
+    note: |
+      What did block 33 cost? One disk read, two harts' worth of sleeping, a disk interrupt
+      on a third hart, and a migration from hart 1 to hart 0. Along the way the two
+      processes took five different sleep-locks between them (root inode, inode 10, inode 6,
+      block 47 inside `dirlookup`, block 33), and every sleep-lock operation took its inner
+      spinlock for a handful of instructions.
+
+      | | Spinlock | Sleep-lock |
+      |---|---|---|
+      | Owner | a CPU (`lk->cpu`) | a process (`lk->pid`) |
+      | Waiter | spins, interrupts off | sleeps, CPU free |
+      | Holder may sleep? | no (`sched locks`) | yes |
+      | Interrupts while held | off | unchanged |
+      | Usable in interrupt handlers | yes | no |
+      | Good for | short updates of shared data | long operations, such as disk I/O |
+      | Built from | `amoswap` | a spinlock + a flag + sleep/wakeup |
+
+      The key idea: a sleep-lock moves the *waiting* out of the CPU and into the scheduler.
+      That is what makes it possible to hold a lock across something as slow as a disk, and
+      what makes it unusable where there is no process to put to sleep.
+locks:
+  - lock: "root inode ip->lock (sleep-lock)"
+    where: "[[ilock]] in [[namex]]"
+    protects: "The root directory's in-memory inode fields while its entries are scanned"
+  - lock: "inode 10 / inode 6 ip->lock (sleep-lock)"
+    where: "[[ilock]] in [[kexec]]"
+    protects: "`valid`, `type`, `size`, `addrs` and the other in-memory inode fields"
+  - lock: "itable.lock (spinlock)"
+    where: "[[iget]], [[iput]], [[idup]]"
+    protects: "Which table slot holds which inode, and each slot's `ref`"
+  - lock: "bcache.lock (spinlock)"
+    where: "[[bget]], [[brelse]]"
+    protects: "Each buffer's `dev`, `blockno` and `refcnt`, and the recently-used list; never a buffer's data"
+  - lock: "b->lock (sleep-lock)"
+    where: "[[bget]] (taken), [[brelse]] (released)"
+    protects: "`b->valid` and `b->data`: one process at a time reads, fills or changes the block"
+  - lock: "b->lock.lk (inner spinlock)"
+    where: "[[acquiresleep]], [[releasesleep]], [[holdingsleep]]"
+    protects: "The sleep-lock's `locked` flag and `pid`, for a few instructions at a time"
+  - lock: "disk.vdisk_lock (spinlock)"
+    where: "[[virtio_disk_rw]], [[virtio_disk_intr]]"
+    protects: "The virtqueue descriptors and rings, and `b->disk`"
+  - lock: "p->lock (spinlock)"
+    where: "[[sleep_prepare]], [[sleep]], [[wakeup]]"
+    protects: "`p->chan` and `p->state` of the sleepers"
+  - lock: "begin_op (not a lock)"
+    where: "[[kexec]]"
+    protects: "Reserves room in the log; can make the caller wait, but owns no data"
+quiz:
+  - q: "Why does `bget` release `bcache.lock` *before* calling `acquiresleep(&b->lock)`, and why is the gap between those two lines safe?"
+    a: "`acquiresleep` may sleep, and a process must not sleep holding a spinlock ([[sched]] panics with `sched locks`; other harts would spin with interrupts off). The gap is safe because `refcnt` was already incremented under `bcache.lock`, so the buffer cannot be recycled for another block, and anyone else wanting the same block finds this buffer and waits on its sleep-lock."
+  - q: "`ls` sleeps in `virtio_disk_rw` while owning two sleep-locks. Why doesn't `sched`'s check `mycpu()->noff != 1` panic?"
+    a: "`noff` counts spinlocks held by this hart. Each sleep-lock's inner spinlock was released at the end of `acquiresleep`; owning a sleep-lock is only `locked = 1` in memory. The single spinlock held at `sched` is `p->lock`."
+  - q: "The disk interrupt handler calls `wakeup(b)`. Why doesn't that wake `grep`, which is waiting for the same buffer, and why is that correct?"
+    a: "`grep` sleeps on channel `&b->lock`, which is a different address (`b + 16`). The disk finishing does not make the buffer's lock free: `ls` still owns it and has not used the data yet. `grep` is woken later by `releasesleep`'s `wakeup(lk)`."
+  - q: "Suppose `acquiresleep` called `sleep_prepare(lk)` *after* `release(&lk->lk)`. Give an interleaving in which `grep` sleeps forever."
+    a: "`grep` sees `locked == 1` and releases `lk->lk`. Before it registers, `ls` on another hart runs `releasesleep`: `locked = 0`, `wakeup(lk)` finds nobody registered. Then `grep` registers and sleeps, and no one will ever call `wakeup(lk)` again unless someone else takes and releases the lock."
+  - q: "Why can't the virtio interrupt handler simply take block 33's sleep-lock itself and mark the buffer valid?"
+    a: "An interrupt handler is not a process. Taking a sleep-lock may sleep, and sleeping there would either put an unrelated interrupted process to sleep or, when the hart was in its scheduler (as hart 0 was), there is no process at all. Interrupt handlers may only use spinlocks; the handler changes `b->disk` under `disk.vdisk_lock` and lets the owner continue."
+  - q: "Why is `acquiresleep`'s test `while (lk->locked)` and not `if (lk->locked)`?"
+    a: "A wakeup means only that the lock was released at some point. All waiters are woken, and another process may take the lock before this one runs again. The woken process must re-check `locked` under the inner spinlock and sleep again if it lost."

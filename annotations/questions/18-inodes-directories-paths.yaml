@@ -1,0 +1,749 @@
+title: Inodes, directories and path lookup
+summary: The inode table, ref versus nlink, iget/ilock/iput, directories as arrays of dirents, namex's one-lock-at-a-time walk, and create, link and unlink.
+questions:
+  - id: ino-01
+    level: 1
+    type: choice
+    q: |
+      A `struct inode` in memory has both `ref` and `nlink`. What does each one count?
+    code: kernel/file.h:16-30
+    options:
+      - text: ref counts in-memory pointers to the table entry (open files, current directories, temporary lookups); nlink counts directory entries on disk that name the inode.
+        correct: true
+        why: |
+          `ref` lives only in memory and is changed by [[iget]], [[idup]] and [[iput]] under
+          `itable.lock`. `nlink` is a copy of the on-disk [[dinode]] field, changed by
+          `link`, `unlink` and `create` under the inode's sleep-lock.
+      - text: ref counts open file descriptors; nlink counts processes using the file.
+        why: |
+          You may have mixed up the levels. Descriptors point to a `struct file`, which has
+          its own `ref`; the inode's `ref` counts pointers to the inode (one per open
+          `struct file`, plus current directories and in-progress lookups). `nlink` has
+          nothing to do with processes.
+      - text: They are the same count kept in two places, one in memory and one on disk.
+        why: |
+          You may have assumed `ref` is a cache of `nlink`. They can differ freely: a file
+          deleted while open has `nlink == 0` and `ref == 1`; a file on disk that nobody uses
+          has `nlink == 1` and no table entry at all.
+      - text: ref counts the data blocks the inode owns; nlink counts the indirect blocks.
+        why: |
+          You may have connected "references" with block pointers. Blocks are listed in
+          `addrs[]`; neither count is about blocks.
+    explain: |
+      `ref` answers "may this table entry be recycled?"; `nlink` answers "does any name
+      still lead to this file?". A file is freed only when both reach zero, in [[iput]]
+      ([[tour:33]], [[g:link-count]], [[g:reference-count]]).
+
+  - id: ino-02
+    level: 1
+    type: number
+    q: |
+      How many on-disk inodes ([[dinode]]) fit in one disk block in this file system
+      (the value of `IPB`)?
+    code: kernel/fs.h:31-45
+    answer: 16
+    wrong:
+      32: |
+        You may have estimated a 32-byte dinode. Count the fields: four `short`s (8 bytes),
+        `size` (4) and 13 block addresses of 4 bytes (52): 64 bytes.
+      13: |
+        You may have confused this with the number of block addresses in a dinode
+        (`NDIRECT + 1` = 13). IPB is `BSIZE / sizeof(struct dinode)`.
+      8: |
+        You may have assumed 512-byte blocks. [[BSIZE]] is 1024 here, so 1024 / 64 = 16.
+    why_wrong: Compute sizeof(struct dinode) from its fields, then divide BSIZE by it.
+    explain: |
+      A dinode is 8 + 4 + 13 * 4 = 64 bytes, and a block is 1024 bytes, so `IPB` = 16.
+      That is why inodes 1-15 share a block with inode 0 and inodes 16-31 share the next
+      one ([[tour:33]]).
+
+  - id: ino-03
+    level: 1
+    type: choice
+    q: |
+      What does the content of a directory (its data blocks) consist of in this file
+      system?
+    code: kernel/fs.h:53-61
+    options:
+      - text: An array of 16-byte entries, each a 2-byte inode number and a 14-byte name; an entry with inode number 0 is free.
+        correct: true
+        why: |
+          That is `struct dirent`. [[dirlookup]] scans it linearly 16 bytes at a time and
+          skips entries with `inum == 0`.
+      - text: The full path of every file below it, for fast lookup.
+        why: |
+          You may have imagined paths stored on disk. No path is stored anywhere; a path
+          is a recipe for a walk, one directory at a time, done by [[namex]].
+      - text: The inodes of the files it contains, copied inline.
+        why: |
+          You may have thought a directory holds its files' metadata. It holds only
+          numbers and names; the inodes themselves live in the inode blocks.
+      - text: A hash table from names to inode numbers.
+        why: |
+          You may know file systems that index directories. xv6 has no index: lookup is a
+          linear scan of every entry.
+    explain: |
+      A directory is an ordinary inode of type `T_DIR` whose data happens to be an array of
+      [[g:directory]] entries. Names map to numbers; the numbers lead to [[dinode]]s
+      ([[tour:34]]).
+
+  - id: ino-04
+    level: 1
+    type: tf
+    q: |
+      True or false: when `rm` removes the only name of a file that another process still
+      has open, the file's data blocks are freed immediately.
+    answer: false
+    why_tf: |
+      You may have equated "delete" with "free". Unlinking removes a *name*; the blocks are
+      freed only when the last reference goes away too.
+    reasons:
+      - text: sys_unlink drops nlink to 0, but its iput sees ref greater than 1 (the open file's reference), so it only decrements ref; the last close frees the blocks.
+        correct: true
+        why: |
+          [[iput]] frees only if `ref == 1 && nlink == 0`. The open `struct file` holds a
+          reference, so the final [[iput]] in [[fileclose]] does the truncation.
+      - text: sys_unlink refuses to remove a file that is open, and fails with -1.
+        why: |
+          You may know systems that lock open files. xv6 never checks whether a file is
+          open; the unlink succeeds, and the reader keeps reading.
+      - text: The blocks are freed only by ireclaim at the next boot.
+        why: |
+          You may have generalized from the crash case. On a running system the final
+          close frees them; [[ireclaim]] is only needed if the machine crashes before that
+          close.
+    explain: |
+      This is the Unix rule: a file lives as long as a name *or* a reference keeps it alive.
+      `cat` can finish printing a file that `rm` deleted underneath it ([[tour:33]]).
+
+  - id: ino-05
+    level: 1
+    type: choice
+    q: |
+      [[iget]] returns an inode table entry with `valid = 0` and does not read the inode
+      from disk; [[ilock]] does that later. Why not read it in `iget`?
+    code: kernel/fs.c:245-279
+    options:
+      - text: iget runs while holding itable.lock, a spinlock, and reading the disk sleeps; ilock holds the inode's sleep-lock, under which sleeping is allowed.
+        correct: true
+        why: |
+          A disk read waits in [[virtio_disk_rw]] by sleeping, and sleeping with a spinlock
+          held makes [[sched]] panic. `ilock` reads the disk under the inode's
+          [[g:sleeplock]], which also ensures only one process loads the entry.
+      - text: To save disk reads, since most callers never look at the inode's contents.
+        why: |
+          You may have thought of laziness as the goal. Nearly every caller does lock the
+          inode soon after; the split exists because of what may be done under which lock.
+      - text: Because iget does not know the inode number yet.
+        why: |
+          You may have misread its arguments. `iget(dev, inum)` is given the number and
+          stores it in the entry.
+      - text: Because the disk driver cannot be used until ilock has set up the buffer cache.
+        why: |
+          You may have mixed up initialization order. The buffer cache is set up once at
+          boot ([[binit]]); nothing in `ilock` prepares it.
+    explain: |
+      Separating "get a reference" ([[iget]], quick, under a spinlock) from "lock and load"
+      ([[ilock]], may sleep, under a sleep-lock) also lets [[namex]] carry references
+      without holding locks ([[tour:33]]).
+
+  - id: ino-06
+    level: 1
+    type: match
+    q: |
+      Match each function with its job.
+    pairs:
+      - left: "[[iget]]"
+        right: find or claim an inode-table entry for (dev, inum) and take a reference, without reading the disk
+        why: iget only touches the in-memory table under itable.lock; valid stays 0 for a new entry.
+      - left: "[[ilock]]"
+        right: take the inode's sleep-lock and load the dinode from disk if the entry is not valid
+        why: The disk read happens here, under a lock that may be held while sleeping.
+      - left: "[[iupdate]]"
+        right: copy the in-memory inode's fields into its disk block and log_write that block
+        why: Every change to a field that lives on disk must be followed by iupdate, inside a transaction.
+      - left: "[[iput]]"
+        right: drop a reference, and truncate and free the inode if it was the last reference and nlink is 0
+        why: iput is where files actually die, whether after rm, a failed create, or ireclaim at boot.
+      - left: "[[ialloc]]"
+        right: scan the on-disk inodes for one with type 0 and mark it allocated
+        why: The on-disk type field is the allocation mark; there is no inode bitmap.
+    explain: |
+      The typical sequence is `iget`, `ilock`, examine or modify, `iupdate` if a disk
+      field changed, `iunlock`, `iput` (the comment above [[itable]] gives this sequence; `iupdate`
+      comes from the rule in the comment above [[iupdate]])
+      ([[tour:33]]).
+
+  - id: ino-07
+    level: 1
+    type: line
+    q: |
+      In [[namex]], click the line that gives up the current directory (its lock and its
+      reference) after finding the next element, before the loop locks that element.
+    code: kernel/fs.c:691-728
+    answer: 720
+    lines:
+      713: |
+        This unlocks the directory too, but only on the [[nameiparent]] path, which stops
+        one level early and *returns* the parent, keeping its reference.
+      704: |
+        This is a failure exit: the current inode is not a directory. It does release lock
+        and reference, but the walk ends here.
+      716: |
+        This finds the next element and takes a reference to it with [[iget]]. The parent
+        is still locked at this point.
+      721: |
+        This moves the walk on (`ip = next`). The parent was already released on the
+        line before.
+      702: |
+        This *takes* the current directory's lock at the top of each iteration; it does not
+        release anything.
+    why_wrong: Look for the call that both unlocks and drops the reference of `ip` on the success path.
+    explain: |
+      Line 720, `iunlockput(ip)`, runs after [[dirlookup]] has returned `next` with its own
+      reference. Only then does the loop lock `next`. So `namex` never holds two inode locks
+      at once, which rules out deadlock on `..` and `.` ([[tour:34]]).
+
+  - id: ino-08
+    level: 1
+    type: number
+    q: |
+      What is the largest number of data blocks one file can have in this file system
+      ([[MAXFILE]])?
+    code: kernel/fs.h:26-28
+    answer: 268
+    wrong:
+      12: |
+        You may have counted only the direct blocks. `addrs[NDIRECT]` points to an
+        indirect block that lists 256 more.
+      256: |
+        You may have counted only the indirect block's entries. The 12 direct blocks come
+        first.
+      269: |
+        You may have counted the indirect block itself. It holds block numbers, not file
+        data, so it is not one of the file's data blocks.
+    why_wrong: "MAXFILE = NDIRECT + NINDIRECT, and NINDIRECT = BSIZE / sizeof(uint)."
+    explain: |
+      12 direct + 1024 / 4 = 256 indirect = 268 blocks, so the largest file is
+      268 * 1024 = 274,432 bytes; [[writei]] refuses to go past it ([[bmap]]).
+
+  - id: ino-09
+    level: 2
+    type: number
+    q: |
+      In this image the superblock says `inodestart = 33`. Which disk block holds inode 24?
+    code: kernel/fs.h:41-45
+    answer: 34
+    wrong:
+      33: |
+        You may have thought all the low-numbered inodes share the first inode block. Block
+        33 holds inodes 0-15 only; 24 / 16 = 1, so it is in the next block.
+      57: |
+        You may have added the inode number to `inodestart` directly. Sixteen inodes share
+        a block, so you divide first: `24 / IPB`.
+      35: |
+        You may have rounded up, or started counting inode blocks at 1. Integer division
+        gives 24 / 16 = 1, and block 33 is inode block 0.
+    why_wrong: "IBLOCK(i, sb) = i / IPB + sb.inodestart, with IPB = 16 and integer division."
+    explain: |
+      `IBLOCK(24, sb) = 24 / 16 + 33 = 34`, and inside that block the inode is entry
+      `24 % 16 = 8`, at byte 8 * 64 = 512. [[ialloc]], [[ilock]] and [[iupdate]] all use
+      this formula ([[tour:35]]).
+
+  - id: ino-10
+    level: 2
+    type: choice
+    q: |
+      Why does [[namex]] unlock the current directory *before* it locks the next path
+      element, instead of locking the child first and then letting go of the parent?
+    code: kernel/fs.c:691-728@716-721
+    options:
+      - text: "Holding both could deadlock: looking up \".\" returns the same inode (the process would wait for its own lock), and \"..\" lets two walks lock the same two directories in opposite orders."
+        correct: true
+        why: |
+          `dirlookup(dp, ".")` returns `dp` itself, so `ilock(next)` would wait forever for a
+          lock this process holds. With `..`, one process holding `a` and wanting `b` can meet
+          another holding `b` and wanting `a`.
+      - text: Because the inode table has room for only one locked inode per process.
+        why: |
+          You may have thought the table limits locks. [[NINODE]] limits table entries in
+          total; [[create]] and [[sys_unlink]] routinely hold two inode locks.
+      - text: To make the whole path lookup one atomic snapshot of the tree.
+        why: |
+          It is the opposite: because nothing is held between the two locks, a lookup is a
+          series of atomic steps, and another process can change the tree in between.
+      - text: Because a sleep-lock cannot be acquired while another sleep-lock is held.
+        why: |
+          You may have generalized the spinlock rule. Holding a sleep-lock while acquiring
+          another is allowed (create holds the parent and the child); only *spinlocks* must
+          not be held while sleeping.
+    explain: |
+      The reference taken by [[dirlookup]] (through [[iget]]) keeps `next` alive while no
+      lock is held, so the walk can safely let go of the parent first. The price is that
+      the tree may change between steps ([[tour:34]]).
+
+  - id: ino-11
+    level: 2
+    type: order
+    q: |
+      `open("newfile", O_CREATE|O_WRONLY)` calls [[create]] for a name that does not exist
+      yet. Put the steps of `create` in order.
+    code: kernel/sysfile.c:258-317
+    items:
+      - text: "[[nameiparent]] returns the parent directory, referenced but unlocked, and the last name"
+        why: Nothing can be checked or written in the parent until create has found it.
+      - text: "`ilock(dp)`, then check that `dp->nlink` is not 0"
+        why: The deleted-directory check needs the parent's fields, which are valid only under its lock.
+      - text: "[[dirlookup]] finds no entry with that name"
+        why: The name check must be made under the parent's lock, so that it is still true when the entry is added.
+      - text: "[[ialloc]] claims a free dinode and gives it type T_FILE"
+        why: The inode is allocated only once the name is known to be free.
+      - text: "`ilock(ip)`, set `nlink = 1`, [[iupdate]]"
+        why: The new inode must be locked before its fields are set; ialloc returns it unlocked.
+      - text: "[[dirlink]] writes the entry (name, inum) into the parent"
+        why: The name is added last, so a failure before it leaves no entry pointing at a half-built inode.
+      - text: "`iunlockput(dp)` and return the new inode, still locked"
+        why: The parent lock is held from the lookup until the entry is written, then released.
+    why_wrong: The parent's lock must span "is the name free?" through "add the name"; everything about the new inode happens inside that span.
+    explain: |
+      Find and lock the parent, check the name, allocate, initialize, link, release the
+      parent. Holding the parent's lock from [[dirlookup]] to [[dirlink]] is what makes
+      "create if absent" atomic against another process creating the same name
+      ([[tour:35]]).
+
+  - id: ino-12
+    level: 2
+    type: multi
+    q: |
+      Which of these code paths hold **two** inode sleep-locks at the same time?
+    options:
+      - text: create() making a new file
+        correct: true
+        why: It holds the parent `dp` and locks the new inode `ip` (line 294) before dirlink, parent first.
+      - text: sys_unlink() removing a file
+        correct: true
+        why: It locks the parent (line 218) and then the file (line 226), parent first.
+      - text: sys_link()
+        why: |
+          You may have expected it to hold the file and the target directory. It unlocks the
+          file (line 153) before [[nameiparent]] and locks the directory alone; holding the
+          file while locking a directory would be child-then-parent.
+      - text: namex() walking /a/b/c
+        why: |
+          You may have expected lock coupling. [[namex]] unlocks each directory (line 720)
+          before the loop locks the next one.
+      - text: create() when the name already exists as a file
+        why: |
+          You may have expected it to lock the existing file under the parent. It calls
+          `iunlockput(dp)` first (line 281), then `ilock(ip)`, so it never holds both.
+      - text: sys_open() of an existing file without O_CREATE
+        why: |
+          You may have forgotten that [[namei]] returns the inode unlocked and holds no lock
+          itself when it returns. `sys_open` then locks only that one inode.
+    explain: |
+      Wherever two inode locks are held, the order is a directory first, then an inode
+      named in it (or just allocated for it). Paths that would break that order give up the
+      first lock instead ([[concept:locks#order]], [[tour:35]]).
+
+  - id: ino-13
+    level: 2
+    type: number
+    q: |
+      Starting from nothing, a user runs `mkdir /d`, `mkdir /d/x`, `mkdir /d/y` and
+      `echo hi > /d/f`. What is the `nlink` of directory `d` afterwards?
+    answer: 3
+    wrong:
+      4: |
+        You may have counted the file `f`. A file's entry in `d` links to `f`, not to `d`;
+        only a subdirectory's `..` entry points back at `d`.
+      5: |
+        You may have counted `d`'s own `.` entry and the file. [[create]] deliberately does
+        not count `.` ("avoid cyclic ref count"), and the file does not count.
+      2: |
+        You may have counted `d`'s name and `.`. `.` is not counted, but each of the two
+        subdirectories' `..` entries is.
+    why_wrong: Count the directory entries anywhere on disk that hold d's inode number, excluding d's own ".".
+    explain: |
+      `mkdir /d` sets `nlink = 1` (its name in `/`). Each `mkdir` of a subdirectory runs
+      `dp->nlink++` for the child's `..` (line 311). So 1 + 2 = 3. xv6 does not count `.`
+      (create's comment: "avoid cyclic ref count"), so [[sys_unlink]]'s single `nlink--`
+      brings an empty directory to 0. Systems that do count `.` start a directory at
+      `nlink` 2 and drop both links on rmdir ([[tour:35]]).
+
+  - id: ino-14
+    level: 2
+    type: choice
+    q: |
+      [[sys_unlink]] refuses the names `.` and `..` (line 221) before it calls
+      [[dirlookup]] and `ilock(ip)`. Apart from keeping the tree intact, what would go
+      wrong with the locks if `unlink("d/.")` were allowed through?
+    code: kernel/sysfile.c:201-233@218-226
+    options:
+      - text: dirlookup would return d itself, and ilock(ip) on line 226 would wait forever for the lock this process already holds on d.
+        correct: true
+        why: |
+          `.` names the directory itself, so `ip == dp`. Sleep-locks do not detect a
+          self-deadlock: [[acquiresleep]] sees `locked == 1` and sleeps, and nobody will
+          ever release it.
+      - text: The kernel would panic with "acquire", because the same lock is taken twice.
+        why: |
+          You may be thinking of spinlocks. [[acquire]] panics on a double acquire because it
+          checks `holding()`. [[acquiresleep]] has no such check; the process would hang.
+      - text: Nothing would go wrong with the locks; the entry would be removed and d would become unreachable.
+        why: |
+          The tree damage is real, but the code never gets that far: the second `ilock` of
+          the same inode blocks before any entry is cleared.
+      - text: dirlookup would panic, because "." is not stored in the directory.
+        why: |
+          You may have thought `.` is virtual. [[create]] writes real `.` and `..` entries
+          into every new directory, and [[dirlookup]] finds them like any other name.
+    explain: |
+      The check rules out `.` (a self-deadlock) and `..` (locking the parent's parent while
+      holding the child, against the parent-first order) before any second lock is taken
+      ([[tour:35]]).
+
+  - id: ino-15
+    level: 2
+    type: choice
+    q: |
+      A program creates `abcdefghijklmnop` (16 characters) and then calls
+      `open("abcdefghijklmnXY", O_RDONLY)` in the same directory. What happens?
+    code: kernel/fs.c:662-685@675-681
+    options:
+      - text: The open succeeds and returns the same file, because names are cut to 14 bytes and compared with strncmp limited to 14.
+        correct: true
+        why: |
+          [[skipelem]] copies only [[DIRSIZ]] = 14 bytes of a long element (line 677),
+          [[dirlink]] stores those 14, and [[namecmp]] compares at most 14. Both names start
+          with `abcdefghijklmn`.
+      - text: The open fails, because no file of that exact name exists.
+        why: |
+          You may have assumed full names are stored. Only the first 14 bytes reach the
+          disk, and only 14 are compared, so the trailing characters are ignored.
+      - text: The create already failed, because names longer than 14 characters are rejected.
+        why: |
+          You may have expected a length check. Nothing rejects long names; `skipelem`
+          silently truncates them.
+      - text: The open succeeds but reads garbage, since the stored name has no terminating zero.
+        why: |
+          A 14-byte name is stored without a terminator, but nothing treats it as a C string:
+          it is compared with a length limit. The inode found is the right one.
+    explain: |
+      `DIRSIZ` is a hard limit applied by truncation, not by error. The missing terminator
+      is harmless because every comparison is bounded to 14 bytes ([[tour:34]]).
+
+  - id: ino-16
+    level: 2
+    type: order
+    q: |
+      [[iput]] is dropping the last reference to an inode whose `nlink` is 0. Put its steps
+      in order.
+    code: kernel/fs.c:349-378
+    items:
+      - text: "acquire `itable.lock`; compute `last` and copy `dev` and `inum` into locals"
+        why: The decision must be made under the lock that protects ref.
+      - text: "`acquiresleep(&ip->lock)` while still holding `itable.lock`"
+        why: The inode's fields may be touched only under its sleep-lock; ref == 1 guarantees it is free, so this never sleeps.
+      - text: "release `itable.lock`"
+        why: Truncation reads and writes the disk, which sleeps; the spinlock must go first.
+      - text: "[[itrunc]]: free the data blocks, set size 0, [[iupdate]]"
+        why: The blocks are freed while the inode is still allocated on disk and still in the table.
+      - text: "`valid = 0`, then release the sleep-lock"
+        why: The entry no longer describes a live inode once it is truncated.
+      - text: "re-acquire `itable.lock`, `ref--` (to 0), release it"
+        why: The table entry becomes free only after the inode's contents are dealt with.
+      - text: "[[ifree]]`(dev, inum)`: write type 0 on disk"
+        why: The number becomes allocatable only after ref is 0, so no iget can still find the old entry for it.
+    why_wrong: Each step needs the right lock; and the inode number must become reusable only at the very end.
+    explain: |
+      Decide, lock, drop the spinlock, truncate, invalidate, drop the reference, and only
+      then free the number. The last two were the other way round before xv6 commit
+      `d7e85f1`, which could leak an inode ([[tour:33]]).
+
+  - id: ino-17
+    level: 2
+    type: choice
+    q: |
+      [[fileclose]] wraps the `iput` of an inode in [[begin_op]] and [[end_op]], even though
+      closing a file usually writes nothing. Why?
+    code: kernel/file.c:58-83@78-81
+    options:
+      - text: This iput might be the last reference to an unlinked inode; then it truncates and frees it, writing the bitmap and inode blocks, and every disk change must be inside a transaction.
+        correct: true
+        why: |
+          [[iput]] calls [[itrunc]] and [[ifree]], which call [[log_write]]; `log_write`
+          panics ("log_write outside of trans") if no transaction is open. Whether this
+          `iput` is the freeing one is known only inside it.
+      - text: To flush the file's modified data blocks to disk on close.
+        why: |
+          You may know systems that flush on close. Each `write` already logged its blocks in
+          its own transaction, which commits with its group; close has nothing to flush.
+      - text: Because iput takes itable.lock, which may only be taken inside a transaction.
+        why: |
+          You may have connected two unrelated rules. `itable.lock` is an ordinary spinlock,
+          taken by [[iget]] outside transactions too.
+      - text: To update the file's access time on disk.
+        why: |
+          You may know Unix file systems that record access times. A [[dinode]] here has no
+          time fields at all.
+    explain: |
+      "All calls to iput() must be inside a transaction in case it has to free the inode"
+      (the comment above [[iput]]). When nothing is freed, the transaction logs nothing and
+      its commit does no I/O ([[tour:33]]).
+
+  - id: ino-18
+    level: 2
+    type: bits
+    q: |
+      gdb shows the first 12 bytes of inode 24's [[dinode]] (little-endian: `type`, `major`,
+      `minor`, `nlink` as 2-byte shorts, then `size` as a 4-byte uint):
+      `01 00 00 00 00 00 03 00 40 00 00 00`. Decode it.
+    value: "0100 0000 0000 0300 40000000"
+    fields:
+      - label: "`type`"
+        options: ["T_DIR (1)", "T_FILE (2)", "T_DEVICE (3)", "free (0)"]
+        answer: "T_DIR (1)"
+        why: "Bytes 01 00 are the short 1, and stat.h defines T_DIR as 1."
+      - label: "`nlink`"
+        options: ["3", "0", "768", "1"]
+        answer: "3"
+        why: "The fourth short is 03 00 = 3 in little-endian. 768 (0x0300) is the big-endian reading."
+      - label: How many subdirectories does it have?
+        options: ["2", "3", "1", "cannot be zero for a directory"]
+        answer: "2"
+        why: "A directory's nlink is 1 for its own name plus 1 for each subdirectory's `..`; its own `.` is not counted."
+      - label: How many 16-byte entries does its content hold (`size` / 16)?
+        options: ["4", "64", "3", "2"]
+        answer: "4"
+        why: "size = 0x40 = 64 bytes, and a dirent is 16 bytes: `.`, `..` and the two subdirectories."
+      - label: If its ref dropped to 0 now, would iput free it?
+        options: ["no", "yes"]
+        answer: "no"
+        why: "iput frees only an inode with nlink == 0; this one still has three links."
+    explain: |
+      A directory with `nlink 3` and 64 bytes of content: `.`, `..`, and two subdirectories,
+      each of whose `..` adds one link. [[create]] and [[sys_unlink]] maintain this count
+      ([[tour:35]]).
+
+  - id: ino-19
+    level: 3
+    type: multi
+    q: |
+      `rm /x` removes a regular file `/x` that has 3 data blocks, `nlink 1`, and is not open
+      anywhere. Which blocks does this one transaction log (pass to [[log_write]])?
+    options:
+      - text: The root directory's data block that held the entry for x
+        correct: true
+        why: "[[sys_unlink]] zeroes the 16-byte entry with [[writei]], which logs that block."
+      - text: The block holding the root directory's inode
+        correct: true
+        why: "[[writei]] always ends with [[iupdate]] of the directory, even though its size did not change."
+      - text: The block holding x's inode
+        correct: true
+        why: "`nlink--` is written with iupdate, then itrunc's iupdate and [[ifree]] write it again (absorbed into one entry)."
+      - text: The bitmap block
+        correct: true
+        why: "The final [[iput]] sees ref 1 and nlink 0, so [[itrunc]] calls [[bfree]] for each of the 3 blocks, clearing their bits."
+      - text: x's 3 data blocks
+        why: |
+          You may have thought freeing erases the data. [[bfree]] only clears bits in the
+          bitmap; the old contents stay in the blocks until they are reused.
+      - text: The log header block
+        why: |
+          You may have thought the header is logged like other blocks. It is written directly
+          by [[write_head]] during the commit; nothing passes it to `log_write`.
+    explain: |
+      Unlinking the last name of an unopened file both removes the name and, through the
+      `iput` in `iunlockput(ip)`, frees the inode: directory block, directory inode, file
+      inode, bitmap. Whether the two inode blocks are one block or two depends on the inode
+      numbers; either way each block is logged once ([[tour:33]], [[tour:35]]).
+
+  - id: ino-20
+    level: 2
+    type: line
+    q: |
+      In [[iput]], click the line after which [[ialloc]] on another hart may hand this
+      inode's number to a brand-new file.
+    code: kernel/fs.c:349-378
+    answer: 377
+    lines:
+      365: |
+        [[itrunc]] frees the data blocks, not the inode. The on-disk `type` stays non-zero
+        (the comment says so), so `ialloc` still sees the inode as in use.
+      366: |
+        `valid = 0` only marks the in-memory entry as stale. `ialloc` reads the disk, not
+        the table.
+      373: |
+        `ref--` frees the *table entry*, so [[iget]] can recycle it for another inode. The
+        inode number is still allocated on disk until the next step.
+      357: |
+        This only *decides* that the inode must be freed. Nothing on disk changes here.
+    why_wrong: ialloc decides by reading `type` in the on-disk dinode; find the line that sets it to 0.
+    explain: |
+      Line 377 calls [[ifree]], which writes `type = 0` through the log. It runs only after
+      `ref` is 0, so when the number is reused, [[iget]] cannot find a live entry for it and
+      takes a fresh slot that it reads from disk ([[tour:33]]).
+
+  - id: ino-21
+    level: 3
+    type: state
+    q: |
+      `cat` calls `close(3)` on a file that `rm` already unlinked. Inside [[fileclose]] →
+      [[iput]], line 362's `acquiresleep` has just returned and line 363 has not run yet.
+      What is the state of the hart running `cat`?
+    code: kernel/fs.c:349-378@362
+    state:
+      mode: S
+      stack: kernel
+      satp: kernel
+      sie: "off"
+      noff: 1
+      intena: 1
+    why:
+      noff: |
+        `itable.lock` (taken on line 352) is still held: one push_off level. The sleep-lock
+        just taken does not count, and [[acquiresleep]] released its inner `lk->lk` before
+        returning.
+      sie: |
+        A spinlock is held, so interrupts are off on this hart; push_off turned them off
+        when `itable.lock` was acquired.
+      intena: |
+        intena records SIE before the outermost push_off. This is a system call, and
+        [[usertrap]] turned interrupts on before calling `syscall`, and `fileclose` and
+        [[begin_op]] released their spinlocks, so SIE was on: intena 1.
+      stack: |
+        System calls run on the calling process's kernel stack, here `cat`'s.
+      satp: |
+        The kernel runs on the kernel page table; [[usertrap]] was entered through the
+        trampoline, which switched satp.
+    why_wrong: Count which spinlocks are held at this instant and what SIE was before the first of them.
+    explain: |
+      S-mode, `cat`'s kernel stack, kernel page table, one spinlock (`itable.lock`) held so
+      SIE is off and noff is 1, intena 1. `iput` holds a sleep-lock under a spinlock here,
+      legal only because `ref == 1` guarantees `acquiresleep` did not sleep
+      ([[concept:locks#unusual]], [[tour:33]]).
+
+  - id: ino-22
+    level: 3
+    type: choice
+    q: |
+      [[iput]] copies `ip->dev` and `ip->inum` into the locals `dev` and `inum` (line 358),
+      and line 377 calls `ifree(dev, inum)` rather than `ifree(ip->dev, ip->inum)`. Why?
+    code: kernel/fs.c:349-378@358-377
+    options:
+      - text: After ref drops to 0 and itable.lock is released, another hart's iget may recycle this table entry for a different inode, overwriting ip->dev and ip->inum.
+        correct: true
+        why: |
+          A table entry with `ref == 0` is free; [[iget]] can claim it and set new `dev` and
+          `inum` the moment `itable.lock` is released on line 374. Reading them after that
+          could free the wrong inode.
+      - text: Because ip->inum is cleared by itrunc.
+        why: |
+          You may have thought truncation resets the identity. [[itrunc]] clears `addrs[]` and
+          `size`; it never touches `dev` or `inum`.
+      - text: Because ifree needs the values after ip has been passed to kfree.
+        why: |
+          You may have thought table entries are heap-allocated. The inode table is a fixed
+          array; entries are never freed with [[kfree]], only reused.
+      - text: Only for speed, to avoid reading ip twice.
+        why: |
+          You may have taken it as an optimization. The comment on lines 354-356 explains it
+          is about correctness: once `ref` is 0, `ip` may describe another inode.
+    explain: |
+      Once `ref` is 0 and `itable.lock` is free, `ip` is no longer ours. Everything `iput`
+      still needs after that point must have been saved before ([[tour:33]]).
+
+  - id: ino-23
+    level: 3
+    type: choice
+    q: |
+      On a fresh disk a user runs `mkdir /a`, `mkdir /a/b`, `cd /a/b`, `/rm /a/b`, `/rm /a`,
+      and then `/ls ..`. What happens in this kernel, and which check is responsible?
+    code: kernel/fs.c:691-728@707-710
+    options:
+      - text: "ls prints that it cannot open \"..\": namex locks b, finds nlink == 0 (b was unlinked) and returns 0 without looking up \"..\"."
+        correct: true
+        why: |
+          The shell's `cwd` still references `b`, so `b` was not freed, but its `nlink` is 0.
+          Line 707 stops the walk there. Without it, `b`'s `..` entry still names `a`'s inode
+          number, `a` has been freed (type 0), and [[ilock]] would panic "ilock: no type".
+      - text: ls lists the root directory, because a deleted directory's ".." is redirected to /.
+        why: |
+          You may have expected a fallback. Nothing in xv6 rewrites `..`; the stale entry in
+          `b` still names `a`'s old inode number.
+      - text: "The kernel panics with \"ilock: no type\"."
+        why: |
+          That is what happened before xv6 commit `9da28f5` added the `nlink == 0` check on
+          line 707. In this version the walk stops at `b` first.
+      - text: "`/rm /a/b` fails, because b is the shell's current directory."
+        why: |
+          You may know systems that refuse this. [[sys_unlink]] checks only that `b` is an
+          empty directory; nobody checks whether it is someone's `cwd`.
+    explain: |
+      A directory can be deleted while still referenced (as a `cwd`), so [[namex]] must
+      check `nlink` after locking each directory, just as [[create]] does for the parent
+      ([[tour:34]]).
+
+  - id: ino-24
+    level: 3
+    type: multi
+    q: |
+      Two processes on two harts call `open("same", O_CREATE|O_WRONLY)` in `/` at nearly the
+      same moment; `same` does not exist yet. Which statements are true afterwards?
+    code: kernel/sysfile.c:258-292
+    options:
+      - text: Both open calls succeed
+        correct: true
+        why: The second [[create]] finds the entry and, for a `T_FILE` request on a `T_FILE`, returns the existing inode (line 283).
+      - text: The root directory contains exactly one entry named same
+        correct: true
+        why: The lookup and the dirlink happen under `/`'s lock, so the second process's lookup sees the first one's entry.
+      - text: ialloc was called only once for same
+        correct: true
+        why: The process that loses the race finds the name in [[dirlookup]] and returns before reaching [[ialloc]].
+      - text: The two processes share one struct file and therefore one offset
+        why: |
+          You may have thought one inode means one open file. Each [[sys_open]] calls
+          [[filealloc]], so each has its own `struct file` and offset; their writes overlap
+          at offset 0.
+      - text: The second open fails because the name already exists
+        why: |
+          You may be thinking of `mkdir`, which does fail on an existing name. `open` with
+          `O_CREATE` of an existing file simply opens it.
+    explain: |
+      Holding the parent's lock from [[dirlookup]] to [[dirlink]] makes "create if absent"
+      atomic: without it both could see "absent", allocate two inodes, and write two
+      entries with the same name ([[tour:35]]).
+
+  - id: ino-25
+    level: 3
+    type: choice
+    q: |
+      [[sys_link]] increments the file's `nlink`, then **unlocks** the file (line 153)
+      before calling [[nameiparent]] and locking the target directory. Why not keep the
+      file locked until the new entry is written?
+    code: kernel/sysfile.c:122-172@151-157
+    options:
+      - text: Locking a directory while holding a file in it reverses the parent-before-child order; a concurrent rm of the file (parent, then file) could deadlock with it.
+        correct: true
+        why: |
+          `ln newfile alias` in `/`: the target directory `/` is `newfile`'s parent.
+          [[sys_unlink]] locks `/` and then the file. Holding the file while waiting for `/`
+          would let each wait for the other forever.
+      - text: Because dirlink panics if the inode it links to is locked.
+        why: |
+          You may have thought [[dirlink]] locks the target inode. It only writes `(name,
+          inum)` into the directory; it never touches the inode being named.
+      - text: So that other processes can see the higher nlink as soon as possible.
+        why: |
+          You may have thought visibility is the goal. The change is inside a transaction
+          and nobody outside sees it until the commit anyway.
+      - text: Because a process may hold at most one sleep-lock.
+        why: |
+          You may have overgeneralized. [[create]] and [[sys_unlink]] hold two inode locks
+          (and [[writei]] adds a buffer); the limit here is about order, not count.
+    explain: |
+      Holding one inode lock at a time sidesteps the ordering question. The cost is a
+      window where `nlink` is one higher than the number of names; the `bad:` path
+      decrements it again if the link fails, and the transaction hides the window from the
+      disk ([[tour:35]]).

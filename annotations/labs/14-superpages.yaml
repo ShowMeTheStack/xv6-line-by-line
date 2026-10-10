@@ -1,0 +1,1651 @@
+published: true
+title: Superpages
+area: Memory
+stars: 4
+branch: ext/14-superpages
+prerequisites: {tours: [20, 24, 25, 26, 27, 28], concepts: [stacks, locks]}
+summary: |
+  Every user page in this tree is 4096 bytes, mapped by a [[g:pte]] in a level-0 page-table
+  page that [[walk]] reaches through two higher levels. A process that grows its heap by
+  4 megabytes gets 1,024 PTEs, two level-0 page-table pages to hold them, and 1,024
+  translations for the hardware to cache. Yet the [[g:sv39]] hardware can map 2 megabytes
+  with a single PTE one level higher up: a *superpage* (the RISC-V specification calls it a
+  megapage).
+
+  In this lab you let `sbrk` use them. The idea is one sentence; the consequences reach into
+  every corner of the memory system. Where does 2 megabytes of physically contiguous,
+  aligned memory come from, when the allocator hands out single pages in no particular
+  order, and what happens to that supply after the machine has been running for a while?
+  Which page-table functions assume, without saying so, that every leaf sits at level 0,
+  and what does each of them do when it meets one that does not? What does `fork` do with a
+  superpage when no 2-megabyte chunk is free, and what does `sbrk(-n)` do when the new end
+  falls in the middle of one?
+
+  The reference solution is nine small commits. With it, a 4-megabyte `sbrk` is mapped by
+  two PTEs, a 64-megabyte heap needs 32 fewer page-table pages, and the allocator keeps all
+  63 chunks of RAM above the kernel available as superpages even after a full `usertests`
+  run. You will also measure, honestly, what superpages do *not* buy on QEMU.
+learn:
+  - "How the Sv39 walk decides that a PTE is a leaf, why a leaf may sit at any level, and what the hardware requires of a leaf above level 0 (and what it does when the requirement is not met)."
+  - "Which of the kernel's page-table functions silently assume that every leaf is at level 0, and what each of them does with a superpage when nobody tells it."
+  - "Why physically contiguous memory is a resource of its own, how an allocator can hand out both pages and 2-megabyte chunks, and what physical fragmentation looks like on a running system."
+  - "What `sbrk` must do when the new end falls inside a superpage, and what can go wrong."
+  - "What locks are held when `fork` and `wait` copy and free superpages, and why that rules out sleeping in the allocator."
+  - "What superpages buy (page-table pages, TLB reach on real hardware) and how to measure what they buy on an emulator."
+spec: |
+  **Behaviour.** When a process grows its memory with an eager `sbrk(n)` (not `sbrklazy`),
+  every 2-megabyte-aligned, 2-megabyte range that lies entirely inside the new memory is
+  mapped by one leaf PTE in a level-1 page-table page: a superpage, backed by 2 megabytes of
+  physical memory that is contiguous and 2-megabyte aligned. Whatever does not fit (the
+  unaligned ends, or every range when no such physical memory is free) gets ordinary
+  4096-byte pages, as before.
+
+  - `fork` gives the child a superpage of its own where it can, and otherwise the same bytes
+    in 4096-byte pages. It must not fail just because no 2-megabyte chunk is free.
+  - `sbrk(-n)` that ends in the middle of a superpage keeps the bytes below the new end.
+  - Lazy growth (`sbrklazy` and [[vmfault]]) keeps using 4096-byte pages.
+  - Two new system calls for testing: `int pglevel(void *va)` returns the level of the leaf
+    PTE that maps `va` (0 for a page, 1 for a superpage, -1 if unmapped);
+    `int freesuper(void)` returns how many superpages could be allocated right now.
+
+  **What must not change.** Every system call behaves as before: [[copyin]], [[copyout]]
+  and friends must work on superpages; out of memory must never panic the kernel; no page
+  may leak. **`usertests -q` must print `ALL TESTS PASSED` on 3 harts.**
+
+  **The test program**, `supertest`, prints one line per check (two lines are
+  information):
+
+  ```text
+  $ supertest
+  supertest: heap at 0x0000000000005000, superpages at 0x0000000000200000 and 0x0000000000400000
+  supertest: superpages: OK
+  supertest: every byte: OK
+  supertest: system calls: OK
+  supertest: fork copies superpages: OK
+  supertest: fragmented: 0 free superpages, 14145 free pages
+  supertest: fork without free superpages: OK
+  supertest: shrink splits: OK
+  supertest: unaligned growth uses pages: OK
+  supertest: lazy growth uses pages: OK
+  supertest: free pages 32459 before, 32459 after
+  supertest: free superpages 63 before, 63 after
+  supertest: no leaks: OK
+  supertest: ALL OK
+  ```
+
+  - **superpages**: grow the heap to a 2-megabyte boundary, then by 4 megabytes; `pglevel`
+    must report level 1 at both 2-megabyte halves and at the last byte, level 0 for the
+    padding below, and `freesuper` must have dropped by exactly 2.
+  - **every byte**: all 4,194,304 bytes read as zero, then hold a pattern.
+  - **system calls**: 400 bytes that cross a page boundary inside the second superpage go
+    into a pipe with `write` and come back with `read` into the first superpage, across a
+    page boundary there too.
+  - **fork copies superpages**: the child sees level 1 and the same bytes; its writes do not
+    reach the parent.
+  - **fork without free superpages**: two helper processes take turns allocating 64 pages at
+    a time until no superpage is free, then one exits. With about half of memory free but
+    no whole 2-megabyte chunk, a `fork` must still work, with the child at level 0.
+  - **shrink splits**: `sbrk` back to 2 pages below the 3-megabyte mark of the region: the
+    first superpage stays, the second becomes pages, the bytes below the new end survive, and
+    growing again gives zeroed memory.
+  - **unaligned growth**, **lazy growth**: 2 megabytes of growth that starts one page past a
+    boundary, and 2 megabytes of lazy growth, use level-0 pages.
+  - **no leaks**: the tests run in a child process; free pages (counted with `sbrk` in yet
+    another child) and free superpages are equal before and after.
+think:
+  - title: What does the hardware do with a leaf at level 1?
+    q: |
+      Read the comment above [[walk]] and the PTE bits in [[kernel/riscv.h:395]]. [[walk]]
+      always goes down to level 0, and every leaf this kernel writes sits there. But the
+      hardware walk runs on its own, from `satp`, on every access that misses the
+      [[g:tlb]]. What makes it stop at a PTE instead of descending, and could it stop at
+      level 1? If it does, how big is the region that one PTE maps, where does the low part
+      of the physical address come from, and what must be true of the physical page number
+      in that PTE? Commit to answers before the hints.
+    hints:
+      - "Look at [[freewalk]] ([[kernel/vm.c:270]]): how does the kernel's own code tell a pointer to a lower page-table page from a leaf?"
+      - "A level-1 PTE stands for 512 consecutive level-0 PTEs. Count the virtual-address bits that the walk has not used yet when it stops at level 1."
+      - "Steps 4 and 5 (current numbering) and the final step of the translation algorithm in the privileged specification: a valid PTE with R or X set is a leaf at whatever level it is found; the PTE's low page-number bits must then be zero; and the physical address is the PTE's page number with the unused VPN fields copied in as an offset."
+    answer: |
+      A valid PTE is a leaf when any of R, W, X is set (the specification's step 4 tests R
+      and X; R=0 with W=1 is reserved). Nothing restricts that to level 0: "Any level of PTE
+      may be a leaf PTE, so in addition to 4 KiB pages, Sv39 supports 2 MiB megapages and
+      1 GiB gigapages, each of which must be virtually and physically aligned to a boundary
+      equal to its size." [[freewalk]] already uses exactly this rule; it is the only place
+      in this tree that does.
+
+      A walk that stops at level 1 has used VPN[2] and VPN[1]; the remaining 21 bits of the
+      virtual address (VPN[0] and the page offset) become the offset into a 2-megabyte
+      region. The physical address is the PTE's PPN shifted left by 12, plus those 21 bits.
+      For that sum to make sense the PPN's low 9 bits must be zero, and the hardware checks:
+      step 5 of the algorithm says "If i>0 and pte.ppn[i-1:0] ≠ 0, this is a misaligned
+      superpage; stop and raise a page-fault exception corresponding to the original access
+      type." So a superpage costs nothing in the hardware, as long as the kernel finds
+      physical memory aligned to 2 megabytes; clinic 1 shows the fault when it does not.
+
+      What it buys: one PTE instead of 512, no level-0 page-table page at all, and one TLB
+      entry (on hardware that caches superpages as such) covering 512 times more memory. A
+      TLB with 64 entries reaches 256 KiB of 4096-byte pages, or 128 MiB of superpages
+      (arithmetic, not a measurement: RISC-V does not specify TLB sizes).
+    checks:
+      - id: lab14-01
+        level: 2
+        type: bits
+        q: |
+          On the reference branch, gdb stopped in `mapsuper` right after it wrote the leaf
+          for user address `0x200000` into the level-1 page-table page:
+          `0x21f80017`. Decode it.
+        value: "0x21f80017"
+        fields:
+          - label: "V (bit 0)"
+            options: ["0", "1"]
+            answer: "1"
+            why: "The low 10 bits are 0x017 = 00 0001 0111: bit 0 is set, the PTE is valid."
+          - label: "R, W, X (bits 1-3)"
+            options: ["0 0 0: points to a level-0 page", "1 1 0: a leaf, readable and writable", "1 1 1: a leaf, also executable"]
+            answer: "1 1 0: a leaf, readable and writable"
+            why: "0x7 in the low nibble is V, R and W; X (0x8) is clear. You may have thought a level-1 PTE always points to a lower table: with R or W set it is a leaf, at any level."
+          - label: "U (bit 4)"
+            options: ["0", "1"]
+            answer: "1"
+            why: "0x10 is set: user mode may use it. It is heap memory created by sbrk."
+          - label: "A and D (bits 6, 7)"
+            options: ["both 0", "both 1"]
+            answer: "both 0"
+            why: "Nothing has touched the superpage yet: the kernel zeroed it through the direct map, which uses a different PTE. QEMU sets A on the first user access and D on the first store (the demotion in the reveal shows both set, 0xd7)."
+          - label: "Physical address it maps"
+            options: ["0x87e00000", "0x21f80000", "0x87e00017"]
+            answer: "0x87e00000"
+            why: "PPN = 0x21f80017 >> 10 = 0x87e00; times 4096 = 0x87e00000. You may have masked off the flags without shifting, or kept the flag bits."
+          - label: "Is the PPN 2-megabyte aligned?"
+            options: ["yes: its low 9 bits are 0", "no: its low 9 bits are 0x17"]
+            answer: "yes: its low 9 bits are 0"
+            why: "0x87e00 & 0x1ff = 0. You may have looked at the PTE's low bits, which are the flags, not the PPN."
+        explain: |
+          `0x21f80017 >> 10` = `0x87e00`, the physical page number of the chunk at
+          `0x87e00000`; `0x87e00 & 0x1ff` = 0, so step 5 of the hardware walk is satisfied.
+          The flags `0x17` are V, R, W, U: a user-writable leaf at level 1. See
+          [[kernel/riscv.h:395]] and [[g:pte]].
+      - id: lab14-02
+        level: 1
+        type: number
+        q: |
+          A process's heap grows by exactly 4 megabytes, starting at a 2-megabyte boundary.
+          With 4096-byte pages, how many level-0 page-table pages does this growth need
+          (assuming none of them existed)? With superpages, the answer is 0.
+        answer: 2
+        wrong:
+          1024: |
+            You may have counted PTEs instead of page-table pages. 1,024 PTEs fill two
+            page-table pages of 512 entries each.
+          4: |
+            You may have assumed one level-0 page per megabyte. One level-0 page holds 512
+            PTEs, so it maps 512 × 4096 bytes = 2 megabytes.
+          1: |
+            You may have thought one level-0 page maps 4 megabytes. It maps exactly the
+            2 megabytes that one level-1 PTE stands for.
+        why_wrong: "One level-0 page-table page maps 512 pages of 4096 bytes: 2 megabytes."
+        explain: |
+          4 MiB / 2 MiB per level-0 page = 2 pages, 8 KiB of page tables. Small here; for the
+          64-megabyte heap in the measure section the saving is 32 pages, and it was observed
+          as exactly that difference in free pages.
+  - title: Where do 2 megabytes of contiguous memory come from?
+    q: |
+      Read [[kalloc]] and [[kfree]]. A superpage needs 2 megabytes of physical memory that is
+      contiguous *and* starts at a multiple of 2 megabytes. Could you build one from 512
+      calls to [[kalloc]]? If not, what must the allocator know that it does not know today,
+      and how will it keep 4096-byte allocations (page tables, kernel stacks, pipes, the
+      pages of every small process) working at the same time? Think about where the kernel
+      itself sits in RAM, too.
+    hints:
+      - "[[kfree]] pushes on a single list and [[kalloc]] pops from it: after a while, consecutive pops return pages from anywhere in RAM. Where is [[KERNBASE]], and how big is RAM ([[PHYSTOP]])?"
+      - "RAM from `0x80000000` to `0x88000000` contains exactly 64 aligned 2-megabyte regions. The kernel image (`end` is `0x80021f88` in this build) occupies part of the first one."
+      - "Give each aligned 2-megabyte chunk a state: whole and free, whole and in use as a superpage, or split into 512 pages with its own free list. Hand out whole chunks for superpages; split one only when no split chunk has a free page left."
+    answer: |
+      512 calls to [[kalloc]] return 512 pages in whatever order the free list holds them:
+      not contiguous, and not aligned. Contiguity is a property of physical memory that a
+      list of single pages has already thrown away. The allocator has to *keep* it.
+
+      RAM is 128 MiB from [[KERNBASE]], exactly 64 chunks of 2 megabytes, each aligned. The
+      reference keeps a state for each (`FREE`, `SUPER`, `SPLIT`), a free list per split
+      chunk and its count of free pages, all under the one `kmem.lock`:
+
+      - Chunk 0 holds the kernel (up to `end`, `0x80021f88` in this build) and is `SPLIT`
+        from boot: its 478 free pages above `end` serve the first small allocations.
+      - Chunks 1 to 63 start `FREE`. `superalloc` hands out a whole one; `superfree` takes
+        it back.
+      - [[kalloc]] takes a page from a split chunk, and splits a free chunk into 512 pages
+        only when no split chunk has one left. So 4096-byte allocations work until memory is
+        truly exhausted, exactly as before.
+
+      Why one lock for both kinds: a split and a superpage allocation look at the same chunk
+      states, so they must not interleave. No lock-order question arises, because the
+      allocator never takes another lock while holding `kmem.lock`. The new functions never
+      sleep, which matters in the next questions.
+    checks:
+      - id: lab14-03
+        level: 1
+        type: number
+        q: |
+          RAM runs from [[KERNBASE]] (`0x80000000`) to [[PHYSTOP]] (`0x88000000`). The
+          kernel image ends at `0x80021f88`. How many whole, 2-megabyte-aligned chunks of
+          RAM lie entirely above the kernel?
+        code: kernel/memlayout.h:40-44
+        answer: 63
+        wrong:
+          64: |
+            You may have counted every chunk of RAM. The first one, `0x80000000` to
+            `0x80200000`, contains the kernel's code and data, so it cannot be handed out
+            whole.
+          62: |
+            You may have thought the last chunk ends past [[PHYSTOP]]. 63 chunks start at
+            `0x80200000`, `0x80400000`, ..., `0x87e00000`; the last ends exactly at
+            `0x88000000`.
+        why_wrong: "128 MiB / 2 MiB = 64 chunks; the kernel occupies part of the first."
+        explain: |
+          `freesuper()` reports exactly 63 on a fresh boot of the reference branch. The free
+          pages of chunk 0 above `end` (478 of them) are used for small allocations.
+      - id: lab14-04
+        level: 2
+        type: choice
+        q: |
+          A learner builds `superalloc` as "call [[kalloc]] 512 times and keep the pages if
+          they happen to be consecutive and the first is 2-megabyte aligned". Why is this a
+          poor design in this kernel?
+        options:
+          - text: "The free list returns pages in the order they were freed; after the system has run for a while, 512 consecutive aligned pages in a row almost never come out, so it would almost always fail."
+            correct: true
+            why: |
+              Right. A single LIFO list remembers nothing about where pages are. Contiguity
+              has to be kept by the allocator's data structure, not hoped for.
+          - text: "It is fine; kalloc returns increasing addresses."
+            why: |
+              You may be thinking of a freshly booted kernel: [[freerange]] frees pages in
+              increasing order, so [[kalloc]] first returns them in *decreasing* order, and
+              after any process exits the list is in the order of its frees.
+          - text: "kalloc cannot be called 512 times while holding a lock."
+            why: |
+              You may have thought the lock limits the count. [[kalloc]] takes and releases
+              `kmem.lock` each time; nothing stops 512 calls.
+          - text: "The hardware does not require physical contiguity for superpages."
+            why: |
+              It does: one PTE holds one physical page number, and the walk adds the 21-bit
+              offset to it. The 2 megabytes behind it must be contiguous and aligned.
+        explain: |
+          A superpage is one physical address plus a 21-bit offset, so the memory must be one
+          aligned 2-megabyte block. The allocator has to know which blocks are wholly free;
+          the reference tracks the state of each of the 64 chunks.
+  - title: Which chunk should a small allocation use?
+    q: |
+      With chunks in place, every `kalloc` has a choice: which split chunk to take a page
+      from, and, when none has one, which free chunk to split. And when the 512 pages of a
+      split chunk are all free again, should it become a superpage again? Consider a design
+      with one free list for all pages of all split chunks, used like the original (last
+      freed, first allocated), that turns a chunk back into a superpage when its 512 pages
+      are free. Where would long-lived small allocations (page-table pages, kernel stacks,
+      pipe buffers) land under that rule? Then predict what `supertest` sees with that
+      design, on a fresh boot. One fact you need: before its tests, `supertest`
+      counts free pages in a child process that calls `sbrk(4096)` until it fails, then
+      exits; its exit frees its data pages first and its page-table pages last.
+    hints:
+      - "Page-table pages, kernel stacks and pipes are long-lived small allocations. Where would they land if the list hands out the most recently freed page first?"
+      - "One page in use is enough to keep a chunk from ever being whole again. The danger is spreading small allocations thinly over many chunks."
+      - "Address-ordered: take a page from the *lowest* split chunk that has one, split the *lowest* free chunk when needed, and hand out superpages from the *top* down. A split chunk whose 512 pages are free counts as whole."
+    answer: |
+      With that design `supertest` got none: `superpages: FAIL`, `fork copies
+      superpages: FAIL`, even on a fresh boot with 63 chunks free a moment before. The test
+      first counts free pages in a child, which allocates all of memory and exits. The
+      explanation, reasoned from the code (the run shows only the result): the child's
+      page-table pages, about one in every chunk, are freed last, so they sit on top of
+      the list; the next allocations (the padding `sbrk` before the superpages) pop exactly those pages
+      first, and no chunk is whole any more. And after one `usertests -q` run with that
+      design, `supertest` found only 52 free superpages where it had found 63.
+
+      The reference allocates small pages from the lowest split chunk that has one, splits
+      the lowest free chunk only when it must, and gives out superpages from the highest
+      whole chunk. Small allocations pile up at the bottom of RAM, near the kernel, and the
+      top stays whole. With it, `supertest` reports 63 free superpages before and after,
+      also after a full `usertests -q`. Every split chunk whose 512 pages are free again
+      counts as whole (`whole()` in commit 3): with a free list per chunk there is nothing
+      to unlink, `superalloc` forgets the list.
+
+      What no policy can fix: a chunk with one page in use is not available. `supertest`
+      shows it on purpose (the "fragmented" line): with two processes interleaving their
+      allocations, 14,145 pages (55 megabytes) were free and not one superpage. Real kernels
+      go further: they move pages to make room (compaction) or group allocations by
+      lifetime.
+    checks:
+      - id: lab14-05
+        level: 2
+        type: choice
+        q: |
+          Right after `fragment()` in `supertest`, 14,145 pages are free but `freesuper()`
+          returns 0. What is true?
+        options:
+          - text: "Every split chunk still has at least one page in use, so none can be handed out whole; the free memory is scattered over many chunks."
+            correct: true
+            why: |
+              Right. The two helpers took 64 pages at a time in turn, so every chunk they
+              touched holds pages of both; when one exits, the other's pages pin every chunk.
+          - text: "freesuper only counts chunks that were never split."
+            why: |
+              You may have missed `whole()`: a split chunk whose 512 pages are all free counts
+              too. None of them qualifies here.
+          - text: "The free pages are page-table pages of the exited process."
+            why: |
+              You may have mixed up who holds what. The exited process's page-table pages
+              were freed with it; they are part of the 14,145 free pages.
+          - text: "The kernel reserves the free memory for small allocations."
+            why: |
+              Nothing is reserved: any chunk with all 512 pages free would be handed out as a
+              superpage.
+        explain: |
+          Free memory and *usable* memory differ once the unit you need is bigger than the
+          unit you allocate. This is physical fragmentation; `fork` copes with it by falling
+          back to pages (question 5).
+  - title: Which page-table functions assume every leaf is at level 0?
+    q: |
+      Go through `vm.c` function by function: [[walk]], [[walkaddr]], [[mappages]],
+      [[uvmunmap]], [[uvmalloc]], [[uvmdealloc]], [[uvmcopy]], [[uvmfree]], [[freewalk]],
+      [[copyout]], [[copyin]], [[ismapped]], [[vmfault]]. For each, imagine it handed an
+      address inside a superpage. Which do something wrong today, and what exactly? Start
+      with [[walk]]: what does its loop do when the level-1 PTE is valid?
+    hints:
+      - "[[walk]]'s loop ([[kernel/vm.c:104]]) takes any valid PTE as a pointer to the next page-table page. What is at that physical address when the PTE is a superpage leaf?"
+      - "Callers get a PTE pointer back and assume it maps one 4096-byte page at `PTE2PA(*pte)`. For a level-1 leaf that is only the first page of 512."
+      - "Make the walk stop at a leaf and report the level it stopped at. Then revisit each caller with one question: does it assume the PTE it got back maps exactly 4096 bytes at `PTE2PA(*pte)`?"
+    answer: |
+      [[walk]] is the root of it. Its loop descends through any valid PTE. At a superpage
+      leaf it would take the superpage's first 4096 bytes of *user data* as a level-0 table
+      and return a pointer into them. Everything built on [[walk]] then works on garbage that
+      the user wrote; clinic 2 shows what happened when that was left in. The reference
+      `walklevel` stops at a leaf, like the hardware, and says which level it stopped at;
+      [[walk]] keeps its interface.
+
+      Then, for a superpage address:
+
+      | function | with the leaf-stopping walk, function unchanged | needs |
+      |---|---|---|
+      | [[walkaddr]] | returns the superpage's first page for every address in it | add the offset of va's 4096-byte piece |
+      | [[mappages]] | finds the level-1 leaf valid and panics `remap` | nothing: mapping a page over a superpage is a bug |
+      | [[uvmunmap]] | [[kfree]]s the first page only, as if it were a page | free the superpage whole, skip its 512 pages; refuse to free part of one |
+      | [[uvmcopy]] | copies the first 4096 bytes 512 times | copy the superpage, or its 512 pieces |
+      | [[uvmdealloc]] | cuts a superpage in two | split it first (question 5) |
+      | [[uvmalloc]] | — | where the superpages are made |
+      | [[freewalk]] | panics `freewalk: leaf` on any leaf | nothing: no leaf may be left |
+      | [[uvmclear]] | would clear `PTE_U` on the whole superpage | nothing: it is only used on `exec`'s guard page, and the guard page and stack are 2 pages, never a superpage |
+      | [[copyin]], [[copyout]], [[ismapped]], [[vmfault]] | correct once [[walkaddr]] and [[walk]] are | nothing |
+
+      [[freewalk]] is the instructive one. Its test `(pte & (PTE_R|PTE_W|PTE_X)) == 0` is
+      exactly the hardware's leaf rule, applied at every level, and its panic is the safety
+      net: if [[uvmunmap]] ever leaves a superpage mapped, the process cannot be freed. Lazy
+      allocation stays as it is: [[vmfault]] maps one page at a time and refuses addresses
+      that are mapped, including those inside a superpage.
+    checks:
+      - id: lab14-06
+        level: 2
+        type: multi
+        q: |
+          Which existing functions does the reference branch change in `vm.c` and
+          `proc.c`?
+        options:
+          - text: "walk and walkaddr"
+            correct: true
+            why: "The software walk must stop where the hardware stops (walk now calls walklevel), and walkaddr adds the offset of the 4096-byte piece inside the superpage."
+          - text: "uvmunmap"
+            correct: true
+            why: "It frees a superpage whole and skips the rest of its range."
+          - text: "uvmcopy"
+            correct: true
+            why: "fork must copy 2 megabytes, into a superpage or 512 pages."
+          - text: "uvmalloc, uvmdealloc and growproc"
+            correct: true
+            why: "uvmalloc makes superpages; uvmdealloc splits one that the new end cuts; growproc reports a failed split."
+          - text: "freewalk"
+            why: |
+              You may have expected it to need a level-1 case. Its leaf test already works at
+              every level; finding any leaf is a bug in the caller, and the panic stays.
+          - text: "copyout and copyin"
+            why: |
+              You may have thought they walk page tables themselves. They call
+              [[walkaddr]] (and [[walk]] for the `PTE_W` test), which give the right answer
+              once those are fixed.
+        explain: |
+          Seven existing functions change (walk, walkaddr, uvmunmap, uvmcopy, uvmalloc,
+          uvmdealloc, growproc), and three new ones appear (`walklevel`, `mapsuper`,
+          `demote`); [[walk]] itself becomes a three-line wrapper around `walklevel`. The
+          functions that only *use* translations need nothing, because the translation is
+          right at its source. [[vmfault]] needs nothing either: lazy pages stay 4096 bytes,
+          and [[ismapped]] reports an address inside a superpage as mapped.
+      - id: lab14-07
+        level: 3
+        type: choice
+        q: |
+          A learner keeps the original [[uvmunmap]] but uses the new `walk`, which returns the
+          level-1 leaf for any address inside a superpage. A process with one superpage at
+          `0x200000` exits. What happens on the reference allocator?
+        code: kernel/vm.c:194-213
+        options:
+          - text: "The first iteration in the superpage calls kfree on the superpage's physical address, and kfree panics because that chunk is not split: kfree: whole chunk."
+            correct: true
+            why: |
+              Right; recorded in clinic 4. [[kfree]]'s new check exists for exactly this.
+          - text: "All 512 pages are freed one by one, which is slower but correct."
+            why: |
+              You may have expected 512 different PTEs. [[walk]] returns the *same* level-1
+              PTE for every address in the superpage, and the first iteration clears it; the
+              next 511 find nothing valid.
+          - text: "panic: freewalk: leaf, because the level-1 leaf stays."
+            why: |
+              The leaf does not stay: the loop sets `*pte = 0` after freeing. The problem is
+              what it frees.
+          - text: "Nothing visible; the memory just leaks."
+            why: |
+              That is what the original allocator would do (one page freed, 511 lost). The
+              reference allocator refuses a 4096-byte free inside a chunk that is not split.
+        explain: |
+          A leaf above level 0 must be freed as the unit it is. [[uvmunmap]] in the reference
+          checks `level == 1`, frees with `superfree`, and skips `SUPERPGSIZE - PGSIZE` more
+          bytes.
+  - title: What happens when sbrk shrinks into the middle of a superpage?
+    q: |
+      A process has a superpage at `0x400000` and calls `sbrk` so that its new size is
+      `0x4fe000`. The pages from `0x4fe000` up must be freed; the 1,016 KiB below must keep
+      their bytes. One PTE cannot map half of 2 megabytes. What has to happen to the page
+      table, what has to happen in the allocator, and what can fail? And what would happen
+      if [[uvmdealloc]] left the superpage alone because it could not free all of it?
+    hints:
+      - "[[uvmunmap]] in the reference refuses to free part of a superpage. Something must run before it, in [[uvmdealloc]]."
+      - "512 level-0 PTEs can map the same 2 megabytes the level-1 PTE maps, piece by piece, with the same permissions. That needs one new page: a level-0 page-table page."
+      - "A new level-0 page-table page can stand in for the leaf. What must its entries say, what must the allocator be told before [[kfree]] sees any of the pieces, and what should `sbrk` do if that one page cannot be allocated?"
+    answer: |
+      Demotion: allocate a level-0 page-table page, fill its 512 PTEs with
+      `PA2PTE(pa + i * PGSIZE)` and the superpage's flags, then replace the level-1 leaf by a
+      pointer to the new page (no R, W, X). Nothing moves: the same physical bytes, now
+      reached through 512 PTEs. gdb on the reference recorded it for `va 0x4fe000`: the
+      leaf was `0x21f000d7` (PPN `0x87c00`, flags V R W U A D), and the new entries `l0[0]`,
+      `l0[1]`, `l0[511]` were `0x21f000d7`, `0x21f004d7`, `0x21f7fcd7`, one page apart. Then
+      [[uvmunmap]] frees the top 258 pieces with [[kfree]].
+
+      The allocator must agree: the chunk was `SUPER`, and [[kfree]] refuses pages of a chunk
+      that is not `SPLIT`. `supersplit` turns it into a split chunk with no free pages; as the
+      pieces are freed its count rises, and when all 512 are free it can become a superpage
+      again.
+
+      What can fail is the new page-table page. [[uvmdealloc]] then frees nothing and returns
+      the old size, and `growproc` turns that into `sbrk` returning -1. A shrink that fails
+      for lack of memory is new in this kernel; it is the price of one PTE that cannot be
+      split without a page to split it into.
+
+      If [[uvmdealloc]] left the superpage mapped instead (clinic 3), memory above `p->sz`
+      would stay mapped and usable, and the next growth would try to map a page where the
+      superpage still is: `panic: mappages: remap`. Had the process exited instead,
+      [[uvmfree]] would have left the leaf and [[freewalk]] would have panicked.
+    checks:
+      - id: lab14-08
+        level: 2
+        type: tf
+        q: |
+          True or false: demoting a superpage requires copying its 2 megabytes into 512
+          newly allocated pages.
+        answer: false
+        why_tf: |
+          You may have thought a superpage's memory is different from pages' memory. It is
+          the same physical memory; only the way it is mapped changes.
+        reasons:
+          - text: "The 512 new level-0 PTEs point at the 512 pieces of the same physical chunk; only one page (the new page-table page) is allocated."
+            correct: true
+            why: Right. That is why demotion keeps data and costs one page.
+          - text: "The hardware requires level-0 pages to be allocated by kalloc."
+            why: |
+              The hardware knows nothing about kalloc. A level-0 PTE may name any page of RAM;
+              the allocator's bookkeeping is the kernel's own business (`supersplit`).
+          - text: "Copying is needed so that the old superpage can be freed with superfree."
+            why: |
+              Nothing is freed whole: the chunk becomes a split chunk and its pieces are freed
+              one at a time.
+        explain: |
+          A page-table change, not a data change. gdb showed `l0[1]` = `0x21f004d7`, PPN
+          `0x87c01`: the second 4096 bytes of the same chunk.
+      - id: lab14-09
+        level: 2
+        type: choice
+        q: |
+          On the reference branch, under memory pressure, `sbrk(-4096)` returns -1. What
+          happened?
+        options:
+          - text: "The new end falls inside a superpage, and demote could not allocate the level-0 page-table page it needs; nothing was freed."
+            correct: true
+            why: |
+              Right. [[uvmdealloc]] returns the old size and `growproc` reports failure.
+          - text: "sbrk can never shrink a superpage, so it always fails there."
+            why: |
+              It shrinks it by demoting; only the allocation of one page can fail.
+          - text: "uvmunmap panicked and the system call returned -1."
+            why: |
+              A panic stops the kernel; it does not return -1. [[uvmunmap]] is never asked
+              to free part of a superpage, because demotion runs first.
+          - text: "The process has no superpages; shrinking never fails for pages."
+            why: |
+              That part is right for pages, but then `sbrk(-4096)` would not have failed.
+        explain: |
+          Splitting a superpage needs memory. The reference's choice is to fail the shrink
+          cleanly; another design could keep a reserve of page-table pages.
+  - title: What does fork do with a superpage, and under which locks?
+    q: |
+      [[kfork]] calls [[uvmcopy]] while holding the child's `np->lock` (taken in
+      [[allocproc]]). The parent has a superpage. Should the child get a superpage too, and
+      what if none is free (remember the fragmented case of question 3)? Then: which
+      spinlocks are held while 2 megabytes are being copied, what does that mean for
+      interrupts on this hart, and which functions may therefore be called?
+    hints:
+      - "`fork` failing when 55 megabytes are free would be a regression. A superpage's bytes can live in pages just as well."
+      - "Holding a spinlock means SIE is 0 on this hart ([[concept:locks#invariant]]). [[sched]] panics if a process gives up the CPU holding a spinlock other than its own `p->lock`."
+      - "At the first page of a superpage, try `superalloc`; on success copy 2 megabytes and map one leaf. Otherwise let the loop go on 4096 bytes at a time, copying the piece of the superpage that holds each address into a fresh page."
+    answer: |
+      The child gets a superpage when `superalloc` has one: one 2-megabyte `memmove` and one
+      leaf in its level-1 page. When none is free, the loop does what it always did, one
+      4096-byte step at a time, with the source address advanced into the superpage:
+      `pa += i - SUPERPGROUNDDOWN(i)`. The child ends up with 512 pages holding the same
+      bytes; `supertest` checks both cases. The alignment test `(i % SUPERPGSIZE) == 0`
+      makes sure a superpage is tried only at its start; after a failed try the rest of the
+      range goes the page way.
+
+      Locks: `np->lock` is held throughout ([[kernel/proc.c:271]] runs before the release at
+      294), so interrupts are off on this hart for the whole copy, 2 megabytes at a time
+      here, just as the original copies page by page under the same lock. Inside
+      `superalloc` `kmem.lock` is taken too: gdb recorded noff 2, intena 1 there (intena 1
+      because the system call turned interrupts on before the first acquire). So
+      `superalloc`, [[kalloc]], `superfree` and [[kfree]] must never sleep, and they don't.
+
+      Freeing is the same story on the other side: when the parent reaps the child in
+      [[kwait]], [[freeproc]] runs under `wait_lock` and the child's `p->lock`, and
+      `superfree` adds `kmem.lock`: noff 3, recorded with gdb. `superfree` also fills the
+      2 megabytes with junk there, with interrupts off; the original kernel does the same
+      work page by page under the same locks.
+
+      No TLB flush is needed for any of this: the hart runs on the kernel page table while
+      in the kernel, and [[userret]] executes `sfence.vma` before and after it loads the user
+      page table ([[kernel/trampoline.S:110]], [[kernel/trampoline.S:112]]).
+    checks:
+      - id: lab14-10
+        level: 2
+        type: state
+        q: |
+          The shell's child `supertest` (a process with two superpages) calls `fork`.
+          [[uvmcopy]] reaches the first superpage and calls `superalloc`, which acquires
+          `kmem.lock`. Fill in this hart's state at that moment.
+        code: kernel/proc.c:259-275@271-271
+        state:
+          mode: S
+          stack: kernel
+          satp: kernel
+          sie: "off"
+          noff: 2
+          intena: 1
+        why:
+          noff: |
+            Two spinlocks: the child's `np->lock` from [[allocproc]], still held by
+            [[kfork]], and `kmem.lock`. gdb recorded noff 2.
+          intena: |
+            The outermost acquire (`np->lock`) happened after [[usertrap]] turned interrupts
+            on for the system call, so intena is 1.
+          sie: |
+            Any held spinlock means interrupts are off on this hart.
+          stack: |
+            `fork` is a system call: the process's kernel stack, with `usertrap → syscall →
+            sys_fork → kfork → uvmcopy → superalloc`.
+          satp: |
+            The kernel always runs on the kernel page table; the user's pages are reached
+            through the direct map.
+        why_wrong: "Follow ecall → usertrap (intr_on) → kfork (allocproc acquired np->lock) → uvmcopy → superalloc (acquire)."
+        explain: |
+          Observed with gdb on the reference: hart 1, pid 5, noff 2, intena 1, SIE 0, inside
+          `superalloc` called from [[uvmcopy]]. The copy of 2 megabytes that follows runs at
+          noff 1, still with interrupts off.
+  - title: What does all this buy on QEMU?
+    q: |
+      Superpages save page-table pages and, on real hardware, TLB entries and walk steps.
+      Before you measure, predict: for a 64-megabyte heap, how many page-table pages are
+      saved? And will a loop that loads one byte from each of the 16,384 pages, many times
+      over, run measurably faster on QEMU with superpages? Think about what QEMU caches when
+      it translates a guest address.
+    hints:
+      - "One level-0 page maps 2 megabytes."
+      - "QEMU is a program: its own translation cache is per 4096-byte guest page, whatever the size of the guest's leaf."
+      - "Count 32 pages; expect no difference in time, and measure both ways on the same kernel by growing once (superpages) or in 1-megabyte steps (pages)."
+    answer: |
+      32 page-table pages (128 KiB) for 64 megabytes, observed as exactly 32 fewer pages used
+      when the same 64 megabytes is allocated with superpages instead of pages (the measure
+      section explains how). Small in a 128-megabyte machine, but it is 1/512 of the memory
+      mapped, for every process, and real systems map gigabytes.
+
+      Time on QEMU: no measurable difference. Loads across all 16,384 pages took 44-55
+      ticks with superpages and 44-59 with pages (20,000 passes), and the original kernel
+      48-59: the noise between runs is larger than any effect. The reason is in QEMU's
+      source: its software TLB is filled with one entry per 4096-byte guest page
+      (`tlb_size = TARGET_PAGE_SIZE` in `riscv_cpu_tlb_fill`), even when the guest PTE is a
+      superpage, so the main hardware benefit, TLB reach, does not exist in the emulator. The honest conclusion: count page-table pages here,
+      and time superpages on real hardware.
+    checks:
+      - id: lab14-11
+        level: 1
+        type: number
+        q: |
+          A process maps 64 megabytes of heap, 2-megabyte aligned. How many level-0
+          page-table pages does it need with superpages, compared to pages? Give the
+          difference.
+        answer: 32
+        wrong:
+          16384: |
+            You may have counted the data pages; they are the same in both cases.
+          64: |
+            You may have assumed one level-0 page per megabyte. Each maps 2 megabytes.
+          31: |
+            You may have assumed one level-0 page is still needed. With every 2 megabytes
+            mapped by a level-1 leaf, there is no level-0 page in that range at all.
+        why_wrong: "64 MiB / 2 MiB per level-0 page."
+        explain: |
+          The measurement on the reference: the same 64 megabytes used 32 fewer pages when
+          grown in one `sbrk` (superpages) than when grown in 1-megabyte steps (pages). On the
+          original kernel both ways cost the same.
+build: |
+  **Start.**
+
+  ```text
+  git checkout -b my-superpages 06aad25
+  ```
+
+  Write the test first: `user/supertest.c` with the checks from the spec, and add
+  `$U/_supertest\` to `UPROGS`. You will need the two test system calls early (add them to
+  `syscall.h`, `syscall.c`, `sysproc.c`, `usys.pl` and `user.h`; `pglevel` can return 0 for
+  every mapped page until superpages exist).
+
+  **Milestones, in an order that keeps the system bootable and `usertests -q` passing after
+  each one.**
+
+  1. **A walk that stops at a leaf.** `SUPERPGSIZE`, the rounding macros and a leaf test in
+     `riscv.h`; a walk that reports the level where it stopped; [[walkaddr]] adding the
+     offset. Nothing maps a superpage yet. Test: `usertests -q`.
+  2. **Chunks in the allocator.** Chunk states, per-chunk free lists, `superalloc` and
+     `superfree`, [[kalloc]] splitting chunks lowest first. Test: `usertests -q` (it
+     exhausts memory more than once, a good test of splitting).
+  3. **Whole again.** A split chunk with all 512 pages free counts as whole.
+  4. **Map and unmap.** A function that installs a level-1 leaf; [[uvmunmap]] freeing it
+     whole.
+  5. **fork.** [[uvmcopy]] with both cases.
+  6. **Demotion.** Split a superpage in [[uvmdealloc]]; let the allocator know.
+  7. **Flip the switch in [[uvmalloc]].** Now everything above is exercised. Test:
+     `supertest`, `usertests -q`, `supertest` again (it must still find 63 free superpages).
+
+  **Debugging advice.** For breakpoints at boot, start QEMU halted with `make qemu-gdb`
+  (it waits for gdb on the port it prints); for later events, attaching to a running QEMU
+  also works.
+
+  - The kernel is built with `-O`: gdb often says `<optimized out>` for locals, and an
+    error in a breakpoint's `commands` aborts the whole script. Use `info args` and
+    `info locals`, which print `<optimized out>` without failing.
+  - To see a mapping, stop in your mapping function and `p/x *pte`; decode it by hand (PPN
+    = value >> 10, flags = low 10 bits) and check that the PPN's low 9 bits are 0.
+  - QEMU can tell you why a translation failed: run it with `-d guest_errors`. A misaligned
+    superpage is reported as `get_physical_address: PPN bits in PTE is misaligned`.
+  - Print the chunk states: `p kmem.state` and `p kmem.nfree` in gdb show at a glance which
+    chunks are split and how full they are.
+  - `panic: freewalk: leaf` means a leaf survived [[uvmunmap]]: break on `panic`, go up to
+    [[freewalk]] and print `i`: in a level-1 page, index `i` is the 2-megabyte region
+    `i << 21`.
+clinic:
+  - bug: The superpage's PPN is counted in 2-megabyte units
+    change: |
+      A natural misconception: "a superpage number counts superpages". In `mapsuper`:
+
+      ```diff
+      -  *pte = PA2PTE(pa) | perm | PTE_V;
+      +  *pte = ((pa >> 21) << 10) | perm | PTE_V; // PPN of a superpage
+      ```
+    symptom: |
+      $ supertest
+      supertest: heap at 0x0000000000005000, superpages at 0x0000000000200000 and 0x0000000000400000
+      supertest: superpages: OK
+      usertrap(): unexpected scause 0xd pid=5
+                  sepc=0x258 stval=0x200000
+      panic: superfree
+
+      # another run of the same kernel, QEMU started with -d guest_errors:
+      get_physical_address: PPN bits in PTE is misaligned: addr: 0x80022008 pte: 0x000000000010fc17
+      usertrap(): unexpected scause 0xd pid=5
+
+      # a third run, gdb, breakpoint on panic:
+      == hart 2 pid 3 supertest noff 2 intena 1 sie 0 sp 0x3fffff9e50
+      [...]
+      #1  0x0000000080000dbc in superfree (pa=<optimized out>) at kernel/kalloc.c:146
+      #2  0x00000000800017e0 in uvmunmap (pagetable=0x80153000, va=va@entry=0, npages=npages@entry=1536, do_free=do_free@entry=1) at kernel/vm.c:283
+      [...]
+      #6  0x00000000800028f4 in kwait (addr=20348) at kernel/proc.c:400
+      [...]
+      uvmunmap a 0x200000 pte 0x10fc17 ppn 0x43f
+    why: |
+      For the chunk at `0x87e00000`, `pa >> 21` is `0x43f`, so the PTE says PPN `0x43f`
+      (`0x10fc17` = `0x43f << 10 | 0x17`). Two different consumers read that PTE:
+
+      - **The kernel** wrote the superpage's zeros with `memset` through the
+        [[g:direct-map]] *before* mapping it, and `pglevel` only reads the PTE in software:
+        `superpages: OK`. Nothing in the kernel noticed.
+      - **The hardware** walk reached the level-1 leaf on the user's first load from
+        `0x200000` (`lbu a4,0(a5)` at `0x258` in `bytetest`). The PPN's low 9 bits are
+        `0x03f`, not 0: a misaligned superpage. As the specification says, the walk stops
+        and raises a page fault "corresponding to the original access type": a load, so
+        `scause` 13 (`0xd`), with `stval` the virtual address. QEMU's log line is that check
+        (it returns `TRANSLATE_FAIL` for a misaligned PPN). [[vmfault]] declines a mapped
+        address, so [[usertrap]] kills the process.
+
+      The panic comes later, when the parent (pid 3) reaps the killed child: [[uvmunmap]]
+      hands `PTE2PA` = `0x43f000` to `superfree`, which rejects any address below `end`. Had
+      the wrong PPN happened to be aligned, the hardware would have accepted it and the user
+      would have read and written whatever lies at that physical address: the alignment check
+      is the only thing that caught this bug early.
+  - bug: walk does not stop at a leaf
+    change: |
+      Everything as in the reference except the leaf test in `walklevel`, which a learner
+      who thinks "only level 0 has leaves" leaves out:
+
+      ```diff
+           if (*pte & PTE_V) {
+      -      if (PTE_LEAF(*pte))
+      -        return pte; // a superpage: no page-table page below
+             pagetable = (pagetable_t)PTE2PA(*pte);
+      ```
+    symptom: |
+      $ supertest
+      supertest: heap at 0x0000000000005000, superpages at 0x0000000000200000 and 0x0000000000400000
+      supertest: superpages: FAIL
+      supertest: every byte: OK
+      supertest: system calls: FAIL
+      supertest: fork copies superpages: FAIL
+      supertest: fragmented: 0 free superpages, 15159 free pages
+      supertest: fork without free superpages: FAIL
+      supertest: shrink splits: FAIL
+      supertest: unaligned growth uses pages: OK
+      supertest: lazy growth uses pages: OK
+      panic: freewalk: leaf
+
+      # gdb, breakpoint on panic:
+      == hart 1 pid 3 supertest noff 2 intena 1 sie 0 sp 0x3fffff9e90
+      #0  panic (s=s@entry=0x800081e0 "freewalk: leaf") at kernel/printk.c:139
+      #1  0x00000000800019e4 in freewalk (pagetable=0x80022000) at kernel/vm.c:371
+      #2  0x0000000080001a02 in freewalk (pagetable=pagetable@entry=0x80153000) at kernel/vm.c:368
+      #3  0x0000000080001a30 in uvmfree (pagetable=pagetable@entry=0x80153000, sz=sz@entry=6291456) at kernel/vm.c:384
+      [...]
+      #6  0x00000000800028ea in kwait (addr=20348) at kernel/proc.c:400
+    why: |
+      The hardware is unaffected: `mapsuper` still installs a correct level-1 leaf, so the
+      user's own loads and stores work (`every byte: OK`). Every *software* walk, though,
+      takes that leaf for a pointer to a level-0 table and indexes into the superpage's
+      first 4096 bytes of user data:
+
+      - `pglevel` found a zero "PTE" in freshly zeroed memory and reported the page as
+        unmapped (`superpages: FAIL`, before anything was written).
+      - After `bytetest`, those 4096 bytes hold the test's pattern, and [[walkaddr]] in the
+        pipe test interpreted pattern bytes as PTEs (`system calls: FAIL`; the run does not
+        tell whether `write` failed or copied the wrong bytes). Data a user controls was
+        being used as page-table entries by the kernel: with the right bytes a user could
+        have made [[copyout]] write anywhere in physical memory.
+      - When the test child exited, [[uvmunmap]] walked the same way, never saw the level-1
+        leaf, and never cleared it. The parent's [[kwait]] then ran [[freewalk]], whose leaf
+        test is the hardware's rule. The two `freewalk` frames are the level-2 page and the
+        level-1 page at `0x80022000`; gdb printed `i 1` in the inner one: entry 1, the region `1 << 21` = `0x200000`, is
+        the superpage, valid with R and W set, and it panics.
+
+      [[freewalk]] needed no change in this lab, and here it is the only code that
+      recognised the superpage.
+  - bug: Shrinking leaves the superpage alone instead of splitting it
+    change: |
+      No demotion in [[uvmdealloc]], and [[uvmunmap]] quietly skips a superpage it cannot
+      free whole, which looks harmless ("free what you can"):
+
+      ```diff
+         if (PGROUNDUP(newsz) < PGROUNDUP(oldsz)) {
+      -    // a superpage that straddles the new end must be split first.
+      -    if ((PGROUNDUP(newsz) % SUPERPGSIZE) != 0 &&
+      -        demote(pagetable, PGROUNDUP(newsz)) != 0)
+      -      return oldsz;
+           int npages = (PGROUNDUP(oldsz) - PGROUNDUP(newsz)) / PGSIZE;
+      ```
+
+      ```diff
+             if ((a % SUPERPGSIZE) != 0 || a + SUPERPGSIZE > va + npages * PGSIZE)
+      -        panic("uvmunmap: part of a superpage");
+      +        continue; // can't free part of it: leave it alone
+      ```
+    symptom: |
+      $ supertest
+      supertest: heap at 0x0000000000005000, superpages at 0x0000000000200000 and 0x0000000000400000
+      supertest: superpages: OK
+      supertest: every byte: OK
+      supertest: system calls: OK
+      supertest: fork copies superpages: OK
+      supertest: fragmented: 0 free superpages, 14145 free pages
+      supertest: fork without free superpages: OK
+      panic: mappages: remap
+
+      # gdb, breakpoint on panic:
+      == hart 2 pid 5 supertest noff 0 intena 1 sie 1 sp 0x3fffff7ec0
+      #0  panic (s=s@entry=0x80008178 "mappages: remap") at kernel/printk.c:139
+      #1  0x000000008000151e in mappages (pagetable=pagetable@entry=0x80153000, va=va@entry=5234688, size=size@entry=4096, pa=<optimized out>, pa@entry=2150670336, perm=perm@entry=22) at kernel/vm.c:188
+      #2  0x00000000800018da in uvmalloc (pagetable=0x80153000, oldsz=5234688, newsz=6291456, xperm=xperm@entry=4) at kernel/vm.c:326
+      #3  0x00000000800022be in growproc (n=1056768) at kernel/proc.c:246
+    why: |
+      `shrinktest` cuts the region at `0x4fe000`, inside the superpage at `0x400000`. The
+      buggy [[uvmunmap]] skips the whole superpage, so `sbrk` "succeeds": `p->sz` drops to
+      `0x4fe000`, but all 2 megabytes stay mapped, readable and writable above the size the
+      process asked for. (The test does not look there; this part is reasoned from the
+      code.)
+
+      Then the test grows the heap back. [[uvmalloc]] starts at `0x4fe000`, which is not
+      2-megabyte aligned, so it maps a page there with [[mappages]]; `walk` returns the
+      level-1 leaf that still covers that address, it is valid, and [[mappages]] panics
+      `remap` (va `5234688` = `0x4fe000` in the backtrace). Had the process exited instead,
+      [[uvmfree]] would have skipped the superpage the same way and [[freewalk]] would have
+      panicked with `freewalk: leaf`.
+
+      The reference's [[uvmunmap]] panics at the first sign of this ("part of a
+      superpage"), and demotion in [[uvmdealloc]] means it never happens.
+  - bug: uvmunmap treats a superpage as a page
+    change: |
+      The superpage branch is missing from [[uvmunmap]]; with the new `walk`, a superpage
+      address gets the level-1 leaf, and the old code frees `PTE2PA(*pte)` as one page:
+
+      ```diff
+      -    if (level == 1) {
+      -      if ((a % SUPERPGSIZE) != 0 || a + SUPERPGSIZE > va + npages * PGSIZE)
+      -        panic("uvmunmap: part of a superpage");
+      -      if (do_free)
+      -        superfree((void *)PTE2PA(*pte));
+      -      *pte = 0;
+      -      a += SUPERPGSIZE - PGSIZE; // skip the rest of it
+      -      continue;
+      -    }
+           if (do_free) {
+             uint64 pa = PTE2PA(*pte);
+             kfree((void *)pa);
+      ```
+    symptom: |
+      $ supertest
+      supertest: heap at 0x0000000000005000, superpages at 0x0000000000200000 and 0x0000000000400000
+      supertest: superpages: OK
+      supertest: every byte: OK
+      supertest: system calls: OK
+      panic: kfree: whole chunk
+
+      # gdb, breakpoint on panic:
+      == hart 2 pid 5 supertest noff 3 intena 1 sie 0 sp 0x3fffff7e70
+      #0  panic (s=s@entry=0x80008040 "kfree: whole chunk") at kernel/printk.c:139
+      #1  0x0000000080000b44 in kfree (pa=0x87a00000) at kernel/kalloc.c:77
+      #2  0x00000000800017c8 in uvmunmap (pagetable=0x8030e000, va=va@entry=0, npages=npages@entry=1536, do_free=do_free@entry=1) at kernel/vm.c:281
+      [...]
+      #6  0x0000000080002898 in kwait (addr=20316) at kernel/proc.c:400
+      [...]
+      uvmunmap va 0x0 npages 1536 a 0x200000 pte 0x21e800d7
+    why: |
+      The first process to free a superpage is the child of `fork copies superpages`; it
+      exits, and the test process (pid 5) reaps it in [[kwait]], under `wait_lock` and the
+      child's `p->lock`, plus `kmem.lock` inside [[kfree]]: noff 3. [[uvmunmap]] meets the
+      level-1 leaf `0x21e800d7` (PPN `0x87a00`, the child's own superpage) at `a = 0x200000`
+      and hands `0x87a00000` to [[kfree]] as if it were one page.
+
+      [[kfree]] on the reference branch checks the chunk's state under `kmem.lock` and
+      panics: chunk 61 is `SUPER`, not `SPLIT`. On the original allocator, with no such
+      check, the first 4096 bytes would have gone on the free list, the PTE would have been
+      cleared, the next 511 iterations would have found no valid PTE, and 2,044 KiB would
+      have leaked silently, every time a process with a superpage exited (reasoned from the
+      code, not run). The check costs one comparison per free.
+  - bug: fork copies only the first 4096 bytes of a superpage
+    change: |
+      A leftover from the page loop in [[uvmcopy]]'s superpage branch:
+
+      ```diff
+      -      memmove(mem, (char *)pa, SUPERPGSIZE);
+      +      memmove(mem, (char *)pa, PGSIZE);
+      ```
+    symptom: |
+      $ supertest
+      supertest: heap at 0x0000000000005000, superpages at 0x0000000000200000 and 0x0000000000400000
+      supertest: superpages: OK
+      supertest: every byte: OK
+      supertest: system calls: OK
+      supertest: fork copies superpages: FAIL
+      supertest: fragmented: 0 free superpages, 14145 free pages
+      supertest: fork without free superpages: OK
+      supertest: shrink splits: OK
+      supertest: unaligned growth uses pages: OK
+      supertest: lazy growth uses pages: OK
+      supertest: free pages 32459 before, 32459 after
+      supertest: free superpages 63 before, 63 after
+      supertest: no leaks: OK
+      supertest: SOME TESTS FAILED
+      $ usertests -q
+      usertests starting
+      [...]
+      ALL TESTS PASSED
+
+      # a copy of supertest that prints what the child saw:
+      child: pglevel 1 1
+      child: first difference at offset 0x1000: 0x5, expected 0x1
+    why: |
+      The child does get superpages (level 1), but only their first 4096 bytes were copied.
+      From offset `0x1000` on it sees `0x05`: the junk that `superalloc` fills a fresh chunk
+      with, exactly so that a missing copy shows up as recognisable bytes instead of
+      plausible zeros. The parent's memory is untouched, and `fork without free superpages`
+      passes, because the page-by-page fallback copies correctly.
+
+      **`usertests -q` passes.** No test in it forks a process that has a superpage and
+      then reads past the first page in the child. This bug corrupts every forked process
+      whose heap holds a superpage, silently, in a kernel that passes the standard suite.
+  - bug: Demotion points every piece at the first page
+    change: |
+      The offset is forgotten when filling the new level-0 page:
+
+      ```diff
+         for (int i = 0; i < 512; i++)
+      -    l0[i] = PA2PTE(pa + i * PGSIZE) | PTE_FLAGS(*pte);
+      +    l0[i] = PA2PTE(pa) | PTE_FLAGS(*pte);
+      ```
+    symptom: |
+      $ supertest
+      [...]
+      supertest: fork without free superpages: OK
+      supertest: shrink splits: FAIL
+      supertest: unaligned growth uses pages: OK
+      supertest: lazy growth uses pages: OK
+      scause=0xd sepc=0x80000c5e stval=0x0
+      panic: kerneltrap
+
+      # gdb, same run:
+      ### demote va 0x4fe000 pte 0x21f000d7 l0[0] 0x21f000d7 l0[1] 0x21f000d7 l0[511] 0x21f000d7
+      [...]
+      ### panic: kerneltrap
+      == hart 1 pid 11 supertest noff 1 intena 1 sie 0 sp 0x3fffff7dc0
+      [...]
+      $1 = {0 <repeats 62 times>, 510, 0}
+      $2 = {0x0 <repeats 64 times>}
+    why: |
+      All 512 level-0 PTEs name the same physical page, `0x87c00000`. Two things follow.
+
+      - **Data loss.** Below the new end, every 4096-byte piece of the second superpage now
+        shows the bytes of its first piece: `shrink splits: FAIL`. The other 511 pages of the
+        chunk are still in memory with the right bytes, but nothing maps them.
+      - **Allocator corruption.** [[uvmunmap]] frees the top 258 pieces, and every one of
+        them is the same page: [[kfree]] pushes `0x87c00000` onto chunk 62's free list 258
+        times, so the page's `next` field points at itself, and the count rises by 258 for
+        one page. The process's exit frees the remaining 254 pieces the same way. That is
+        258 + 254 = 512 frees of one page, which never pushes the count *above* 512, so the
+        `kfree: double free` check from commit 2 cannot see it (reasoned from the code). From then
+        on chunk 62's count and list disagree. The final state gdb printed ($1 and $2 are
+        `kmem.nfree` and `kmem.freelist`): chunk 62 claims 510 free pages and has an empty
+        list. The next [[kalloc]] that chose chunk 62 popped `r = 0` and loaded `r->next`:
+        a load page fault at address 0 inside [[kalloc]] (`sepc 0x80000c5e` is `ld
+        a2,0(s1)` there in this build), and [[kerneltrap]] panics. (We did not trace every
+        step between the demotion and the crash; the counts and the self-pointing list are
+        what gdb showed at the end.)
+
+      One missing `+ i * PGSIZE` turns into a kernel panic several system calls later, in a
+      different process (pid 11): a reminder that allocator bookkeeping must match what the
+      page tables really map.
+reveal:
+  - title: A leaf, at any level
+    commit: 1
+    file: kernel/riscv.h
+    lines: 389-412
+    focus: 395-409
+    diff: true
+    state:
+      hart: any
+      proc: "(definitions used by every function below)"
+      locks: []
+    note: |
+      The story of this tour comes from one gdb-recorded run of `supertest` on the reference
+      branch, 3 harts: pid 3 is `supertest`, pid 4 counts free pages, pid 5 runs the tests,
+      and pids 6 and later are its children. Steps quote the harts and values gdb printed.
+
+      Commit 1 teaches the kernel's software walk the hardware's rule. `SUPERPGSIZE` is
+      `1 << 21`: the 21 virtual-address bits that a walk stopping at level 1 has not used.
+      `PTE_LEAF` is the test from step 4 of the specification's translation algorithm: a
+      valid PTE with any of R, W, X set is a leaf. With all three clear it points to the
+      next page-table page. The specification allows a leaf "at any level"; until now the
+      kernel only ever wrote leaves at level 0, and only [[freewalk]] used the rule.
+
+      The rounding macros mirror `PGROUNDUP` and `PGROUNDDOWN` for 2 megabytes; the
+      allocator and [[uvmalloc]] will need them.
+  - title: walklevel stops where the hardware stops
+    commit: 1
+    file: kernel/vm.c
+    lines: 86-134
+    focus: 103-124
+    diff: true
+    state:
+      hart: 1
+      mode: S
+      proc: supertest (pid 5)
+      intr: "off"
+      satp: kernel
+      locks: [pi->lock]
+      irq: {noff: 1, intena: 1}
+      stack: [usertrap, syscall, sys_write, filewrite, pipewrite, copyin, walkaddr, walklevel]
+      sp: {"on": kernel, detail: "pid 5's kernel stack at `0x3fffff7000`"}
+    note: |
+      The loop is the old [[walk]] with two changes. It walks down only to the level the
+      caller asks for (`*level` on entry: 0 for a page, 1 to find a superpage's slot), and
+      it stops at a valid leaf, returning that PTE and leaving its level in `*level`.
+
+      Without the stop, line 115 would take a superpage's physical address for a page-table
+      page and return a pointer into the user's data: clinic 2 shows the kernel then
+      treating bytes the user wrote as PTEs, until [[freewalk]] panics.
+
+      [[walk]] keeps its interface, so its many callers compile unchanged; but they now get
+      a level-1 PTE back for a superpage address, and each one must be checked. [[mappages]]
+      is already safe: a valid leaf where it wants to map a page makes it panic `remap`.
+
+      State: the moment shown is a later one in the recorded run, `supertest`'s pipe test.
+      [[pipewrite]] holds `pi->lock` (noff 1, intena 1, since the system call had turned
+      interrupts on) and copies the user's bytes one at a time with [[copyin]], which calls
+      [[walkaddr]], which calls this function.
+    others: |
+      `pi->lock` makes a reader of the same pipe on another hart spin in [[piperead]]; the
+      walk itself touches only pid 5's page table, which no other hart can be using.
+  - title: walkaddr adds the offset inside the superpage
+    commit: 1
+    file: kernel/vm.c
+    lines: 136-160
+    focus: 156-159
+    diff: true
+    state:
+      hart: 1
+      mode: S
+      proc: supertest (pid 5)
+      intr: "off"
+      satp: kernel
+      locks: [pi->lock]
+      irq: {noff: 1, intena: 1}
+      stack: [usertrap, syscall, sys_write, filewrite, pipewrite, copyin, walkaddr]
+      sp: {"on": kernel}
+    note: |
+      [[walkaddr]]'s callers ([[copyin]], [[copyout]], [[copyinstr]], `loadseg`) treat its
+      result as the physical address of the 4096-byte page holding `va`. For a superpage,
+      `PTE2PA(*pte)` is the start of 2 megabytes, so the offset of `va`'s page inside them
+      is added: `PGROUNDDOWN(va) - SUPERPGROUNDDOWN(va)`.
+
+      gdb stopped here with `va` = `0x402000` (the pipe test's source bytes, which start at
+      `0x402f38`), `level` 1, and `pa` = `0x87c00000` before the addition: the second
+      superpage's chunk. After the addition the copy reads from `0x87c02000`. Forget the
+      addition and every address in a superpage reads its first page: `system calls` would
+      send the wrong 400 bytes.
+
+      Nothing else in [[copyin]] or [[copyout]] changes. They still copy at most 4096 bytes
+      per step, even inside a superpage; correct and simple.
+  - title: Sixty-four chunks of RAM
+    commit: 2
+    file: kernel/kalloc.c
+    lines: 18-55
+    focus: 22-46
+    diff: true
+    state:
+      hart: 0
+      mode: S
+      proc: none (boot)
+      intr: "off"
+      satp: bare
+      locks: []
+      irq: 0
+      stack: [main, kinit]
+      sp: {"on": boot, detail: "hart 0's slice of `stack0`; paging is still off"}
+    note: |
+      RAM from [[KERNBASE]] to [[PHYSTOP]] is 64 aligned chunks of 2 megabytes, and the
+      allocator now tracks each: `FREE` (whole and free), `SUPER` (whole, in use as a
+      superpage) or `SPLIT` (512 pages, each free or in use). A split chunk has its own free
+      list and count.
+
+      [[kinit]] marks the chunk that holds the kernel `SPLIT` (in this build `end` is
+      `0x80021f88`, so only chunk 0) and frees its pages above `end` as before: 478 pages.
+      Chunks 1 to 63 need no work: a static array starts at 0, which is `FREE`. That also
+      means boot no longer writes junk over 126 megabytes; pages are junk-filled when they
+      are allocated or freed.
+
+      No lock is needed: hart 0 runs alone, harts 1 and 2 wait in [[main]] for `started`.
+  - title: kfree puts a page back on its own chunk's list
+    commit: 2
+    file: kernel/kalloc.c
+    lines: 57-84
+    focus: 75-83
+    state:
+      hart: any
+      mode: S
+      proc: "a process shrinking with sbrk(-n)"
+      intr: "off"
+      satp: kernel
+      locks: [kmem.lock]
+      irq: {noff: 1, intena: 1}
+      stack: [usertrap, syscall, sys_sbrk, growproc, uvmdealloc, uvmunmap, kfree]
+      sp: {"on": kernel}
+    note: |
+      A freed page goes onto the list of the chunk it belongs to, `CHUNK(pa)`, and the
+      chunk's count goes up. The count will matter in commit 3: a split chunk whose 512
+      pages are all free is as good as a free chunk.
+
+      The state check is new and cheap: a page can only be freed one at a time if its chunk
+      is split. Freeing a page of a superpage (or of a free chunk) is always a bug, and the
+      panic `kfree: whole chunk` catches it at the call that makes the mistake (clinic 4).
+      The original allocator would have accepted it and leaked or double-allocated memory.
+
+      The second check narrows a hole that chunks open. Freeing a page twice already
+      corrupts the original free list; here it can also make a chunk's count reach 512
+      while one of its pages is still in use, and commit 3 would then hand that chunk out
+      as a superpage over a live page. A count that would exceed 512 can only mean a page
+      was freed twice, so [[kfree]] panics `kfree: double free`. It does not catch every
+      double free: one in a chunk that still has a page in use can leave the count at
+      exactly 512. Catching all of them would take a "free" bit per page.
+
+      The state shown is the reasoned one for a page freed by `sbrk(-n)` in a system call:
+      `kmem.lock` held, noff 1, intena 1.
+  - title: kalloc takes a page from the lowest chunk it can
+    commit: 2
+    file: kernel/kalloc.c
+    lines: 86-136
+    focus: 112-131
+    state:
+      hart: 2
+      mode: S
+      proc: supertest (pid 4)
+      intr: "off"
+      satp: kernel
+      locks: [kmem.lock]
+      irq: {noff: 1, intena: 1}
+      stack: [usertrap, syscall, sys_sbrk, growproc, uvmalloc, kalloc, split]
+      sp: {"on": kernel, detail: "pid 4's kernel stack at `0x3fffff7000`"}
+    note: |
+      [[kalloc]] scans the 64 chunks for the lowest split chunk with a free page. Only if
+      there is none does it split the lowest free chunk: `split` pushes the chunk's 512
+      pages onto its list (top first, so the list starts at the chunk's lowest page) and
+      marks it `SPLIT`.
+
+      gdb caught the first splits of the run: pid 4, the child that counts free memory by
+      calling `sbrk(4096)` until it fails, on hart 2, split chunk 1 when its heap reached
+      `0x10f000`: chunk 0's free pages above the kernel were used up. Then chunk 2 at
+      `0x30e000`, chunk 3 at `0x50d000`, and so on: about 2 megabytes of heap per chunk,
+      because the low chunks fill up first.
+
+      This order is the allocator's whole policy against fragmentation: small allocations
+      pile up at the bottom of RAM, and the chunks at the top stay whole. Think question 3
+      tells what happens with an allocator that reuses the most recently freed page
+      first: after a full `usertests -q`, only 52 of the 63 chunks were still available as
+      superpages.
+
+      The scan costs up to 64 comparisons per [[kalloc]], under `kmem.lock` with interrupts
+      off: noff 1, intena 1, SIE 0, as gdb printed.
+  - title: Superpages come from the top
+    commit: 2
+    file: kernel/kalloc.c
+    lines: 138-180
+    focus: 138-180
+    diff: true
+    state:
+      hart: any
+      proc: "(commit 2: nothing calls superalloc yet)"
+      locks: []
+    note: |
+      `superalloc` hands out the highest `FREE` chunk, the opposite end from [[kalloc]], and
+      `superfree` takes one back. Both fill the 2 megabytes with junk (`5` on allocation,
+      `1` on free), as [[kalloc]] and [[kfree]] do with a page; clinic 5 shows the `0x05`
+      bytes catching a copy that was too short.
+
+      Their checks mirror [[kfree]]'s: `superfree` panics on an unaligned address or one
+      below `end` (clinic 1 hits it with `0x43f000`), and on a chunk that is not `SUPER`.
+
+      After this commit the kernel boots and passes `usertests -q`: small allocations split
+      chunks as needed, and nothing asks for a superpage yet.
+  - title: A split chunk can be whole again
+    commit: 3
+    file: kernel/kalloc.c
+    lines: 158-191
+    focus: 158-185
+    diff: true
+    state:
+      hart: 1
+      mode: S
+      proc: supertest (pid 5)
+      intr: "off"
+      satp: kernel
+      locks: [kmem.lock]
+      irq: {noff: 1, intena: 1}
+      stack: [usertrap, syscall, sys_sbrk, growproc, uvmalloc, superalloc]
+      sp: {"on": kernel, detail: "pid 5's kernel stack at `0x3fffff7000`"}
+    note: |
+      Without this commit, every chunk that [[kalloc]] ever split would be lost to
+      superpages for good. `whole(c)` also accepts a `SPLIT` chunk whose count is 512, and
+      `superalloc` takes it by forgetting its list: no page of it is in use, so nothing else
+      can be holding a pointer into that list.
+
+      This is the path the recorded run took every time. pid 4 had split chunks 1 to 63
+      while counting free memory and freed them all when it exited. When pid 5 asked for its
+      two superpages, gdb printed `superalloc takes chunk 63 state 2 nfree 512`, then
+      chunk 62: state 2 is `SPLIT`, with all 512 pages free.
+
+      `superalloc` runs inside `sbrk`, holding only `kmem.lock`: noff 1, intena 1.
+  - title: mapsuper writes one PTE at level 1
+    commit: 4
+    file: kernel/vm.c
+    lines: 198-218
+    focus: 203-218
+    diff: true
+    state:
+      hart: 1
+      mode: S
+      proc: supertest (pid 5)
+      intr: "on"
+      satp: kernel
+      locks: []
+      irq: 0
+      stack: [usertrap, syscall, sys_sbrk, growproc, uvmalloc, mapsuper]
+      sp: {"on": kernel, detail: "`0x3fffff7ee0`"}
+    note: |
+      `mapsuper` asks `walklevel` for the level-1 slot (`level = 1` on entry), allocating
+      the level-1 page-table page if needed, and writes one leaf there. Two refusals:
+
+      - An unaligned `va` or `pa` is a kernel bug: panic. The hardware would turn an
+        unaligned `pa` into page faults (clinic 1); catching it here is clearer.
+      - A valid PTE already in the slot means a level-0 page-table page is there (left behind
+        by earlier pages in this 2 megabytes; xv6 never frees an empty one before exit) or a
+        superpage is. Return -1, and the caller uses pages.
+
+      One cost of the second refusal (reasoned from the code, and observed in a
+      run): after a demotion the level-0 page stays, so a later growth that covers
+      that 2 megabytes again allocates a superpage, zeroes it, has `mapsuper` refuse it,
+      frees it (2 more megabytes of junk fill) and then maps pages. Correct, but wasted
+      work; a kernel could free an empty level-0 page, or check the slot first.
+
+      Recorded on hart 1 for pid 5's `sbrk(4 MiB)`: the leaf for `0x200000` at
+      `0x80022008`, entry 1 of the level-1 page at `0x80022000`, is `0x21f80017` (PPN
+      `0x87e00`, V R W U); the one for `0x400000` at `0x80022010` is `0x21f00017`. Each 2
+      megabytes of heap: one store. noff 0, SIE 1: interrupts are on during the system
+      call outside any lock.
+  - title: uvmunmap frees a superpage whole
+    commit: 4
+    file: kernel/vm.c
+    lines: 233-268
+    focus: 247-261
+    diff: true
+    state:
+      hart: 2
+      mode: S
+      proc: supertest (pid 5)
+      intr: "off"
+      satp: kernel
+      locks: [wait_lock, "child's p->lock"]
+      irq: {noff: 2, intena: 1}
+      stack: [usertrap, syscall, sys_wait, kwait, freeproc, proc_freepagetable, uvmfree, uvmunmap]
+      sp: {"on": kernel}
+    note: |
+      For a level-1 leaf the loop frees the chunk with `superfree`, clears the PTE, and
+      advances `a` past the remaining 511 pages of the range. A range that covers only part
+      of a superpage panics: freeing half of one is impossible, and the caller must split it
+      first (commit 6). Clinic 3 shows what skipping it quietly leads to.
+
+      Recorded: pid 5 reaping its first `fork` child in [[kwait]] on hart 2, `a` =
+      `0x200000`, PTE at `0x8030a008`, level 1. [[kwait]] holds `wait_lock` and the zombie's
+      `p->lock` while [[freeproc]] frees its memory: noff 2, intena 1. Inside `superfree`
+      `kmem.lock` makes it noff 3; gdb printed that too.
+
+      `superfree` writes 2 megabytes of junk before it takes the lock, but with two
+      spinlocks already held interrupts are off for all of it on this hart. The original
+      kernel did the same total work page by page under the same locks.
+    others: |
+      While pid 5 holds `wait_lock`, any other process that exits on another hart spins in
+      [[kexit]]'s `acquire(&wait_lock)` until the junk fill and the frees are done; a timer
+      interrupt for this hart waits too (SIE 0). The lock order is the existing one:
+      `wait_lock` → `p->lock` → `kmem.lock`.
+  - title: fork gives the child a superpage
+    commit: 5
+    file: kernel/vm.c
+    lines: 347-395
+    focus: 369-379
+    diff: true
+    state:
+      hart: 1
+      mode: S
+      proc: supertest (pid 5)
+      intr: "off"
+      satp: kernel
+      locks: ["np->lock (the child's)"]
+      irq: {noff: 1, intena: 1}
+      stack: [usertrap, syscall, sys_fork, kfork, uvmcopy]
+      sp: {"on": kernel, detail: "`0x3fffff7ee0`"}
+    note: |
+      At the first page of a parent's superpage (`level == 1` and `i` aligned), [[uvmcopy]]
+      asks for a superpage, copies 2 megabytes, and maps it in the child with the parent's
+      flags (`0xd7` here: V R W U A D; the parent had used it). On success `i` skips the
+      other 511 pages.
+
+      Recorded on hart 1: pid 5 forking for `fork copies superpages`, `i` = `0x200000`,
+      source `pa` `0x87e00000`, new `mem` `0x87a00000` (chunk 61). [[kfork]] holds the
+      child's `np->lock` from [[allocproc]] through the copy: noff 1 here, noff 2 inside
+      `superalloc` (`kmem.lock`), intena 1. So the 2-megabyte `memmove` runs with
+      interrupts off on this hart, like the original's page copies.
+
+      The child's level-1 slot is always empty here: its page table is new and filled in
+      address order, so `mapsuper` can fail only for lack of a page-table page, and then the
+      whole fork is undone.
+  - title: fork without a free superpage
+    commit: 5
+    file: kernel/vm.c
+    lines: 347-395
+    focus: 380-388
+    state:
+      hart: 0
+      mode: S
+      proc: supertest (pid 5)
+      intr: "off"
+      satp: kernel
+      locks: ["np->lock (the child's)"]
+      irq: {noff: 1, intena: 1}
+      stack: [usertrap, syscall, sys_fork, kfork, uvmcopy]
+      sp: {"on": kernel}
+    note: |
+      When `superalloc` returns 0, the loop falls through to the page path. `walklevel`
+      returns the same level-1 leaf for each of the 512 addresses, and line 381 moves `pa`
+      to the piece that holds `i`. The child gets 512 ordinary pages with the same bytes;
+      the parent keeps its superpage.
+
+      Recorded during `fork without free superpages`: gdb stopped here at `i` =
+      `0x200000`, `0x201000`, ..., and at the 512th piece `0x3ff000`, each time with `pa` =
+      `0x87e00000` before the addition. At that moment `freesuper()` was 0 while 14,145
+      pages were free: two helpers had interleaved their allocations so that no chunk was
+      whole. Without this path, `fork` would fail on a machine with 55 megabytes free.
+  - title: Splitting a superpage keeps its bytes
+    commit: 6
+    file: kernel/vm.c
+    lines: 220-244
+    focus: 226-243
+    diff: true
+    state:
+      hart: 0
+      mode: S
+      proc: supertest (pid 5)
+      intr: "on"
+      satp: kernel
+      locks: []
+      irq: 0
+      stack: [usertrap, syscall, sys_sbrk, growproc, uvmdealloc, demote]
+      sp: {"on": kernel, detail: "`0x3fffff7f00`"}
+    note: |
+      `demote` replaces a level-1 leaf by a level-0 page-table page whose 512 entries map
+      the same chunk piece by piece, with the same flags. Recorded at `va` `0x4fe000`
+      (`shrinktest` cutting the second superpage): the leaf `0x21f000d7`, the new page at
+      `0x8030a000`, and its entries `l0[0]` `0x21f000d7`, `l0[1]` `0x21f004d7`, `l0[511]`
+      `0x21f7fcd7`: PPNs `0x87c00`, `0x87c01`, `0x87dff`.
+
+      Order matters a little: the level-0 page is complete before line 242 makes the
+      level-1 PTE point at it, so no walk can see a half-built table. (None could anyway:
+      only this process uses its page table, and it is here.) No `sfence.vma` either: the
+      hart is on the kernel page table, and [[userret]] flushes before the process runs
+      again.
+
+      `supersplit` (in `kalloc.c`) moves the chunk from `SUPER` to `SPLIT` with 0 free
+      pages, under `kmem.lock`. The [[kalloc]] for the new page is the only thing that can
+      fail. noff 0 and SIE 1 here: a plain system call, no lock held.
+  - title: uvmdealloc splits first; sbrk can now fail when shrinking
+    commit: 6
+    file: kernel/vm.c
+    lines: 325-346
+    focus: 336-343
+    diff: true
+    state:
+      hart: 0
+      mode: S
+      proc: supertest (pid 5)
+      intr: "on"
+      satp: kernel
+      locks: []
+      irq: 0
+      stack: [usertrap, syscall, sys_sbrk, growproc, uvmdealloc]
+      sp: {"on": kernel}
+    note: |
+      If the new end, rounded up to a page, is not 2-megabyte aligned, a superpage may
+      straddle it; `demote` splits it (and does nothing if the address lies in pages). Then
+      [[uvmunmap]] frees the pieces above the new end with [[kfree]], which accepts them now
+      that the chunk is split; when all of a chunk's pieces are free again, commit 3 lets it
+      be a superpage once more.
+
+      If `demote` fails, nothing has been freed and [[uvmdealloc]] returns `oldsz`.
+      `growproc` (lines 250-252 of `kernel/proc.c` on this commit) recognises "a shrink
+      was asked for and the size did not change" and returns -1, so `sbrk` fails cleanly.
+      The test `sz + n < sz` also keeps the old behaviour for a negative `n` larger than the
+      process, which `sbrk8000` in `usertests` relies on: that wraps around, and the old
+      code returned success without freeing anything.
+
+      Recorded: pid 5 shrinking from `0x600000` to `0x4fe000` (`n` = -1,056,768 in the
+      backtrace).
+  - title: The switch, in uvmalloc
+    commit: 7
+    file: kernel/vm.c
+    lines: 296-334
+    focus: 309-319
+    diff: true
+    state:
+      hart: 1
+      mode: S
+      proc: supertest (pid 5)
+      intr: "on"
+      satp: kernel
+      locks: []
+      irq: 0
+      stack: [usertrap, syscall, sys_sbrk, growproc, uvmalloc]
+      sp: {"on": kernel}
+    note: |
+      Everything before was preparation; this is where superpages appear. Every address in
+      the new range that is 2-megabyte aligned, with 2 full megabytes below `newsz`, gets a
+      zeroed superpage if `superalloc` has one and `mapsuper` finds the slot free;
+      otherwise the old page code runs. A superpage that `mapsuper` refused goes back with
+      `superfree`.
+
+      Recorded: `uvmalloc(oldsz=0x200000, newsz=0x600000)` for pid 5's `sbrk(4 MiB)`, two
+      `superalloc`s (chunks 63 and 62) and two `mapsuper`s, and none of the 1,024
+      [[kalloc]]s the original would have made. The 2-megabyte `memset` runs with
+      interrupts on and no lock held, so a timer interrupt may preempt it there, and the
+      process may continue on another hart.
+
+      Two properties the rest of the branch relies on: a superpage always lies entirely
+      below the new size (so [[uvmfree]] always covers it whole), and every caller of
+      [[uvmalloc]] gets them, including [[kexec]] for a program whose segments span an
+      aligned 2 megabytes. Lazy growth never comes here: `sbrklazy` raises `p->sz` only, and
+      [[vmfault]] maps one page per fault.
+  - title: freewalk needed no change
+    commit: 7
+    file: kernel/vm.c
+    lines: 359-377
+    focus: 365-374
+    state:
+      hart: 0
+      mode: S
+      proc: supertest (pid 3)
+      intr: "off"
+      satp: kernel
+      locks: [wait_lock, "child's p->lock"]
+      irq: {noff: 2, intena: 1}
+      stack: [usertrap, syscall, sys_wait, kwait, freeproc, proc_freepagetable, uvmfree, freewalk]
+      sp: {"on": kernel}
+    note: |
+      [[freewalk]] frees page-table pages recursively after [[uvmunmap]] has removed every
+      leaf. Its test on line 367 is the hardware's rule at every level: a valid PTE with R,
+      W and X clear points to a table; any other valid PTE is a leaf, and finding one means
+      somebody forgot to unmap it.
+
+      This lab changes nothing here, and the panic is its most useful line. In clinic 2
+      (`walk` descending into superpages) it was the *only* code that recognised the
+      superpage: [[uvmunmap]] never saw the level-1 leaf, and [[freewalk]] stopped at entry
+      1 of the level-1 page, the region `0x200000`, with `panic: freewalk: leaf`.
+
+      State (reasoned for the reference, matching clinic 2's gdb run): the parent reaping
+      in [[kwait]] under `wait_lock` and the zombie's `p->lock`, noff 2.
+  - title: Asking the kernel what it did
+    commit: 8
+    file: kernel/sysproc.c
+    lines: 114-137
+    focus: 116-130
+    diff: true
+    state:
+      hart: any
+      mode: S
+      proc: supertest
+      intr: "on"
+      satp: kernel
+      locks: []
+      irq: 0
+      stack: [usertrap, syscall, sys_pglevel]
+      sp: {"on": kernel}
+    note: |
+      A test that runs in user space cannot see a page table, and "the program works" does
+      not show that superpages were used: the original kernel runs `supertest`'s byte checks
+      perfectly. `pglevel` walks the caller's page table with `walklevel` and returns the
+      level of the leaf, and `freesuper` returns the count of chunks `superalloc` could hand
+      out, which [[kalloc]]-level bugs (clinic 4's, clinic 6's) would disturb.
+
+      Both are debugging interfaces, not something a real kernel would expose this way;
+      Linux reports the same facts through `/proc/<pid>/smaps` (`AnonHugePages`).
+  - title: The test that makes fragmentation on purpose
+    commit: 9
+    file: user/supertest.c
+    lines: 161-227
+    focus: 166-203
+    diff: true
+    state:
+      hart: any
+      mode: U
+      proc: supertest (pid 5)
+      intr: "on"
+      satp: user
+      locks: []
+      stack: [main, demotefork, fragment]
+      sp: {"on": user}
+    note: |
+      `fragment` forks two helpers. Each first gives back the superpages it inherited (so it
+      holds only pages), then on every command allocates 64 pages with `sbrk`. The test
+      process sends commands to them in turn until `freesuper()` reaches 0, then makes one
+      exit. Because the reference [[kalloc]] fills the lowest split chunk first, each chunk
+      ends up holding 64-page runs of both helpers, and when one leaves, the other's pages
+      pin every chunk: 14,145 free pages and 0 superpages in every recorded run.
+
+      Two details matter. The helpers must give back their inherited superpages first:
+      if they keep them, the survivor's allocations use up the freed memory before any
+      chunk is split, and the test hangs in `wait`. And the free-page
+      count runs in a child that exits: the counting process's own page-table pages, freed
+      last, would otherwise pin chunks themselves.
+verify: |
+  On the branch (`ext/14-superpages`, 9 commits), built with the project toolchain and run on
+  3 harts (`-smp 3 -m 128M`), in one boot:
+
+  ```text
+  $ supertest
+  supertest: heap at 0x0000000000005000, superpages at 0x0000000000200000 and 0x0000000000400000
+  supertest: superpages: OK
+  supertest: every byte: OK
+  supertest: system calls: OK
+  supertest: fork copies superpages: OK
+  supertest: fragmented: 0 free superpages, 14145 free pages
+  supertest: fork without free superpages: OK
+  supertest: shrink splits: OK
+  supertest: unaligned growth uses pages: OK
+  supertest: lazy growth uses pages: OK
+  supertest: free pages 32459 before, 32459 after
+  supertest: free superpages 63 before, 63 after
+  supertest: no leaks: OK
+  supertest: ALL OK
+  $ usertests -q
+  usertests starting
+  test copyin: OK
+  test copyout: OK
+  [...]
+  test MAXVAplus: usertrap(): unexpected scause 0xf pid=6526
+  [...]
+  ALL TESTS PASSED
+  $ supertest
+  [...]
+  supertest: free pages 32459 before, 32459 after
+  supertest: free superpages 63 before, 63 after
+  supertest: no leaks: OK
+  supertest: ALL OK
+  ```
+
+  Every line of `supertest` is checked by the program itself; the two information lines
+  are printed for the reader. The `usertrap()` lines inside `usertests` are the expected
+  kills of tests that touch memory they must not, as on the original kernel. `usertests`
+  exercises the superpage paths (from reading its code; we did not trace them during the
+  run): `sbrkmuch` grows to 100 megabytes, which can take up to 49 superpages, shrinks by
+  one page, which demotes the last one, and grows back; `sbrkfail` runs memory out with
+  ten processes. And `supertest` after it
+  still finds all 63 superpages free: nothing `usertests` did left a stray page in a chunk.
+
+  Every commit was built on its own, and `usertests -q` passed on 3 harts at every commit
+  of the branch.
+measure: |
+  **Page-table pages.** A measurement program (not on the branch) aligned its heap, grew it
+  by 64 megabytes either in one `sbrk` (superpages on the branch) or in 64 steps of
+  1 megabyte (no step contains a whole aligned 2 megabytes, so pages), and counted free
+  pages before and after with helper processes forked while it was still small:
+
+  | kernel | grown in one `sbrk` | grown in 1 MiB steps |
+  |---|---|---|
+  | reference branch | 16,352 pages counted as used | 16,384 |
+  | original 06aad25 | 16,384 | 16,384 |
+
+  Both rows include the same distortion: the counting helper itself needs fewer page-table
+  pages when less memory is free, which cancels the 32 level-0 pages of the page-only case.
+  The *difference* is what matters, and it is exactly 32 pages (128 KiB): one level-0 page
+  per 2 megabytes, present with pages, absent with superpages. Same numbers in every run on
+  each kernel (six on the branch, three on the original).
+
+  **Fragmentation.** Free superpages reported by `supertest` (before its own tests run):
+
+  | allocator | fresh boot | after `usertests -q` |
+  |---|---|---|
+  | reference (lowest split chunk first) | 63 | 63 |
+  | one free list, last freed first | 63, but `supertest` got no superpage at all | 52 |
+
+  With one free list the pages freed last by `supertest`'s counting child (its
+  page-table pages, one in nearly every chunk) were the first ones handed out again, so
+  every chunk had a page in use by the time the test asked for a superpage.
+
+  **Time, honestly.** The same program timed four things: six runs on the branch (three
+  of them without its final one-line check in `kfree`), three on the original kernel (ticks are tenths of a second):
+
+  | | branch, superpages | branch, pages | original |
+  |---|---|---|---|
+  | one load per page, 16,384 pages × 20,000 | 44-55 | 44-59 | 48-59 |
+  | every word, 64 MiB × 400 | 55-105 | 52-110 | 64-100 |
+  | `fork` + `exit` + `wait` of the 64 MiB process × 20 | 19-20 | 20 | 19-20 |
+  | grow 64 MiB | 1-3 | 1-3 | 1-3 |
+
+  No difference stands out from the noise. The loop with one load per page is the one that
+  would show TLB reach on hardware: 16,384 pages are more than typical TLBs hold as
+  4096-byte entries, and 32 superpage entries would cover them. QEMU does not show it; the
+  explanation is in QEMU's source, not in a timing run: in QEMU 10.2.1,
+  `riscv_cpu_tlb_fill` in `target/riscv/cpu_helper.c` installs every
+  translation with `tlb_size = TARGET_PAGE_SIZE` (only PMP can make it smaller), so its
+  software TLB holds one entry per 4096-byte guest page whatever the guest's leaf size, and
+  a superpage saves QEMU at most a shorter walk on a miss. Measure superpages on real hardware; on
+  QEMU, count page-table pages.
+further: |
+  - **Transparent promotion.** When a process has touched all 512 pages of an aligned
+    2 megabytes (lazily, or after a demotion), copy them into a free chunk and replace the
+    level-0 page by one leaf. It teaches when the kernel may move a process's memory under
+    it, and why the TLB must then be flushed on every hart that might use the old entries.
+  - **Compaction.** When no chunk is whole, move the few pages in use out of an almost-free
+    chunk. Page-table pages and kernel stacks cannot be moved this way, which is why real
+    kernels allocate them from different chunks than user pages (Linux's migrate types).
+  - **Superpages for exec.** [[kexec]] already gets them for any segment that spans an
+    aligned 2 megabytes; link a program whose code is that large and check with `pglevel`.
+    Think about what `PTE_X` on a superpage means for `fence.i`.
+  - **Gigapages.** A level-2 leaf maps 1 gigabyte. This machine has 128 megabytes, but the
+    kernel's own direct map could use level-1 leaves: map RAM in [[kvmmake]] with
+    superpages and count the page-table pages saved (the direct map of RAM alone uses one
+    level-0 page per 2 megabytes, 64 of them).
+  - **Shared superpages with copy-on-write.** Combine with lab 11: what does a store fault
+    on a shared superpage copy, 4096 bytes after a demotion or all 2 megabytes?

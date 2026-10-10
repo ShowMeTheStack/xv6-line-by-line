@@ -1,0 +1,841 @@
+title: fork
+group: Processes
+prerequisites: [5, 13, 16]
+summary: |
+  You type `ls` at the `$` prompt and press Enter. Before a single line of `ls` runs, the
+  shell has to make a second copy of itself: a new process with its own memory, its own
+  kernel stack and its own process ID, but the same open files, the same current directory
+  and the same registers. That is [[g:fork-exec|fork]], and this tour watches it happen,
+  from the shell's call on hart 0 to the moment the copy wakes up for the first time on
+  hart 2 and sees `fork()` return 0.
+
+  On the way you will see a free slot found in the process table under its lock, a
+  [[g:pid]] handed out under a second lock, five pages of the shell's memory copied one by
+  one, open files shared by bumping [[g:reference-count|reference counts]], and then the
+  delicate part: *publishing* the new process to the other harts. The kernel releases one
+  lock, takes another, then retakes the first, and every step of that dance is there to
+  avoid a deadlock or a half-built process being run.
+
+  The system-call path in and out of the kernel is the one from [[tour:5]]; this tour
+  starts where [[kernel:syscall]] calls [[kernel:sys_fork]]. Pids, slots, sizes and
+  addresses were checked in a QEMU run of this build with gdb attached. The hart assignment
+  is staged: in that run the child started on the same hart as the shell (hart 0), and this
+  tour follows the case where another hart picks it up, because the code must be correct
+  either way.
+cast: |
+  The machine has three [[g:hart|harts]]. When the tour starts:
+
+  | Hart | What it is doing |
+  |---|---|
+  | 0 | Running the shell `sh` (pid 2) in user mode. It has just read `ls\n` into its buffer |
+  | 1 | In its [[kernel:scheduler]], finding nothing runnable, waiting in `wfi` |
+  | 2 | The same: idle in its own scheduler loop |
+
+  `init` (pid 1) is asleep in [[kernel:kwait]], waiting for the shell. The process table
+  [[kernel:proc|proc[]]] has 64 slots: slot 0 is `init`, slot 1 is `sh`, and slots 2–63 are
+  `UNUSED`.
+steps:
+  - title: The shell decides to fork
+    file: user/sh.c
+    lines: 159-178
+    focus: 172-174
+    state:
+      hart: 0
+      mode: U
+      proc: sh (pid 2)
+      intr: on
+      satp: user
+      locks: []
+      stack: [main]
+      sp: user
+    note: |
+      [[user:getcmd]] has filled `buf` with `"ls\n"`. It is not `cd`, so the shell calls
+      [[user:fork1]], a wrapper that calls `fork()` and panics if it fails, then
+      `wait(0)`.
+
+      Why fork at all? The shell wants to run `ls` and then *keep being the shell*.
+      [[g:exec]] replaces the memory of the process that calls it, so if the shell called
+      `exec("ls")` itself, the shell would be gone. Instead it makes a copy; the copy
+      parses the command and turns itself into `ls`, while the original waits. This
+      pairing is the [[g:fork-exec]] pattern, and it is how every Unix shell runs every
+      command.
+
+      Notice what is *not* done here: the shell does not parse the command. Parsing
+      allocates memory with `malloc` (see [[tour:26]]), and line 173 does it in the child,
+      so the shell's own memory never grows. That is why the shell stays at five pages
+      for its whole life, a number that will matter in a moment.
+
+      `fork()` is a [[g:syscall-stub]]: `li a7,1` (`SYS_fork`) and `ecall` at address
+      `0xc80` in `user/sh.asm`. From the `ecall` to [[kernel:sys_fork]], the path is exactly
+      [[tour:5]]'s.
+
+  - title: sys_fork hands over to kfork
+    file: kernel/sysproc.c
+    lines: 25-29
+    focus: 28
+    state:
+      hart: 0
+      mode: S
+      proc: sh (pid 2)
+      intr: on
+      satp: kernel
+      locks: []
+      irq: 0
+      stack: [usertrap, syscall, sys_fork]
+      sp: {"on": kernel, switched: "`ld sp, 8(a0)` in [[uservec]] ([[kernel/trampoline.S:76]])", detail: "sh's kernel stack, KSTACK(1): 0x3fffffb000–0x3fffffc000"}
+    note: |
+      [[sys_fork]] takes no arguments, so it does not fetch any. It calls [[kfork]] and
+      returns whatever it returns: the child's pid, or -1. [[syscall]] will store that
+      value in the shell's saved `a0` ([[kernel/syscall.c:146]]).
+
+      Remember the state of things on hart 0 at this moment. [[usertrap]] has already saved
+      the user program counter and **added 4 to it**, so `p->trapframe->epc` holds `0xc84`,
+      the `ret` right after the `ecall`. It has turned interrupts back on. The shell's
+      trapframe holds every user register exactly as they were at the `ecall`.
+
+      That trapframe is about to be photocopied. Everything in it, including that already
+      advanced `epc`, will become the child's starting point.
+
+      Two stacks belong to the shell, and this step uses the second. Its **user stack**, the
+      page at `0x4000`, was abandoned at the `ecall`: [[uservec]] saved the user `sp`
+      (`0x4f80` in our run) in the trapframe and loaded `sp` from `kernel_sp`. Hart 0 now runs
+      on the shell's **kernel stack**, the page at `KSTACK(1)`, empty at the moment of the
+      trap and now holding `usertrap → syscall → sys_fork` ([[concept:stacks]]).
+
+  - title: kfork asks for an empty process
+    file: kernel/proc.c
+    lines: 256-276
+    focus: 263-266
+    state:
+      hart: 0
+      mode: S
+      proc: sh (pid 2)
+      intr: on
+      satp: kernel
+      locks: []
+      irq: 0
+      stack: [usertrap, syscall, sys_fork, kfork]
+      sp: kernel
+    note: |
+      [[kfork]] has the whole job in outline: get a blank process ([[allocproc]]), copy the
+      parent's memory ([[uvmcopy]]), copy its registers, share its files, and finally make
+      the child runnable.
+
+      `p` is the shell, found with [[myproc]]. `np` ("new process") will be the child.
+      If [[allocproc]] returns 0, the table is full or memory ran out, and `fork()`
+      returns -1 to the shell, and [[user:fork1]] calls the shell's own `panic`, which
+      prints `fork` on the console and exits.
+
+      Read the rest of the function with one fact in mind: **from line 266 to line 294,
+      hart 0 holds the child's `p->lock`.** [[allocproc]] returns with it held. That means
+      interrupts are off on hart 0 for the whole copy, and any other hart that wants this
+      slot's lock (a scheduler scan, [[wakeup]], `kill(3)`) must wait. What keeps schedulers
+      from running the half-built child is its `USED` state; the fields being filled in
+      (memory, trapframe, files) are private to the process ([[kernel/proc.h:95]]), and no
+      other hart reads them.
+    others: |
+      Harts 1 and 2 are idle, but their schedulers are not asleep forever: every timer tick
+      wakes them out of `wfi`, and they sweep the process table, taking each `p->lock` in
+      turn to look at `p->state`. In a moment, hart 0 will start claiming a slot in that same
+      table.
+
+  - title: Scanning the table, one lock at a time
+    file: kernel/proc.c
+    lines: 105-126
+    focus: 124-126
+    state:
+      hart: 0
+      mode: S
+      proc: sh (pid 2)
+      intr: off
+      satp: kernel
+      locks: ["proc[2].lock (child)"]
+      irq: {noff: 1, intena: 1, note: "intena 1: when noff last went from 0 to 1 (this slot's acquire; each earlier slot was released), interrupts were on, because this is a system call after `usertrap`'s `intr_on`"}
+      stack: [usertrap, syscall, sys_fork, kfork, allocproc]
+      sp: kernel
+    note: |
+      [[allocproc]] walks `proc[]` from the start. For each slot it takes that slot's lock,
+      looks at `state`, and lets go if the slot is in use:
+
+      | Slot | Holder | State | What allocproc does |
+      |---|---|---|---|
+      | 0 | `init` | `SLEEPING` | acquire, look, release |
+      | 1 | `sh` (itself) | `RUNNING` | acquire, look, release |
+      | 2 | nobody | `UNUSED` | acquire, **keep it**, jump to `found` |
+
+      It needs the lock even to *read* `state`, because another hart could be changing it.
+      And it must *keep* the lock between seeing `UNUSED` and writing `USED` on line 126:
+      otherwise two harts forking at once could both see slot 2 free and both claim it.
+
+      With the lock held, line 126 sets `state = USED`. From now on no other
+      [[allocproc]] will pick this slot, and no scheduler will run it, since schedulers
+      only run `RUNNABLE` processes.
+
+      Holding the first spinlock turned interrupts **off** on hart 0 ([[push_off]]); they
+      stay off while any spinlock is held, and from line 124 on, the one held is slot 2's.
+    others: |
+      A scheduler on hart 1 might be holding `proc[0].lock` at the very moment hart 0 wants
+      it:
+
+      | Time | Hart 0 (sh, in allocproc) | Hart 1 (scheduler) |
+      |---|---|---|
+      | t1 | `acquire(&proc[0].lock)`: spins | holds `proc[0].lock`, sees `SLEEPING` |
+      | t2 | still spinning | `release(&proc[0].lock)`, moves to slot 1 |
+      | t3 | gets it, sees `SLEEPING`, releases | `acquire(&proc[1].lock)` |
+      | t4 | `acquire(&proc[1].lock)`: spins briefly | releases it |
+
+      The two scans chase each other down the table, waiting at most a few instructions at
+      each slot. Each check-and-act on a slot (is it `UNUSED`? claim it; is it `RUNNABLE`?
+      run it) happens under that slot's lock, so no two harts can act on the same
+      observation.
+
+  - title: A pid from its own lock
+    file: kernel/proc.c
+    lines: 92-103
+    focus: 97-100
+    state:
+      hart: 0
+      mode: S
+      proc: sh (pid 2)
+      intr: off
+      satp: kernel
+      locks: ["proc[2].lock (child)", pid_lock]
+      irq: {noff: 2, intena: 1}
+      stack: [usertrap, syscall, sys_fork, kfork, allocproc, allocpid]
+      sp: kernel
+    note: |
+      [[allocpid]] hands out process IDs from the global counter [[nextpid]]. `init` got
+      1, the shell 2, and this child gets **3**. (In our gdb run: `child pid=3 slot=2`.)
+
+      Why a separate lock, [[pid_lock]], and not the slot's `p->lock`? Because `nextpid` is
+      not part of any one slot. Two harts forking at once hold *different* slot locks
+      (slot 2 and slot 3, say), so neither slot lock would stop them both reading
+      `nextpid == 3` and handing out the same pid twice. The read and the increment must
+      be one indivisible step for everyone, and that needs one lock for everyone.
+
+      Note the nesting: `proc[2].lock` is held while `pid_lock` is taken. That is safe
+      because no code anywhere holds `pid_lock` and then asks for a `p->lock`, so no cycle
+      can form ([[tour:18]]). `pid_lock` is one of only four locks a measured run ever saw
+      taken under a `p->lock`, and fork takes all four ([[tour:51]]). The strip shows
+      `noff` 2: two spinlocks held on this hart ([[concept:locks#nesting]]).
+
+      Pids are never reused within a boot: the counter only grows. Slots are reused all the
+      time; slot 2 will hold pid 4 for the next command.
+    others: |
+      Without `pid_lock`, the race is the classic lost update ([[g:race-condition]]):
+
+      | Time | Hart 0 | Hart 1 |
+      |---|---|---|
+      | t1 | `pid = nextpid` (3) | |
+      | t2 | | `pid = nextpid` (3) |
+      | t3 | `nextpid = 4` | |
+      | t4 | | `nextpid = 4` |
+
+      Two processes with pid 3: `kill(3)` would hit whichever comes first in the table, and
+      the shell's `wait` could return 3 for either child. With the lock, hart 1's `acquire` spins until hart 0 has written 4.
+
+  - title: A trapframe page and an empty page table
+    file: kernel/proc.c
+    lines: 124-141
+    focus: 128-141
+    state:
+      hart: 0
+      mode: S
+      proc: sh (pid 2)
+      intr: off
+      satp: kernel
+      locks: ["proc[2].lock (child)"]
+      irq: {noff: 1, intena: 1, note: "each `kalloc` here makes it 2 for a moment (`kmem.lock`)"}
+      stack: [usertrap, syscall, sys_fork, kfork, allocproc]
+      sp: kernel
+    note: |
+      The child needs two things before it can ever run in user mode:
+
+      - a [[g:trapframe]] page, from [[kalloc]], where its user registers will live;
+      - a user [[g:page-table]], from [[proc_pagetable]] ([[kernel/proc.c:175]]). It is
+        empty of user memory, but it already maps two pages at the top: the shared
+        [[g:trampoline]] at `TRAMPOLINE` (`0x3ffffff000`) and this child's own trapframe
+        just below it at `TRAPFRAME`. [[tour:25]] walks these mappings bit by bit.
+
+      Each [[kalloc]] briefly takes `kmem.lock`, the lock on the shared free-page list
+      ([[tour:27]]). The page table needs three of them: one for the top-level page and two
+      for the levels below that [[walk]] creates when the first mapping is added.
+
+      Either allocation can fail. Then [[freeproc]] undoes whatever was done (it checks
+      each pointer before freeing), sets the slot back to `UNUSED`, and the lock is
+      released. The table is left exactly as it was.
+    others: |
+      [[kalloc]] on hart 0 and a [[kfree]] on hart 2 can collide on the free list.
+      `kmem.lock` makes each push and pop indivisible, so two harts never take the same
+      page. Here hart 0 is nesting `kmem.lock` inside `proc[2].lock`, which is fine: the
+      allocator never takes any other lock while holding its own.
+
+  - title: Rigging the first context switch
+    file: kernel/proc.c
+    lines: 143-150
+    focus: 145-149
+    state:
+      hart: 0
+      mode: S
+      proc: sh (pid 2)
+      intr: off
+      satp: kernel
+      locks: ["proc[2].lock (child)"]
+      irq: {noff: 1, intena: 1}
+      stack: [usertrap, syscall, sys_fork, kfork, allocproc]
+      sp: kernel
+    note: |
+      A process starts running when some scheduler calls [[swtch]] into its saved
+      [[kernel:context|context]]: [[swtch]] loads `ra`, `sp` and the callee-saved registers
+      and executes `ret`, which jumps to `ra` ([[tour:13]]). A brand-new process has never
+      run, so there is no real saved context. These lines forge one:
+
+      - `ra = forkret`: the `ret` at the end of [[swtch]] will "return" into [[forkret]]
+        (address `0x8000193a` in this build).
+      - `sp = p->kstack + PGSIZE`: the top of the child's [[g:kernel-stack]]. Each slot's
+        stack was mapped at boot by [[proc_mapstacks]] at [[KSTACK]]`(slot)`. For slot 2 that
+        is `0x3fffff9000`, so `sp = 0x3fffffa000`, exactly what gdb printed.
+
+      Everything else is zeroed by `memset`. [[forkret]] does not care about the other
+      callee-saved registers, because it is the first function on an empty stack.
+
+      Note what is **not** copied: the shell's kernel stack. Right now two kernel stacks are
+      involved, and they look nothing alike:
+
+      ```text
+      sh's kernel stack (KSTACK(1))      child's kernel stack (KSTACK(2))
+        top 0x3fffffc000 ─► usertrap       top 0x3fffffa000 ─► (empty)
+                            syscall                             ▲ context.sp
+                            sys_fork                            context.ra = forkret
+                            kfork
+                            allocproc ◄─ sp
+      ```
+
+      The child never made the `fork` call, so it has no frames to inherit; the shell's
+      frames would be meaningless to it. Its stack page was not allocated by `fork` either:
+      it was mapped at boot and has belonged to slot 2 ever since ([[tour:24]]). Whatever an
+      earlier occupant of slot 2 left in it is simply below the new `sp` and will be
+      overwritten.
+
+      [[allocproc]] now returns `np`, still locked.
+
+  - title: Copying the shell's memory
+    file: kernel/proc.c
+    lines: 270-282
+    focus: 270-276
+    state:
+      hart: 0
+      mode: S
+      proc: sh (pid 2)
+      intr: off
+      satp: kernel
+      locks: ["proc[2].lock (child)"]
+      irq: {noff: 1, intena: 1}
+      stack: [usertrap, syscall, sys_fork, kfork]
+      sp: kernel
+    note: |
+      Back in [[kfork]], [[uvmcopy]] gives the child a private copy of every user page the
+      shell has. The shell's size `p->sz` is `0x5000` (five pages; [[tour:25]] draws them):
+
+      | Address | Contents | PTE flags |
+      |---|---|---|
+      | `0x0000`, `0x1000` | code and read-only data | R X U |
+      | `0x2000` | data and bss (holds `buf`, with `"ls\n"`) | R W U |
+      | `0x3000` | [[g:guard-page]] | R W (no U) |
+      | `0x4000` | the user stack | R W U |
+
+      If the copy fails (out of memory), [[uvmcopy]] has already freed the pages it copied;
+      [[freeproc]] then frees the page-table pages and the trapframe, and `fork` returns -1.
+      Line 276 records the size only after success. Until then `np->sz` is 0, which is why
+      [[uvmcopy]] must clean up after itself.
+
+      This is the expensive part of `fork`, and it is mostly wasted: in a moment the child
+      will call `exec`, which throws all five copies away ([[tour:22]]). Real kernels avoid
+      the waste with copy-on-write; xv6 keeps the simple version.
+
+  - title: uvmcopy, page by page
+    file: kernel/vm.c
+    lines: 292-326
+    focus: 306-320
+    state:
+      hart: 0
+      mode: S
+      proc: sh (pid 2)
+      intr: off
+      satp: kernel
+      locks: ["proc[2].lock (child)"]
+      irq: {noff: 1, intena: 1, note: "each `kalloc` makes it 2 for a moment (`kmem.lock`)"}
+      stack: [usertrap, syscall, sys_fork, kfork, uvmcopy]
+      sp: kernel
+    note: |
+      [[uvmcopy]] steps through the parent's addresses a page at a time, `i = 0x0, 0x1000,
+      …, 0x4000`. For each:
+
+      1. [[walk]] finds the parent's [[g:pte]] (without allocating). Unmapped pages are
+         skipped; that is how lazily allocated holes survive a fork ([[tour:26]]).
+      2. `pa` is the parent's physical page, `flags` its permission bits.
+      3. [[kalloc]] a fresh page and `memmove` all 4096 bytes. This works because the
+         kernel can reach any physical page at its own address ([[g:direct-map]]).
+      4. [[mappages]] maps the copy at the **same virtual address** with the **same
+         flags** in the child's table.
+
+      Same address and same flags, so the child's memory looks exactly like the shell's. Even
+      the guard page at `0x3000` keeps its missing `U` bit: the child gets a guard too.
+
+      The page at `0x4000` is the shell's **user stack**, and it is copied like any other
+      page: `uvmcopy` neither knows nor cares that it is a stack. So the child gets the
+      shell's stack frames byte for byte (`start`'s and `main`'s frames, which hold saved
+      registers and return addresses, and [[user:fork1]]'s frame with its return address
+      into `main`), and since its saved `sp` will also be the shell's (next step), it will
+      resume on its own copy as if it had made the call itself.
+
+      Five pages, five `kalloc`s, 20 KiB copied, plus the page-table pages [[mappages]]
+      needs below the top level. The failure path (`err:`) unmaps and frees the `i/PGSIZE`
+      pages already copied, so a half-copied child leaks nothing.
+    others: |
+      Is it safe to read the shell's page table without a lock? Yes. Only the shell's own
+      system calls (`sbrk`, `exec`) and its own page faults ([[vmfault]]) change it, and the
+      shell is right here, busy in `fork`.
+      The child's page table is not visible to anyone else either.
+
+      What *is* contended is the allocator: five `kalloc` calls for the copies, plus two
+      inside [[walk]] for the child's lower page-table pages, each take `kmem.lock`.
+      And note the price of holding `proc[2].lock`: hart 0 runs this whole copy with
+      **interrupts off**. A timer tick that arrives now waits until line 294.
+
+  - title: Registers, and the one that differs
+    file: kernel/proc.c
+    lines: 278-282
+    focus: 279-282
+    state:
+      hart: 0
+      mode: S
+      proc: sh (pid 2)
+      intr: off
+      satp: kernel
+      locks: ["proc[2].lock (child)"]
+      irq: {noff: 1, intena: 1}
+      stack: [usertrap, syscall, sys_fork, kfork]
+      sp: kernel
+    note: |
+      Line 279 is a C struct assignment: it copies the shell's whole [[g:trapframe]], 288
+      bytes, into the child's. The child gets the shell's `sp`, `ra`, `s0`…, and above all
+      its `epc`, `0xc84`, already past the `ecall`. When the child first reaches user mode it
+      will continue at the `ret` of the `fork` stub, just like the parent.
+
+      Line 282 is the only difference: the child's saved `a0` becomes 0. Since `a0` carries a
+      system call's return value, `fork()` returns **0 in the child**, while the parent's `a0`
+      will get the pid 3. That one register is how the two identical programs tell
+      themselves apart (`if (fork1() == 0)`).
+
+      The copied `sp`, `0x4f80` in our run, is right for the child: the same address in its
+      own copy of the stack page. The copy also brings across fields that are wrong for the
+      child: `kernel_sp` is the top of the *shell's* kernel stack (`0x3fffffc000`),
+      `kernel_hartid` is hart 0. Harmless:
+      [[prepare_return]] rewrites all the kernel fields on the child's way out to user mode
+      (step 18), before the child can ever trap.
+
+  - title: Sharing open files and the current directory
+    file: kernel/proc.c
+    lines: 284-292
+    focus: 285-288
+    state:
+      hart: 0
+      mode: S
+      proc: sh (pid 2)
+      intr: off
+      satp: kernel
+      locks: ["proc[2].lock (child)"]
+      irq: {noff: 1, intena: 1, note: "`filedup` (`ftable.lock`) and `idup` (`itable.lock`) each make it 2 for a moment"}
+      stack: [usertrap, syscall, sys_fork, kfork]
+      sp: kernel
+    note: |
+      The child gets the same file descriptors, pointing at the **same**
+      [[g:open-file|open files]]. Copying a `struct file *` pointer creates a second user, so
+      [[filedup]] bumps the file's [[g:reference-count]], and [[idup]] does the same for the
+      current directory's [[g:inode]].
+
+      The shell has descriptors 0, 1 and 2, all pointing at one `struct file` for the console:
+      `init` opened it once and `dup`ed it twice (3 references), and forking the shell added 3
+      more. So this loop takes that count from **6 to 9**. Its other 13 descriptors are empty.
+
+      This sharing is what makes redirection work: `ls`'s output goes wherever the shell's
+      descriptor 1 goes, and a parent and child sharing a file also share its offset.
+
+      The counts live in shared tables, so [[filedup]] takes `ftable.lock` and [[idup]] takes
+      `itable.lock`, each for a few instructions, nested inside `proc[2].lock`. That nesting
+      is safe because [[filedup]] and [[idup]] take no other lock, and no code holds
+      `ftable.lock` or `itable.lock` while waiting for a `p->lock`.
+    others: |
+      Hart 2 could be closing a console descriptor at this very moment (any process exiting
+      does). `ref++` here and `ref--` in [[fileclose]] are both read-modify-write updates of
+      one integer; `ftable.lock` makes them take turns, so neither update is lost and the
+      file is never freed while the child still points at it.
+
+  - title: Name, pid, and a lock let go
+    file: kernel/proc.c
+    lines: 290-294
+    focus: 290-292
+    state:
+      hart: 0
+      mode: S
+      proc: sh (pid 2)
+      intr: off
+      satp: kernel
+      locks: ["proc[2].lock (child)"]
+      irq: {noff: 1, intena: 1}
+      stack: [usertrap, syscall, sys_fork, kfork]
+      sp: kernel
+    note: |
+      [[safestrcpy]] copies the name, so the child is also called `sh` until `exec` renames
+      it. (That is why our gdb log shows `pid=3 name=sh` calling `sbrk` before it becomes
+      `ls`.) The pid is saved in a local because `np->pid` may only be read under
+      `np->lock`, and the lock is about to go.
+
+      Line 294 then releases the child's lock. The child is complete but still `USED`, so no
+      scheduler will run it. Releasing pops the last [[push_off]], so interrupts come back
+      **on** after that line.
+
+      Why let go now, only to take the same lock again at line 300? Because the next step
+      needs [[wait_lock]], and xv6's rule is that `wait_lock` must be acquired **before** any
+      `p->lock`, never after ([[kernel/proc.c:26]]). Taking `wait_lock` while still holding
+      `np->lock` would break that order, and the next step shows the deadlock that would
+      follow.
+
+  - title: Recording the parent under wait_lock
+    file: kernel/proc.c
+    lines: 294-305
+    focus: 296-298
+    state:
+      hart: 0
+      mode: S
+      proc: sh (pid 2)
+      intr: off
+      satp: kernel
+      locks: [wait_lock]
+      irq: {noff: 1, intena: 1}
+      stack: [usertrap, syscall, sys_fork, kfork]
+      sp: kernel
+    note: |
+      `np->parent = p` records that the shell is the child's parent. The `parent` field is
+      not protected by `p->lock` but by the global [[wait_lock]] ([[kernel/proc.h:92]]),
+      because the code that reads it looks at *other* processes' parent fields: [[kwait]]
+      scans the table for `pp->parent == p`, and [[reparent]] in a dying process rewrites
+      its children's parents. One global lock gives all of them a consistent view of the
+      family tree.
+
+      The parent is set **before** the child becomes runnable (next step). So by the time
+      the child can run, and therefore by the time it could possibly call `exit`, its
+      `parent` is the shell, and [[kexit]]'s `wakeup(p->parent)` will reach the right
+      process.
+    others: |
+      Suppose kfork took `wait_lock` *without* first releasing `np->lock`. Some other
+      process, `X`, is exiting on hart 2:
+
+      | Time | Hart 0 (sh in kfork) | Hart 2 (X in kexit) |
+      |---|---|---|
+      | t1 | holds `proc[2].lock` | `acquire(&wait_lock)` succeeds |
+      | t2 | `acquire(&wait_lock)`: spins | [[wakeup]]`(X->parent)` walks the table, taking every `p->lock` |
+      | t3 | spinning, interrupts off | reaches slot 2: `acquire(&proc[2].lock)`: spins |
+      | t4 | spinning forever | spinning forever |
+
+      Each hart holds what the other wants. Both have interrupts off, so not even the timer
+      can break it: a [[g:deadlock]], and two dead harts. xv6's fixed order (`wait_lock`,
+      then `p->lock`) makes the cycle impossible, which is why line 294 lets go first.
+
+  - title: Publishing the child
+    file: kernel/proc.c
+    lines: 294-305
+    focus: 300-302
+    state:
+      hart: 0
+      mode: S
+      proc: sh (pid 2)
+      intr: off
+      satp: kernel
+      locks: ["proc[2].lock (child)"]
+      irq: {noff: 1, intena: 1}
+      stack: [usertrap, syscall, sys_fork, kfork]
+      sp: kernel
+    note: |
+      The last write, under `np->lock` again: `state = RUNNABLE`. This single store is the
+      moment of publication. Before it, the child is invisible to every scheduler; after it,
+      any hart may pick it up.
+
+      The order of the whole function is built around this line:
+
+      1. build everything (memory, registers, files, name) while the slot is `USED`;
+      2. set the parent;
+      3. only then, `RUNNABLE`.
+
+      Publishing *last* means no scheduler can ever see a half-built process. And the lock
+      around the store does more than serialize it: [[release]] contains a memory fence
+      ([[g:memory-barrier]]), so every earlier write (the trapframe copy, the page table, the
+      file pointers) is visible to the other harts before `RUNNABLE` is. A scheduler that
+      takes `proc[2].lock` and sees `RUNNABLE` is guaranteed to see the finished child, not
+      stale memory ([[tour:19]]).
+    others: |
+      Hart 2 is sweeping the table at this instant. If it reaches slot 2 *before* line 300,
+      it sees `USED` and moves on; if it reaches it while hart 0 holds the lock, it spins;
+      if it arrives *after* line 302, it sees `RUNNABLE` and runs the child. Those are the
+      only three possibilities, and all three are safe.
+
+  - title: The parent goes back to wait
+    file: user/sh.c
+    lines: 159-178
+    focus: 172-174
+    state:
+      hart: 0
+      mode: U
+      proc: sh (pid 2)
+      intr: on
+      satp: user
+      locks: []
+      stack: [main]
+      sp: {"on": user, switched: "`ld sp, 48(a0)` in [[userret]] ([[kernel/trampoline.S:118]]) and `sret` ([[kernel/trampoline.S:153]])", detail: "0x4f80 when sret lands in the fork stub; 0x4f90 here in main, after fork1 pops its frame"}
+    note: |
+      [[kfork]] returns 3. [[syscall]] stores it into the shell's saved `a0`, and the shell
+      returns to user mode the way every system call does ([[tour:5]]). `fork1()` returns 3,
+      which is not 0, so the shell skips `runcmd` and calls `wait(0)`. On the way out, the
+      shell's kernel stack emptied frame by frame as the functions returned, and
+      [[userret]] reloaded the user `sp` from the trapframe: hart 0 is back on the user
+      stack it left at the `ecall`.
+
+      The shell now goes to sleep in [[kwait]] until its child exits. [[tour:21]] follows
+      that half of the story: the zombie, the reaping, and why [[wait_lock]] is held while
+      the shell decides to sleep.
+
+      From here on the parent and the child run independently. Which one runs first, and
+      on which hart, is up to the schedulers. In our gdb run both happened to land on the
+      same hart; we follow the case where the child starts on a different one, because
+      that is what the code must be prepared for.
+
+      The same-hart case is the common one. Nothing tells an idle hart that a process
+      became `RUNNABLE`; hart 2 only notices at its next timer tick, up to about 0.1 s
+      later. Meanwhile the shell goes to sleep in [[kwait]] almost at once, and hart 0's own
+      scheduler, resuming its scan just after the shell's slot, finds slot 2 immediately.
+    others: |
+      The child might already be running on hart 2 before the shell's `sret` on hart 0. Or
+      it might not start until the shell is asleep. The program must not depend on the
+      order, and `sh` doesn't: the child parses and execs, the parent waits, and `wait`
+      works whether the child exits before or after the parent starts waiting.
+
+  - title: Hart 2's scheduler finds the child
+    file: kernel/proc.c
+    lines: 428-470
+    focus: 445-453
+    state:
+      hart: 2
+      mode: S
+      proc: none (scheduler)
+      intr: off
+      satp: kernel
+      locks: ["proc[2].lock (child)"]
+      irq: {noff: 1, intena: 0, note: "the scheduler takes `p->lock` with interrupts already off (line 442), so intena is 0"}
+      stack: [main, scheduler]
+      sp: {"on": scheduler, detail: "hart 2's slice of stack0, top 0x8000a890"}
+    note: |
+      The next timer interrupt pulls hart 2 out of `wfi`. Its [[scheduler]] sweeps the
+      table, taking each lock in turn. At slot 2 it finds `RUNNABLE`.
+
+      Holding `proc[2].lock`, it sets the state to `RUNNING`, records the process in
+      `c->proc` (this hart's `struct cpu`), and calls [[swtch]], saving the scheduler's own
+      registers in `c->context` and loading the child's forged context.
+
+      Until that `swtch`, hart 2 runs on its **scheduler stack**: the same 4 KiB slice of
+      [[stack0]] it booted on, which became the scheduler stack when [[main]] called
+      [[scheduler]] and never returned. It belongs to the hart, not to any process, and
+      it has no guard page.
+
+      The lock is **not** released before the switch. It travels across [[swtch]] with the
+      thread of control: the scheduler took it, and the child, on the far side, will release
+      it ([[tour:13]] tells that story in full). Until then, no other hart can see slot 2 in
+      the inconsistent state "marked `RUNNING` but not actually running yet".
+    others: |
+      Hart 1's scheduler may reach slot 2 a moment later. It spins on `proc[2].lock`, gets
+      it only after the child has released it in [[forkret]], and then sees `RUNNING`, so it
+      leaves it alone. Without the lock, both harts could see `RUNNABLE` and both switch to
+      the child: one process, one kernel stack, running on two CPUs at once, each hart's
+      `sp` pushing frames over the other's.
+
+  - title: swtch "returns" into forkret
+    file: kernel/proc.c
+    lines: 510-536
+    focus: 513-520
+    state:
+      hart: 2
+      mode: S
+      proc: sh (pid 3)
+      intr: off
+      satp: kernel
+      locks: ["proc[2].lock (child)"]
+      irq: {noff: 1, intena: 0, note: "still the scheduler's count and intena: the `release` on line 520 takes noff to 0 and leaves interrupts off"}
+      stack: [forkret]
+      sp: {"on": kernel, switched: "`ld sp, 8(a1)` in [[swtch]] ([[kernel/swtch.S:26]])", detail: "the child's kernel stack, KSTACK(2), top 0x3fffffa000; only forkret's frame on it"}
+    note: |
+      [[swtch]] loaded `sp = 0x3fffffa000` (line 26, [[kernel/swtch.S:26]]) and
+      `ra = forkret`, and its final `ret` jumped there. That `ld sp` is the moment hart 2
+      leaves its scheduler stack (where `swtch` just saved the scheduler's `sp` into
+      `c->context`) for the child's kernel stack. gdb at `forkret`'s first instruction:
+      `sp=0x3fffffa000`, the very top. The child is running for the first time, on hart 2, on its own empty
+      [[g:kernel-stack]]. The call stack shows only `forkret`: there is nothing beneath it,
+      no `usertrap`, no `syscall`, because the child never made the `fork` call. It only
+      inherited its result.
+
+      [[myproc]] now says pid 3, because the scheduler set `c->proc`. The first thing to do is
+      release `p->lock`, the lock hart 2's scheduler acquired. (A process returning to the
+      scheduler via [[sched]] would release it in its own code after `sched` returns; a new
+      process has no such code, so [[forkret]] does it.)
+
+      That release does not turn interrupts on. The `noff` and `intena` it consults are the
+      ones the scheduler left: it acquired `p->lock` with interrupts already off, so
+      `intena` is 0, and line 520 takes `noff` from 1 to 0 with interrupts still off
+      ([[concept:locks#handoff]], [[concept:locks#intena]]). They come on only when `sret`
+      enters user mode.
+
+      The `first` block runs only once per boot, for `init`, to set up the file system
+      and exec `/init`. For our child it is skipped.
+
+  - title: forkret leaves for user space
+    file: kernel/proc.c
+    lines: 536-543
+    focus: 538-542
+    state:
+      hart: 2
+      mode: S
+      proc: sh (pid 3)
+      intr: off
+      satp: kernel
+      locks: []
+      irq: 0
+      stack: [forkret, prepare_return]
+      sp: kernel
+    note: |
+      [[forkret]] now does what the end of [[usertrap]] does, by hand:
+
+      - [[prepare_return]] turns interrupts off and refills the kernel fields of the
+        trapframe: `kernel_sp` = the top of **the child's** kernel stack (`0x3fffffa000`),
+        `kernel_hartid` = **2**, the kernel page table and the address of [[usertrap]]. The
+        stale values copied from the shell in step 10 are gone. It also sets `sepc` to the
+        saved `epc`, `0xc84`.
+      - `MAKE_SATP` builds the `satp` value for the child's page table.
+      - It calls [[userret]] at its trampoline address, `TRAMPOLINE + (userret -
+        trampoline)` = `0x3ffffff09c`, passing `satp` in `a0`.
+
+      From [[userret]] on it is the return path of [[tour:5]]: `fence.i`, switch `satp`
+      to the child's table, reload the 31 registers from the trapframe (with `a0 = 0`), and
+      `sret`.
+
+      Inside [[userret]] the page table changes first and `sp` second. After `csrw satp`
+      ([[kernel/trampoline.S:111]]) `sp` still holds a kernel-stack address that the child's
+      page table does not map, so there is no usable stack from here until `sret`; `ld sp, 48(a0)`
+      ([[kernel/trampoline.S:118]]) loads the child's user `sp`, which becomes usable only when
+      `sret` returns to user mode. `forkret`'s frame is never
+      popped: it is simply abandoned, and the next trap starts again at `kernel_sp`, the top.
+
+  - title: The child sees fork() return 0
+    file: user/sh.c
+    lines: 159-178
+    focus: 172-173
+    state:
+      hart: 2
+      mode: U
+      proc: sh (pid 3)
+      intr: on
+      satp: user
+      locks: []
+      stack: [main]
+      sp: {"on": user, switched: "`ld sp, 48(a0)` in [[userret]] ([[kernel/trampoline.S:118]]) and `sret` ([[kernel/trampoline.S:153]])", detail: "0x4f80 when sret lands in the fork stub; 0x4f90 here in main, after fork1 pops its frame, in the child's copy of the stack page at 0x4000"}
+    note: |
+      `sret` lands at `0xc84`, the `ret` in the `fork` stub, with `a0 = 0`. The stub
+      returns, [[user:fork1]] returns 0, and line 172's test succeeds. This process takes
+      the other branch: `runcmd(parsecmd(cmd))`.
+
+      Everything the child sees is the shell's world: `buf` still contains `"ls\n"` (it is
+      at `0x2020` in the child's copy of the data page), `sp` resumes at the shell's `0x4f80` (`0x4f90` once `fork1` returns) and
+      the user stack holds the same frames,
+      descriptors 0–2 are the console. The only differences are the return value and
+      everything the program cannot see: a different pid, different physical pages, a
+      different kernel stack (empty again, since nothing of the child's runs in the kernel
+      while it is in user mode).
+
+      `parsecmd` will grow the child's heap by 64 KiB ([[tour:26]]), and `runcmd` will call
+      `exec("ls", argv)` ([[tour:22]]), which discards everything fork just copied.
+
+  - title: What one fork cost
+    file: kernel/proc.c
+    lines: 256-305
+    focus: 304
+    state:
+      hart: 0
+      mode: S
+      proc: sh (pid 2)
+      intr: on
+      satp: kernel
+      locks: []
+      irq: 0
+      stack: [usertrap, syscall, sys_fork, kfork]
+      sp: kernel
+    note: |
+      Count it up. To run `ls`, `fork` took **11 pages** from the allocator: 1 trapframe,
+      5 copies of user pages, and 5 page-table pages (the top level, plus a level-1 and a
+      level-0 page for the trampoline and trapframe at the top, and another pair for user
+      memory at the bottom). That is 44 KiB for a process that will throw its memory away a
+      moment later, when it calls `exec`.
+
+      It took six kinds of lock: each `p->lock` in turn during the scan (including the
+      shell's own slot 1), `pid_lock`, `kmem.lock` once per page (11 times), `ftable.lock`
+      (3 times), `itable.lock`, and `wait_lock`. And it followed three rules that recur
+      across xv6:
+
+      - **Claim under a lock**: see `UNUSED` and write `USED` without letting go.
+      - **Publish last**: make the object runnable only when it is complete, under its lock,
+        so the release fence publishes everything before it.
+      - **Respect the lock order**: `wait_lock` before `p->lock`, even if it means releasing
+        a lock and taking it again.
+
+      Stacks cost nothing extra: the user stack was one of the five copied pages, and the
+      child's kernel stack was already waiting in slot 2, mapped at boot. The only "stack
+      work" `fork` did was two stores: `context.sp` and `context.ra`.
+
+      Two copies of the shell now exist, distinguishable only by one register (in our
+      staging, one on hart 0 and one on hart 2).
+      Next, the child turns into `ls` ([[tour:22]]).
+locks:
+  - lock: "p->lock (each slot, in turn)"
+    where: "[[allocproc]] scan"
+    protects: "`p->state`: deciding whether a slot is free, and claiming it (`UNUSED` → `USED`) indivisibly"
+  - lock: "np->lock (the child's)"
+    where: "[[allocproc]] through line 294 of [[kfork]]; again at line 300"
+    protects: "Claiming the slot (pid and `USED` set together); the failure paths' `freeproc`; then the `RUNNABLE` store that publishes the child. The fields filled in between are private to the process ([[kernel/proc.h:95]]); `USED` is what keeps schedulers away"
+  - lock: pid_lock
+    where: "[[allocpid]]"
+    protects: "`nextpid`, shared by all slots, so two forks never get the same pid"
+  - lock: kmem.lock
+    where: "[[kalloc]], from [[allocproc]], [[proc_pagetable]], [[uvmcopy]], [[walk]]"
+    protects: "The shared free-page list"
+  - lock: "ftable.lock / itable.lock"
+    where: "[[filedup]], [[idup]]"
+    protects: "Reference counts of the shared open files and the current directory inode"
+  - lock: wait_lock
+    where: "[[kfork]] line 296"
+    protects: "`np->parent`, read by other processes in [[kwait]] and [[reparent]]"
+  - lock: "(no lock) the parent's page table and p->sz"
+    where: "[[uvmcopy]]"
+    protects: "Nothing needed: only the shell's own system calls and its own page faults (`vmfault`) change them, and the shell is busy in fork"
+  - lock: "p->lock handed across swtch"
+    where: "[[scheduler]] acquires, [[forkret]] releases"
+    protects: "Keeps other harts from seeing the child `RUNNING` before it really runs"
+quiz:
+  - q: "Why must allocproc keep `p->lock` held between seeing `UNUSED` and writing `USED`, instead of checking and then locking?"
+    a: "Two harts forking at once could otherwise both see slot 2 `UNUSED` and both claim it, building two processes in one slot. Checking and claiming under one lock makes the pair indivisible."
+  - q: "kfork releases `np->lock` at line 294 and reacquires it at line 300. What would go wrong if it kept holding it while taking `wait_lock`?"
+    a: "It would take `wait_lock` after a `p->lock`, against xv6's order. A process exiting on another hart holds `wait_lock` and, in `wakeup`, takes every `p->lock` including the child's. Each hart would wait for the other forever, with interrupts off."
+  - q: "The child's trapframe is a byte-for-byte copy of the shell's, including `kernel_sp`, which points to the shell's kernel stack. Why doesn't the child's first trap corrupt the shell's stack?"
+    a: "Before the child ever reaches user mode, `forkret` calls `prepare_return`, which rewrites `kernel_sp`, `kernel_hartid`, `kernel_satp` and `kernel_trap` for the child. A trap can only come from user mode after that."
+  - q: "Why is `state = RUNNABLE` the last thing kfork does, and why is it done under `np->lock`?"
+    a: "Once `RUNNABLE`, any hart's scheduler may run the child, so everything must already be in place. The lock makes the store and the schedulers' reads take turns, and `release`'s fence makes all the earlier writes (memory, trapframe, files) visible to another hart before it can see `RUNNABLE`."
+  - q: "The shell has 5 pages of user memory, but `fork` takes 11 pages from the allocator. Where do the other 6 go?"
+    a: "One for the child's trapframe and five page-table pages: the top-level page, plus a level-1 and a level-0 page for the low addresses (user memory) and another pair for the top (trapframe and trampoline)."
+  - q: "In the child, the call stack in forkret is just `[forkret]`. How does the child end up returning from `fork()` in user mode if it never called it?"
+    a: "It inherited the shell's saved user registers, including `epc` already advanced past the `ecall`, with `a0` set to 0. `forkret` returns to user space with those registers, so the child resumes at the `ret` of the `fork` stub as if the call had returned 0."

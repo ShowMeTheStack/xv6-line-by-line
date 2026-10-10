@@ -1,0 +1,739 @@
+title: Physical memory, sbrk and page faults
+summary: The kalloc free list and kmem.lock, junk fills and who zeroes pages, eager sbrk versus lazy sbrklazy, and how vmfault turns a page fault into a page or a kill.
+questions:
+  - id: mem-01
+    level: 1
+    type: choice
+    q: |
+      [[kalloc]] and [[kfree]] keep a linked list of free pages. Where are the list's nodes
+      stored?
+    code: kernel/kalloc.c:17-24
+    options:
+      - text: In the first 8 bytes of each free page itself, read as a struct run.
+        correct: true
+        why: |
+          A free page is 4096 bytes nobody is using, so the allocator borrows its first word
+          for the `next` pointer. The only separate storage is [[kmem]]: a lock and the head
+          pointer.
+      - text: In an array of 32,768 entries in the kernel's .bss, one per physical page.
+        why: |
+          You may be thinking of a bitmap or page-descriptor allocator. This one keeps no
+          per-page bookkeeping at all, which is also why it cannot detect a double free.
+      - text: In nodes allocated with malloc in the kernel.
+        why: |
+          You may have assumed the kernel has a heap. It doesn't: `malloc` exists only in
+          user space ([[user/umalloc.c]]). kalloc *is* the kernel's only allocator.
+      - text: In the kernel page table, as PTEs with V clear.
+        why: |
+          You may have confused the allocator with paging. The free list is plain memory
+          addressed through the direct map; page tables are among its customers, not its
+          storage.
+    explain: |
+      The bookkeeping costs nothing because it lives in memory that is free anyway. The price:
+      the allocator can only answer "give me *a* page". Once a page is handed out, its first
+      8 bytes belong to the caller. See [[tour:27]] and [[g:page-allocator]].
+
+  - id: mem-02
+    level: 2
+    type: number
+    q: |
+      In this build the kernel image ends at `end` = `0x80020bb0`, and [[PHYSTOP]] is
+      `0x88000000`. How many pages does [[freerange]] put on the free list at boot?
+    code: kernel/kalloc.c:26-40
+    answer: 32735
+    wrong:
+      32768: |
+        You may have counted all 128 MiB of RAM. The kernel's own pages, from `0x80000000`
+        up to `end` rounded up, are never handed to [[kfree]].
+      32736: |
+        You may have rounded `end` *down* to `0x80020000`. [[freerange]] uses
+        [[PGROUNDUP]], so the first free page is `0x80021000`; the partly used page
+        `0x80020000` is skipped.
+      32734: |
+        You may have thought the loop stops one page early. `p + PGSIZE <= pa_end` lets the
+        last page, `0x87fff000`, in: it ends exactly at `PHYSTOP`.
+    why_wrong: Round `end` up to a page boundary and count 4096-byte pages from there to PHYSTOP.
+    explain: |
+      `(0x88000000 - 0x80021000) / 4096` = `0x7fdf` = 32,735 pages. The 1,104 bytes
+      between `end` and `0x80021000` are never used. See [[tour:27]].
+
+  - id: mem-03
+    level: 1
+    type: choice
+    q: |
+      Right after [[kinit]], which physical page does the first [[kalloc]] return (it becomes
+      the root of the kernel page table)?
+    code: kernel/kalloc.c:33-40
+    options:
+      - text: "`0x87fff000`, the highest page below PHYSTOP"
+        correct: true
+        why: |
+          [[freerange]] frees pages from low to high, and [[kfree]] pushes each onto the
+          *front* of the list. The last page freed, `0x87fff000`, ends up at the head.
+      - text: "`0x80021000`, the first page after the kernel"
+        why: |
+          You may have thought the list is a queue (first freed, first allocated). It is a
+          stack: kfree pushes and kalloc pops at the same end.
+      - text: "`0x80020bb0`, the address of end"
+        why: |
+          You may have forgotten the rounding. `end` is not page-aligned; [[freerange]]
+          rounds up, and [[kfree]] would panic on an unaligned address anyway.
+      - text: "`0x88000000`, PHYSTOP"
+        why: |
+          You may have taken PHYSTOP as the last page. It is one past the end of RAM the
+          kernel uses; the last page *starts* at `PHYSTOP - 4096`.
+    explain: |
+      Push at the head plus an upward loop gives a list that runs from the top of RAM downward,
+      which is why the kernel's page-table pages show up at `0x87fff000`, `0x87ffe000`, … in
+      gdb. See [[tour:27]] and [[tour:24]].
+
+  - id: mem-04
+    level: 2
+    type: choice
+    q: |
+      [[kalloc]] fills each page it hands out with `0x05` bytes instead of zeros, even though
+      many callers then zero it themselves. Why?
+    code: kernel/kalloc.c:68-82@79-80
+    options:
+      - text: Zeros would hide bugs where a caller uses memory without initialising it, and some callers overwrite the whole page anyway.
+        correct: true
+        why: |
+          Zeros often look like a valid empty state (a null pointer, an empty string, a count
+          of 0). `0x0505…` looks like nothing, so a missing initialisation shows up fast.
+          [[uvmcopy]] overwrites the page with `memmove`, so zeroing it first would be wasted
+          work.
+      - text: Because 5 is the fastest value to store on RISC-V.
+        why: |
+          You may have thought the fill value matters for speed. `memset` costs the same for
+          any byte value; the choice of 5 is about being recognisable in a debugger.
+      - text: To mark the page as allocated, so kfree can detect a double free.
+        why: |
+          You may have thought kfree checks the contents. It checks only alignment and range;
+          a double free goes undetected (and kfree overwrites the page with `0x01` anyway).
+      - text: Because zeroing must be done under kmem.lock, which would slow other harts.
+        why: |
+          You may have thought any fill must happen under the lock. The `0x05` fill already
+          runs *after* `release` (line 77), on a page that is now private; zeroing could be
+          done there just as well.
+    explain: |
+      kalloc gives junk; callers that need zeros ([[walk]], [[uvmalloc]], [[vmfault]],
+      [[kvmmake]], [[uvmcreate]]) clear the page themselves. Two fill values, `0x05` on
+      alloc and `0x01` on free, even tell you in a debugger which state a page is in. See
+      [[tour:27]].
+
+  - id: mem-05
+    level: 1
+    type: line
+    q: |
+      A program calls `sbrklazy(4096)`. Click the line in [[sys_sbrk]] that is the **entire**
+      allocation work the kernel does for it.
+    code: kernel/sysproc.c:39-65
+    answer: 62
+    lines:
+      51: |
+        [[growproc]] is the eager path. `sbrklazy` passes `t = SBRK_LAZY` and a positive
+        `n`, so line 50's test is false and this line is skipped.
+      48: |
+        This reads the old size, which becomes the return value. It changes nothing.
+      60: |
+        This is a check that the new end stays below `TRAPFRAME`, not an allocation.
+      58: |
+        This only rejects a sum that wrapped around 2^64.
+    why_wrong: Find the line in the lazy branch that changes the process's state.
+    explain: |
+      `myproc()->sz += n` raises the limit and nothing else: no page is allocated and the page
+      table is untouched. From then on `sz` is a promise that [[vmfault]] keeps one page at a
+      time. See [[tour:26]].
+
+  - id: mem-06
+    level: 2
+    type: multi
+    q: |
+      [[kalloc]] returns pages full of `0x05` junk. Which of these functions zero the page
+      they get from kalloc before using it?
+    options:
+      - text: "[[walk]], for a new page-table page"
+        correct: true
+        why: "Line 111 clears it; a table full of junk would be full of entries with V set."
+      - text: "[[uvmalloc]], for a new heap page"
+        correct: true
+        why: "Line 233 zeroes it, so the program never sees another process's old data."
+      - text: "[[vmfault]], for a lazily allocated page"
+        correct: true
+        why: "Line 472 zeroes it, for the same reason as uvmalloc."
+      - text: "[[uvmcopy]], for the child's copy of a page"
+        why: |
+          You may have thought every user page is zeroed. uvmcopy overwrites all 4096 bytes
+          with `memmove` from the parent's page, so zeroing first would be wasted work.
+      - text: "[[allocproc]], for the trapframe page"
+        why: |
+          You may have thought the trapframe starts clean. allocproc does not clear it: for a
+          forked child, [[kfork]] copies the parent's whole trapframe over it, and
+          [[prepare_return]] fills in the kernel fields before any trap needs them.
+      - text: "[[proc_mapstacks]], for the kernel stacks"
+        why: |
+          You may have thought stacks need zeroing. A stack is always written before it is
+          read, so the stacks start full of `0x05` and that is harmless.
+    explain: |
+      Zeroing is the caller's job, done only where junk would be dangerous (page tables) or
+      would leak data (user memory). See [[tour:27]] and [[tour:26]].
+
+  - id: mem-07
+    level: 2
+    type: line
+    q: |
+      Click the line in [[vmfault]] that makes a user-mode store to the stack's
+      [[g:guard-page]] fatal instead of quietly supplying a new page.
+    code: kernel/vm.c:458-478
+    answer: [466, 467]
+    lines:
+      463: |
+        This rejects addresses at or above `sz`. The guard page is *below* `sz` (it is inside
+        the program's memory), so it passes this check.
+      465: |
+        Rounding down to the page start is bookkeeping; it does not decide anything.
+      473: |
+        If vmfault ever got this far for the guard page, [[mappages]] would panic with
+        "remap", not refuse cleanly. The refusal has to come earlier.
+      470: |
+        This handles running out of memory, not the guard page.
+    why_wrong: The guard page is below sz and is mapped (valid, but without U). Which test notices that?
+    explain: |
+      [[ismapped]] reports that the page already has a valid PTE, so this fault is a
+      permission problem, not a missing page, and vmfault returns 0. [[usertrap]] then prints
+      `unexpected scause` and kills the process. See [[tour:26]].
+
+  - id: mem-08
+    level: 2
+    type: order
+    q: |
+      After `sbrklazy(1 << 30)`, `usertests` stores to `0x13000`, a page that is not mapped
+      yet. Put the events in order.
+    items:
+      - text: "The store finds a level-0 PTE with V clear and raises a store page fault: scause 15, stval 0x13000"
+        why: Everything starts with the hardware failing the translation.
+      - text: "uservec saves the user registers in the trapframe and switches satp to the kernel page table"
+        why: The trampoline always runs first on any trap from user mode.
+      - text: "usertrap sees scause 15 and calls vmfault with p->sz and stval"
+        why: usertrap decides what kind of trap it is only after uservec has brought it into the kernel.
+      - text: "vmfault checks 0x13000 < sz and that the page is not mapped, then kallocs, zeroes and maps it R W U"
+        why: The page can only be supplied once vmfault has been called and its checks passed.
+      - text: "userret installs the user page table between two sfence.vma and executes sret"
+        why: The return to user mode happens after the page is mapped.
+      - text: "The same store executes again, since sepc was not advanced, and succeeds"
+        why: The retry is the last step; the faulting store did not complete the first time.
+    why_wrong: Follow the trap path, fault → trampoline → usertrap → vmfault → back out through userret, and the retried store.
+    explain: |
+      Unlike a system call, usertrap does not add 4 to `epc` here, so `sret` goes back to the
+      faulting store. The `sfence.vma` in [[userret]] makes sure the hart sees the new PTE.
+      See [[tour:26]] and [[concept:mode-stack-page-table#t2]].
+
+  - id: mem-09
+    level: 3
+    type: state
+    q: |
+      A process takes a page fault on a lazily allocated heap page. [[usertrap]] calls
+      [[vmfault]], which calls [[kalloc]], which has just acquired `kmem.lock`. What is the
+      state of this hart?
+    code: kernel/trap.c:54-74@71-73
+    state:
+      mode: S
+      stack: kernel
+      satp: kernel
+      sie: "off"
+      noff: "1"
+      intena: "0"
+    why:
+      sie: |
+        Interrupts are off: the trap cleared SIE, and only the system-call branch of
+        [[usertrap]] calls [[intr_on]]. In any case acquire's push_off clears SIE while a
+        spinlock is held.
+      intena: |
+        You may have assumed intena is 1 as in a system call. For a page fault, SIE was
+        already 0 when push_off ran, so it records 0, and `release` will leave interrupts
+        off.
+      noff: |
+        Only `kmem.lock` is held. vmfault and usertrap take no spinlock of their own on this
+        path.
+      stack: |
+        [[uservec]] switched to the process's kernel stack, as for any trap from user mode.
+        The user stack is not involved; the fault was on a heap page.
+      satp: |
+        [[uservec]] installed the kernel page table before calling usertrap. vmfault changes
+        the user table through the direct map, not by switching to it.
+    why_wrong: "Trace the fault path: hardware trap (SIE cleared), uservec, usertrap's page-fault branch (no intr_on), vmfault, kalloc, acquire."
+    explain: |
+      Supervisor mode, the process's kernel stack, the kernel page table, SIE off, noff 1 and
+      intena 0. The whole page-fault path runs with interrupts off; that is fine because it is
+      short and never sleeps. See [[tour:26]] and [[concept:locks#intena]].
+
+  - id: mem-10
+    level: 3
+    type: tf
+    q: |
+      True or false: after `sbrk(-8192)` frees two pages, xv6 must flush them from the TLB,
+      but it forgets to, so the program could still reach the freed pages through stale TLB
+      entries.
+    code: kernel/vm.c:248-260
+    answer: false
+    why_tf: |
+      You may know that real kernels must flush TLB entries when unmapping. xv6 does not
+      need a targeted flush, because by the time [[uvmdealloc]] runs there are no user
+      translations left in this hart's TLB.
+    reasons:
+      - text: "uservec flushed the whole TLB right after installing the kernel page table, and userret flushes again around installing the user table; the process runs on only one hart at a time, so no other hart holds its translations either."
+        correct: true
+        why: |
+          Every trap from user mode passes [[kernel/trampoline.S:95]], and every return passes
+          [[kernel/trampoline.S:110]]–112. So the next user access walks the updated page
+          table and faults.
+      - text: "uvmunmap sets the PTEs to 0, and the hardware always rereads PTEs from memory."
+        why: |
+          You may have thought the TLB watches memory. It doesn't: a cached translation stays
+          usable until an `sfence.vma`. Clearing the PTE alone would not be enough.
+      - text: "kfree fills the pages with 0x01, so a stale access would be harmless."
+        why: |
+          You may have thought the junk makes stale access safe. The page could be handed to
+          another process a moment later, and a stale translation would let this program
+          read or overwrite that process's data.
+    explain: |
+      xv6 pays a full TLB flush on every trap and every return to user mode. In exchange, the
+      kernel never has to flush anything when it changes a user page table, and never has to
+      coordinate flushes between harts. See [[tour:26]].
+
+  - id: mem-11
+    level: 3
+    type: number
+    q: |
+      In our run, the `usertests` child running `lazy_alloc` had `p->sz` = `0x12000` when it
+      called `sbrklazy(1 << 30)`. It then stores to `0x13000`, `0x53000`, … , every 64 pages,
+      4096 stores in all. Besides the 4096 data pages, how many **page-table pages** does
+      [[walk]] allocate during these faults?
+    code: user/usertests.c:2627-2649
+    answer: 511
+    wrong:
+      512: |
+        You may have counted one level-0 page per 2 MiB region touched (512 regions) and
+        forgotten that region 0, `0x0`–`0x1fffff`, already has one: it maps the program
+        itself.
+      4096: |
+        You may have thought every fault needs its own table page. One level-0 page covers
+        2 MiB, and the stores are 256 KiB apart, so 8 faults share each one.
+      0: |
+        You may have thought the tables exist already. Lazy `sbrk` only changes `sz`; the
+        page table grows only when [[vmfault]]'s [[mappages]] calls [[walk]] with
+        `alloc` = 1.
+    why_wrong: "One level-0 page maps 2 MiB. Count the 2 MiB regions the stores land in, and subtract those that already had a level-0 page. The level-1 page for the first GiB already exists."
+    explain: |
+      The stores fall in 512 regions of 2 MiB (8 stores each), from `0x13000` up to
+      `0x3ffd3000`, all below 1 GiB, so the existing level-1 page covers them. Region 0
+      already had a level-0 page, so walk allocates 511. That is about 4,600 pages, roughly
+      18 MiB, for a "gibibyte". See [[tour:26]].
+
+  - id: mem-12
+    level: 1
+    type: choice
+    q: |
+      A process with `p->sz = 0x5000` calls `sbrk(65536)` and it succeeds. What does
+      [[user:sbrk]] return?
+    code: kernel/sysproc.c:39-65@48
+    options:
+      - text: "`0x5000`, the old end, which is the start of the new memory"
+        correct: true
+        why: |
+          [[sys_sbrk]] records `addr = myproc()->sz` before growing and returns it. That is
+          why [[user:morecore]] can write a header at the returned address.
+      - text: "`0x15000`, the new end of memory"
+        why: |
+          You may have thought sbrk returns the new size. The new end is `p->sz` after the
+          call; the return value is the *old* one, which is the useful address.
+      - text: "0, meaning success"
+        why: |
+          You may be thinking of [[growproc]], which returns 0 on success. sys_sbrk returns
+          an address, or -1 on failure.
+      - text: "`0x5000 + 65536`, rounded up to a page"
+        why: |
+          You may have confused the return value with `sz` after rounding. `0x15000` is
+          already page-aligned, and in any case it is not what is returned.
+    explain: |
+      `sbrk(n)` returns a pointer to the `n` new bytes, which start at the old end of memory.
+      `(char *)-1` (`SBRK_ERROR`) means the kernel refused. See [[tour:26]].
+
+  - id: mem-13
+    level: 2
+    type: choice
+    q: |
+      [[kexec]] maps the user stack's guard page and then clears its `PTE_U`, instead of
+      simply leaving the page unmapped. In this kernel, why does that difference matter?
+    code: kernel/exec.c:86-97@91-95
+    options:
+      - text: The guard page is below sz, and vmfault treats an unmapped page below sz as a lazily allocated one, so an unmapped guard would quietly get a fresh page.
+        correct: true
+        why: |
+          [[vmfault]] supplies any unmapped page below `sz`. The guard page's valid PTE makes
+          [[ismapped]] return 1, so vmfault refuses and the overflowing process is killed.
+      - text: Unmapped pages cannot exist below sz in xv6.
+        why: |
+          You may have thought `sz` and the page table always agree. After `sbrklazy` most of
+          the pages below `sz` are unmapped; that is exactly what lazy allocation means.
+      - text: A missing PTE would cause a kernel panic instead of a user page fault.
+        why: |
+          You may have thought unmapped user addresses crash the kernel. A user access to an
+          unmapped page is an ordinary user page fault that [[usertrap]] handles.
+      - text: So that the kernel can still use the guard page as extra stack during system calls.
+        why: |
+          You may have thought the kernel shares the user stack. System calls run on the
+          process's kernel stack; the kernel never uses the guard page.
+    explain: |
+      A guard page works because it is *present and forbidden*. With lazy allocation, absent
+      means "not delivered yet", and vmfault would deliver it. See [[tour:26]] and
+      [[concept:stacks#guards]].
+
+  - id: mem-14
+    level: 3
+    type: number
+    q: |
+      A process has `p->sz = 0x5000` (page-aligned, nothing mapped above it). It calls
+      `sbrk(1)` and then `sbrk(1)` again, both eager. How many physical pages does
+      [[uvmalloc]] allocate in total across the two calls?
+    code: kernel/vm.c:215-242@226-227
+    answer: 1
+    wrong:
+      2: |
+        You may have thought each `sbrk` allocates a page. The second call asks to grow from
+        `0x5001` to `0x5002`; [[uvmalloc]] rounds the old size up to `0x6000`, and the loop
+        `a < newsz` does not run.
+      0: |
+        You may have thought one byte is too little to allocate for. The first call grows
+        from `0x5000` to `0x5001`: the loop runs once for `a = 0x5000`, mapping a whole page.
+    why_wrong: Trace uvmalloc twice. Note that p->sz becomes 0x5001 after the first call, not 0x6000.
+    explain: |
+      Memory is mapped in whole pages but `sz` is kept to the byte. The first call maps page
+      `0x5000` and sets `sz` = `0x5001`; the second only moves `sz` to `0x5002`, inside the
+      page already mapped. The calls return `0x5000` and `0x5001`.
+
+  - id: mem-15
+    level: 3
+    type: choice
+    q: |
+      A process has `p->sz = 0x5000` (page-aligned, nothing mapped above it). It calls
+      `sbrklazy(1)`, then, as its very next memory access above `0x5000`, stores a byte at
+      `0x5800`. What happens?
+    code: kernel/vm.c:458-468@463-464
+    options:
+      - text: The process is killed, because 0x5800 is not below the new sz (0x5001), so vmfault refuses.
+        correct: true
+        why: |
+          The store faults (nothing is mapped at `0x5000`). [[vmfault]] compares the *byte*
+          address with `psz`: `0x5800 >= 0x5001`, so it returns 0 and [[usertrap]] kills the
+          process.
+      - text: vmfault maps page 0x5000 and the store succeeds, as it would after sbrk(1).
+        why: |
+          You may have assumed lazy and eager growth allow the same addresses. After eager
+          `sbrk(1)` the whole page is mapped and the store would succeed; lazily, vmfault
+          checks the address against `sz` before rounding to the page.
+      - text: The store succeeds without any fault, because sbrklazy maps a page when n is small.
+        why: |
+          You may have thought small lazy requests are served eagerly. The lazy branch of
+          [[sys_sbrk]] never maps anything, whatever `n` is.
+      - text: sys_sbrk rejects sbrklazy(1) because 1 is not a multiple of the page size.
+        why: |
+          You may have thought sbrk requires page multiples. The only checks are wrap-around
+          and the `TRAPFRAME` ceiling; `sz` becomes `0x5001`.
+    explain: |
+      `sz` is kept to the byte, and [[vmfault]] checks `va >= psz` before `PGROUNDDOWN`. Had
+      the program touched `0x5000` first, the page would have been mapped and a later store
+      to `0x5800` would then succeed without any fault. See [[tour:26]].
+
+  - id: mem-16
+    level: 2
+    type: multi
+    q: |
+      Which of these functions can call [[vmfault]] to allocate a lazily promised page?
+    options:
+      - text: "[[usertrap]]"
+        correct: true
+        why: "For a user load or store page fault (scause 13 or 15)."
+      - text: "[[copyout]]"
+        correct: true
+        why: "When the kernel writes into a user page that is not mapped yet, for example `read` into a lazily grown buffer."
+      - text: "[[copyin]]"
+        correct: true
+        why: "When the kernel reads from a user page that is not mapped yet."
+      - text: "[[copyinstr]]"
+        correct: true
+        why: "When a string argument (a path, say) lies in a page that is not mapped yet."
+      - text: "[[kerneltrap]]"
+        why: |
+          You may have thought kernel page faults are handled the same way. kerneltrap handles
+          only device interrupts and panics on every exception; the kernel never dereferences
+          user addresses, so it never needs vmfault.
+      - text: "[[walkaddr]]"
+        why: |
+          You may have thought walkaddr allocates missing pages. It only looks: it returns 0
+          if the page is missing, and its *callers* (the copy functions) decide to try
+          vmfault.
+    explain: |
+      Lazy pages can be touched in two ways: by the program (a hardware page fault, handled by
+      [[usertrap]]) or by the kernel on the program's behalf (the copy functions, which see
+      [[walkaddr]] fail and ask vmfault). Both must keep `sz`'s promise. See [[tour:26]]
+      and [[tour:28]].
+
+  - id: mem-17
+    level: 2
+    type: choice
+    q: |
+      A program grows its memory with `sbrklazy`, writes machine code into the new region
+      (which faults the page in), and then jumps to it. What happens at the jump?
+    code: kernel/trap.c:69-79
+    options:
+      - text: The fetch faults and the process is killed, because lazily allocated pages are mapped R W U without X, and usertrap doesn't treat scause 12 as a lazy fault anyway.
+        correct: true
+        why: |
+          [[vmfault]] maps with `PTE_W | PTE_U | PTE_R` (line 473). An instruction fetch
+          needs X, so it raises scause 12, which the page-fault branch (13 or 15 only)
+          does not accept: "unexpected scause" and a kill.
+      - text: The code runs, because the page is mapped and readable.
+        why: |
+          You may have thought readable means executable. Fetches need X, a separate bit.
+      - text: vmfault adds PTE_X to the page and the jump is retried.
+        why: |
+          You may have thought vmfault upgrades permissions. It refuses any page that is
+          already mapped, and it is not even called for scause 12.
+      - text: The kernel panics in kerneltrap.
+        why: |
+          You may have thought any unhandled fault crashes the kernel. A fault in *user*
+          mode goes to [[usertrap]], which kills only the process.
+    explain: |
+      Heap pages, eager or lazy, are never executable in xv6: [[growproc]] passes `PTE_W`
+      only and vmfault never sets X. Page faults from instruction fetches are always fatal.
+      See [[tour:26]].
+
+  - id: mem-18
+    level: 1
+    type: tf
+    q: |
+      True or false: [[kalloc]] returns a page filled with zeros.
+    code: kernel/kalloc.c:68-82
+    answer: false
+    why_tf: |
+      You may have expected an allocator to hand out clean memory, as `calloc` does. kalloc
+      deliberately does not.
+    reasons:
+      - text: "It fills the page with 0x05 bytes after popping it, so that callers who forget to initialise memory see obvious junk."
+        correct: true
+        why: |
+          Line 80, `memset((char *)r, 5, PGSIZE)`. Callers that need zeros clear the page
+          themselves.
+      - text: "It returns the page as it was when freed, still holding the previous owner's data."
+        why: |
+          You may have thought nothing overwrites a page between uses. [[kfree]] fills it
+          with `0x01` and kalloc fills it again with `0x05`, so no old data survives.
+      - text: "It fills the page with 0x01 bytes, the same value kfree uses."
+        why: |
+          You may have mixed up the two fills. kfree uses `0x01`, kalloc `0x05`, so you can
+          tell a freed page from a freshly allocated one in a debugger.
+    explain: |
+      Zeroing is the caller's choice: [[walk]], [[uvmalloc]], [[vmfault]], [[uvmcreate]] and
+      [[kvmmake]] do it; [[uvmcopy]] overwrites the page instead. See [[tour:27]].
+
+  - id: mem-19
+    level: 2
+    type: match
+    q: |
+      Match each function with what it writes into a physical page it has just freed or
+      obtained.
+    pairs:
+      - left: "[[kfree]]"
+        right: "fills it with 0x01 bytes, before taking kmem.lock"
+        why: "Line 55 runs before the `acquire` on line 59: the page is still private to the caller."
+      - left: "[[kalloc]]"
+        right: "fills it with 0x05 bytes, after releasing kmem.lock"
+        why: "Line 80 runs after the `release` on line 77: once popped, the page belongs to this caller alone."
+      - left: "[[uvmalloc]]"
+        right: "zeroes it, then maps it with R, U and the caller's extra permission"
+        why: "Line 233, then `PTE_R | PTE_U | xperm` on line 234."
+      - left: "[[vmfault]]"
+        right: "zeroes it, then maps it with R, W and U"
+        why: "Line 472, then `PTE_W | PTE_U | PTE_R` on line 473; no caller chooses the permissions."
+      - left: "[[uvmcopy]]"
+        right: "copies 4096 bytes from the parent's page into it"
+        why: "Line 315, `memmove`; no fill is needed because every byte is overwritten."
+    explain: |
+      The two allocator fills happen outside the lock, on pages no other hart can reach; the
+      lock covers only the few instructions that touch the list head. See [[tour:27]].
+
+  - id: mem-20
+    level: 3
+    type: choice
+    q: |
+      Imagine `kmem.lock` were removed. Hart 1 in [[kalloc]] reads the head (`A`); then hart 2
+      runs a complete `kfree(P)`; then hart 1 stores `A->next` (`B`) as the new head. What is
+      the result?
+    code: kernel/kalloc.c:57-81
+    options:
+      - text: "P is on no list and owned by nobody: it has leaked until reboot."
+        correct: true
+        why: |
+          Hart 2 made `P` the head with `P->next = A`, but hart 1's store overwrote the head
+          with `B`. Hart 1 still gets `A` correctly; `P` simply vanished.
+      - text: "Hart 1 gets P instead of A."
+        why: |
+          You may have thought hart 1 rereads the head. It read `A` before hart 2's push and
+          never looks again.
+      - text: "A is handed out twice."
+        why: |
+          That is a *different* interleaving: hart 2 reads the head before hart 1's pop and
+          writes it after, giving `P → A → B` with `A` both on the list and allocated. In the
+          order given here, `A` is handed out once.
+      - text: "Nothing goes wrong, because each kfree and kalloc touches the head only once."
+        why: |
+          You may have thought single loads and stores are atomic enough. Each is atomic, but
+          the read and the later write of the head are separate steps that another hart can
+          slip between.
+    explain: |
+      Neither failure crashes when it happens, which is what makes such races hard to find.
+      The lock makes each pop or push one indivisible step as far as other harts can tell.
+      See [[tour:27]] and [[concept:locks#why]].
+
+  - id: mem-21
+    level: 2
+    type: multi
+    q: |
+      Which of these calls make [[kfree]] panic? (In this build `end` = `0x80020bb0` and
+      `PHYSTOP` = `0x88000000`.)
+    code: kernel/kalloc.c:46-52@51-52
+    options:
+      - text: "`kfree((void*)0x80021800)`"
+        correct: true
+        why: "Not page-aligned: `0x800 % 4096 != 0`."
+      - text: "`kfree((void*)0x80010000)`"
+        correct: true
+        why: "Aligned, but below `end`: that page holds the kernel's own data, which must never be handed out."
+      - text: "`kfree((void*)0x88000000)`"
+        correct: true
+        why: "At `PHYSTOP`: the check is `pa >= PHYSTOP`, outside the memory the allocator manages."
+      - text: "`kfree` of a page that is already on the free list"
+        why: |
+          You may have thought kfree detects double frees. It has no record of which pages
+          are free, so it pushes the page a second time, creating a corrupted list that
+          causes trouble later.
+      - text: "`kfree((void*)0x87fff000)` on a page from kalloc"
+        why: |
+          You may have thought the top page is special. It is aligned, above `end` and below
+          `PHYSTOP`: a perfectly ordinary page.
+    explain: |
+      kfree checks only alignment and range. It catches pointers that could never have come
+      from [[kalloc]], but not a correct pointer freed twice. See [[tour:27]].
+
+  - id: mem-22
+    level: 1
+    type: choice
+    q: |
+      A program calls `sbrklazy(-8192)` to give back two pages. What does [[sys_sbrk]] do?
+    code: kernel/sysproc.c:39-65@50-53
+    options:
+      - text: It calls growproc, exactly as for an eager shrink, which unmaps the pages and frees those that exist now.
+        correct: true
+        why: |
+          Line 50 sends every negative `n` to [[growproc]], whatever `t` is. [[uvmdealloc]]
+          then unmaps and frees the present pages and skips the ones that were never touched.
+      - text: It only subtracts 8192 from sz; the pages are freed when the process exits.
+        why: |
+          You may have thought "lazy" applies to shrinking too. Pages that exist must be
+          freed now, or the program could keep using memory beyond its `sz` and the pages
+          could not be reused.
+      - text: It returns -1, because lazy sbrk cannot shrink.
+        why: |
+          You may have thought shrinking needs the eager call. Both wrappers reach the same
+          system call, and a negative `n` always takes the growproc path.
+      - text: It marks the pages for vmfault to free on the next page fault.
+        why: |
+          You may have thought vmfault also frees. It only allocates; freeing happens in
+          [[uvmunmap]] during the shrink.
+    explain: |
+      Laziness is only for growth: there is nothing to defer when giving memory back. Shrinking
+      tolerates unmapped pages because [[uvmunmap]] skips missing PTEs. See [[tour:26]].
+
+  - id: mem-23
+    level: 2
+    type: number
+    q: |
+      The shell's child has `p->sz = 0x5000` and its whole memory is mapped through a single
+      level-0 page-table page. `malloc` calls `sbrk(65536)` (eager). How many times is
+      [[kalloc]] called during that system call?
+    code: kernel/vm.c:215-242@227-234
+    answer: 16
+    wrong:
+      17: |
+        You may have added a page-table page. The new pages are at level-0 indexes 5 to 20
+        of the same level-0 page, which covers 2 MiB, so [[walk]] finds every table already
+        there.
+      64: |
+        You may have counted KiB instead of pages. 65536 bytes / 4096 = 16 pages.
+      1: |
+        You may have thought sbrk allocates one big block. kalloc hands out single 4096-byte
+        pages, and [[uvmalloc]] calls it once per page.
+    why_wrong: Count the pages from 0x5000 up to 0x15000, then ask whether any new page-table page is needed.
+    explain: |
+      `0x5000` to `0x15000` is 16 pages, all in the first 2 MiB, so 16 kallocs and no table
+      pages. Each takes `kmem.lock` once. See [[tour:26]].
+
+  - id: mem-24
+    level: 1
+    type: choice
+    q: |
+      Physical memory is nearly exhausted. How does running out show up to a program that grew
+      with eager `sbrk`, compared with one that used `sbrklazy`?
+    options:
+      - text: "Eager: sbrk returns -1 at the call, and the program can handle it. Lazy: some later load or store faults, vmfault gets no page, and the process is killed."
+        correct: true
+        why: |
+          [[uvmalloc]] fails cleanly and undoes the partial growth. With lazy allocation the
+          shortage is found inside [[vmfault]], at an arbitrary instruction, where the only
+          option is to kill the process. (If the kernel touches the page first, inside
+          [[copyout]] or [[copyin]], the system call just returns -1 instead.)
+      - text: Both return -1 from the sbrk call.
+        why: |
+          You may have thought sbrklazy checks free memory. It checks only wrap-around and the
+          `TRAPFRAME` ceiling; it can promise a GiB on a 128 MiB machine.
+      - text: "Lazy: the faulting process sleeps until another process frees memory."
+        why: |
+          You may have thought the kernel waits for memory. No code in this kernel sleeps
+          waiting for free pages; [[kalloc]] returns 0 at once.
+      - text: Both cause a kernel panic.
+        why: |
+          You may have thought out-of-memory is fatal to the kernel. User memory failures
+          are reported (eager) or kill the process (lazy); the kernel keeps running.
+    explain: |
+      Eager allocation fails early and visibly; lazy allocation fails late, at a random
+      store. That is the trade-off for the work laziness saves. See [[tour:26]].
+
+  - id: mem-25
+    level: 1
+    type: bits
+    q: |
+      Right after `exec`, the level-0 PTE for `sh`'s page at `0x3000` (just below its one
+      stack page) read `0x21fce407` in our run. Decode it.
+    value: "0x21fce407"
+    fields:
+      - label: "V (bit 0)"
+        options: ["1 (valid)", "0 (invalid)"]
+        answer: "1 (valid)"
+        why: "The low hex digit 7 = `0b0111` has bit 0 set: the page is present."
+      - label: "R and W (bits 1-2)"
+        options: ["both set", "only R", "neither"]
+        answer: "both set"
+        why: "7 = V + R + W. The page was allocated like an ordinary stack page."
+      - label: "U (bit 4)"
+        options: ["0: supervisor only", "1: user may access"]
+        answer: "0: supervisor only"
+        why: "The second hex digit is 0, so bit 4 (`0x10`) is clear: [[uvmclear]] removed it."
+      - label: "What vmfault does on a user store fault here"
+        options: ["refuses, so the process is killed", "maps a fresh page", "adds PTE_U and retries"]
+        answer: "refuses, so the process is killed"
+        why: "The page is below `sz` but [[ismapped]] sees V set, so [[vmfault]] returns 0. A missing PTE would have been treated as lazy."
+    explain: |
+      This is the user stack's [[g:guard-page]]: present (V R W) but forbidden to user mode.
+      A runaway stack that crosses into it faults, and because it is mapped, the fault is
+      fatal rather than "lazily allocated". See [[tour:25]] and [[tour:26]].

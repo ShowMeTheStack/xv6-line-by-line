@@ -1,0 +1,363 @@
+summary: |
+  The [[g:console]]: the device that user programs read from and write to when they use
+  file descriptors 0, 1 and 2. It sits between the file layer above and the
+  [[g:uart|UART]] driver in [[kernel/uart.c]] below.
+
+  Output is the simple direction. [[consolewrite]] copies the program's bytes into the
+  kernel and passes them to [[uartwrite]]; kernel messages go through [[consputc]] instead.
+
+  Input is where the work is. Typed characters arrive one at a time from the UART interrupt
+  handler and go to [[consoleintr]], which provides [[g:line-editing]]: it echoes each
+  character to the screen, lets backspace and control-U erase what has not been submitted,
+  and stores the line in a circular buffer, [[cons]]. Only when you press Enter (or
+  control-D) does the line become visible to [[consoleread]], which a `read()` system call
+  reaches. Until then the reader sleeps. Control-P prints a process list, for debugging.
+
+  [[consoleinit]] connects the two functions to the file system's device table, so that
+  `read` and `write` on the file `/console` end up here.
+
+  **Read before:** [[kernel/uart.c]]. **Read next:** [[kernel/printk.c]] (kernel output) and
+  [[kernel/file.c]] (how `read` and `write` reach a device).
+
+blocks:
+  - lines: 1-10
+    title: What the console does
+    note: |
+      The header comment lists the special input characters. "control-h" means holding the
+      Ctrl key and pressing H, which a terminal sends as the byte 8. Most terminals send a
+      different byte, 127 (DEL), for the Backspace key; [[consoleintr]] accepts both.
+
+  - lines: 12-23
+    title: Headers
+    note: |
+      [[kernel/file.h]] provides [[devsw]] and [[CONSOLE]], used by [[consoleinit]]; it
+      needs [[kernel/fs.h]] and [[kernel/sleeplock.h]] before it. [[kernel/proc.h]] is for
+      [[myproc]] and [[killed]] in [[consoleread]].
+
+      `<stdarg.h>` (line 12) is not used in this file; nothing here takes a variable number
+      of arguments (formatted output, which does, is in [[kernel/printk.c]]). Removing the
+      line would change nothing.
+
+  - lines: 25-26
+    title: Two helper macros
+    note: |
+      [[BACKSPACE]] is a made-up code meaning "erase the last character on the screen". Its
+      value, `0x100` (256), is outside the range of a byte (0–255), so it can never be
+      confused with a real character that was typed.
+
+      `C(x)` gives the byte a terminal sends for Ctrl+*x*. Terminals send the code of the
+      uppercase letter minus 64, and `'@'` is 64: `C('D')` is `'D' - '@'` = 68 − 64 = 4, `C('H')` = 8,
+      `C('P')` = 16, `C('U')` = 21. Writing `C('D')` instead of `4` keeps the intent
+      readable.
+
+  - lines: 28-36
+    title: "consputc(): print one character, without sleeping"
+    note: |
+      The output path for kernel messages ([[printk]]) and for echoing typed input, called
+      from [[consoleintr]] inside an interrupt handler. Neither may sleep, so it uses
+      [[uartputc_sync]], which busy-waits for the UART instead of waiting for an interrupt.
+      `write()` system calls do *not* come here; they use [[consolewrite]].
+
+  - lines: 37-45
+    title: Erasing a character on the screen
+    note: |
+      A terminal cannot delete a character it has already shown. What it can do is move the
+      cursor. So erasing takes three bytes: `'\b'` (backspace, byte 8) moves the cursor one
+      column left, `' '` overwrites the old character with a blank (which moves the cursor
+      right again), and a second `'\b'` moves it back to where the next character should
+      appear. Every other value is sent to the UART unchanged.
+
+  - lines: 47-56
+    title: The input buffer
+    note: |
+      [[cons]] holds characters typed but not yet read by any process, in a circular buffer
+      of 128 bytes. Three indices divide it into regions:
+
+      - `r` (read): the next character [[consoleread]] will hand to a process.
+      - `w` (write): the end of the input that is *committed*, that is, ready to be read.
+        Everything from `r` up to `w` is finished lines.
+      - `e` (edit): the end of everything typed. Characters from `w` up to `e` belong to
+        the line still being typed. Backspace and control-U may erase them; a reader cannot
+        see them yet.
+
+      So `r ≤ w ≤ e` at all times. The indices only ever grow, except when erasing
+      (`e--`) and when a ^D is put back (`r--`, line 116); the actual slot is `index % INPUT_BUF_SIZE`. Because they are `uint`, they wrap
+      around from 2^32−1 to 0 after four billion characters, and since 128 divides 2^32
+      the slot numbers stay continuous across the wrap. Differences such as `e - r` stay
+      correct too, which is what the "is the buffer full" test relies on.
+
+      `cons.lock` protects all four fields. Both the interrupt handler ([[consoleintr]]) and
+      readers ([[consoleread]]) change them, possibly on different CPUs at the same time.
+
+  - lines: 58-64
+    title: "consolewrite(): write() on the console"
+    note: |
+      Reached from [[filewrite]] through [[devsw]] ([[kernel/file.c:147]]) when a program
+      writes to a console file descriptor. `user_src` says whether `src` is a user-space
+      address (1, always the case from [[filewrite]]) or a kernel address; `n` is the
+      number of bytes. It returns the number of bytes written.
+
+      The kernel cannot read a user address directly, because the address means something
+      only in the process's own [[g:page-table]]. So the bytes are first copied into `buf`,
+      a 32-byte array on the [[g:kernel-stack]], by [[either_copyin]], and then sent from
+      there with [[uartwrite]], which may sleep until the UART has taken them.
+
+  - lines: 65-79
+    title: Copy and send in 32-byte batches
+    note: |
+      The kernel stack is small (one page), so instead of a buffer as large as the request,
+      the loop reuses one small buffer: each pass copies the next `nn` bytes (32, or fewer
+      for the last piece) and sends them.
+
+      If the copy fails (the program passed a bad address), the loop stops and returns the
+      number of bytes already written, which may be 0. A failing write therefore never
+      returns -1 from here.
+
+      Each batch is a separate [[uartwrite]] call, and [[tx_lock]] is held only during one
+      call. Another process's output can therefore appear between two 32-byte batches.
+
+  - lines: 81-93
+    title: "consoleread(): read() on the console"
+    note: |
+      Reached from [[fileread]] through [[devsw]] ([[kernel/file.c:119]]). It copies
+      committed input into the caller's buffer `dst` (a user address when `user_dst` is 1),
+      at most `n` bytes, and stops early at the end of a line. So a program that asks for
+      100 bytes while you type `ls` and press Enter gets 3 bytes, `"ls\n"`. If no committed
+      input is waiting, the process sleeps until there is.
+
+      `target` remembers the requested count so that the number of bytes copied is
+      `target - n` at the end. `cons.lock` is held for the whole loop, except while
+      sleeping.
+
+  - lines: 94-108
+    title: Sleep until a line has been committed
+    note: |
+      `cons.r == cons.w` means there is no committed input left. The process then sleeps on
+      the channel `&cons.r` until [[consoleintr]] commits a line and calls
+      `wakeup(&cons.r)` (line 183). It is a `while`, not an `if`: after waking, another
+      process reading the console may have taken the line first, so the condition must be
+      checked again.
+
+      The three steps are in a careful order ([[g:sleep-wakeup]]). [[sleep_prepare]]
+      registers the process on the channel while `cons.lock` is still held. Only then is
+      the lock released, which lets [[consoleintr]] run, and only then does [[sleep]] block.
+      [[consoleintr]] commits and wakes while holding `cons.lock`, so it cannot do so
+      before the registration; and if it does so between the release and `sleep()`, the
+      wakeup clears the registration and `sleep()` returns at once. Either way the wakeup
+      is not lost. The lock cannot be held during `sleep()` itself: it is a
+      [[g:spinlock]], and holding it would keep [[consoleintr]] from ever adding input.
+
+      If the process has been killed (for example by the `kill` program), it gives up and
+      returns -1 instead of waiting for input that may never come.
+
+  - lines: 110
+    title: Take one character
+    note: |
+      Read the oldest committed character and advance `r`. The `% INPUT_BUF_SIZE` turns the
+      ever-growing index into a slot in the circular buffer.
+
+  - lines: 112-119
+    title: Control-D means end of file
+    note: |
+      Control-D (byte 4) is the console's way to say "end of file". A program reading the
+      console stops when `read` returns 0, so pressing Ctrl+D at the start of a line ends,
+      for example, a program that reads until end of input.
+
+      There are two cases. If the ^D is the first character of this read (`n == target`), it
+      is consumed and the read returns 0. If some characters were already copied, the read
+      returns those, and line 116 puts the ^D back by decrementing `r`, so the *next*
+      `read` sees it first and returns 0. Either way the ^D itself is never copied to the
+      program.
+
+  - lines: 121-133
+    title: Copy the character out, stop at end of line
+    note: |
+      The character is copied through a one-byte variable `cbuf`, because `c` is an `int`
+      and only one byte should be written. [[either_copyout]] writes it to the user (or
+      kernel) address `dst`. If that fails, the loop stops; the character has already been
+      taken from the buffer and is lost, and the read returns the count copied before it.
+
+      After a newline the read returns even if `n` is not used up: one `read` returns at most
+      one line. If `n` runs out first, the rest of the line stays in the buffer for the next
+      `read`.
+
+  - lines: 134-138
+    title: Return the count
+    note: |
+      `target - n` is the number of bytes copied: 0 for end of file, otherwise up to and
+      including the newline. The return type is `int`, and the subtraction is done on
+      `uint` and converted back; for any count that fits in an `int` the result is the
+      same.
+
+  - lines: 140-150
+    title: "consoleintr(): handle one typed character"
+    note: |
+      Called by [[uartintr]] for every byte the UART receives, so it runs inside an
+      interrupt handler and must not sleep. This function is the [[g:line-editing]]
+      layer: it decides what each key means, echoes it, and decides when a line is
+      complete.
+
+      It takes `cons.lock` because a process in [[consoleread]] on another CPU may be using
+      the buffer at the same moment. Taking the lock also disables interrupts on this CPU
+      ([[acquire]] calls [[push_off]]), which is what makes it safe for this interrupt
+      handler and [[consoleread]] to share a spinlock: an interrupt cannot arrive on a CPU
+      that already holds `cons.lock` and try to take it again ([[g:interrupts-and-locks]]).
+
+  - lines: 151-154
+    title: Control-P prints the process list
+    note: |
+      A debugging aid. [[procdump]] prints one line per process (PID, state, name) with
+      [[printk]], even if the system seems stuck. Nothing is stored in the buffer.
+
+  - lines: 155-161
+    title: Control-U erases the line being typed
+    note: |
+      Erases characters from the end of the uncommitted part, one at a time, both in the
+      buffer (`e--`) and on the screen ([[consputc]] with [[BACKSPACE]]), until the
+      uncommitted part is empty (`e == w`).
+
+      The second condition, "stop at a newline", can never be what ends the loop in this
+      version. Every newline stored in the buffer commits the line immediately (line 182
+      sets `w` to `e`), so no newline is ever found between `w` and `e`. It is a defensive
+      check.
+
+  - lines: 162-168
+    title: Backspace erases one character
+    note: |
+      Ctrl+H (byte 8) and the Delete key code (byte 127, which most terminals send for the
+      Backspace key) both erase the last typed character, but only if it is not yet
+      committed (`e != w`). Once Enter has been pressed, the line belongs to the readers and
+      cannot be edited.
+
+  - lines: 169-172
+    title: An ordinary character
+    note: |
+      Byte 0 is ignored. A character is accepted only if the buffer has room: `e - r` is
+      the number of characters stored and not yet read (committed or not), and at most 128
+      fit. When the buffer is full, further characters are dropped without an echo.
+
+      A terminal sends a carriage return (`'\r'`, byte 13) when you press Enter. xv6
+      programs expect a line to end with `'\n'` (byte 10), so line 171 converts it.
+
+  - lines: 173-177
+    title: Echo and store
+    note: |
+      The character is shown on the screen (with [[consputc]], which does not sleep, since
+      this is an interrupt handler) and appended at `e`. Echoing is the kernel's job here:
+      the terminal QEMU is connected to does not display what you type by itself, so
+      without this you would type blind.
+
+  - lines: 179-185
+    title: Commit the line and wake readers
+    note: |
+      Three events make the typed text available to [[consoleread]]: a newline (Enter), a
+      ^D (end of file), or a full buffer. Setting `w = e` commits everything typed so far,
+      and `wakeup(&cons.r)` wakes any process sleeping in [[consoleread]].
+
+      The full-buffer case prevents a deadlock. Without it, a 128-character line with no
+      newline would fill the buffer: new characters would be dropped (so Enter could never
+      arrive), and the reader would wait forever for a line that can never be completed.
+      Committing the full buffer lets the reader drain it.
+
+  - lines: 186-190
+    title: Done
+    note: |
+      Release the lock (re-enabling interrupts if they were on before).
+
+  - lines: 192-203
+    title: "consoleinit(): set up the console"
+    note: |
+      Called once, by hart 0, as the very first step of [[main]]
+      ([[kernel/main.c:14]]), so that [[printk]] works as early as possible. It initializes
+      the lock, configures the UART with [[uartinit]], and installs [[consoleread]] and
+      [[consolewrite]] in the device switch table [[devsw]] at index [[CONSOLE]] (1).
+
+      [[devsw]] is an array of [[g:function-pointer|function pointers]], one pair per
+      device number. The file `/console` is a *device file* created by the first user program, `init`
+      ([[user/init.c:20]] calls `mknod("console", CONSOLE, 0)`); opening it gives a file
+      whose `major` number is 1, and [[fileread]] and [[filewrite]] call
+      `devsw[1].read` and `devsw[1].write`. That is how a `read(0, ...)` in the shell ends
+      up in [[consoleread]].
+
+lines:
+  35: |
+    `c` is an `int`, not a `char`, so that it can carry the out-of-band value
+    [[BACKSPACE]].
+  48: |
+    A [[g:spinlock]] that protects `buf`, `r`, `w` and `e`.
+  51: |
+    The buffer size, 128 bytes: the most input that can be stored and not yet read,
+    including the line still being typed. A `#define` inside a struct is legal C; the
+    preprocessor does not care where it is.
+  56: |
+    `cons` is the one instance of this unnamed struct type, a global with no initializer,
+    so it starts out all zeros: `r = w = e = 0`, an empty buffer.
+  65: |
+    32 bytes on the kernel stack, reused for each batch.
+  69: |
+    The batch size: 32, or whatever is left if less.
+  72: |
+    Copy the next batch from the caller's memory into `buf` with [[either_copyin]]; stop on
+    a bad address.
+  74: |
+    Send it to the UART with [[uartwrite]], sleeping as needed.
+  95: |
+    Take `cons.lock` for the rest of the function; it is released only while sleeping.
+  100: |
+    A killed process stops waiting and returns -1. [[killed]] reads the flag set by
+    [[kkill]], which also wakes a sleeping victim so that it gets here.
+  104: |
+    Register as waiting on `&cons.r` with [[sleep_prepare]] while still holding the lock.
+  105: |
+    Release the lock so that [[consoleintr]] can add input.
+  106: |
+    Block until [[consoleintr]] commits a line, unless it already did after line 104.
+  107: |
+    Reacquire the lock before looking at the indices again.
+  110: |
+    Take the character at `r` and advance `r` (post-increment: the old value selects the
+    slot).
+  116: |
+    Un-read the ^D so that the next `read` returns 0.
+  123: |
+    Copy one byte to `dst` with [[either_copyout]]; stop if the address is bad.
+  126: |
+    Advance the destination address.
+  127: |
+    One fewer byte wanted.
+  129: |
+    A newline ends the read: one `read` returns at most one line.
+  149: |
+    Take `cons.lock` (this also disables interrupts on this CPU).
+  153: |
+    Print the process table with [[procdump]].
+  156: |
+    Stop when the uncommitted part is empty, or (never in practice) at a newline.
+  158: |
+    Remove the last character from the buffer.
+  159: |
+    Erase it on the screen.
+  164: |
+    Nothing to erase if everything typed is already committed.
+  170: |
+    Accept the character only if it is not 0 and the buffer has room.
+  171: |
+    Turn Enter's carriage return into a newline.
+  174: |
+    Echo the character to the screen with [[consputc]].
+  177: |
+    Store it at slot `e % 128` and advance `e`.
+  179: |
+    End of line, end of file, or a full buffer: time to commit.
+  182: |
+    Commit: everything typed so far is now readable.
+  183: |
+    Wake readers sleeping on `&cons.r` with [[wakeup]].
+  195: |
+    Initialize `cons.lock` with [[initlock]].
+  197: |
+    Configure the UART chip: [[uartinit]].
+  201: |
+    `read` on a console file now calls [[consoleread]].
+  202: |
+    `write` on a console file now calls [[consolewrite]].

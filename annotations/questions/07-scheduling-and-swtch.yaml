@@ -1,0 +1,803 @@
+title: Scheduling and swtch
+summary: One scheduler loop per hart, the 14 registers swtch saves, the p->lock handed across every switch, and the intena bookkeeping that keeps interrupts honest.
+questions:
+  - id: sched-01
+    level: 1
+    type: choice
+    q: |
+      [[swtch]] saves the registers of the thread that is stopping into a `struct context`.
+      Which registers are they?
+    code: kernel/proc.h:1-19
+    options:
+      - text: "`ra`, `sp` and the callee-saved registers `s0`–`s11`: 14 registers in all."
+        correct: true
+        why: |
+          `swtch` is reached by an ordinary C call, so the calling convention already lets it
+          destroy the `a` and `t` registers; the caller saved any it still needs on its own
+          stack. Only the registers a function must *preserve* (`s0`–`s11`), plus `ra` (where
+          to "return") and `sp` (which stack), describe the stopped thread.
+      - text: All 31 general-purpose registers, the same set the trapframe holds.
+        why: |
+          You may have confused the context with the [[g:trapframe]]. The trapframe must hold
+          every user register because a trap can interrupt user code at *any* instruction. A
+          context switch happens only at a known C call, so the other 17 need no saving: the 15
+          caller-saved `a` and `t` registers are dead or already saved by the compiler, and
+          `gp` and `tp` are not per-thread values (`tp` names the hart).
+      - text: "`ra`, `sp`, `s0`–`s11`, plus `satp` and `sstatus`."
+        why: |
+          You may have thought a switch changes the page table or the interrupt state. Every
+          kernel thread runs on the one kernel page table, so `satp` never needs switching, and
+          `sstatus` is not saved: SIE is off on both sides of every switch. `swtch` contains no
+          CSR instruction at all.
+      - text: The argument registers `a0`–`a7` and the temporaries `t0`–`t6`.
+        why: |
+          That is exactly backwards. `a` and `t` registers are *caller-saved*: a called
+          function may overwrite them freely. The callee-saved `s` registers are the ones a
+          function must hand back unchanged, so they are the ones `swtch` has to store.
+    explain: |
+      A kernel thread is fully described by where it will continue (`ra`), its stack (`sp`)
+      and the registers the [[g:calling-convention]] promises to preserve (`s0`–`s11`).
+      Everything else is in memory, on the thread's stack. See [[kernel/swtch.S:10]] and
+      [[concept:locks#handoff]].
+
+  - id: sched-02
+    level: 1
+    type: number
+    q: |
+      Hart 1 is running process A. A's timer tick makes it [[yield]], and hart 1 next runs
+      process B. How many calls to [[swtch]] does hart 1 make between "running A" and
+      "running B"?
+    answer: 2
+    wrong:
+      1: |
+        You may have thought `swtch` goes straight from A to B. It never does: [[sched]]
+        switches from A's kernel stack to hart 1's scheduler, and then [[scheduler]] switches
+        from the scheduler to B. Every process-to-process switch passes through the
+        scheduler thread.
+      3: |
+        You may have counted a separate switch back to A, or one for the scan. The scan runs
+        on the scheduler stack without switching. Only two `swtch` calls happen: A to
+        scheduler, scheduler to B.
+      4: |
+        You may have counted each `swtch` as two switches (save and load). One call does both
+        halves: it stores the old thread's 14 registers and loads the new one's.
+    why_wrong: Follow `sp`. Count the times it moves from one thread's stack to another's between A and B.
+    explain: |
+      `swtch(&A->context, &cpus[1].context)` in [[sched]] puts hart 1 on its scheduler stack;
+      `swtch(&c->context, &B->context)` in [[scheduler]] puts it on B's kernel stack. Two calls,
+      and the scheduler thread runs in between ([[concept:mode-stack-page-table#t6]]).
+
+  - id: sched-03
+    level: 1
+    type: choice
+    q: |
+      When [[sched]] switches away from a process, hart 1 continues in [[scheduler]]. Which
+      memory is hart 1's stack pointer pointing into while the scheduler scans `proc[]`?
+    options:
+      - text: Hart 1's own 4 KiB slice of `stack0`, the same stack it booted on.
+        correct: true
+        why: |
+          `main` calls `scheduler()` at [[kernel/main.c:44]] without changing `sp`, and
+          `scheduler` never returns. So the boot stack that [[kernel/entry.S:17]] gave hart 1
+          simply becomes its scheduler stack.
+      - text: Inside `cpus[1]`, in the `context` field.
+        why: |
+          You may have confused a save area with a stack. `cpus[1].context` holds 14 saved
+          registers, including a *pointer* into the scheduler stack, but nothing is pushed
+          there. The stack itself is the `stack0` slice ([[concept:stacks#save-areas]]).
+      - text: A page that `kalloc` allocated for the scheduler when the hart started.
+        why: |
+          You may have thought each hart's scheduler gets a stack page like a process does. xv6
+          allocates nothing for it: the scheduler inherits the boot stack in the kernel image's
+          `stack0` array.
+      - text: The kernel stack of the process that just stopped.
+        why: |
+          You may have thought the scheduler borrows the last process's stack. It cannot: that
+          process may be resumed on another hart at any moment, and two harts would then share
+          one stack. `swtch`'s `ld sp` moves hart 1 off that stack before the scheduler runs.
+    explain: |
+      Each hart has exactly one scheduler thread, and its stack is the hart's slice of
+      [[stack0]], reused after boot ([[concept:stacks#scheduler]]). Unlike a process's kernel
+      stack, it has no guard page.
+
+  - id: sched-04
+    level: 1
+    type: multi
+    q: |
+      Which of these functions call [[sched]] directly?
+    options:
+      - text: "[[yield]]"
+        correct: true
+        why: It marks the process `RUNNABLE` under `p->lock` and calls `sched()` ([[kernel/proc.c:506]]).
+      - text: "[[sleep]]"
+        correct: true
+        why: If `p->chan` is still set it marks the process `SLEEPING` and calls `sched()` ([[kernel/proc.c:569]]).
+      - text: "[[kexit]]"
+        correct: true
+        why: It marks the process `ZOMBIE` and calls `sched()`, which never returns for it ([[kernel/proc.c:363]]).
+      - text: "[[scheduler]]"
+        why: |
+          You may have thought the scheduler goes "through" `sched`. It calls [[swtch]]
+          itself, with `&c->context` as the old context. `sched` is the process side of the
+          switch, and it checks rules (one lock held, state not `RUNNING`) that only make sense
+          for a process.
+      - text: "[[kwait]]"
+        why: |
+          You may have remembered that `wait` blocks. It does, but through [[sleep]]: `kwait`
+          calls `sleep_prepare` and `sleep()`, and `sleep` is what calls `sched`.
+      - text: "[[forkret]]"
+        why: |
+          `forkret` is where a brand-new process *arrives* after its first `swtch`; it releases
+          `p->lock` and heads for user space. It never gives up the hart itself.
+    explain: |
+      There are exactly three ways for a process to give up its hart: yield (timer), sleep
+      (waiting) and exit (dying). All three take `p->lock`, change `p->state`, and call
+      [[sched]], the only way into the scheduler from a process ([[tour:11]], [[tour:13]]).
+
+  - id: sched-05
+    level: 1
+    type: line
+    q: |
+      In [[swtch]], click the instruction at which the hart stops using the old thread's stack
+      and starts using the new thread's stack.
+    code: kernel/swtch.S:8-40
+    answer: 26
+    lines:
+      11: |
+        You may have picked the line that mentions `sp`. `sd sp, 8(a0)` only *saves* the old
+        `sp` into the old context; `sp` itself does not change.
+      25: |
+        Loading `ra` decides where `ret` will jump, but the hart is still on the old stack.
+        The stack changes one line later.
+      40: |
+        You may have thought the switch happens when control moves. `ret` changes `pc`, but by
+        then `sp` already points into the new stack: that happened at line 26.
+    why_wrong: The active stack is whatever `sp` points into. Find the instruction that writes `sp`.
+    explain: |
+      `ld sp, 8(a1)` is one of only four instructions in xv6 that move `sp` to another stack
+      ([[concept:stacks#switches]]). Before it the hart is on the old thread's stack, after it
+      on the new one's; `ret` then jumps to the new thread's `ra`.
+
+  - id: sched-06
+    level: 1
+    type: choice
+    q: |
+      A process created by `fork` has never run. When a scheduler first calls
+      `swtch(&c->context, &p->context)` for it, where does `swtch`'s `ret` jump?
+    code: kernel/proc.c:143-149
+    options:
+      - text: To the first instruction of [[forkret]].
+        correct: true
+        why: |
+          [[allocproc]] forged the context: `ra = forkret` and `sp` = the top of the empty kernel
+          stack. `ret` jumps to `ra`, so `forkret` begins as if it had been called.
+      - text: To the instruction after the `swtch` call in [[sched]], like every other process.
+        why: |
+          That is true for a process that has run before and stopped through `sched`. A new
+          process never called `sched`, so its context holds nothing of the kind; line 146 put
+          `forkret` in `ra` instead.
+      - text: To the user instruction after the parent's `ecall`, in user mode.
+        why: |
+          You may have thought `swtch` can return to user mode. It cannot: it changes no
+          privilege and no page table. The child reaches that user instruction later, through
+          [[prepare_return]] and [[userret]]'s `sret`.
+      - text: Into [[usertrap]], so that the child returns from the fork system call like its parent.
+        why: |
+          You may have thought the child inherits the parent's kernel frames. It has an empty
+          kernel stack with no `usertrap` frame on it; `forkret` imitates the end of
+          `usertrap` by hand instead.
+    explain: |
+      `swtch` treats every thread the same: load 14 registers, `ret`. A new process works
+      because [[allocproc]] wrote a context that looks as if the process had called `swtch`
+      from the first instruction of [[forkret]] on an empty stack ([[tour:13]]).
+
+  - id: sched-07
+    level: 1
+    type: number
+    q: |
+      Lines 10–23 of [[swtch]] store the old thread's registers into its context. How many
+      bytes do they write in total?
+    code: kernel/swtch.S:8-23
+    answer: 112
+    wrong:
+      14: |
+        That is the number of registers (14 `sd` instructions). Each `sd` stores a 64-bit
+        register: 8 bytes.
+      248: |
+        You may have counted 31 registers, as in a trapframe. `swtch` saves only `ra`, `sp` and
+        `s0`–`s11`.
+      128: |
+        You may have counted 16 registers, perhaps adding `pc` and `tp`. There is no `pc`
+        field (`ra` plays that role) and `tp` is never switched.
+      104: |
+        The last store is at offset 104, but it writes 8 bytes there, so the stores cover
+        offsets 0 through 111.
+    why_wrong: Count the `sd` instructions and multiply by the size of one register on RV64.
+    explain: |
+      14 stores × 8 bytes = 112 bytes, the size of `struct context`. The 14 loads on lines
+      25–38 read the same 112 bytes from the new context. A suspended kernel thread is these
+      112 bytes plus its stack ([[tour:13]]).
+
+  - id: sched-08
+    level: 1
+    type: tf
+    q: |
+      True or false: [[swtch]] ought to save and restore `tp` as well, and leaving it out
+      means a process resumed on a different hart will compute [[mycpu]] wrongly.
+    answer: false
+    why_tf: |
+      You may have assumed every register a thread uses must travel with it. `tp` is the
+      exception: in the kernel it names the *hart*, not the thread.
+    reasons:
+      - text: "`tp` holds the number of the hart executing the code; a thread resumed on hart 2 must see 2, so `tp` must stay with the hart."
+        correct: true
+        why: |
+          [[cpuid]] reads `tp`. If `swtch` restored the `tp` saved on hart 1, a thread
+          resumed on hart 2 would use `cpus[1]` and corrupt another hart's state. Leaving `tp`
+          alone makes [[mycpu]] right after every switch.
+      - text: "`tp` is caller-saved, so the C compiler already saved it before calling `swtch`."
+        why: |
+          `tp` is neither caller-saved nor callee-saved: the calling convention reserves it as
+          the thread pointer, and the compiler never uses it for its own values. xv6 puts the
+          hart number in it, which is why it must *not* follow the thread.
+      - text: The kernel never reads `tp`, so its value does not matter.
+        why: |
+          The kernel reads it constantly: `cpuid()` is `r_tp()`, and every [[myproc]] and
+          `mycpu()` depends on it ([[kernel/proc.c:67]]).
+    explain: |
+      Registers that describe the thread (`ra`, `sp`, `s0`–`s11`) are switched; registers
+      that describe the hart (`tp`, the CSRs) are not. That split is what lets a process
+      migrate between harts ([[tour:11]]).
+
+  - id: sched-09
+    level: 2
+    type: choice
+    q: |
+      [[yield]] acquires `p->lock`, sets `p->state = RUNNABLE`, and calls [[sched]] *still
+      holding the lock*. The lock is released by the scheduler only after [[swtch]]. Why must
+      it stay held across the switch?
+    code: kernel/proc.c:499-508
+    options:
+      - text: So that no other hart can see `RUNNABLE` and start running the process while this hart is still executing on its kernel stack and saving its registers.
+        correct: true
+        why: |
+          Between the state change and the end of `swtch`, the process is still running here.
+          Every scheduler reads `state` under `p->lock`, so none can act on `RUNNABLE` until
+          this hart's scheduler releases the lock at [[kernel/proc.c:463]], when the
+          registers are saved and `sp` has left the process's stack.
+      - text: Because `swtch` must run with interrupts off, and holding a spinlock is the only way to keep them off.
+        why: |
+          You may have mistaken a side effect for the reason. Interrupts are indeed off while
+          the lock is held, but the danger the lock addresses is *another hart* running the
+          same process, which interrupts on this hart have nothing to do with.
+      - text: Because [[sched]] needs the lock to find the process's `context` field.
+        why: |
+          `sched` finds the context through `myproc()`, which reads `c->proc`; no lock is
+          involved in finding it. The `holding` check in `sched` enforces the hand-off rule,
+          not a lookup.
+      - text: So that the process keeps its claim on this hart and is resumed on the same hart.
+        why: |
+          You may have thought a process belongs to a hart. It does not: once the lock is
+          released, any hart's scheduler may pick it up, and it often resumes elsewhere.
+    explain: |
+      The lock makes "change state" and "stop using the stack" one indivisible step as far as
+      other harts can tell. Without it, two harts could load the same context and push onto
+      the same kernel stack ([[concept:locks#handoff]], [[tour:11]]).
+
+  - id: sched-10
+    level: 2
+    type: choice
+    q: |
+      Each pass of [[scheduler]]'s outer loop executes `intr_on()` immediately followed by
+      `intr_off()`. What is the point of turning interrupts on for a single instruction?
+    code: kernel/proc.c:435-443
+    options:
+      - text: It is the one place in the loop where a pending device or timer interrupt can be taken, so handlers can run and wake processes even when nothing is runnable.
+        correct: true
+        why: |
+          The scheduler scans with interrupts off. If every process were asleep waiting for the
+          disk or the keyboard, the device's interrupt must be handled somewhere so that
+          [[wakeup]] can make a process `RUNNABLE`. The one-instruction window is that place;
+          it is safe because no lock is held there.
+      - text: It lets the timer interrupt preempt the scheduler and switch to a process.
+        why: |
+          You may have expected the scheduler to be preemptible like a process. [[kerneltrap]]
+          yields only if `myproc() != 0`, and `c->proc` is 0 here, so a tick in the window is
+          acknowledged and the loop continues ([[kernel/trap.c:157]]).
+      - text: It turns interrupts on for the process the scheduler is about to run.
+        why: |
+          The window closes before any process is picked. A resumed process gets its interrupt
+          state back from its own saved `intena` (restored by [[sched]]) or, on the way to user
+          mode, from `SPIE` at `sret`.
+      - text: It lets other harts acquire the `p->lock`s this hart was spinning on.
+        why: |
+          You may have thought SIE affects other harts. It only controls interrupts on this
+          hart, and no lock is held or awaited at this point of the loop.
+    explain: |
+      The scheduler is the only thread on an idle hart, so it must let interrupts in
+      somewhere or wakeups from devices could never be delivered on that hart. It opens the
+      window when it holds no lock, so `noff` is 0 and the invariant holds ([[tour:12]],
+      [[concept:locks#invariant]]).
+
+  - id: sched-11
+    level: 2
+    type: choice
+    q: |
+      Hart 2 is idle. A timer interrupt has been pending, and it is taken right after
+      `intr_on()` at line 441. What does [[kerneltrap]] do with it?
+    code: kernel/trap.c:136-164
+    options:
+      - text: "[[devintr]] calls [[clockintr]], which re-arms `stimecmp`; since `myproc()` is 0, there is no `yield`, and the trap returns into the scheduler."
+        correct: true
+        why: |
+          `c->proc` was set to 0, so line 157's `myproc() != 0` is false. The scheduler is not
+          a process: it has no `p->lock` to take and nothing to yield to. The `kernelvec` frame
+          on the scheduler stack is popped and the scan begins.
+      - text: It calls [[yield]], which switches to another `RUNNABLE` process.
+        why: |
+          That is what happens to a timer tick taken during a process's system call. With no
+          current process, `yield` would have no `p` to work on; line 157 guards against
+          exactly this case.
+      - text: "It panics with `kerneltrap: interrupts enabled`, because the scheduler had just turned interrupts on."
+        why: |
+          You may have thought SIE is still on inside the handler. Taking a trap clears
+          `sstatus.SIE` (saving the old value in `SPIE`), so `intr_get()` reads 0 at line 146.
+      - text: The trap goes through [[uservec]] and [[usertrap]], because no process is running.
+        why: |
+          Where a trap lands depends on `stvec`, not on whether a process exists. In the
+          scheduler, `stvec` points at [[kernelvec]], set by [[trapinithart]] and by every
+          `usertrap`.
+    explain: |
+      `myproc() == 0` is exactly "this trap landed on a scheduler stack". The tick is
+      acknowledged (and, on hart 0, counted), the frame is popped, and the scheduler carries
+      on ([[tour:12]], [[concept:stacks#scheduler]]).
+
+  - id: sched-12
+    level: 2
+    type: number
+    q: |
+      An idle hart runs one full pass of [[scheduler]]'s inner `for` loop and finds nothing
+      `RUNNABLE`. How many times does it call [[acquire]] during that pass?
+    code: kernel/proc.c:444-468
+    answer: 64
+    wrong:
+      0: |
+        You may have thought the scheduler peeks at `state` without locking. The rule
+        ([[kernel/proc.h:85]]) is that `state` is read only under `p->lock`, and the loop
+        follows it for every slot.
+      3: |
+        You may have counted harts. The loop walks process slots, not CPUs.
+      8: |
+        That is `NCPU`. The loop runs over `proc[0]` to `proc[NPROC - 1]`.
+    why_wrong: Look at what the loop iterates over and whether any slot is skipped before `acquire`.
+    explain: |
+      `NPROC` is 64 and the loop takes each slot's lock in turn, even for `UNUSED` slots, then
+      releases it at line 463. One simple rule, applied to every slot, and never more than one
+      `p->lock` held at a time ([[tour:12]]).
+
+  - id: sched-13
+    level: 2
+    type: state
+    q: |
+      Pid 5 was spinning in user mode on hart 1 when a timer interrupt arrived. [[usertrap]]
+      called [[yield]], which called [[sched]], which called [[swtch]]. Hart 1 has *just*
+      executed line 26, `ld sp, 8(a1)`. What is hart 1's state?
+    code: kernel/swtch.S:8-40@26
+    state:
+      mode: S
+      stack: scheduler
+      satp: kernel
+      sie: "off"
+      noff: 1
+      intena: 0
+    why:
+      stack: |
+        Line 26 loaded `sp` from `cpus[1].context`, which points into hart 1's scheduler
+        stack. Before that line the hart was on pid 5's kernel stack.
+      noff: |
+        Pid 5's `p->lock` is still held; the scheduler will release it after `swtch`
+        returns. That one lock is the only one: [[sched]] checked `noff == 1`.
+      intena: |
+        A timer trap enters the kernel with SIE off and `usertrap` never turns it on for an
+        interrupt, so `yield`'s `acquire` recorded intena 0.
+      sie: |
+        A spinlock (`p->lock`) is held, so SIE must be off; [[sched]] even panics if it is
+        not.
+      satp: |
+        `swtch` never touches `satp`. Both pid 5's kernel thread and the scheduler use the one
+        kernel page table.
+    why_wrong: Ask what each instruction since the trap changed. `swtch` changed only `ra`, `sp` and the `s` registers.
+    explain: |
+      At this instant hart 1 is on its scheduler stack, still holding pid 5's lock, with
+      interrupts off and intena 0 left over from pid 5. The scheduler will set intena to 0
+      (line 456), clear `c->proc` and release the lock ([[tour:11]],
+      [[concept:locks#sched-intena]]).
+
+  - id: sched-14
+    level: 2
+    type: state
+    q: |
+      Hart 0's scheduler has just returned from `acquire(&p->lock)` at line 446, during a
+      scan. What is hart 0's state?
+    code: kernel/proc.c:435-464@446
+    state:
+      mode: S
+      stack: scheduler
+      satp: kernel
+      sie: "off"
+      noff: 1
+      intena: 0
+    why:
+      intena: |
+        Line 442 turned interrupts off before the scan, so when this `acquire`'s
+        [[push_off]] recorded the old SIE, it was 0.
+      noff: |
+        The scheduler holds exactly one lock here. It released the previous slot's lock at line
+        463 before taking this one.
+      stack: |
+        No `swtch` has happened yet in this iteration; the scheduler runs on hart 0's slice
+        of `stack0`.
+      sie: |
+        Off twice over: line 442 cleared it, and a spinlock is now held.
+    why_wrong: Track the interrupt window at lines 441–442 and the one-lock-at-a-time scan.
+    explain: |
+      The scheduler always scans with interrupts off, so every one of its `acquire`s records
+      intena 0, and every `release` at line 463 leaves interrupts off ([[tour:12]],
+      [[concept:locks#intena]]).
+
+  - id: sched-15
+    level: 2
+    type: multi
+    q: |
+      Which of these are true at the instant [[scheduler]] executes the call
+      `swtch(&c->context, &p->context)` on line 453?
+    code: kernel/proc.c:444-464@451-453
+    options:
+      - text: This hart holds `p->lock`.
+        correct: true
+        why: It was acquired at line 446 and is not released here; the process will release it on the other side of the switch.
+      - text: "`p->state` is `RUNNING`."
+        correct: true
+        why: Line 451 set it, under the lock, so every later reader sees the process as taken.
+      - text: "`c->proc` is `p`."
+        correct: true
+        why: Line 452 set it, so that [[myproc]] on this hart returns `p` as soon as the process's code runs.
+      - text: "`sstatus.SIE` is 0."
+        correct: true
+        why: A spinlock is held, and the scan began with `intr_off()` anyway.
+      - text: "`sp` already points into `p`'s kernel stack."
+        why: |
+          You may have thought choosing a process moves the hart onto its stack. The hart is
+          still on the scheduler stack until `swtch` executes `ld sp, 8(a1)`.
+      - text: "`noff` is 0, because the lock will be released by another thread."
+        why: |
+          Who releases a lock does not change what is held now. One spinlock is held, so
+          `noff` is 1; it drops to 0 when the process releases the lock.
+    explain: |
+      The scheduler claims the process completely (lock, `RUNNING`, `c->proc`) before it
+      switches, and stays on its own stack until `swtch` line 26. The process's code then
+      releases the lock: in [[sched]]'s caller, or in [[forkret]] ([[tour:13]]).
+
+  - id: sched-16
+    level: 2
+    type: order
+    q: |
+      Pid 5 is preempted by a timer tick on hart 1 and later resumed by hart 0. Put these
+      events in the order they must happen.
+    items:
+      - text: "[[usertrap]] sees `which_dev == 2` and calls [[yield]]"
+        why: Everything starts with the tick deciding that pid 5 must give up hart 1.
+      - text: "`yield` acquires pid 5's `p->lock` and sets `RUNNABLE`"
+        why: The state change must happen under the lock, before the switch, so that the lock covers it.
+      - text: "[[sched]] checks its four rules and copies `intena` into a local"
+        why: sched runs between yield and swtch; it must save intena before swtch freezes the thread.
+      - text: "[[swtch]] saves pid 5's registers and loads hart 1's scheduler context"
+        why: The registers are saved while the lock is still held on hart 1.
+      - text: Hart 1's scheduler releases pid 5's `p->lock` (line 463)
+        why: The scheduler can release only after swtch has returned into it, off pid 5's stack.
+      - text: Hart 0's scheduler acquires pid 5's `p->lock`, sees `RUNNABLE` and sets `RUNNING`
+        why: Hart 0 cannot get the lock before hart 1's scheduler releases it.
+      - text: Hart 0's `swtch` loads pid 5's context, and `yield` releases the lock
+        why: Only after hart 0 has claimed pid 5 can it switch to it; pid 5's own code then releases the lock hart 0's scheduler took.
+    why_wrong: Follow pid 5's `p->lock`. Each step needs it held, or needs it to have just been released.
+    explain: |
+      The lock is acquired by pid 5 on hart 1, released by hart 1's scheduler, acquired by
+      hart 0's scheduler and released by pid 5 on hart 0. Each acquire/release pair is on one
+      hart, in two different threads ([[tour:11]], [[concept:locks#handoff]]).
+
+  - id: sched-17
+    level: 2
+    type: choice
+    q: |
+      Hart 1's scheduler switched to the process in `proc[4]`. A tick later that process
+      yields, and the scheduler returns from the `swtch` on line 453. Which slot does it
+      examine next?
+    code: kernel/proc.c:444-469
+    options:
+      - text: "`proc[5]`: it continues the same `for` loop where it left off."
+        correct: true
+        why: |
+          The scheduler resumes inside the iteration for `proc[4]`, releases that lock at line
+          463, and `p++` moves on. The process that just ran is now behind the scan position.
+      - text: "`proc[0]`: every return from a process restarts the scan from the beginning."
+        why: |
+          You may have expected a fresh scan. The loop variable `p` is a local of the scheduler,
+          saved in its stack frame and registers across `swtch`, so the scan simply resumes.
+          A restart from `proc[0]` happens only when the loop reaches the end of the table.
+      - text: "`proc[4]` again, because it is `RUNNABLE` once more."
+        why: |
+          You may have thought the loop re-tests the same slot. After the release at line 463
+          the `for` loop advances; `proc[4]` is reconsidered only on a later pass.
+      - text: "Whichever `RUNNABLE` process has waited longest."
+        why: |
+          xv6 keeps no record of waiting time. The only fairness mechanism is the scan
+          position: round-robin over the table, per hart.
+    explain: |
+      Because the scheduler is an ordinary C function frozen mid-loop by `swtch`, its scan
+      position survives every switch. That gives per-hart round-robin with no extra data
+      structure ([[tour:12]]).
+
+  - id: sched-18
+    level: 2
+    type: match
+    q: |
+      Each `release(&p->lock)` below releases a lock that was acquired somewhere else. Match
+      each release with the code that acquired that lock.
+    pairs:
+      - left: "`release(&p->lock)` in [[scheduler]], line 463, just after `swtch` has returned"
+        right: The process's own thread, in yield, sleep or kexit, before it called sched
+        why: |
+          After `swtch` returns into the scheduler, the lock it releases is the one the stopping
+          process took before calling [[sched]] ([[kernel/proc.c:504]], [[kernel/proc.c:566]],
+          [[kernel/proc.c:355]]).
+      - left: "`release(&p->lock)` in [[forkret]], line 520"
+        right: A scheduler, just before it switched to a process that had never run
+        why: |
+          A new process has no `sched` frame to return into, so `forkret` must release the lock
+          the scheduler took at line 446.
+      - left: "`release(&p->lock)` at the end of [[yield]], line 507"
+        right: A scheduler, just before it switched back to a process that had stopped in yield
+        why: |
+          When `sched` returns into `yield`, the lock held is the one taken by the scheduler that
+          resumed the process, possibly on a different hart from where yield started.
+      - left: "`release(&p->lock)` in [[kkill]], line 616"
+        right: kkill itself, at line 609, a moment earlier
+        why: |
+          An ordinary critical section: `kkill` takes the lock, sets `killed`, and releases it in
+          the same thread. Only the locks around `swtch` cross threads.
+    explain: |
+      `p->lock` is the one lock in xv6 released by a different thread than the one that took
+      it, always on the same hart. [[holding]] checks the hart, not the thread, so this is
+      legal ([[concept:locks#handoff]]).
+
+  - id: sched-19
+    level: 2
+    type: line
+    q: |
+      Once a process is running, its `p->lock` is free: any scheduler can lock the slot and
+      look at it. Click the line that makes those schedulers leave the process alone.
+    code: kernel/proc.c:444-464
+    answer: 451
+    lines:
+      446: |
+        The lock keeps other schedulers out only while it is held, and the process releases it
+        within a few instructions of starting. Something must keep them out after that.
+      452: |
+        `c->proc` is per-hart bookkeeping for [[myproc]] on *this* hart; other schedulers never
+        read it.
+      453: |
+        `swtch` starts the process but leaves no mark in `proc[]` that other harts check.
+      447: |
+        This line tests for `RUNNABLE`; it is the check other schedulers run, not the mark that
+        makes it fail for them.
+    why_wrong: Other schedulers test only one field of each slot. Find the line that changes it.
+    explain: |
+      `p->state = RUNNING` is what every other scheduler sees, under the lock, at line 447,
+      and skips. The lock is held *while the state changes*; the state itself keeps others
+      away the rest of the time ([[tour:12]]).
+
+  - id: sched-20
+    level: 3
+    type: choice
+    q: |
+      Why does [[scheduler]] turn interrupts *off* (line 442) before scanning, instead of
+      leaving them on for the scan?
+    code: kernel/proc.c:435-470
+    options:
+      - text: So that an interrupt arriving during a fruitless scan stays pending and makes `wfi` return at once, instead of being handled mid-scan and leaving the hart in `wfi` with a process it has just woken.
+        correct: true
+        why: |
+          If a disk interrupt were taken after the scan passed a slot, its handler could make
+          that process `RUNNABLE`, `found` would still be 0, and `wfi` would stall until the
+          next interrupt, up to a tick. With interrupts off the interrupt stays pending, `wfi`
+          returns immediately, and the next window handles it before the next scan.
+      - text: Because [[acquire]] requires interrupts to be off before it is called.
+        why: |
+          You may have thought the caller must disable interrupts. `acquire` does that itself
+          with [[push_off]] and restores the old state in [[pop_off]]; callers may call it
+          with interrupts on (system calls do all the time).
+      - text: To stop other harts from changing `proc[]` while this hart scans it.
+        why: |
+          You may have thought SIE affects other harts. It is per-hart. Other harts are kept
+          away from a slot only by its `p->lock`.
+      - text: Because `wfi` only works when interrupts are disabled.
+        why: |
+          `wfi` works either way: it resumes when an interrupt is pending and enabled in `sie`,
+          whatever `sstatus.SIE` says. The issue is not whether `wfi` works but whether a
+          wakeup handled during the scan is noticed.
+    explain: |
+      Scanning with interrupts off and letting them in only in a window at the top of the
+      loop means no wakeup can fall between "found nothing" and `wfi`. This ordering came
+      from a 2024 fix (commit `f7b14e5`, "maybe fix a race between interrupt and wfi") ([[tour:12]]).
+
+  - id: sched-21
+    level: 3
+    type: choice
+    q: |
+      Right after its `swtch` returns, [[scheduler]] executes `mycpu()->intena = 0` (line
+      456). What would go wrong without that line?
+    code: kernel/proc.c:444-464@456
+    options:
+      - text: After a process that slept inside a system call (intena 1), the release at line 463 would turn interrupts on in the middle of the scan.
+        correct: true
+        why: |
+          `cpus[i].intena` still holds the stopped process's value. A process that called
+          [[sleep]] from a system call took its lock with interrupts on, so the value is 1;
+          when line 463 takes `noff` to 0, [[pop_off]] would enable interrupts, undoing line
+          442 and reopening the `wfi` race.
+      - text: The next process the scheduler runs would start with interrupts permanently disabled.
+        why: |
+          You may have thought the scheduler's intena is passed to the next process. A process
+          resuming in [[sched]] restores its *own* saved intena (line 496), and a new process
+          reaches user mode with interrupts enabled by `sret`.
+      - text: "[[release]] would panic, because `holding()` checks `intena`."
+        why: |
+          `holding()` checks only `locked` and `lk->cpu`. `intena` matters only to
+          [[pop_off]], when `noff` reaches 0.
+      - text: "`noff` would stay at 1 forever, so the next `acquire` would panic."
+        why: |
+          Line 456 does not touch `noff`; `release` at line 463 brings it from 1 to 0 as usual.
+    explain: |
+      `intena` belongs to a thread but lives in `struct cpu`. [[sched]] saves and restores it
+      for processes; the scheduler, whose own value is always 0, simply resets it after every
+      switch back. The line was added in August 2026, commit `37081bd` ("reset intena in scheduler") ([[concept:locks#sched-intena]],
+      [[tour:13]]).
+
+  - id: sched-22
+    level: 3
+    type: multi
+    q: |
+      Process P stops on hart 1 through [[sched]] and is later resumed on hart 2. Which of
+      these are carried from hart 1 to hart 2 *with P*, so that P finds its own values after
+      the switch?
+    options:
+      - text: "`sp`"
+        correct: true
+        why: Saved by `swtch` into `P->context`, and loaded by hart 2's `swtch`. P's kernel stack is mapped at the same address in the kernel page table on every hart.
+      - text: "`s0`–`s11`"
+        correct: true
+        why: These are the callee-saved registers `swtch` stores and loads. P's C code relies on them surviving the call to `swtch`.
+      - text: P's `intena`
+        correct: true
+        why: |
+          [[sched]] copies `mycpu()->intena` into a local before `swtch` (in this build it lives
+          in `s3`) and writes it into hart 2's `struct cpu` afterwards (lines 494 and 496).
+      - text: "`tp`"
+        why: |
+          `tp` is the hart number. `swtch` leaves it alone, so on hart 2 it reads 2. That is the
+          point: P must find the hart it is *now* on.
+      - text: "`noff`"
+        why: |
+          `noff` is not saved anywhere. It is exactly 1 on both sides of every switch (the one
+          `p->lock` being handed over), so there is nothing to carry.
+      - text: "`satp`"
+        why: |
+          Every kernel thread runs on the one kernel page table, so hart 2's `satp` already holds
+          the right value; `swtch` never touches it. P's user page table is installed later, in
+          [[userret]].
+    explain: |
+      What describes the thread travels with it: the 14 context registers, and `intena`
+      smuggled through `sched`'s local variable. What describes the hart (`tp`, the CSRs,
+      `noff`'s count of locks held right now) stays put ([[concept:locks#sched-intena]],
+      [[tour:11]]).
+
+  - id: sched-23
+    level: 3
+    type: tf
+    q: |
+      True or false: when an idle hart executes `wfi` on line 467, its timer interrupt can
+      still end the wait, even though `sstatus.SIE` is 0 at that point.
+    code: kernel/proc.c:435-470@467
+    answer: true
+    why_tf: |
+      You may have reasoned "interrupts are off, so nothing can wake the hart, so `wfi` would
+      hang forever". `wfi` does not depend on the global enable bit.
+    reasons:
+      - text: "`wfi` resumes when an interrupt is pending and enabled in `sie`, whatever `sstatus.SIE` says; the interrupt is not taken yet, and the hart goes on to the next instruction."
+        correct: true
+        why: |
+          That is the RISC-V rule. The timer's `sie.STIE` was set by [[start]], so the pending
+          timer ends the `wfi`; the loop goes round, and `intr_on()` at line 441 lets the
+          interrupt be taken.
+      - text: The timer interrupt is delivered to M-mode, which is never masked by `sstatus.SIE`.
+        why: |
+          In this tree there is no M-mode timer handler: with Sstc the timer interrupt goes
+          straight to S-mode, delegated by `mideleg`. After boot, M-mode is never entered again.
+      - text: "`wfi` turns `sstatus.SIE` back on while the hart waits."
+        why: |
+          `wfi` changes no CSR. SIE stays 0 until line 441 sets it on the next pass.
+    explain: |
+      Waiting with SIE off is deliberate: the interrupt that ends `wfi` stays pending until the
+      scheduler is ready for it, at the top of the loop ([[tour:12]]).
+
+  - id: sched-24
+    level: 3
+    type: multi
+    q: |
+      Suppose `release(&p->lock)` on line 520 were moved to become the first statement inside
+      the `if (first)` block, so that `init` still releases it but no later fork child does.
+      A new child, pid 9, reaches user mode on hart 1. Which of these would then happen?
+    code: kernel/proc.c:510-543@520
+    options:
+      - text: Any other hart's scheduler that reaches pid 9's slot spins in `acquire` and never gets the lock.
+        correct: true
+        why: |
+          Hart 1 still holds pid 9's lock (`lk->cpu == &cpus[1]`) and nothing will ever release
+          it. Other schedulers, and any [[wakeup]] or [[kkill]] walking the table, spin there
+          with interrupts off.
+      - text: "At pid 9's next trap into the kernel on hart 1, the first `acquire` of its own `p->lock` (for example in [[killed]]) panics with `acquire`."
+        correct: true
+        why: |
+          A user-mode process stays on its hart, so its next trap is on hart 1, which already
+          holds the lock. [[acquire]]'s `holding()` check turns the self-deadlock into
+          `panic("acquire")`; [[usertrap]] calls `killed(p)` on every path before it could
+          `yield`.
+      - text: Nothing goes wrong, because `sret` releases any spinlocks the hart holds.
+        why: |
+          You may have thought privilege changes clean up locks. `sret` changes the mode, `pc`
+          and `SIE`; it knows nothing about spinlocks, which are just memory words.
+      - text: Pid 9 runs in user mode with interrupts disabled, so it can never be preempted.
+        why: |
+          [[prepare_return]] sets `SPIE`, so `sret` turns SIE on, and in user mode supervisor
+          interrupts are taken regardless. The leftover `noff` = 1 does not stop that.
+      - text: The scheduler that acquired the lock releases it after pid 9's first `yield`.
+        why: |
+          The scheduler releases only the lock that a stopping process hands back through
+          `sched`. Pid 9 could never get as far as `yield`: its next `acquire` of its own lock
+          panics first.
+    explain: |
+      Every path out of `swtch` into a process must release the lock the scheduler took. For a
+      process that has run before, the code after `sched` does it; for a new one, only
+      [[forkret]] can ([[tour:13]], [[concept:locks#handoff]]).
+
+  - id: sched-25
+    level: 3
+    type: choice
+    q: |
+      `cat` called [[sleep]] from inside `read`, with interrupts on, on hart 1. It is woken
+      and resumed by hart 2's scheduler. Suppose line 496 of [[sched]],
+      `mycpu()->intena = intena;`, were deleted (line 494 kept). What changes for `cat`?
+    code: kernel/proc.c:479-497@494-496
+    options:
+      - text: "`cpus[2].intena` stays 0 from hart 2's scheduler, so when `sleep` releases `p->lock`, interrupts stay off for the rest of `cat`'s system call, until `sret`."
+        correct: true
+        why: |
+          Hart 2's scheduler acquired `cat`'s lock with interrupts off, recording intena 0.
+          Without line 496, `cat`'s own value (1) is never put back, so `pop_off` leaves SIE
+          off and the rest of `read` runs unpreemptible.
+      - text: Nothing changes, because [[swtch]] restores `intena` from `cat`'s context.
+        why: |
+          `struct context` has no `intena` field. `swtch` only restores `cat`'s *local
+          variable* (in a register); line 496 is what writes it back into `struct cpu`.
+      - text: "[[sched]] panics with `sched interruptible`."
+        why: |
+          That check runs before the switch, on hart 1, where interrupts were off as required.
+          Deleting line 496 does not affect it.
+      - text: Interrupts turn on in the middle of hart 2's scheduler loop.
+        why: |
+          You may be thinking of the opposite half, line 456 in the [[scheduler]]. Here the
+          wrong intena lands in `cat`'s thread, not the scheduler's.
+    explain: |
+      `intena` is "were interrupts on when *this thread* took its first lock". `sched` keeps it
+      in a local across the switch and writes it into whichever hart's `struct cpu` resumes the
+      thread ([[tour:13]], [[concept:locks#sched-intena]]).

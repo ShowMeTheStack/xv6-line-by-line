@@ -1,0 +1,1746 @@
+published: true
+title: "User threads: clone, join and futex"
+area: Scheduling
+stars: 5
+branch: ext/09-threads
+prerequisites: {tours: [5, 7, 16, 20, 21, 23, 26, 28, 43], concepts: [stacks, locks]}
+summary: |
+  Every xv6 process has exactly one thread: one page table, one trapframe, one kernel stack,
+  one stream of instructions. In this lab you add threads. `clone(fn, arg, stack)` starts a
+  new thread that runs in the *caller's* address space, on a stack the caller allocated;
+  `join()` waits for one to finish; `futex_wait` and `futex_wake` let threads sleep and wake
+  each other on a word of shared memory; and a small user library builds `thread_create`,
+  `thread_join` and a mutex on top of them.
+
+  Sharing one page table between several [[g:hart|harts]] at once breaks assumptions that
+  hold so quietly in this tree that nobody wrote them down. The trampoline finds the
+  [[g:trapframe]] at a fixed address: where does the second thread's trapframe go, and how
+  does [[uservec]], with every register full of user data, find it? Who frees a page table
+  that four threads use, and when? What happens when two threads call `sbrk`, or touch the
+  same lazily allocated page, on two harts at the same moment? What does `exit` mean now,
+  and `wait`, and `kill`? And how do you put a thread to sleep until some *user* memory
+  changes without losing the wakeup that arrives a moment too early?
+
+  The reference solution is ten small commits. With it, creating and joining a thread costs
+  no page allocations at all (a `fork` of a 1 MiB process costs 266), and 2000
+  create-and-join pairs take 3 timer ticks where 2000 fork-and-wait pairs take 69.
+learn:
+  - "What a thread is to a kernel: which state must be private (registers, trapframe, kernel stack, user stack) and which is shared (the page table, the size of user memory), and why the shared part needs a reference count and a lock of its own."
+  - "How the trap entry code can find per-thread state at a moment when every general-purpose register still belongs to the user."
+  - "What happens to a page table that several harts use at once: which changes race, what each race does on a real run, and what it takes for code that only reads the page table to stay safe."
+  - "How the lifetime rules of processes (exit, wait, kill, orphans and init) extend to threads, and what goes wrong when a shared resource is freed by the first user instead of the last."
+  - "How a user-level sleep primitive is built on this tree's `sleep_prepare`/`sleep`/`wakeup` protocol, what decides whether a wakeup can get lost, and how a mutex can avoid system calls when nobody contends."
+spec: |
+  **System calls.**
+
+  - `int clone(void (*fn)(void *), void *arg, void *stack)` creates a thread in the
+    caller's address space and returns its id (a pid), or -1. The thread starts at `fn`
+    with `a0 = arg` and `sp = stack`; `stack` is the *top* of memory the caller allocated.
+    The thread has its own pid, kernel stack and trapframe, and copies of the caller's open
+    files and current directory (as with `fork`). `fn` must not return; it ends with
+    `exit(status)`.
+  - `int join(int *status)` waits for a thread that the calling thread created, stores its
+    exit status and returns its id; -1 if there is none.
+  - `int futex_wait(int *addr, int val)`: if `*addr == val`, sleep until a `futex_wake` on
+    `addr`; otherwise return at once. Spurious returns are allowed: callers re-check.
+  - `int futex_wake(int *addr, int n)` wakes up to `n` threads waiting on `addr` and
+    returns how many it woke.
+
+  **The library** (`user/uthread.c`): `thread_create(fn, arg)` (fn returns the exit status),
+  `thread_join(&status)`, and `struct mutex` with `mutex_lock`/`mutex_unlock`. An
+  uncontended lock and unlock make no system call.
+
+  **Semantics to decide and keep.** `wait` must never return a thread and `join` never a
+  child process. The process ends when its first thread exits (the one its parent waits
+  for), and a `kill` or a fatal fault in any thread ends every thread. Every thread may
+  call `sbrk` and touch lazily allocated memory at the same time as the others. A process
+  may have up to 8 threads alive (including zombies not yet joined).
+
+  **What must not change.** Single-threaded programs behave exactly as before: user memory
+  may still reach up to `TRAPFRAME` (`usertests lazy_sbrk` checks the very last page), and
+  **`usertests -q` must print `ALL TESTS PASSED` on 3 harts.**
+
+  **The test program**, `threadtest`, prints one line per check (output from the reference,
+  3 harts):
+
+  ```text
+  $ threadtest
+  threadtest: create and join: OK
+  threadtest: registers: OK
+  threadtest: mutex: 140000 of 140000
+  threadtest: mutex: OK
+  threadtest: without the mutex: 120203 of 140000 (not checked)
+  threadtest: ping-pong: OK
+  threadtest: sbrk: OK
+  threadtest: lazy: OK
+  threadtest: shared memory only grows: OK
+  threadtest: wait and join: OK
+  threadtest: stress: OK
+  threadtest: exit ends all threads: OK
+  threadtest: kill ends all threads: OK
+  threadtest: free pages 32469 before, 32469 after
+  threadtest: no leaks: OK
+  threadtest: ALL OK
+  ```
+
+  - **create and join**: 7 threads return 100…106; each status comes back exactly once
+    through `join`, an eighth thread cannot be created, and a further `join` returns -1.
+  - **registers**: 7 threads each make 2000 `getpid` calls; every call must return the
+    thread's own id, and the thread's id and loop state (kept in callee-saved registers)
+    and its counters (kept on its own stack) must survive the traps.
+  - **mutex**: 7 threads each add 1 to a shared counter 20,000 times, slowly (read, a
+    200-iteration delay, write), under the mutex. The same without the mutex is printed for
+    comparison and is *not* checked: how many updates get lost depends on how much the
+    threads overlap.
+  - **ping-pong**: two threads pass a turn back and forth 5000 times, each sleeping in
+    `futex_wait` until the other wakes it.
+  - **sbrk**: 7 threads each call `sbrk(4096)` 50 times at once; every page must be its
+    caller's alone, and the break must have moved by exactly 350 pages.
+  - **lazy**: 7 threads write one byte each into the same 512 lazily allocated pages at once.
+  - **shared memory only grows**: with a second thread alive, an eager `sbrk` of 128 MiB
+    (more than the machine has) fails and leaves the break where it was, and `sbrk(-4096)`
+    and `exec` fail; alone again, shrinking works.
+  - **wait and join**: with one child process and one thread, each call returns only its
+    own kind.
+  - **stress**: 20 rounds of 7 threads doing mutex increments, lazy `sbrk` and a
+    `fork`+`wait` each.
+  - **exit / kill ends all threads**: a child whose first thread exits (or is killed) while
+    other threads spin or sleep; the parent's `wait` returns, and the free page count comes
+    back to its starting value once init has reaped the rest.
+  - **no leaks**: free pages counted with `sbrk` before and after are equal.
+think:
+  - title: What does a thread share, and what must it own?
+    q: |
+      Two threads of one process run on two harts at the same time, in the same address
+      space. Go through `struct proc` ([[kernel/proc.h:82]]) field by field: which fields
+      can stay per thread, and which describe something the threads must *share*, so that a
+      change by one is seen by all? Commit to a list before the hints, and think about what
+      happens to the shared part when one thread exits.
+    hints:
+      - "Read `struct proc` in [[kernel/proc.h:82]] and how [[growproc]] and [[sys_sbrk]] ([[kernel/sysproc.c:48]]) use `p->sz`."
+      - "Anything a thread changes for the whole process must exist once: if `sz` lived in each thread, two threads could both move the break from the same old value. A thing several threads point to needs a count of its users, so the last one can free it."
+      - "Sort the fields into two piles: what describes executing (and so cannot be shared by two harts running at once), and what describes memory. Where would the second pile live so that every thread sees the same copy, and what must it know about its users?"
+    answer: |
+      Per thread: everything about *executing*: `state`, `chan`, `killed`, `xstate`, `pid`,
+      `parent`, `kstack`, `context`, and the saved user registers (the trapframe). Each
+      thread runs on its own hart with its own registers, so each needs its own place to
+      save them and its own kernel stack to run system calls on.
+
+      Shared: the address space. That is the page table and `sz`, the size of user memory,
+      which [[sys_sbrk]] and [[vmfault]] read and change. If each thread had its own `sz`, a
+      thread that grew memory would leave the others with a stale size: [[vmfault]] would
+      refuse their accesses to the new memory, and their own `sbrk` would hand out the same
+      addresses again.
+
+      The reference adds `struct vm` (`lock`, `ref`, `sz`, and later the trapframe page),
+      allocated from a static table `vms[NPROC]` like `proc[]`: every address space has at
+      least one thread, so `NPROC` of them always suffice. `p->vm` points to it; `ref` counts
+      the threads using it; the thread that drops `ref` to 0 frees the page table. The page
+      table pointer stays in each `struct proc` as a copy, because it never changes while
+      the address space is shared (that rule comes from a later question). Open files are a
+      judgment call: the reference copies the descriptor table, as `fork` does, so threads
+      share open files but not descriptor numbers created later (a stretch goal below shares
+      the table itself).
+    checks:
+      - id: lab09-01
+        level: 1
+        type: multi
+        q: |
+          Which of these must exist **once per thread**, not once per address space, when
+          two threads of a process run on two harts at once?
+        options:
+          - text: "The kernel stack"
+            correct: true
+            why: |
+              Both threads can be inside system calls at the same moment, on two harts; each
+              needs its own stack to run [[usertrap]] and everything it calls.
+          - text: "The saved user registers (the trapframe)"
+            correct: true
+            why: |
+              Each thread has its own `pc`, `sp` and registers, and both can trap at the same
+              moment. One save area would be overwritten by the other's trap.
+          - text: "The page table"
+            why: |
+              You may have thought each thread needs its own mappings. Sharing them is the
+              whole point: a store by one thread must be visible to the other at the same
+              address. One page table, used by every thread.
+          - text: "`sz`, the size of user memory"
+            why: |
+              You may have treated `sz` like a register. It describes the address space:
+              after one thread's `sbrk`, every thread must see the new size, or [[vmfault]]
+              refuses their accesses to the new memory and the next `sbrk` reuses addresses.
+          - text: "The pid"
+            correct: true
+            why: |
+              Each thread is a separate `struct proc` to the scheduler, so it has its own pid.
+              `clone` and `join` use it as the thread id.
+        explain: |
+          The dividing line: whatever describes *execution* (registers, stacks, scheduling
+          state) is per thread; whatever describes *memory* (the page table and its size) is
+          per address space and shared, with a count of its users. See [[tour:25]] for what an
+          address space is in this tree.
+  - title: Where does each thread's trapframe live, and how does uservec find it?
+    q: |
+      The trapframe page is mapped at `TRAPFRAME` in every user page table
+      ([[kernel/proc.c:197]]), and [[uservec]] finds it with `li a0, TRAPFRAME`
+      ([[kernel/trampoline.S:37]]). Two threads share one page table now. Where does the
+      second thread's trapframe go, and how does the trap entry code, which may not touch a
+      single register before saving it, learn which one to use?
+    hints:
+      - "Read [[kernel/trampoline.S:30]] to [[kernel/trampoline.S:37]] and [[kernel/trampoline.S:114]]. Which register does uservec already use as scratch space, and why that one? Then look at what lives just below `TRAPFRAME` in a big process: [[user/usertests.c:2793]]."
+      - "Every per-thread value the trampoline needs must reach it through something the kernel can set before `sret` and the hardware leaves alone until the next trap: a CSR. The address must also be different for each thread, but inside the one page table."
+      - "How small is a trapframe compared with a page? And which value, set by the kernel just before `sret`, could uservec trade for a register in a single instruction?"
+    answer: |
+      Two parts.
+
+      **Where.** The obvious place, one page per thread below `TRAPFRAME`, collides with
+      user memory: a single-threaded program may grow right up to `TRAPFRAME`, and
+      `usertests lazy_sbrk` checks exactly that ([[user/usertests.c:2793]]–[[user/usertests.c:2806]]).
+      Lowering the limit would change existing behaviour. But a trapframe is only 288 bytes.
+      The reference splits the one trapframe page into 8 slots of 512 bytes (`TFSIZE`,
+      checked by a `_Static_assert`); thread slot *i* lives at `TRAPFRAME + i*512`. The page
+      now belongs to the address space, not to a thread: it is allocated with the `struct vm`
+      and freed with it, and no mapping ever changes when threads come and go.
+
+      **How uservec finds it.** At the first instruction of [[uservec]] every general-purpose
+      register holds a user value that must be saved; the original code borrows `sscratch`
+      to free `a0`, then loads the constant. With a per-thread address, the constant is gone,
+      but `sscratch` is still there, and the kernel controls it. So
+      [[prepare_return]] writes the thread's slot address into `sscratch`, and uservec's first
+      instruction becomes `csrrw a0, sscratch, a0`: one atomic exchange that leaves the slot
+      address in `a0` and the user's `a0` in `sscratch`, exactly where the old code had them
+      after two instructions. [[userret]] reads it back with `csrr a0, sscratch` instead of
+      `li a0, TRAPFRAME`, leaving it in `sscratch` for the next trap.
+
+      Alternatives: keep a per-hart table indexed by `tp` (but `tp` belongs to the user in
+      user mode); or have [[usertrap]] return the address in `a1` (it reaches userret, but
+      uservec runs *before* any kernel code). `sscratch` is the only state that survives from
+      the kernel's last instruction to uservec's first.
+    checks:
+      - id: lab09-02
+        level: 2
+        type: number
+        q: |
+          On the reference branch, `TRAPFRAME` is `0x3fffffe000` and `TFSIZE` is 512. gdb
+          stopped [[uservec]] right after its first instruction, in the thread that lives in
+          slot 1. What value does `a0` hold? (Hex is fine.)
+        answer: "0x3fffffe200"
+        wrong:
+          "0x3fffffe000": "You may have thought every thread still uses `TRAPFRAME`. That is slot 0, the process's first thread. Slot 1 is 512 bytes higher."
+          "0x3ffffff000": "You may have confused the trapframe page with the trampoline page, `TRAMPOLINE`, one page higher. That page holds code, not saved registers."
+          "0x3fffffd000": "You may have assumed one page per thread, growing downwards. The reference keeps one trapframe page and splits it into 512-byte slots."
+        why_wrong: |
+          The slot address is `TRAPFRAME + slot * TFSIZE` = `0x3fffffe000 + 1 * 0x200`.
+        explain: |
+          gdb recorded exactly this on the reference: after `csrrw a0, sscratch, a0`,
+          `a0 = 0x3fffffe200` and `sscratch` held the user's `a0`. The kernel had written
+          `0x3fffffe200` into `sscratch` in [[prepare_return]] before the thread's previous
+          return to user space.
+      - id: lab09-03
+        level: 3
+        type: state
+        q: |
+          A thread in slot 1 executes `ecall`. Fill in the machine state at the instruction
+          right after `csrrw a0, sscratch, a0`, the first instruction of [[uservec]].
+        state: {mode: S, stack: none, satp: user, sie: "off"}
+        why:
+          mode: "The trap already happened: the hart is in S-mode from the first instruction of uservec."
+          stack: "`sp` still holds the user's stack pointer, which S-mode code cannot use (SUM is never set); the kernel stack comes at the `ld sp` a few dozen instructions later. Nothing in uservec pushes anything."
+          satp: "uservec runs with the user page table until `csrw satp`; that is why the trampoline and the trapframe slots are mapped in it."
+          sie: "Taking a trap clears `sstatus.SIE`; the kernel turns interrupts on only later, in usertrap, for system calls."
+        why_wrong: |
+          At the top of uservec nothing has changed except the privilege mode, `sepc`,
+          `scause` and `sstatus` (the hardware's part of the trap) and now `a0`/`sscratch`.
+        explain: |
+          The `csrrw` changes no mode, stack or page table: it only frees a register. See
+          [[tour:43]] for the full CSR-by-CSR picture of a system call and
+          [[concept:stacks]] for why `sp` is "none" here.
+  - title: When can a shared page table be freed?
+    q: |
+      In this tree [[freeproc]] frees a process's page table and all its user memory when its
+      parent reaps it ([[kernel/proc.c:161]]). Now four threads share one page table. Thread
+      A exits and its creator joins it. What must [[freeproc]] do with the page table, the
+      trapframe page and the user memory? Decide who frees them, when, and what has to be
+      read under which lock.
+    hints:
+      - "Look at what [[proc_freepagetable]] and [[uvmfree]] do ([[kernel/proc.c:210]]), and think about the hart that is still running another thread of the same process at that moment."
+      - "A zombie thread still counts: it has not been reaped. The count must drop when a thread is *freed* (in freeproc), and the decision \"I was the last one\" must come from the same critical section that decrements it."
+      - "Which values must be read inside that critical section, given that another hart may reuse the structure the moment the count is 0 and the lock is free? And who does the freeing: the thread that saw which count?"
+    answer: |
+      Only the last user may free it. The reference counts users in `vm->ref`: `allocvm`
+      sets 1, every `clone` adds 1, and `dropvm`, called from [[freeproc]] when a thread is
+      reaped, subtracts 1. Under `vm->lock` it computes the new count *and* reads `sz` and the
+      trapframe page; after releasing the lock, the thread that saw 0 calls
+      [[proc_freepagetable]] and frees the trapframe page.
+
+      Two details matter. First, `sz` must be read inside the critical section: once `ref`
+      is 0 and the lock is released, another `fork` on another hart may pick this `struct
+      vm` from the table and set `sz` to 0. Second, the count drops when a thread is
+      *reaped*, not when it exits: a zombie thread is still "using" its trapframe slot (its
+      exit status is not collected yet), and the slot bit is cleared in the same place.
+
+      If the first thread to be reaped freed everything instead, the other threads would
+      keep running with `satp` pointing at a freed page: clinic 2 shows the result, a hart
+      that loops for ever in an instruction page fault at the trampoline, printing nothing.
+    checks:
+      - id: lab09-04
+        level: 2
+        type: tf
+        q: |
+          True or false: in the reference, a thread that has called `exit` but has not yet
+          been joined still holds its reference to the address space.
+        answer: true
+        why_tf: |
+          You may have thought `exit` releases everything. [[kexit]] only closes files and
+          the current directory; the memory, like a zombie process's, is released by whoever
+          reaps it, in [[freeproc]].
+        reasons:
+          - text: "dropvm runs from freeproc, which the joiner (or init) calls when it reaps the zombie."
+            correct: true
+            why: |
+              Right. The zombie keeps its trapframe slot and its reference until then, which
+              is also why exec and shrinking stay refused while an unjoined zombie exists.
+          - text: "kexit cannot drop the reference because it still runs on the user stack."
+            why: |
+              You may have confused stacks. kexit runs on the thread's *kernel* stack, which
+              belongs to the proc slot and is never freed. The user page table is not in use
+              by kexit at all.
+          - text: "The scheduler drops it when it switches away from the zombie."
+            why: |
+              The scheduler never frees anything. It only skips processes that are not
+              RUNNABLE.
+        explain: |
+          Same rule as for processes ([[tour:21]]): exit makes a zombie, the reaper frees.
+          With threads the reaper may be a joiner, the process's parent, or init.
+  - title: Who reaps a thread, and what ends a process?
+    q: |
+      A shell runs a threaded program and calls `wait`. The program's first thread created
+      three threads. Which of these four `struct proc`s may `wait` return? What should
+      `join` return if the caller also forked a child process? And what should happen to
+      the three threads when the first thread calls `exit(0)`, or when the shell's user
+      types Ctrl-C (`kill`)?
+    hints:
+      - "Read [[kwait]] ([[kernel/proc.c:382]]): it reaps any child. And [[kexit]] gives all children to init ([[kernel/proc.c:350]])."
+      - "A child is a thread of the caller exactly when it shares the caller's address space. Threads left running after the process 'ended' would run with nobody to wait for them, so something must stop them."
+      - "What single comparison between parent and child tells a thread from a process? And which thread's exit should count as the process's exit, and what existing mechanism can stop the others wherever they are?"
+    answer: |
+      **wait vs join.** `wait` returns only child *processes*; `join` only child *threads*.
+      The test is simple and exact: a child is a thread when `pp->vm == p->vm`. The reference
+      keeps one scan, [[kwait]], with a flag that says which kind to accept. An orphaned
+      thread (its creator exited) is handed to init by [[reparent]] as usual; its `vm` is
+      not init's, so init's `wait` reaps it like any orphan.
+
+      **Process exit.** If the first thread's `exit` ended only itself, the shell's `wait`
+      would return while the other threads kept running, invisible and unkillable from the
+      shell. So the reference makes `exit` mean "end the process" when called by the
+      process's first thread (`p->thread == 0`, set for every process made by `fork` or
+      `exec`), and "end this thread" otherwise. A killed thread ends the process too: a
+      `kill`, or a fault that [[usertrap]] turns into `setkilled`, should take the whole
+      program down, as a crash does elsewhere. In both cases [[kexit]] marks every other
+      thread of the address space `killed` and makes the sleeping ones RUNNABLE. Each then
+      exits at its next pass through [[usertrap]], and the last one reaped frees the memory.
+
+      `kill(pid)` itself marks only the thread `pid`; the spreading happens when that
+      thread reaches [[kexit]], which keeps [[kkill]] free of any scan under locks.
+    checks:
+      - id: lab09-05
+        level: 2
+        type: choice
+        q: |
+          The first thread of a process forks a child process and creates a thread. The
+          child process exits at once; the thread is still running. The first thread calls
+          `join(&st)`. What happens in the reference?
+        options:
+          - text: "join sleeps until the thread exits, then returns its id; the child process stays a zombie until wait is called."
+            correct: true
+            why: |
+              join only looks at children that share the caller's `vm`. The zombie child
+              process is skipped, and the thread counts as a living child, so join sleeps.
+          - text: "join returns the child process's pid at once, because it is a zombie."
+            why: |
+              That is what a join without the vm test does: clinic 6. The child's exit
+              status then goes to the wrong call, and the later `wait` finds nothing.
+          - text: "join returns -1, because the caller has a child process."
+            why: |
+              You may have thought mixing kinds is an error. The scan skips the other kind;
+              it fails only if no child of the right kind exists at all.
+          - text: "join reaps both, the zombie first."
+            why: |
+              One call reaps at most one child, and only of its own kind.
+        explain: |
+          `(pp->vm == p->vm) != threads` is the whole filter. `threadtest wait and join`
+          checks this exact situation.
+  - title: Two threads change the address space at once
+    q: |
+      With threads, several harts can run system calls and page faults on the *same* page
+      table at the same moment. List every place that changes a page table or `sz`. For each,
+      what happens if two threads run it at the same time with no lock? Then the hard part:
+      [[copyin]], [[copyout]] and the hardware's own page walker read the page table without
+      any lock. What rule makes that safe, and what does it forbid?
+    hints:
+      - "Start from every caller of [[uvmalloc]] and [[mappages]], and every write to `sz`; then look for code that reads the whole page table and needs it not to change underneath."
+      - "Two writers can read the same old `sz`, or both see a page unmapped and both map it ([[mappages]] panics on a valid PTE, [[kernel/vm.c:466]] is the check). A reader without a lock is only safe if nothing it might be looking at can disappear."
+      - "Which lock, held around which steps, turns each race into one at a time? What should the second of two faulting threads be told when the first has already mapped the page? And which operations remove pages, including failure paths, so that you must forbid or rework them while the address space is shared?"
+    answer: |
+      The races. We produced the first two on 3 harts (clinics 4 and 5); the `fork` row is
+      reasoned from the code:
+
+      | code | race | result |
+      |---|---|---|
+      | `sbrk` | two threads read the same `sz` | both get the same address; with eager `sbrk` both map the same page: `panic: mappages: remap` |
+      | lazy fault | two threads touch an unmapped page | both map it (`remap` panic), or the second sees it mapped, [[vmfault]] returns 0, and the thread is killed |
+      | `fork` | another thread grows memory during [[uvmcopy]] | a copy of a half-changed page table |
+
+      The reference adds `vm->lock` (a spinlock) and takes it around each of them.
+      [[growproc]] now does both kinds of `sbrk` and returns the old size, so reading the
+      break and moving it is one critical section. [[vmfault]] does its check-and-map under
+      the lock, and when the page is already mapped it returns success *if the PTE allows the
+      access* (`PTE_U` and `PTE_R` or `PTE_W`): that is the winner's page. A store to text or
+      a touch of the guard page still fails, as before. [[kfork]] holds the parent's
+      `vm->lock` for the copy.
+
+      Readers take no lock. [[copyout]] may be halfway through a `memmove` into a user page;
+      the hardware walker may be fetching through any PTE, and another hart's TLB may still
+      hold a translation (there is no cross-hart TLB flush in this tree). That is safe only
+      because, **while an address space is shared, pages are only ever added**: nothing
+      unmaps or frees a user page under them. Three things would break that rule, so the
+      reference changes them when `vm->ref > 1`: `sbrk(-n)` (shrinking frees pages) and
+      `exec` (replaces the whole page table) are refused, and an eager `sbrk` no longer uses
+      [[uvmalloc]], whose failure path unmaps and frees the pages it had already mapped in
+      the same call ([[kernel/vm.c:230]]). Instead `uvmgrow` first creates the page-table
+      pages, then takes every physical page it needs, and maps them only when all are in
+      hand; if memory runs out, it gives the pages back before any was mapped. A `sz` read
+      without the lock can then only be too small, never too large. (Simplified: on hardware with a weaker memory order than
+      QEMU's on this host, [[walk]] would also need a fence between zeroing a new page-table
+      page and linking it, so that a lock-free reader never sees the link before the zeros.)
+
+      Lock order: `p->lock` before `vm->lock` (allocproc, freeproc, kwait's copyout), and
+      `vm->lock` before `kmem.lock`. Nothing takes a `p->lock` while holding `vm->lock`.
+    checks:
+      - id: lab09-06
+        level: 3
+        type: choice
+        q: |
+          Remove only the lock from [[growproc]] (everything else as in the reference). Seven
+          threads each call `sbrk(4096)` (eager) 50 times at once on 3 harts. What is the
+          worst outcome the race can produce?
+        options:
+          - text: "panic: mappages: remap, when two threads both map the page at the same old break"
+            correct: true
+            why: |
+              Both read `vm->sz` = X and both call [[uvmalloc]] for X. The first maps it; the
+              second's [[mappages]] finds a valid PTE and panics. We saw it in 6 runs of 48
+              (clinic 4).
+          - text: "Two threads get the same memory, and the test finds the overlap."
+            why: |
+              That is what a *lazy* sbrk race would do, where nothing is mapped at sbrk time.
+              With eager sbrk the second mapping attempt panics first.
+          - text: "Nothing: sbrk is a system call, and system calls on one process are serialized."
+            why: |
+              You may be thinking of the single-threaded world. Each thread enters the
+              kernel on its own hart; nothing serializes them except locks you add.
+          - text: "A deadlock, because both threads spin on kmem.lock."
+            why: |
+              kmem.lock is taken and released inside each [[kalloc]]; neither thread holds it
+              while waiting for the other.
+        explain: |
+          A missing lock usually shows up rarely: here once in 21 runs. The reason to add it
+          is the interleaving, not the test result. See [[tour:26]] for how sbrk maps pages.
+  - title: Sleeping on a word of user memory without losing the wakeup
+    q: |
+      A mutex holder releases the lock and wants to wake one sleeping waiter. The waiter
+      decided to sleep because it saw the word still locked. In this tree, sleeping is
+      [[sleep_prepare]] then [[sleep]], and waking is [[wakeup]] ([[kernel/proc.c:546]] to
+      [[kernel/proc.c:595]]). In what order must `futex_wait` register itself and look at
+      the user word, and does it need a lock of its own around the two? What sleep channel
+      do all threads agree on?
+    hints:
+      - "Read [[sleep_prepare]], [[sleep]] and [[wakeup]], and tour 16 on the lost-wakeup problem. Where in this tree does code call sleep_prepare and then decide not to sleep? ([[kernel/uart.c:86]])"
+      - "The waker changes the word *before* it calls futex_wake. A wakeup is lost if it runs after the waiter has looked at the word but before the waiter is registered."
+      - "Which of the two steps, registering and looking at the word, must come first so that a wake arriving between them is still seen? What address do all threads of the process agree on for a word, and how is a kill that arrives in the same gap seen?"
+    answer: |
+      **Register, then look.** With the order reversed (look, then register), a wakeup that
+      falls between the two finds nobody registered, and the waiter then sleeps on a word
+      that will never be woken again: clinic 3, both ping-pong threads asleep for ever. With
+      the reference order, every `futex_wake` either comes before the waiter's look (then the
+      look sees the new value, since the waker stored it first) or after the registration
+      (then [[wakeup]]-style code finds `p->chan` set, clears it, and the [[sleep]] that
+      follows returns at once). The [[g:lost-wakeup]] cannot happen.
+
+      **No extra lock.** The ordering comes from `p->lock`, which [[sleep_prepare]] takes to
+      set `p->chan` and the waker's scan takes to read it. If the scan takes this thread's
+      `p->lock` after `sleep_prepare` released it, it sees the registration. If it took it
+      before, then `sleep_prepare`'s `acquire` comes after the scan's `release`, and the
+      waker's store to the user word (which came before its system call, before that
+      `release`) is visible to the look that follows. Either way one side sees the other.
+
+      **The channel** is the word's physical address: the same for every thread of the
+      process (they share one page table), and different from every kernel channel, which
+      point into kernel memory.
+
+      Two more details. A thread that decides not to sleep must clear `p->chan`
+      ([[kernel/uart.c:86]] leaves it set, harmlessly, because nothing counts uart
+      wakeups), otherwise `futex_wake(addr, 1)` could spend its one wakeup on a thread that
+      is not waiting.
+
+      And a kill has the same gap as a wakeup. `futex_wait` checks `killed(p)` after
+      registering, but a kill that lands between that check and [[sleep]] only sets
+      `killed`: [[kkill]] makes a thread RUNNABLE only if it is already SLEEPING. The
+      thread then sleeps on a word nobody may ever change, never exits, and its address
+      space is never freed. The reference closes the gap the same way as for wakeups:
+      [[kkill]] and `killthreads` also clear `p->chan`, so that [[sleep]] returns at once.
+      Every sleeper in this tree re-checks its condition (and `killed`) in a loop, so the
+      extra return is harmless. We did not catch the original gap in a normal run (it is a
+      few instructions wide), but with a scratch delay of 5 ticks between the check and
+      [[sleep]] it lost the kill every time:
+
+      ```text
+      $ lostkill
+      lostkill: child 4 exited with 5
+      lostkill: free pages 32470 before, 32458 after: FAIL
+      $
+      1 sleep  init
+      2 sleep  sh
+      5 sleep  lostkill
+      ```
+
+      (`lostkill`, a scratch program, forks a child whose thread blocks in `futex_wait`
+      while the child's first thread exits; the last three lines are Ctrl-P's process list:
+      pid 5, the thread, asleep for ever, its 12 pages lost.) The same delay on the
+      reference kernel printed `32470 before, 32470 after: OK`, with no `lostkill` left in
+      the list, in both runs.
+    checks:
+      - id: lab09-07
+        level: 2
+        type: order
+        q: |
+          Put the steps of the reference `futex_wait(addr, val)` in order.
+        items:
+          - "Find the channel: copyin the word (faulting in a lazy page) and take its physical address"
+          - text: "sleep_prepare(chan)"
+            why: "Registration must come before the look at the word; this is the step the lost-wakeup bug moves."
+          - text: "copyin the word again and compare it with val"
+            why: "Looking after registering is what makes a concurrent futex_wake either visible in the value or effective on p->chan."
+          - "If equal and not killed: sleep()"
+        why_wrong: |
+          The channel must be known before registering, and the look must come after
+          registering; sleeping comes last.
+        explain: |
+          The same discipline as every condition in this tree ([[tour:16]]): register, check
+          the condition, sleep. Only the "condition lock" is missing, because the condition
+          lives in user memory and the waker changed it before entering the kernel.
+      - id: lab09-08
+        level: 2
+        type: choice
+        q: |
+          On the reference, gdb stopped in `futex_wake` with `n = 1` and found the waiting
+          thread (pid 21) on the channel but in state `RUNNING`, not `SLEEPING`. What does
+          the reference do with it?
+        options:
+          - text: "Clears its p->chan and counts it as woken; its sleep() will return at once."
+            correct: true
+            why: |
+              That is the "registered but not asleep yet" case the protocol exists for. The
+              thread is between sleep_prepare and sleep; clearing chan makes sleep() a no-op.
+          - text: "Skips it, because only SLEEPING threads can be woken, and looks for another."
+            why: |
+              You may have thought a wakeup only matters to a sleeping thread. Skipping it
+              would lose the wakeup: the thread is about to sleep and nobody would wake it.
+          - text: "Waits for it to reach sleep() and then makes it RUNNABLE."
+            why: |
+              Nothing in the kernel waits like that. Clearing `p->chan` under its `p->lock`
+              is all that is needed.
+        explain: |
+          `wakeup` in this tree does the same ([[kernel/proc.c:582]]). The measurements show
+          how common the case is: in one contended mutex run, 215 threads were woken but none
+          had actually gone to sleep yet.
+  - title: A mutex that usually needs no system call
+    q: |
+      With `futex_wait` and `futex_wake`, write `mutex_lock` and `mutex_unlock`. The common
+      case (nobody else wants the lock) must use no system call at all, and an unlock must
+      never miss a sleeping waiter. How many values does the lock word need?
+    hints:
+      - "With two values (0 free, 1 held), unlock cannot tell whether anyone sleeps, so it must call futex_wake every time."
+      - "Let the word also say \"held, and someone may be waiting\". A waiter must set that before it sleeps, atomically with checking that the lock is still held."
+      - "What third value would let unlock know whether anyone might be asleep? Which atomic operation can a waiter use to announce itself and, in the same step, find out whether the lock just became free?"
+    answer: |
+      Three values: 0 free, 1 held, 2 held and maybe contended. An uncontended lock is one
+      `compare-and-swap` (0→1) and an uncontended unlock one exchange that returns 1: no
+      system call. A thread that finds the lock held exchanges 2 into the word; if the old
+      value was 0 the lock happened to be free and is now its own (marked 2, which costs at
+      most one unnecessary wakeup later). Otherwise it sleeps in `futex_wait(&v, 2)`, which
+      returns at once if the word is no longer 2, and tries again.
+
+      The unlock exchanges 0 in and wakes one waiter only if it saw 2. A waker that wakes a
+      thread which then loses the race to a third thread loses nothing: the loser's exchange
+      wrote 2 again, so the next unlock wakes someone. This is the mutex from Ulrich
+      Drepper's "Futexes Are Tricky". Measured: 140,000 uncontended lock/unlock pairs made 0
+      futex calls; 7 contending threads made a few thousand.
+    checks:
+      - id: lab09-09
+        level: 1
+        type: number
+        q: |
+          A single thread locks and unlocks a reference `struct mutex` 1000 times, with no
+          other thread alive. How many system calls do `mutex_lock` and `mutex_unlock` make in
+          total?
+        answer: 0
+        wrong:
+          1000: "You may have thought every unlock wakes someone. It wakes only when it finds 2, which only a waiter writes."
+          2000: "You may have thought a futex mutex is a system call per operation. The point of the design is that the uncontended path stays in user space."
+        why_wrong: |
+          Lock is a successful compare-and-swap 0→1, unlock an exchange that returns 1: no
+          futex call either way.
+        explain: |
+          The kernel is involved only under contention. The measurement on the reference:
+          140,000 pairs, 0 `futex_wait` and 0 `futex_wake` calls.
+build: |
+  **Start.**
+
+  ```text
+  git checkout -b my-threads 06aad25
+  ```
+
+  Add `threadtest` early, even before the system calls exist (declare them in
+  `user/user.h`, add them to `user/usys.pl`, and let the kernel return -1). It will fail
+  everywhere; each milestone makes more of it pass.
+
+  **Milestones, in an order that keeps `usertests -q` passing after each one.**
+
+  1. **`struct vm`.** Move `sz` into it, with `ref` and a spinlock; every `p->sz` in the
+     kernel becomes `p->vm->sz`; `allocproc` takes a vm from a static table; `freeproc` drops
+     the reference and the last one frees the page table. Every vm has one user. Test:
+     `usertests -q`.
+  2. **The trampoline.** Put the trapframe address in `sscratch` in [[prepare_return]] and
+     make [[uservec]] and [[userret]] use it (still `TRAPFRAME`). If you get this wrong, the
+     very first return to user space fails: the machine hangs at boot or `init` dies. Test:
+     boot and `usertests -q`.
+  3. **Trapframe slots.** The trapframe page moves into the vm; a thread's trapframe is a
+     slot in it. Test: `usertests -q`.
+  4. **`clone`.** `allocproc` either makes a new vm or joins an existing one in a free slot.
+     A thread is reaped by `wait` for now. Test: a small program whose threads each print
+     their pid (only from the main thread, or the characters interleave), then
+     `usertests -q`.
+  5. **`join`, and `wait` without threads.** Test: `threadtest create and join`.
+  6. **Locks for the shared address space**, then the `exit`/`kill` rules, then the
+     futexes, then the library. Run all of `threadtest` and `usertests -q`, several times.
+
+  **Debugging advice.** Run with `make qemu-gdb CPUS=3` and attach gdb from a second
+  terminal when you need to look inside. A race that
+  `threadtest` hits once in twenty runs is real: run it in a loop and keep the logs.
+
+  - **A silent hang** (no panic, no prompt): attach gdb and run `info threads` and
+    `thread apply all bt`. A hart stuck at `0x3ffffff000` (the first instruction of
+    uservec) with `scause` = 12 is fetching the trampoline through a broken page table
+    (clinic 2). All harts idle in [[scheduler]] means every thread is asleep: print each
+    proc's `pid`, `state` and `chan`, and the user word at `chan` (it is a physical address,
+    which the kernel's direct map lets gdb read): a futex sleeper whose word already has
+    the value it waited for has lost its wakeup (clinic 3).
+  - `usertrap(): unexpected scause 0xc` with a `sepc` that is not a code address means a
+    thread returned to user space with someone else's registers (clinic 1). Check which
+    slot each thread's `p->trapframe` points to and what `sscratch` holds at [[userret]]
+    (`hbreak *0x3ffffff0a8` stops just after it is read).
+  - `panic: mappages: remap` in a threaded program: two harts mapped the same page; find
+    which path took no `vm->lock` (clinics 4 and 5).
+  - Threads made RUNNABLE do not start at once on an idle hart: an idle hart sits in `wfi`
+    until its next timer interrupt (this tree sends no interrupt to other harts), up to a
+    tenth of a second. Short tests may therefore run their threads one after another. Make
+    stress tests long enough to overlap.
+clinic:
+  - bug: Every thread uses the same trapframe
+    change: |
+      The trampoline and the slots are in place, but every thread is given slot 0:
+
+      ```diff
+      -  p->trapframe = (struct trapframe *)(p->vm->tfpage + p->slot * TFSIZE);
+      +  p->trapframe = (struct trapframe *)p->vm->tfpage;
+      ```
+
+      and [[prepare_return]] writes `TRAPFRAME` into `sscratch` for everyone. This is what
+      you get if you share the page table and leave the trapframe mapping alone.
+    symptom: |
+      $ threadtest
+      usertrap(): unexpected scause 0xc pid=4
+      usertrap(): unexpected scause 0xc pid=5
+                  sepc=0x67179a0010800e0 stval=0x67179a0010800e0
+                  sepc=0x67179a0010800e0 stval=0x67179a0010800e0
+      threadtest: the process running the tests was killed
+      usertrap(): unexpected scause 0xc pid=6
+                  sepc=0x22f4067179a00108 stval=0x22f4067179a00108
+      usertrap(): unexpected scause 0xc pid=7
+                  sepc=0x22f4067179a00108 stval=0x22f4067179a00108
+      threadtest: exit ends all threads: FAIL
+      usertrap(): unexpected scause 0xc pid=8
+                  sepc=0x26f022f4067179a0 stval=0x26f022f4067179a0
+      usertrap(): unexpected scause 0xc pid=9
+                  sepc=0x26f022f4067179a0 stval=0x26f022f4067179a0
+      threadtest: kill ends all threads: OK
+      threadtest: free pages 32469 before, 32469 after
+      threadtest: no leaks: OK
+      threadtest: SOME TESTS FAILED
+      $
+    why: |
+      The same kills, at the same addresses, on both boots we tried (in this one the first two
+      messages came out interleaved, as two harts printed at once). The process running the
+      in-process tests (pid 4) and its very first thread (pid 5) die before a single test line is printed,
+      both with an instruction page fault (`scause` 12) at the same address,
+      `0x67179a0010800e0`, which is not a code address at all.
+
+      The chain, reasoned from the code (no gdb run): with one shared frame, the new
+      thread's trapframe *is* the creator's. In `kclone`, `*(np->trapframe) =
+      *(p->trapframe)` copies the frame onto itself, and the next four lines set `epc = fn`,
+      `a0 = arg`, `sp = stack` and `ra = 0` in the **creator's** saved registers. When pid 4
+      returns from `clone`, it does not return from `clone` at all: [[userret]] loads the new
+      thread's `pc`, stack and argument, so pid 4 and pid 5 both run `start` on the same
+      stack, overwrite each other's frames, and sooner or later return through a saved
+      `ra` that is stack garbage. Both jump to the same garbage address and fault. Every
+      later trap of any thread of the process would also overwrite every other thread's
+      registers; here nothing gets that far.
+
+      The `exit` test's child (pid 6) dies the same way before it can `exit(5)`, so its
+      status is -1: `FAIL`. Look at the `kill` line: it says `OK`, but only because the
+      child (pid 8) had already crashed and `wait` returned its -1; the kill had nothing to
+      do. A check that passes for the wrong reason is easy to miss: always read the lines
+      above it.
+  - bug: The first thread to be reaped frees the page table
+    change: |
+      [[freeproc]] frees the page table and user memory whenever it reaps any thread, as the
+      original code did for a process; only the trapframe page waits for the last reference:
+
+      ```diff
+      -  if (ref == 0) {
+      -    if (p->pagetable)
+      -      proc_freepagetable(p->pagetable, sz);
+      -    kfree(tf);
+      -  }
+      +  if (p->pagetable)
+      +    proc_freepagetable(p->pagetable, sz);
+      +  if (ref == 0)
+      +    kfree(tf);
+      ```
+    symptom: |
+      $ threadtest
+
+      (nothing more: no output, no panic, no prompt. gdb attached after 120 s:)
+
+        Id   Target Id                    Frame
+      * 1    Thread 1.1 (CPU#0 [halted ]) s_sstatus (x=2) at kernel/riscv.h:67
+        2    Thread 1.2 (CPU#1 [halted ]) s_sstatus (x=2) at kernel/riscv.h:67
+        3    Thread 1.3 (CPU#2 [running]) 0x0000003ffffff000 in ?? ()
+      [...]
+      Thread 3 (Thread 1.3 (CPU#2 [running])):
+      $1 = 0xc
+      [...]
+      Thread 3 (Thread 1.3 (CPU#2 [running])):
+      $4 = 0x3ffffff000
+      [...]
+      Thread 3 (Thread 1.3 (CPU#2 [running])):
+      $7 = 0x3ffffff000
+      [...]
+      Thread 3 (Thread 1.3 (CPU#2 [running])):
+      $10 = 0x8000000000080024
+
+      (the four values are scause, sepc, stvec and satp of the stuck hart, hart 2. The
+      process table, read through a halted hart:)
+
+      slot 0 pid 1 state 2 chan 0x80011c00 killed 0 thread 0 tslot 0 name init vm 0x80010e00
+      slot 1 pid 2 state 2 chan 0x80011d70 killed 0 thread 0 tslot 0 name sh vm 0x80010e38
+      slot 2 pid 3 state 2 chan 0x80011ee0 killed 0 thread 0 tslot 0 name threadtest vm 0x80010e70
+      slot 3 pid 4 state 4 chan (nil) killed 0 thread 0 tslot 0 name threadtest vm 0x80010ea8
+      slot 5 pid 6 state 5 chan (nil) killed 0 thread 1 tslot 2 name threadtest vm 0x80010ea8
+      [...]
+      slot 10 pid 11 state 5 chan (nil) killed 0 thread 1 tslot 7 name threadtest vm 0x80010ea8
+    why: |
+      It hung on all 3 boots we tried, always the same way. The process table
+      tells the story: pid 4 (the test process's first thread) is RUNNING (state 4), its
+      threads pids 6 to 11 are zombies (state 5) waiting to be joined, and pid 5 is gone: it
+      was the first thread [[kwait]] reaped for `join`, and its [[freeproc]] freed the page
+      table that pid 4 and the zombies still use. [[kfree]] fills each freed page with the
+      byte 1 ([[kernel/kalloc.c:55]]), so the root page-table page `0x80024000` now holds
+      junk.
+
+      gdb shows what hart 2 does with it. `satp` still points at `0x80024000` (PPN
+      `0x80024`). `scause` is 12, an instruction page fault, and `sepc`, `stvec` and the
+      `pc` are all `0x3ffffff000`, the first instruction of [[uservec]]. The next time pid 4
+      trapped, the hart jumped to `stvec` and tried to fetch uservec through the freed page
+      table, which no longer maps the trampoline. That fetch faults, and the fault is a trap
+      too, so the hart jumps to `stvec` again: the same address, the same fault, for ever.
+      It never reaches kernel code, so nothing is printed and no panic can happen, while the
+      other two harts sit idle in [[scheduler]]. (When exactly the trampoline's translation
+      stopped being available, whether at the first trap after the free or after a TLB
+      flush, is not recorded; the loop is.)
+
+      A use-after-free of a page table is the worst kind: the machine does not even reach
+      the code that could report it.
+  - bug: futex_wait looks at the word before registering
+    change: |
+      ```diff
+      -  sleep_prepare(chan);
+         if (copyin(p->pagetable, p->vm->sz, (char *)&x, addr, sizeof(x)) < 0)
+           r = -1;
+         else if (x != val)
+           r = 0;
+         else if (killed(p))
+           r = -1;
+         else {
+      +    sleep_prepare(chan);
+           sleep();
+           return 0;
+         }
+      ```
+
+      It looks harmless: register only when you are really going to sleep.
+    symptom: |
+      $ threadtest
+      threadtest: create and join: OK
+      threadtest: registers: OK
+      threadtest: mutex: 140000 of 140000
+      threadtest: mutex: OK
+      threadtest: without the mutex: 140000 of 140000 (not checked)
+
+      (nothing more for 240 s. gdb: all three harts idle in scheduler; the process table:)
+
+      [...]
+      slot 2 pid 3 state 2 chan 0x80011ee0 killed 0 thread 0 tslot 0 name threadtest vm 0x80010e70
+         word at chan: 0
+      slot 3 pid 4 state 2 chan 0x80012050 killed 0 thread 0 tslot 0 name threadtest vm 0x80010ea8
+         word at chan: 0
+      slot 4 pid 34 state 2 chan 0x8002b010 killed 0 thread 1 tslot 1 name threadtest vm 0x80010ea8
+         word at chan: 1
+      slot 5 pid 35 state 2 chan 0x8002b010 killed 0 thread 1 tslot 2 name threadtest vm 0x80010ea8
+         word at chan: 1
+    why: |
+      Rare: this bug hung `threadtest` in 1 of 24 runs (the others printed `ALL OK`); in
+      other runs of it we also saw it hang in the mutex test. gdb found nothing running:
+      pids 34 and 35, the two ping-pong threads, are both SLEEPING (state 2) on channel
+      `0x8002b010`, the physical address of `turn` (user address `0x2010`, in the page at
+      `0x8002b000`). The word holds 1: it is thread 1's turn. Yet thread 1 (pid 35) sleeps
+      in `futex_wait(&turn, 0)`, waiting for a value the word no longer has. (pid 4 sleeps
+      in `join`, pid 3 in `wait`; their channels are kernel addresses, and the "word" gdb
+      printed there means nothing.)
+
+      The interleaving that produced it:
+
+      | time | hart A: thread 1 (pid 35) | hart B: thread 0 (pid 34) |
+      |---|---|---|
+      | 1 | `futex_wait(&turn, 0)`: copyin reads `turn` = 0 | |
+      | 2 | | stores `turn = 1`, calls `futex_wake(&turn, 1)` |
+      | 3 | | scan finds no thread with `chan` = `0x8002b010`: wakes nobody |
+      | 4 | `sleep_prepare(chan)`, `sleep()`: SLEEPING | |
+      | 5 | | waits for `turn == 0`: `futex_wait(&turn, 1)` reads 1, sleeps |
+
+      Each thread now waits for the other. In the mutex test the same lost wakeup is often
+      repaired by luck: another contender writes 2 into the mutex word and a later unlock
+      wakes the forgotten sleeper. That is why the hang is rare and why the test that hands
+      a turn between exactly two threads is the one that catches it. With the reference
+      order, step 4's registration comes before step 1's look, and step 3 would have found
+      and cleared it ([[tour:16]] is the same story inside the kernel).
+  - bug: sbrk without the address-space lock
+    change: |
+      [[growproc]] without `acquire(&vm->lock)` and its two `release`s; everything else as
+      in the reference (so [[vmfault]] still locks).
+    symptom: |
+      $ threadtest
+      threadtest: create and join: OK
+      threadtest: registers: OK
+      threadtest: mutex: 140000 of 140000
+      threadtest: mutex: OK
+      threadtest: without the mutex: 140000 of 140000 (not checked)
+      threadtest: ping-pong: OK
+      ppanic: amappages: remapnic: mappages: remap
+    why: |
+      6 runs in 48 failed this way; the other 42 printed `ALL OK`. The `sbrk` test runs 7
+      threads that each call `sbrk(4096)` 50 times. Two threads read the same `vm->sz` = X.
+      Each calls `uvmgrow(X, X + 4096)` (the address space is shared): the first maps page
+      X; the next one finds the page-table page already there, takes a physical page, and
+      its [[mappages]] finds the PTE already valid and panics. The garbled line is two
+      panics from two harts (each the loser of such a race), interleaved character by
+      character: once the first hart sets `panicking`, [[printk]] stops taking its lock
+      ([[kernel/printk.c:70]]), so the second hart's message mixes with the first.
+
+      With the *lazy* `sbrk` of the original code ([[kernel/sysproc.c:48]] and
+      [[kernel/sysproc.c:62]], read then add, no lock) the same race returns the same address
+      to two threads without any panic: silent sharing of memory that each believes is its
+      own. The window there is a few instructions, which is why the reference moved both
+      kinds of `sbrk` into [[growproc]] under one lock.
+  - bug: vmfault as in the original tree
+    change: |
+      [[vmfault]] left unchanged from the original kernel: no `vm->lock`, and an
+      already-mapped page means failure:
+
+      ```diff
+      -  acquire(&vm->lock);
+         if (ismapped(pagetable, va)) {
+      -    // another thread may have mapped it a moment ago: ...
+      -    pte = walk(pagetable, va, 0);
+      -    mem = 0;
+      -    if ((*pte & PTE_U) && (*pte & (read ? PTE_R : PTE_W)))
+      -      mem = PTE2PA(*pte);
+      -    release(&vm->lock);
+      -    return mem;
+      +    return 0;
+         }
+      ```
+    symptom: |
+      $ threadtest
+      threadtest: create and join: OK
+      threadtest: registers: OK
+      threadtest: mutex: 140000 of 140000
+      threadtest: mutex: OK
+      threadtest: without the mutex: 108025 of 140000 (not checked)
+      threadtest: ping-pong: OK
+      threadtest: sbrk: OK
+      usertrap(): unexpected scause 0xf pid=44
+                  sepc=0x320 stval=0x25c001
+      usertrap(): unexpected scause 0xf pid=47
+                  sepc=0x320 stval=0x268004
+      threadtest: the process running the tests was killed
+      threadtest: exit ends all threads: OK
+      threadtest: kill ends all threads: OK
+      threadtest: free pages 32469 before, 32469 after
+      threadtest: no leaks: OK
+      threadtest: SOME TESTS FAILED
+      $
+    why: |
+      1 run in 9 failed; 8 printed `ALL OK`. `sepc=0x320` is the store `sb a3,0(a4)` in
+      `lazyfn` (from `user/_threadtest`'s disassembly), and `stval` is the byte being
+      stored: thread 1 writes offset 1 of each page (`0x25c001`), thread 4 offset 4
+      (`0x268004`).
+
+      - **The loser is killed.** Two threads fault on the same page. The first maps it;
+        the second reaches [[ismapped]] ([[kernel/vm.c:466]]) a moment later, sees a valid
+        PTE, and [[vmfault]] returns 0, so [[usertrap]] kills it ("unexpected scause 0xf").
+        Nothing was wrong with the access: the page is there, and writable.
+      - **Both map it.** If both pass [[ismapped]] before either maps, both allocate a page
+        and the second [[mappages]] panics: `remap`. This run shows only the first mode;
+        in other runs of this bug the second appeared, as `panic: mappages: remap`.
+
+      The two kills mark threads `killed`, and their [[kexit]] kills the rest of the
+      process, so the in-process tests stop; the later checks run in other processes and
+      pass. On the reference, gdb caught the benign version of the same race in both runs
+      where we looked: a thread finding its page "already mapped" under the lock, by a
+      thread on another hart.
+  - bug: join takes any child
+    change: |
+      The vm test is applied in one direction only: `wait` skips threads, but `join` accepts
+      any child:
+
+      ```diff
+      -        if ((pp->vm == p->vm) != threads) {
+      +        if (!threads && pp->vm == p->vm) {
+      ```
+    symptom: |
+      $ threadtest
+      threadtest: create and join: OK
+      threadtest: registers: OK
+      threadtest: mutex: 140000 of 140000
+      threadtest: mutex: OK
+      threadtest: without the mutex: 122186 of 140000 (not checked)
+      threadtest: ping-pong: OK
+      threadtest: sbrk: OK
+      threadtest: lazy: OK
+      threadtest: shared memory only grows: OK
+      threadtest: wait and join: FAIL
+      threadtest: stress: OK
+      threadtest: exit ends all threads: OK
+      threadtest: kill ends all threads: OK
+      threadtest: free pages 32469 before, 32469 after
+      threadtest: no leaks: OK
+      threadtest: SOME TESTS FAILED
+      $
+    why: |
+      Every run. In `wait and join` the test forks a child that exits at once with 42, then
+      creates a thread that sleeps 3 ticks and returns 7. `thread_join` runs first: the
+      zombie child process is the first child it finds, so it returns the *child's* pid with
+      status 42. The thread is then reaped by the second `thread_join` (which should have
+      returned -1), and `wait` finds no child process left.
+
+      Notice what does *not* fail: everywhere else in the test, the caller has only one kind
+      of child at a time, so a sloppy join looks correct. Only a test that mixes the two
+      kinds on purpose sees it. The kernel stays consistent (each child is reaped exactly
+      once); the bug is that statuses go to the wrong call, which in a real program means a
+      thread library freeing the stack of a thread that is still running.
+reveal:
+  - title: The address space gets a structure of its own
+    commit: 1
+    file: kernel/proc.h
+    lines: 79-112
+    focus: 81-87
+    diff: true
+    state:
+      hart: 2
+      mode: S
+      proc: threadtest (pid 4)
+      intr: "off"
+      satp: kernel
+      locks: [vm->lock]
+      irq: {noff: 1, intena: 1}
+      stack: [usertrap, syscall, sys_sbrk, growproc]
+      sp: {"on": kernel, detail: "pid 4's kernel stack"}
+    note: |
+      The story of this tour, recorded on 3 harts with gdb attached to the finished branch:
+      `threadtest`'s test process (pid 4) creates its first thread (pid 5), the thread runs,
+      traps and exits, pid 4 joins it, and later the futex and fault paths of other threads.
+      The state boxes come from those runs; where a step's state is reasoned instead, the
+      note says so.
+
+      Commit 1 changes no behaviour. It only moves what describes *memory* out of `struct
+      proc`: `sz` goes into a new `struct vm` with a reference count and a lock, and each
+      `struct proc` gets a pointer to it. With threads, every thread of a process will point
+      to the same `struct vm`; for now each process has its own, with `ref` = 1.
+
+      The state above is a moment from much later (commit 6's [[growproc]]), chosen because
+      it shows the structure in use: pid 4 holds `vm->lock` while it moves the break from
+      `0x7000` to `0x9000` for a second thread's stack, and gdb printed the vm as `ref = 2`,
+      `slots = 3`. The page-table pointer stays in `struct proc` as a copy (comment: "the
+      vm's"): it never changes while threads share it, a rule commit 6 enforces.
+
+      Every `p->sz` in the kernel becomes `p->vm->sz`: about twenty uses in `exec.c`, `file.c`,
+      `pipe.c`, `proc.c`, `syscall.c`, `sysfile.c`, `sysproc.c` and `trap.c`, all mechanical.
+  - title: Allocate an address space, drop a reference
+    commit: 1
+    file: kernel/proc.c
+    lines: 108-146
+    focus: 131-146
+    diff: true
+    state:
+      hart: 2
+      mode: S
+      proc: init (pid 1)
+      intr: "off"
+      satp: kernel
+      locks: [wait_lock, "pid 335's p->lock"]
+      irq: {noff: 2, intena: 1}
+      stack: [usertrap, syscall, sys_wait, kwait, freeproc, dropvm]
+      sp: {"on": kernel, detail: "init's kernel stack"}
+    note: |
+      `allocvm` mirrors [[allocproc]]: scan the static table `vms[NPROC]`, taking each
+      entry's lock, and claim the first with `ref` 0. `dropvm`, called from [[freeproc]],
+      gives one reference back.
+
+      The order inside `dropvm` is the point. Decrement and read `sz` in **one** critical
+      section; decide "was I last?" from the local `ref`, not from a second look at the
+      structure. Once the lock is released with `ref` = 0, a `fork` on another hart may
+      claim this very `struct vm` in `allocvm` and set `sz` to 0, so reading `vm->sz` after
+      the release could free the wrong amount.
+
+      The state is from the finished branch, where `dropvm` has a few more lines (the slot
+      bit and the trapframe page) but the same order of steps: init (pid 1) on hart 2 reaping pid 335, the last thread of a process from
+      `threadtest`'s exit test (its first thread had exited, which killed the others; init
+      inherited them). gdb stopped on the line that frees: `ref` had reached 0, `sz` was
+      `0xb000`. [[kwait]] holds `wait_lock` and the zombie's `p->lock`, so noff is 2; inside
+      `dropvm`, `vm->lock` made it 3 for a few instructions and was already released.
+    others: |
+      `vm->lock` is a new lock class, and its place in the order matters. It is always taken
+      *after* a `p->lock` (here; in [[allocproc]]; in [[kwait]]'s [[copyout]] path) and
+      *before* `kmem.lock` (inside [[kalloc]] or [[kfree]]). No code takes a `p->lock` while
+      holding `vm->lock`, so it adds no cycle to the graph of [[tour:51]].
+  - title: "uservec: one instruction to find this thread's trapframe"
+    commit: 2
+    file: kernel/trampoline.S
+    lines: 19-40
+    focus: 30-34
+    diff: true
+    state:
+      hart: 2
+      mode: S
+      proc: threadtest thread (pid 5)
+      intr: "off"
+      satp: user
+      locks: []
+      irq: 0
+      stack: [uservec]
+      sp: {"on": none, detail: "still the thread's user sp, 0x6fe0"}
+    note: |
+      At the first instruction of [[uservec]] every general-purpose register holds a user
+      value that must be saved, so the code may not touch one. The original borrowed
+      `sscratch` to park `a0` (`csrw sscratch, a0`) and then loaded the constant
+      `TRAPFRAME` into `a0`. A per-thread address cannot be a constant; but it can be
+      *in* `sscratch`, if the kernel put it there before returning to user space (next
+      steps). Then one `csrrw` exchanges the two: `a0` gets the trapframe address,
+      `sscratch` gets the user's `a0`, and lines 69-70 store that into the frame as before.
+
+      Recorded with gdb (a hardware breakpoint at `0x3ffffff004`, right after the `csrrw`),
+      for pid 5, the thread in slot 1, entering the kernel for `exit(100)`: `a0 =
+      0x3fffffe200` (slot 1), `sscratch = 0x64` (100, the exit status the user had in `a0`),
+      `scause = 8` (`ecall`), `sepc = 0xfde` (the `ecall` in the `exit` stub), `sp = 0x6fe0`,
+      on the thread's own user stack. `satp` still holds the user page table
+      (`0x8000000000080024`, root `0x80024000`, the one pid 4 uses too).
+
+      This commit alone changes nothing visible: `sscratch` still holds `TRAPFRAME`.
+  - title: "userret: read it back, and leave it for next time"
+    commit: 2
+    file: kernel/trampoline.S
+    lines: 97-130
+    focus: 106-113
+    state:
+      hart: 2
+      mode: S
+      proc: threadtest thread (pid 5)
+      intr: "off"
+      satp: user
+      locks: []
+      irq: 0
+      stack: [forkret, userret]
+      sp: {"on": none, detail: "kernel stack address, not mapped in the user page table"}
+    note: |
+      On the way out, [[userret]] switches to the user page table (line 108) and then needs
+      the trapframe to restore registers from. `csrr a0, sscratch` reads it without
+      changing `sscratch`: the value must still be there at the thread's next trap, when
+      [[uservec]] swaps it out again.
+
+      Recorded at pid 5's very first entry into user space, coming from [[forkret]]
+      (a hardware breakpoint just after line 113): `a0 = sscratch = 0x3fffffe200`, `satp =
+      0x8000000000080024`, `sepc = 0x15f4` (the library's `start` function, where the thread
+      begins). `sp` is `0x3fffff5fd0`, pid 5's kernel stack, which the user page table does
+      not map; line 117 replaces it with the user's.
+
+      Why is it safe to keep a kernel-chosen value in `sscratch` across user mode? User
+      code cannot read or write `sscratch` (it is an S-mode CSR), and nothing in the kernel
+      touches it between [[prepare_return]] and `sret`, where interrupts are off. Traps taken
+      *in* the kernel go to `kernelvec`, which does not use it.
+  - title: The kernel decides which slot, just before leaving
+    commit: 3
+    file: kernel/trap.c
+    lines: 97-136
+    focus: 114-123
+    diff: true
+    state:
+      hart: 2
+      mode: S
+      proc: threadtest thread (pid 5)
+      intr: "off"
+      satp: kernel
+      locks: []
+      irq: 0
+      stack: [forkret, prepare_return]
+      sp: {"on": kernel, detail: "pid 5's kernel stack, still empty below forkret"}
+    note: |
+      [[prepare_return]] already fills the per-thread fields that uservec will need next
+      time (`kernel_sp`, `kernel_hartid`…, lines 116-119). Those writes go to
+      `p->trapframe`, which is now this thread's slot, so each thread's slot carries its own
+      kernel stack pointer: two threads trapping at once on two harts land on two different
+      kernel stacks. Line 123 adds the one value that cannot live in the frame itself: the
+      frame's own *user* address, `TRAPFRAME + slot * 512`, written into `sscratch`.
+
+      Recorded: pid 5 on hart 2, called from [[forkret]] for its first return, `p->slot =
+      1`, `p->trapframe = 0x80023200` (the kernel address of slot 1 in the trapframe page at
+      `0x80023000`), `epc = 0x15f4`. Interrupts are off since line 108 (gdb: `sstatus` SIE
+      clear, noff 0, intena 0): a timer interrupt here would go through `stvec`, which line
+      112 already pointed at uservec. (Commit 2 wrote the constant `TRAPFRAME` here; commit
+      3 changed it to the slot.)
+  - title: One trapframe page, eight slots
+    commit: 3
+    file: kernel/memlayout.h
+    lines: 46-68
+    focus: 63-68
+    diff: true
+    state:
+      hart: 2
+      mode: S
+      proc: threadtest (pid 4)
+      intr: "off"
+      satp: kernel
+      locks: ["pid 5's p->lock", vm->lock]
+      irq: {noff: 2, intena: 1}
+      stack: [usertrap, syscall, sys_clone, kclone, allocproc, sharevm]
+      sp: {"on": kernel, detail: "pid 4's kernel stack"}
+    note: |
+      A trapframe is 288 bytes (`struct trapframe`, 36 fields of 8 bytes: 4 for the kernel,
+      the user pc and 31 user registers). Commit 3 gives
+      each thread a 512-byte slot in the one page at `TRAPFRAME`, so 8 threads per process
+      (`NTHREAD`), and a `_Static_assert` in `proc.c` stops the build if the struct ever
+      outgrows its slot. The page itself moves into `struct vm` (`tfpage`, plus a bitmask
+      `slots`), and `struct proc` gets its slot number.
+
+      Why not a page per thread below `TRAPFRAME`? Because user memory may already extend
+      up to `TRAPFRAME`: `usertests lazy_sbrk` grows a process to exactly that limit and
+      writes the last page. Slots in the existing page need no new mapping, no unmapping
+      when a thread dies, and no TLB thinking: the page is mapped once, in [[proc_pagetable]],
+      for the life of the address space.
+
+      The state is the moment the slots get used (commit 4's `sharevm`), recorded: pid 4
+      on hart 2 creating pid 5, holding pid 5's `p->lock` (from [[allocproc]]) and
+      `vm->lock`, noff 2. gdb printed `slots = 3` (bits 0 and 1: pid 4 and the new thread),
+      `ref = 1` just before the increment, `tfpage = 0x80023000`.
+  - title: The trapframe page is allocated and freed with the address space
+    commit: 3
+    file: kernel/proc.c
+    lines: 114-161
+    focus: 122-137
+    diff: true
+    state:
+      hart: 0
+      mode: S
+      proc: sh (pid 2)
+      intr: "off"
+      satp: kernel
+      locks: ["child's p->lock"]
+      irq: {noff: 1, intena: 1}
+      stack: [usertrap, syscall, sys_fork, kfork, allocproc, allocvm]
+      sp: {"on": kernel}
+    note: |
+      `allocvm` now also allocates the trapframe page, *before* the scan, so that no
+      [[kalloc]] happens while a `vm->lock` is held (it would be legal, kmem.lock comes after
+      vm->lock in the order, but there is no reason to). If no table entry is free, the page
+      goes back. A new address space starts with `slots = 1`: slot 0 is its first thread's.
+
+      `dropvm` clears the thread's slot bit together with the decrement, and the last
+      reference frees the trapframe page after the page table. The page table must go
+      first: [[proc_freepagetable]] unmaps `TRAPFRAME` (without freeing what it points to),
+      and only then may the page itself be reused.
+
+      State reasoned, not recorded: the shell forking for a command, with the child's
+      `p->lock` held since [[allocproc]] found its slot, so noff 1 and interrupts off; the
+      system call turned them on before ([[usertrap]] line 66), so intena 1.
+  - title: "sharevm: one more user, in a free slot"
+    commit: 4
+    file: kernel/proc.c
+    lines: 140-161
+    focus: 147-153
+    diff: true
+    state:
+      hart: 2
+      mode: S
+      proc: threadtest (pid 4)
+      intr: "off"
+      satp: kernel
+      locks: ["pid 5's p->lock", vm->lock]
+      irq: {noff: 2, intena: 1}
+      stack: [usertrap, syscall, sys_clone, kclone, allocproc, sharevm]
+      sp: {"on": kernel, detail: "pid 4's kernel stack, 0x3fffff7f10"}
+    note: |
+      Recorded at line 151, the first `clone` of the test: gdb stopped on hart 2 with `i =
+      1`, `slots = 3` (the bit was just set), `ref = 1` (about to become 2), and `vm->lock`
+      held by `cpus+256` (hart 2). Taking a slot and raising `ref` happen in one critical
+      section: two threads cloning at the same moment on two harts cannot pick the same
+      slot, and `dropvm`'s "last one out" test can never see a count that misses a thread
+      being born.
+
+      If all 8 slots are taken (counting zombies not yet joined), `sharevm` returns -1 and
+      `clone` fails; `threadtest create and join` checks that an eighth thread is refused.
+    others: |
+      Meanwhile, hart 0 and hart 1 were idle (gdb: both halted in [[scheduler]]'s `wfi`).
+      If another thread of pid 4 were running on one of them and faulted on a lazy page, its
+      [[vmfault]] (from commit 6) would spin on this same `vm->lock` for the few
+      instructions until line 152.
+  - title: allocproc makes a process or a thread
+    commit: 4
+    file: kernel/proc.c
+    lines: 183-241
+    focus: 204-231
+    diff: true
+    state:
+      hart: 2
+      mode: S
+      proc: threadtest (pid 4)
+      intr: "off"
+      satp: kernel
+      locks: ["pid 5's p->lock"]
+      irq: {noff: 1, intena: 1}
+      stack: [usertrap, syscall, sys_clone, kclone, allocproc]
+      sp: {"on": kernel}
+    note: |
+      [[allocproc]] takes the vm to join, or 0 for a new process. A thread gets everything
+      a process gets that is about *running* (a pid, the slot's kernel stack, a fresh
+      context that starts at [[forkret]]) but no page table: line 227 calls
+      [[proc_pagetable]] only for a new vm, and `kclone` copies the caller's pointer.
+
+      Line 226 is where the slot becomes a trapframe: `tfpage + slot * TFSIZE` is the
+      kernel's (direct-mapped, physical) address of the slot, `0x80023200` for pid 5. The
+      same 512 bytes appear in the user page table at `0x3fffffe200`.
+
+      State: one frame above the previous step (reasoned from it): pid 5's `p->lock` held,
+      `vm->lock` not yet taken.
+  - title: kclone sets up the new thread's registers
+    commit: 4
+    file: kernel/proc.c
+    lines: 395-440
+    focus: 406-418
+    diff: true
+    state:
+      hart: 2
+      mode: S
+      proc: threadtest (pid 4)
+      intr: "off"
+      satp: kernel
+      locks: ["pid 5's p->lock"]
+      irq: {noff: 1, intena: 1}
+      stack: [usertrap, syscall, sys_clone, kclone]
+      sp: {"on": kernel, detail: "pid 4's kernel stack, 0x3fffff7f50"}
+    note: |
+      Recorded at line 415 (the first `clone`): `np->pid = 5`, `np->slot = 1`,
+      `np->trapframe = 0x80023200`, `fn = 0x15f4` (the library's `start`), `arg = stack =
+      0x6ff0` (the top 16 bytes of the new stack hold `fn` and `arg` for `start`), and both
+      `np->pagetable` and `p->pagetable` are `0x80024000`. No user memory is copied.
+
+      The new frame starts as a copy of the caller's (line 414: `gp`, `tp` and the rest
+      come along), then gets its own `pc`, argument and stack. `ra = 0`: if `fn` ever
+      returned, the thread would jump to address 0 and fault, and the fault would kill the
+      process; the library's `start` calls `exit` instead.
+
+      With a shared trapframe (clinic 1), lines 414-418 would write into the *caller's*
+      saved registers: the caller would "return" from `clone` into `start`, on the new
+      stack.
+
+      The rest is [[kfork]]'s tail: duplicate file descriptors and the current directory,
+      set `parent` under `wait_lock`, then RUNNABLE under the child's lock. Until commit 5,
+      `wait` reaps threads too.
+  - title: wait and join each reap their own kind
+    commit: 5
+    file: kernel/proc.c
+    lines: 502-562
+    focus: 517-530
+    diff: true
+    state:
+      hart: 2
+      mode: S
+      proc: threadtest (pid 4)
+      intr: "off"
+      satp: kernel
+      locks: [wait_lock, "pid 5's p->lock"]
+      irq: {noff: 2, intena: 1}
+      stack: [usertrap, syscall, sys_join, kwait]
+      sp: {"on": kernel, detail: "pid 4's kernel stack"}
+    note: |
+      One scan, one new test: a child shares the caller's address space exactly when it is
+      a thread of the caller. `wait` passes `threads = 0` and skips threads; `join` passes 1
+      and skips processes.
+
+      Recorded: pid 4 in `join`, line 530, having found pid 5 a zombie with `xstate = 100`
+      (`exitfn` returned 100 + 0). `pp->vm` is read under `pp->lock`: [[allocproc]] sets it
+      and [[freeproc]] clears it under that lock, so the comparison cannot catch a slot in
+      the middle of being reused. [[freeproc]] then calls `dropvm`, which lowers `ref` by
+      one (from 8, reasoned: all 7 threads of this test were still counted); pid 4 still uses
+      the address space, so nothing is freed.
+
+      [[copyout]] of the status into pid 4's memory (line 534) runs with `wait_lock` and
+      pid 5's `p->lock` held; if the target page were still lazy, [[vmfault]] would take
+      `vm->lock` (from commit 6) as a third lock: noff 3, the same depth as the
+      [[kfree]] path below it.
+  - title: sbrk becomes one critical section
+    commit: 6
+    file: kernel/proc.c
+    lines: 318-361
+    focus: 332-356
+    diff: true
+    state:
+      hart: 2
+      mode: S
+      proc: threadtest (pid 4)
+      intr: "off"
+      satp: kernel
+      locks: [vm->lock]
+      irq: {noff: 1, intena: 1}
+      stack: [usertrap, syscall, sys_sbrk, growproc]
+      sp: {"on": kernel}
+    note: |
+      Both kinds of `sbrk` now go through [[growproc]], which returns the *old* size:
+      reading the break and moving it happen under `vm->lock`, so no two threads can be
+      handed the same addresses. The original lazy path read `sz` in [[sys_sbrk]] and added
+      to it separately ([[kernel/sysproc.c:48]], [[kernel/sysproc.c:62]]).
+
+      Recorded at the line that stores the new size (`vm->sz = newsz`): pid 4, `n = 8192`,
+      eager, `sz = 0x7000`, `newsz = 0x9000`, `ref = 2`: the library taking a second thread
+      stack while the first thread runs.
+
+      With `ref > 1` an eager `sbrk` goes through `uvmgrow` instead of [[uvmalloc]]
+      (lines 338-346). [[uvmalloc]] maps page by page and, if memory runs out halfway,
+      unmaps and frees the pages it already mapped ([[kernel/vm.c:230]]); another hart's
+      [[g:tlb]] could still hold one of them. `uvmgrow` creates the page-table pages first,
+      then takes every physical page it needs, and maps them only when all are in hand; on
+      failure it gives back pages that were never mapped. `threadtest` checks it with a
+      128 MiB `sbrk` while a second thread is alive.
+
+      The lock is held across [[uvmalloc]], which may allocate and zero many pages with
+      interrupts off on this hart. A big eager `sbrk` therefore delays this hart's timer
+      interrupt for as long as the allocation takes. [[kfork]] in the original tree already
+      did the same for its whole copy (under the child's `p->lock`), so this adds no new
+      kind of latency.
+
+      Shrinking is refused while `ref > 1` (line 350): another thread may be inside
+      [[copyout]] into the very page, and nothing else protects it.
+    others: |
+      What the lock prevents, as it happened once in 21 runs without it (clinic 4):
+
+      | time | hart 0: thread A | hart 1: thread B |
+      |---|---|---|
+      | 1 | reads `sz` = X | reads `sz` = X |
+      | 2 | [[uvmalloc]] maps page X | |
+      | 3 | `sz` = X + 4096, returns X | [[uvmalloc]] for X: [[mappages]] finds a valid PTE |
+      | 4 | | `panic: mappages: remap` |
+  - title: A lazy fault that another thread already handled
+    commit: 6
+    file: kernel/vm.c
+    lines: 496-535
+    focus: 512-524
+    diff: true
+    state:
+      hart: 1
+      mode: S
+      proc: threadtest thread (pid 43)
+      intr: "off"
+      satp: kernel
+      locks: [vm->lock]
+      irq: {noff: 1, intena: 0}
+      stack: [usertrap, vmfault]
+      sp: {"on": kernel, detail: "pid 43's kernel stack"}
+    note: |
+      Seven threads touch the same 512 lazy pages (`threadtest lazy`). Two faults on one
+      page can now only be handled one at a time, and the second must *succeed*: the page
+      it wanted exists.
+
+      Recorded on the reference, in both runs where we put a breakpoint on line 519: here
+      pid 43 on hart 1 faulted on a store (`read = 0`) to `0x1c8000`, took the lock, and
+      found the PTE `0x2007c817` already there: flags `0x017` = V, R, W, U, with A and D
+      still clear because no access has gone through it yet. Another thread had mapped it
+      a moment earlier. The vm at that moment: `ref = 8`, `slots = 255`, all 8 slots in use.
+      Line 520 accepts the page because it is a user page that allows a write; a store to
+      text (no `W`) or to the guard page (no `U`) still fails and kills, as `usertests`
+      checks.
+
+      Page faults leave interrupts off ([[usertrap]] turns them on only for system calls),
+      so `acquire` recorded intena 0.
+    others: |
+      In an earlier run the same breakpoint caught pid 43 on hart 2 with hart 1 *spinning*
+      in `acquire(&vms[3].lock)` at the same moment: a third thread waiting for its turn at
+      the same page table. Without the lock (clinic 5), the late thread is killed, or both
+      map the page and the kernel panics.
+  - title: exec and fork see a still address space
+    commit: 6
+    file: kernel/exec.c
+    lines: 26-50
+    focus: 37-46
+    diff: true
+    state:
+      hart: 1
+      mode: S
+      proc: threadtest (test process)
+      intr: "off"
+      satp: kernel
+      locks: [vm->lock]
+      irq: {noff: 1, intena: 1}
+      stack: [usertrap, syscall, sys_exec, kexec]
+      sp: {"on": kernel}
+    note: |
+      [[kexec]] builds a new page table and frees the old one ([[kernel/exec.c:138]]).
+      With another thread still running in the old one, that thread's next instruction
+      would fetch through freed memory. The reference refuses: `exec` fails with -1 while
+      `ref > 1`. (Linux instead kills the other threads first; see "further".) The read of
+      `ref` takes the lock for clarity; a count of 1 cannot change underneath, since only a
+      thread of this address space could raise it, and this is the only one.
+
+      This, with the refused shrink and `uvmgrow` in [[growproc]], is what makes the
+      lock-free readers safe: while an address space is shared, nothing removes a user page. [[copyin]],
+      [[copyout]] and the hardware walker may look at the page table at any moment and
+      never find a page freed under them.
+
+      [[kfork]] (same commit) holds the parent's `vm->lock` around [[uvmcopy]], so a fork
+      from one thread copies a consistent snapshot even while another thread grows memory.
+      Only the calling thread exists in the child.
+
+      State reasoned: `threadtest`'s `shared memory only grows` check calling `exec("echo")` with a
+      second thread alive, at line 43 (noff 1 for `vm->lock`, so interrupts are off; intena
+      1, since the system call had turned them on).
+  - title: The first thread's exit ends them all
+    commit: 7
+    file: kernel/proc.c
+    lines: 481-516
+    focus: 482-499
+    diff: true
+    state:
+      hart: 0
+      mode: S
+      proc: threadtest (pid 333)
+      intr: "off"
+      satp: kernel
+      locks: ["pid 334's p->lock"]
+      irq: {noff: 1, intena: 1}
+      stack: [usertrap, syscall, sys_exit, kexit, killthreads]
+      sp: {"on": kernel}
+    note: |
+      `exit` keeps its meaning for the program as a whole: when the first thread exits (the
+      one its parent waits for), or when any thread has been killed, [[kexit]] first marks
+      every other thread of the address space `killed` and wakes the sleeping ones. Each
+      exits the next time it passes through [[usertrap]]: at once if it is in a system call
+      or asleep, at its next timer interrupt if it is computing in user mode.
+
+      Recorded: pid 333, the `exit` test's child, calling `exit(5)` on hart 0. At line 493
+      it holds pid 334's `p->lock`; pid 334 was RUNNABLE (a spinning thread, just
+      preempted), and gdb saw hart 1 at the same moment at user address `0x8`, inside
+      `spinfn`: another of pid 333's threads, still spinning, about to be stopped by its next
+      timer tick.
+
+      `pp->vm == p->vm` is read under `pp->lock`, and our own `vm` cannot be recycled while
+      we use it, so an equal pointer really is a sibling. Who reaps the killed threads? Their
+      parent is pid 333, a zombie soon; [[reparent]] gives them to init, init's `wait` reaps
+      them (their vm is not init's), and the last one frees the memory (step 2 is that
+      moment, recorded in another run). `threadtest` checks that the free page count
+      returns to its starting value.
+  - title: "futex_wait: register, then look"
+    commit: 8
+    file: kernel/futex.c
+    lines: 17-66
+    focus: 45-58
+    diff: true
+    state:
+      hart: 0
+      mode: S
+      proc: threadtest thread (pid 34)
+      intr: "on"
+      satp: kernel
+      locks: []
+      irq: 0
+      stack: [usertrap, syscall, sys_futex_wait, kfutex_wait]
+      sp: {"on": kernel}
+    note: |
+      The channel is the physical address of the user word (`futexchan`, lines 20-31): the
+      same for every thread, since they share one page table, and never equal to a kernel
+      channel. The [[copyin]] there also faults in a lazily allocated word.
+
+      Then the order that matters: [[sleep_prepare]] (line 48) *before* the look at the word
+      (line 49). Recorded at line 56, the ping-pong test: pid 34 (thread 0) about to sleep,
+      `val = 1`, `x = 1`, `p->chan = 0x8002b010`, and the word at that physical address
+      still 1. If the other thread stores 0 and calls `futex_wake` now, it finds `p->chan`
+      set, clears it, and [[sleep]] returns at once.
+
+      No lock is held here (noff 0, interrupts on: a system call), and none is needed
+      around the two steps: `p->lock`, taken inside [[sleep_prepare]] and inside the waker's
+      scan, orders them (think question 6). A thread that does not sleep clears its
+      registration (lines 62-64).
+
+      A kill has the same gap between line 53 and line 56. The same commit makes [[kkill]]
+      and `killthreads` clear `p->chan` along with setting `killed`, so a kill that lands
+      there turns the [[sleep]] on line 56 into an immediate return, exactly as a wakeup
+      would; the thread then exits on its way back through [[usertrap]].
+    others: |
+      The bug of clinic 3 moves line 48 below the check:
+
+      | time | hart A: waiter | hart B: waker |
+      |---|---|---|
+      | 1 | copyin: word = 1, will sleep | |
+      | 2 | | word = 0; `futex_wake` scans: nobody registered |
+      | 3 | `sleep_prepare`; `sleep()` | |
+
+      In the reference, step 3's registration happens before step 1, so step 2's scan
+      finds and clears it.
+  - title: "futex_wake: wake up to n, including those not asleep yet"
+    commit: 8
+    file: kernel/futex.c
+    lines: 68-93
+    focus: 80-91
+    state:
+      hart: 0
+      mode: S
+      proc: threadtest thread (pid 20)
+      intr: "off"
+      satp: kernel
+      locks: ["pid 21's p->lock"]
+      irq: {noff: 1, intena: 1}
+      stack: [usertrap, syscall, sys_futex_wake, kfutex_wake]
+      sp: {"on": kernel}
+    note: |
+      Like [[wakeup]], but it stops after `n` threads and returns the count. Recorded at line
+      88 during the mutex test: pid 20 unlocking with `n = 1`, chan `0x8002b018` (the mutex
+      word `m`, user address `0x2018`), finding pid 21 registered but in state RUNNING: pid
+      21 was somewhere between its [[sleep_prepare]] and its [[sleep]], on another hart.
+      Clearing `p->chan` is what makes that [[sleep]] return at once. Counting it as woken
+      is right: it will retry the mutex.
+
+      In the measured runs this was the common case: of 36 threads woken in one contended
+      mutex run, only 1 had actually gone to sleep (in another, 215 woken and none asleep).
+  - title: A mutex in user space, the kernel only under contention
+    commit: 9
+    file: user/uthread.c
+    lines: 79-108
+    focus: 81-107
+    diff: true
+    state:
+      hart: 1
+      mode: U
+      proc: threadtest thread
+      intr: "on"
+      satp: user
+      locks: []
+      stack: [countfn, mutex_lock]
+      sp: {"on": user, detail: "the thread's 8 KiB stack from sbrk"}
+    note: |
+      Three values: 0 free, 1 held, 2 held and maybe waited for. The fast path is one
+      compare-and-swap (compiled to an `lr.w.aq`/`sc.w` loop: RV64GC has no single
+      compare-and-swap instruction), and the unlock one `amoswap.w.rl` that returns 1: no
+      system call. A waiter
+      exchanges 2 into the word before it sleeps, so the holder's unlock sees 2 and calls
+      `futex_wake`. `futex_wait(&m->v, 2)` returns at once if the word is no longer 2, which
+      closes the gap between the exchange and the system call.
+
+      `__ATOMIC_ACQUIRE` on the lock and `__ATOMIC_RELEASE` on the unlock order the data
+      the mutex protects, as [[acquire]] and [[release]] do in the kernel ([[tour:19]]).
+
+      State reasoned: a thread of the mutex test in user mode, on its own stack.
+  - title: thread_create puts fn and arg on the new stack
+    commit: 9
+    file: user/uthread.c
+    lines: 7-59
+    focus: 23-55
+    state:
+      hart: 2
+      mode: U
+      proc: threadtest (pid 4)
+      intr: "on"
+      satp: user
+      locks: []
+      stack: [main, jointest, startall, thread_create]
+      sp: {"on": user}
+    note: |
+      `clone` passes one argument, so the library writes `fn` and `arg` into the top 16
+      bytes of the new stack and passes their address both as the argument and as the
+      stack pointer: the thread starts in `start(s)` with `sp = s`, and its frames grow
+      downwards from just below them (recorded in step 10: `arg = stack = 0x6ff0`). `start`
+      calls `fn(arg)` and `exit`s with its result, which `join` returns.
+
+      Stacks come from `sbrk` (thread-safe since commit 6) and are reused after
+      `thread_join`. The table is protected by the library's own futex mutex: any thread
+      may create threads. There are no guard pages: a thread that overflows its 8 KiB
+      writes into the next one's stack, silently (see "further").
+  - title: The test that makes faults race
+    commit: 10
+    file: user/threadtest.c
+    lines: 278-308
+    focus: 278-293
+    diff: true
+    state:
+      hart: 1
+      mode: U
+      proc: threadtest thread (pid 43)
+      intr: "on"
+      satp: user
+      locks: []
+      stack: [start, lazyfn]
+      sp: {"on": user}
+    note: |
+      Seven threads walk the same 512 lazily allocated pages in the same order, each
+      writing its own byte. The first thread through a page takes the fault and maps it;
+      the others fault on it at the same moment or find it mapped. `sb a3,0(a4)` at `0x320`
+      is the store that faults: clinic 5's two kills both have `sepc=0x320`.
+
+      Each check in `threadtest` follows one think question: registers (the slot and
+      `sscratch`), `join` and `wait` (the vm test), `sbrk` and `lazy` (the address-space
+      lock), shrink and exec (the "only grow while shared" rule), the exit and kill checks
+      (killing a thread group), ping-pong (futex ordering). The gate, `gatewait`, holds all
+      threads in `futex_wait` until the last is created, so they start together; even so,
+      an idle hart waits in `wfi` for its next timer interrupt before it picks up a woken
+      thread, which is why the tests do enough work to overlap.
+verify: |
+  The branch head (`ext/09-threads`, 10 commits), built with the project toolchain, run on 3
+  harts (`-smp 3 -m 128M`):
+
+  ```text
+  $ threadtest
+  threadtest: create and join: OK
+  threadtest: registers: OK
+  threadtest: mutex: 140000 of 140000
+  threadtest: mutex: OK
+  threadtest: without the mutex: 120203 of 140000 (not checked)
+  threadtest: ping-pong: OK
+  threadtest: sbrk: OK
+  threadtest: lazy: OK
+  threadtest: shared memory only grows: OK
+  threadtest: wait and join: OK
+  threadtest: stress: OK
+  threadtest: exit ends all threads: OK
+  threadtest: kill ends all threads: OK
+  threadtest: free pages 32469 before, 32469 after
+  threadtest: no leaks: OK
+  threadtest: ALL OK
+  $ usertests -q
+  usertests starting
+  test copyin: OK
+  test copyout: OK
+  [...]
+  test kernmem: usertrap(): unexpected scause 0xd pid=6814
+              sepc=0x1b54 stval=0x80000000
+  [...]
+  test lazy_sbrk: OK
+  test partial_write: OK
+  test unlinkcwd: OK
+  ALL TESTS PASSED
+  $ threadtest
+  threadtest: create and join: OK
+  [...]
+  threadtest: without the mutex: 60000 of 140000 (not checked)
+  [...]
+  threadtest: free pages 32469 before, 32469 after
+  threadtest: no leaks: OK
+  threadtest: ALL OK
+  ```
+
+  The `usertrap()` lines inside `usertests` are its expected kills (`kernmem` reads kernel
+  memory and must die). `usertests -q` passing shows the single-threaded world unchanged:
+  `lazy_sbrk` still grows memory up to `TRAPFRAME - PGSIZE`, `nowrite` and `stacktest`
+  still die (the new [[vmfault]] accepts an already-mapped page only if it allows the
+  access), `sbrkfail` and the other out-of-memory tests behave as before (a single-threaded
+  process still grows with [[uvmalloc]]), and the free-page count after all tests equals
+  the one before. `threadtest`
+  after `usertests` reports the same 32,469 free pages. The same three commands passed on
+  a second boot, and `usertests -q` passed at every intermediate commit; every commit
+  builds on its own.
+
+  The "without the mutex" number is printed, not checked: 120,203 and 60,000 here, 59,439
+  and 80,393 on the second boot, 140,000 (no update lost) in some earlier runs. How much the threads overlap depends on when idle harts
+  next take a timer interrupt.
+measure: |
+  **What a thread costs.** A scratch copy of the reference kernel counted [[kalloc]] calls
+  inside [[kfork]] and inside `kclone`, and timed loops with `uptime` (one tick is about a
+  tenth of a second). The program had a 1 MiB heap, written:
+
+  | | `fork` | `clone` |
+  |---|---|---|
+  | pages allocated by the call | 266 (260 for the image, 1 trapframe page, 5 page-table pages) | 0 |
+  | 2000 × create + reap | 69 ticks (`fork` + `wait`; the same in a second run) | 3 ticks (`thread_create` + `thread_join`, both runs) |
+
+  (Tick counts on QEMU depend on what else the computer is doing; yours will differ, but
+  the gap between the two columns will not close.)
+
+  A thread needs a `struct proc` (which has its kernel stack since boot) and a slot in a
+  page that already exists; its user stack (8 KiB from `sbrk`) is the library's and is
+  reused.
+
+  **How often the kernel is involved.** The same scratch copy counted futex calls
+  (instrumentation not on the branch):
+
+  | workload | `futex_wait` calls | went to sleep | `futex_wake` calls | threads woken |
+  |---|---|---|---|---|
+  | 1 thread, 140,000 lock/unlock pairs | 0 | 0 | 0 | 0 |
+  | 7 threads × 20,000 pairs (run 1) | 2,289 | 0 | 3,812 | 215 |
+  | 7 threads × 20,000 pairs (run 2) | 2,375 | 1 | 4,072 | 36 |
+  | ping-pong, 2 threads × 5000 turns (run 1) | 5,204 | 4,835 | 10,000 | 4,837 |
+  | ping-pong (run 2) | 2,856 | 2,756 | 10,000 | 2,757 |
+
+  The mutex stays in user space unless there is contention, and even under contention the
+  holder's critical section (a 200-iteration loop) is usually over before a waiter gets into
+  the kernel, so few waiters actually sleep. "Woken" exceeds "went to sleep" because
+  `futex_wake` counts threads that were registered but still on their way to [[sleep]]:
+  exactly the window the register-then-look order protects. In ping-pong, where a thread
+  can only wait for the other, most `futex_wait` calls do go to sleep; the rest find the
+  turn already handed over.
+further: |
+  - **Share the descriptor table.** `clone` copies the open-file table as `fork` does, so a
+    file one thread opens is invisible to the others. Move `ofile[]` and `cwd` into a
+    refcounted structure like `struct vm`; you will meet the same "last one out" and
+    locking questions for `open` and `close`.
+  - **exec kills the other threads.** Instead of refusing, make `exec` from any thread kill
+    its siblings, wait until they are gone (ref back to 1), and then replace the image. This
+    is what Linux does; it needs a way to wait for threads that are not your children.
+  - **Guard pages for thread stacks.** Allocate each stack with one extra page and clear its
+    `PTE_U` (a new system call, or an `mprotect`-like one), so that an overflow faults
+    instead of corrupting a neighbour.
+  - **Wake an idle hart.** A RUNNABLE thread waits up to a timer tick for an idle hart in
+    `wfi`. Send it a supervisor software interrupt from [[wakeup]] and measure how
+    ping-pong and the mutex test change. The CLINT's `msip` will not do on its own: it
+    raises a machine-level interrupt, which this tree neither delegates nor handles
+    (`start` never sets `mtvec` or `mie.MSIE`). Either run QEMU with
+    `-machine virt,aclint=on` and use the ACLINT's SSWI device, which sets `sip.SSIP` on the
+    target hart, or add a small M-mode handler that turns MSIP into SSIP.
+  - **Copy-on-write meets threads.** After lab 11, a page with reference count 1 may be
+    "taken over" without copying. With threads, two threads of one process can fault on
+    the same COW page at once. Work out which lock `cowfault` needs now.

@@ -1,0 +1,893 @@
+title: Memory ordering across harts
+group: Concurrency primitives
+prerequisites: [3, 15]
+summary: |
+  When you read a C program you assume that its statements happen in the order you wrote
+  them. On one hart that assumption is safe: whatever the compiler and the CPU do behind
+  the scenes, a hart always sees its *own* loads and stores as if they ran in program order.
+  The moment a second hart looks at the same memory, the assumption breaks. The compiler
+  may keep a variable in a register, merge or move accesses, and the CPU may let other harts
+  see its stores in a different order than it made them.
+
+  This tour follows the places where xv6 has to say "this, *then* that, and every hart must
+  agree": the `started` flag that releases harts 1 and 2 at boot, the barriers hidden inside
+  every [[acquire]] and [[release]], a process's saved registers handed from one hart to
+  another through `p->lock`, the fences around the [[g:virtqueue]] that talks to the disk,
+  the difference between `volatile` and atomics, and the `fence.i` executed on every return
+  to user space.
+
+  You will see the real instructions the compiler produced (`kernel/kernel.asm` of this
+  build), what happens without them (timelines), and exactly what each fence promises and
+  what it does not.
+cast: |
+  The tour has two halves. It starts at boot, when the machine has three
+  [[g:hart|harts]] and no processes yet:
+
+  | Hart | What it is doing |
+  |---|---|
+  | 0 | In [[main]], building the kernel: page allocator, page table, process table, devices |
+  | 1 | In [[main]], spinning on the `started` flag, paging off, interrupts off |
+  | 2 | The same as hart 1 |
+
+  Later steps jump forward to a running system, where a shell, `cat` and the disk driver
+  keep three harts busy. Each step says which hart it is on.
+steps:
+  - title: Hart 0 builds, harts 1 and 2 wait
+    file: kernel/main.c
+    lines: 1-45
+    focus: 7
+    state:
+      hart: 0
+      mode: S
+      proc: none (boot)
+      intr: off
+      satp: bare
+      locks: []
+      irq: 0
+      stack: [main]
+      sp: {"on": boot, switched: "`add sp, sp, a0` in `_entry` ([[kernel/entry.S:17]]), at power-on", detail: "hart 0's 4 KiB slice of stack0, top 0x80008890"}
+    note: |
+      All three harts arrive in [[main]] at about the same moment, in supervisor mode, with
+      paging off and interrupts off ([[tour:2]]). Hart 0 does all the one-time setup on lines
+      14–31. Harts 1 and 2 must not touch the kernel's data structures until that setup is
+      finished, so they wait for a flag: `started`, declared on line 7.
+
+      This is the simplest cross-hart protocol there is, the **message-passing** pattern:
+
+      1. Hart 0 writes a lot of data (the free-page list, `kernel_pagetable`, the process
+         table, device state).
+      2. Hart 0 writes a flag: `started = 1`.
+      3. Harts 1 and 2 wait until they see the flag, then read the data.
+
+      It looks trivially correct. It is correct only because of the two GCC
+      [[g:atomic|atomic built-ins]] on lines 33 and 35. With ordinary C assignments the
+      pattern can fail in three different ways: the compiler can break the waiting loop,
+      the compiler can move hart 0's flag store, and the CPU can let harts 1 and 2 see the
+      flag before the data. The next steps take them one at a time. [[tour:3]] tells the
+      story of what hart 0 builds; this tour is about how the other harts are allowed to see
+      it.
+    others: |
+      Harts 1 and 2 are executing lines 35–36 right now, over and over. They hold no locks
+      and could not use any: [[kinit]] and [[procinit]] have not run yet, so most of the locks
+      they might want have not been initialized yet. The flag is the only synchronization available.
+      Each spins on its own boot stack, its own 4 KiB slice of [[stack0]] (hart 1's top is
+      `0x80009890`, hart 2's `0x8000a890`), with its own `sp`; the stacks are private, and
+      only `started` and the data it guards are shared.
+
+  - title: What the compiler may do to a waiting loop
+    file: kernel/main.c
+    lines: 31-42
+    focus: 35-36
+    state:
+      hart: 1
+      mode: S
+      proc: none (boot)
+      intr: off
+      satp: bare
+      locks: []
+      irq: 0
+      stack: [main]
+      sp: boot
+    note: |
+      Suppose line 35 were the plain C `while (started == 0) ;` with `started` an ordinary
+      `int`. The C standard lets the compiler assume no other thread changes a variable
+      unless the program uses atomics, so it may read `started` once and never again. An
+      experiment with this toolchain (GCC 15.2.0 for riscv64, `-O`, xv6's flags) shows
+      that it does exactly that:
+
+      ```
+      lw    a5,0(a5)        # read the flag once
+      beqz  a5,.            # branch to itself, forever
+      ```
+
+      The second instruction jumps to its own address. If the flag was 0 at the first read,
+      the hart spins forever, no matter what hart 0 writes later.
+
+      Declaring the variable [[g:volatile]] fixes *this* problem: in the same experiment the
+      loop reloads `lw` on every pass. But `volatile` emits no fence and says nothing about
+      the *other* variables, as the next steps show.
+
+      xv6 instead uses `__atomic_load_n(&started, __ATOMIC_ACQUIRE)`. GCC's `__atomic`
+      built-ins follow the C11 atomic rules, which require another thread's store to become
+      visible to atomic loads within a reasonable time, so the compiler cannot turn the loop
+      into a single read. In practice GCC performs the load on every pass, and the acquire
+      order adds a barrier (step 6).
+    others: |
+      This failure needs no second hart to show itself: the loop is broken in the compiled
+      code before the program even runs. That is what makes compiler reordering different
+      from hardware reordering. One is visible in `kernel.asm`; the other only in timing.
+
+  - title: What the compiler may do to the publishing side
+    file: kernel/main.c
+    lines: 13-33
+    focus: 22-33
+    state:
+      hart: 0
+      mode: S
+      proc: none (boot)
+      intr: off
+      satp: kernel
+      locks: []
+      irq: 0
+      stack: [main]
+      sp: boot
+    note: |
+      Hart 0's side has a quieter problem. `started` is `static` and its address is never
+      passed to any of the functions on lines 19–31. So, as far as the compiler can tell,
+      none of them can read it. With a plain `started = 1;` the compiler would be allowed to
+      move that store *earlier*, above [[userinit]] or [[kinit]], because to a single thread
+      the result is identical. Whether a particular compiler version actually does so is
+      beside the point: the rules allow it, so correct code cannot depend on it not
+      happening.
+
+      Making `started` volatile, as line 7 does, would stop the compiler from reordering
+      *volatile* accesses among themselves. It would not stop it from moving an ordinary
+      store past the volatile store: if [[kvminit]] were inlined into `main`, its store to
+      `kernel_pagetable` could legally sink below `started = 1`. (In this build `kvminit` is
+      in another file, so GCC cannot see into the call, but correct code must not rely on
+      that.) And even in program order, a volatile store emits no fence, so the CPU may still
+      reorder (step 4).
+
+      The release store on line 33 is stronger: the compiler may not move *any* memory
+      access that comes before it in the program to after it. That is a compiler barrier
+      and, as the next step shows, a hardware one too.
+
+      Note the state: by line 33 hart 0 has run [[kvminithart]] on line 21, so it is the
+      only hart with paging on.
+
+  - title: "What the CPU may do: RVWMO in brief"
+    file: kernel/main.c
+    lines: 19-33
+    focus: 22-33
+    state:
+      hart: 0
+      mode: S
+      proc: none (boot)
+      intr: off
+      satp: kernel
+      locks: []
+      irq: 0
+      stack: [main]
+      sp: boot
+    note: |
+      Even when the compiler emits the stores in program order, the hardware need not show
+      them to other harts in that order. RISC-V's memory model, **RVWMO** (RISC-V Weak
+      Memory Ordering, in the unprivileged specification), is deliberately weak:
+
+      - A hart always sees its own loads and stores as if they happened in program order.
+      - Other harts may observe two accesses to *different* addresses (store–store,
+        store–load, load–load, load–store) in either order, unless something forces the
+        order: a [[g:insn:fence|fence]], an `aq`/`rl` bit on an atomic instruction, or
+        certain dependencies (for example, a load whose address comes from an earlier
+        load).
+
+      A real core gets this freedom from store buffers, caches and loads performed early.
+      So hart 0's store to `kernel_pagetable` (made inside [[kvminit]], line 20) and its
+      later store to `started` may reach hart 1 in the opposite order.
+
+      How often does that happen? It depends entirely on the machine. Simple cores may never
+      do it, aggressive ones do it routinely, and under QEMU it depends on the host CPU and
+      on how QEMU runs the emulated harts. A bug of this kind can stay hidden for years and
+      then appear on new hardware. The only safe approach is to write code that is correct
+      under the model, not under one machine's behavior. (Simplified: RVWMO has more rules,
+      for example about two accesses to the same address; this tour needs only the ones
+      above.)
+
+  - title: The release store, as compiled
+    file: kernel/main.c
+    lines: 31-33
+    focus: 33
+    state:
+      hart: 0
+      mode: S
+      proc: none (boot)
+      intr: off
+      satp: kernel
+      locks: []
+      irq: 0
+      stack: [main]
+      sp: boot
+    note: |
+      `__atomic_store_n(&started, 1, __ATOMIC_RELEASE)` compiles to (`kernel/kernel.asm`):
+
+      ```
+      80000f08:  li     a4,1
+      80000f0a:  fence  rw,w
+      80000f0e:  sw     a4,0(a5)      # a5 = &started (0x8000786c)
+      ```
+
+      [[g:insn:fence|fence rw,w]] has a *predecessor set* (`rw`: earlier reads and writes)
+      and a *successor set* (`w`: later writes). It guarantees that every load and store
+      before the fence is ordered, as seen by every other hart, before every store after
+      it. The store after it is the one that sets `started`.
+
+      So by the time any hart can read `started == 1`, all of hart 0's earlier writes are
+      visible: the free list built by [[kinit]], `kernel_pagetable`, the `proc[]` array,
+      the buffer cache, the inode table, the first process.
+
+      This is half a contract. A release store promises that the data is *published*
+      before the flag. It does not, by itself, stop a *reader* from looking at the data
+      too early. That is the job of the other half.
+    others: |
+      The `sw` is a single aligned 32-bit store, so harts 1 and 2 see either 0 or 1, never a
+      mixture. That is what "atomic" means for a plain store like this one; the ordering is
+      what the `fence` adds.
+
+  - title: The acquire load, as compiled
+    file: kernel/main.c
+    lines: 31-42
+    focus: 35-36
+    state:
+      hart: 1
+      mode: S
+      proc: none (boot)
+      intr: off
+      satp: bare
+      locks: []
+      irq: 0
+      stack: [main]
+      sp: boot
+    note: |
+      On harts 1 and 2 the waiting loop compiles to:
+
+      ```
+      80000e74:  lw     a5,0(a4)      # a4 = &started
+      80000e76:  fence  r,rw
+      80000e7a:  sext.w a5,a5
+      80000e7c:  beqz   a5,80000e74
+      ```
+
+      `fence r,rw` orders the load of `started` before every later load and store of this
+      hart. Without it, RVWMO allows hart 1 to perform a later load, say of
+      `kernel_pagetable` in [[kvminithart]], *before* the load that sees `started == 1`. A
+      branch between them does not help: in RVWMO a control dependency orders a later
+      *store*, not a later load, and a core may load speculatively past a branch.
+
+      Release on the writer plus acquire on the reader is the pairing that makes the
+      message-passing pattern correct. Formally: if an acquire load reads the value written
+      by a release store, everything before the release *happens before* everything after
+      the acquire.
+
+      Notice where the fence sits: inside the loop, after every read. Only the last read
+      (the one that sees 1) needs it, but the compiler cannot know which one that will be.
+      The cost is irrelevant here: the hart has nothing else to do.
+
+  - title: The bug the pair prevents
+    file: kernel/main.c
+    lines: 31-45
+    focus: 35-38
+    state:
+      hart: 1
+      mode: S
+      proc: none (boot)
+      intr: off
+      satp: bare
+      locks: []
+      irq: 0
+      stack: [main]
+      sp: boot
+    note: |
+      Here is the interleaving that plain stores and loads would permit. The state box shows
+      hart 1, which has not turned paging on yet: [[kvminithart]] on line 39 does that.
+
+      | Time | Hart 0 | Hart 1 | Hart 2 |
+      |---|---|---|---|
+      | t1 | [[kvminit]] stores `kernel_pagetable`; the store sits in hart 0's store buffer | spinning | spinning |
+      | t2 | stores `started = 1`; this store becomes visible first | | |
+      | t3 | | reads `started == 1`, leaves the loop | still spinning |
+      | t4 | | [[kvminithart]] reads `kernel_pagetable`: still 0 | |
+      | t5 | | writes `satp` with a root page table at physical address 0 | |
+      | t6 | `kernel_pagetable` store finally becomes visible | next instruction fetch is translated through garbage: hart 1 is lost | |
+
+      The same thing can happen with load reordering on hart 1 alone: even if hart 0's stores
+      arrive in order, hart 1 may have loaded `kernel_pagetable` early (t2) and checked
+      `started` late (t3).
+
+      With the pair, t2 cannot become visible before t1 (the `fence rw,w`), and t4 cannot be
+      performed before t3 (the `fence r,rw`). Hart 1 is guaranteed to see the real page
+      table.
+
+      The `printk("hart %d starting\n")` on line 38 depends on the same guarantee: it uses
+      `pr.lock`, which [[printkinit]] on hart 0 initialized, and the UART that
+      [[consoleinit]] set up.
+    others: |
+      Hart 2 runs the same loop and gets the same guarantee independently. Release and
+      acquire pair up between the one writer and *each* reader; harts 1 and 2 need nothing
+      from each other.
+
+  - title: Visible to the hart is not yet visible to the page-table walker
+    file: kernel/vm.c
+    lines: 72-84
+    focus: 77-78
+    state:
+      hart: 1
+      mode: S
+      proc: none (boot)
+      intr: off
+      satp: bare
+      locks: []
+      irq: 0
+      stack: [main, kvminithart]
+      sp: boot
+    note: |
+      Hart 1 now calls [[kvminithart]]. The acquire made hart 0's page-table stores visible
+      to hart 1's ordinary loads. But once paging is on, the page table is also read by the
+      hardware **page-table walker**, through *implicit* memory accesses that are not part
+      of any instruction's normal loads. The RISC-V privileged specification does not order
+      those with ordinary fences.
+
+      That is the job of [[g:insn:sfence.vma|sfence.vma]] on line 78. The specification says
+      that executing it guarantees that any previous stores *already visible to this hart*
+      are ordered before certain implicit page-table references made by later instructions on
+      this hart. So the chain is:
+
+      1. Hart 0's `fence rw,w` + store to `started` publishes the page table.
+      2. Hart 1's load + `fence r,rw` makes it visible to hart 1.
+      3. Hart 1's `sfence.vma` makes it visible to hart 1's page-table walker.
+
+      Line 80 then writes `satp`, and the `sfence.vma` on line 83 discards any stale
+      translations in the [[g:tlb]] before the next fetch. (The source comment on line 77
+      says "wait for any previous writes to the page table memory to finish", which is the
+      same idea from the writer's point of view: on hart 0, those writes were its own.)
+    others: |
+      No hart ever writes `kernel_pagetable`'s entries again after boot ([[tour:24]]), so this
+      one-time chain is enough. User page tables are different: they change constantly, and
+      every switch to one goes through `sfence.vma` pairs in the trampoline.
+
+  - title: volatile and atomic are different tools
+    file: kernel/main.c
+    lines: 1-13
+    focus: 7
+    state:
+      hart: 0
+      mode: S
+      proc: none (boot)
+      intr: off
+      satp: kernel
+      locks: []
+      irq: 0
+      stack: [main]
+      sp: boot
+    note: |
+      Line 7 declares `started` `volatile` *and* the code accesses it only through atomics.
+      The `volatile` is redundant: the atomics already force every access to happen and
+      add the ordering. It does no harm, and it documents that another hart changes this
+      variable.
+
+      Compare the three tools:
+
+      | | Every access really happens | Atomic (no torn value) | Orders *other* memory accesses |
+      |---|---|---|---|
+      | plain variable | no | not guaranteed | no |
+      | [[g:volatile]] | yes | not guaranteed by C | no (only among volatile accesses, and only in the compiler) |
+      | `__atomic_*` with acquire/release | yes | yes | yes: compiler *and* CPU |
+
+      Where does xv6 use `volatile` on its own? For **device registers**: `Reg()` in
+      [[kernel/uart.c:17]] and `R()` in [[kernel/virtio_disk.c:20]] cast addresses to
+      `volatile` pointers, so that every read of the UART's line-status register really
+      reaches the device, and no write is merged or dropped. A device register changes on
+      its own, and reading or writing it can have side effects. That is exactly the
+      problem `volatile` was designed for. Ordering between harts was never its job.
+
+  - title: A spinlock is a pair of fences
+    file: kernel/spinlock.c
+    lines: 21-42
+    focus: 37-38
+    state:
+      hart: 1
+      mode: S
+      proc: sh (pid 2)
+      intr: off
+      satp: kernel
+      locks: ["child's p->lock (from allocproc)"]
+      irq: {noff: 2, intena: 1, note: "the child's `p->lock`, plus the push_off on line 24 of this `acquire`; `kmem.lock` itself is not held until the swap returns 0"}
+      stack: [usertrap, syscall, sys_fork, kfork, allocproc, kalloc, acquire]
+      sp: kernel
+    note: |
+      Jump forward to a running system. The shell (pid 2) on hart 1 is forking.
+      [[allocproc]] holds the new child's `p->lock` and calls [[kalloc]] for a trapframe
+      page. [[kalloc]] calls [[acquire]] on `kmem.lock`, and the spin loop on line 37 runs
+      ([[tour:15]] follows this lock in detail):
+
+      ```
+      80000c02:  mv            a5,a4          # a4 = 1
+      80000c04:  amoswap.w.aq  a5,a5,(s1)    # s1 = &kmem.lock.locked
+      80000c08:  sext.w        a5,a5
+      80000c0a:  bnez          a5,80000c02
+      ```
+
+      [[g:insn:amoswap|amoswap.w.aq]] does two things. It swaps atomically, which gives
+      mutual exclusion. And its `aq` (acquire) bit means no later load or store of this
+      hart can be observed before the swap. That is exactly the reader half of the
+      message-passing pattern from steps 5–7: the "flag" is `locked`, and the "data" is
+      whatever the lock protects.
+
+      So every lock in xv6 is the `started` protocol in miniature, run thousands of times a
+      second. The previous holder's `release` publishes; this `acquire` reads the
+      publication. That is why code inside a critical section needs no fences of its
+      own to share data with other harts that take the same lock (a device is another
+      matter, step 15).
+    others: |
+      Hart 2 has just released `kmem.lock` after [[kfree]] pushed a page onto the free list.
+      The next step shows what its release did, and what hart 1 would see without it.
+
+  - title: The release half
+    file: kernel/spinlock.c
+    lines: 44-76
+    focus: 51-73
+    state:
+      hart: 2
+      mode: S
+      proc: a process shrinking its memory with sbrk
+      intr: off
+      satp: kernel
+      locks: [kmem.lock]
+      irq: {noff: 1, intena: 1, note: "`kmem.lock` is still held at the fence; `pop_off` on line 75 takes noff to 0 and, because intena is 1, turns interrupts back on"}
+      stack: [usertrap, syscall, sys_sbrk, growproc, uvmdealloc, uvmunmap, kfree, release]
+      sp: kernel
+    note: |
+      On hart 2, [[kfree]] has written `r->next = kmem.freelist` and `kmem.freelist = r`
+      inside the lock, and now calls [[release]]:
+
+      ```
+      80000c82:  sd     zero,16(s1)   # lk->cpu = 0
+      80000c86:  fence  rw,w
+      80000c8a:  sw     zero,0(s1)    # lk->locked = 0
+      ```
+
+      The `fence rw,w` orders both stores to the free list, and the store to `lk->cpu`,
+      before the store that frees the lock. It also orders hart 2's earlier *loads* (the
+      `r` in `rw`): a load inside the critical section must not be performed after the
+      lock is free, or it could read a value written by the next holder.
+
+      Notice that the compiler did not use `amoswap.w.rl` for the release. GCC's RISC-V
+      mapping for a release *store* is a fence followed by a plain `sw`, which has the
+      same effect: the `.rl` bit, if it were used, would mean "no earlier access of this
+      hart can be observed after this instruction". The mapping is a property of this
+      compiler; the guarantee is what the C memory model asks for.
+
+      The state box shows the moment of the fence: `kmem.lock` is still held, so interrupts
+      are still off on hart 2. They come back on in [[pop_off]] after the `sw`, and only
+      because this release takes `noff` to 0 and `intena` is 1: when `noff` last went from 0
+      to 1 (this `kmem.lock` acquire), interrupts were on, because this is a system call
+      after [[usertrap]]'s `intr_on` ([[concept:locks#noff]],
+      [[concept:locks#intena]]).
+
+  - title: The free list without the fences
+    file: kernel/kalloc.c
+    lines: 65-82
+    focus: 74-77
+    state:
+      hart: 1
+      mode: S
+      proc: sh (pid 2)
+      intr: off
+      satp: kernel
+      locks: ["child's p->lock (from allocproc)", kmem.lock]
+      irq: {noff: 2, intena: 1, note: "the child's `p->lock` and `kmem.lock`: a `p->lock` → `kmem.lock` nesting"}
+      stack: [usertrap, syscall, sys_fork, kfork, allocproc, kalloc]
+      sp: kernel
+    note: |
+      Hart 1's swap finally returns 0: it holds `kmem.lock`. It reads `kmem.freelist` and
+      `r->next`. Suppose hart 2 has just freed page P, so the list was Q → … and is now
+      P → Q → …. Without the release and acquire barriers:
+
+      | Time | Hart 0 | Hart 1 (sh, kalloc) | Hart 2 (kfree of P) |
+      |---|---|---|---|
+      | t1 | | spinning | writes `P->next = Q`, `freelist = P` (in its store buffer) |
+      | t2 | | | `locked = 0` becomes visible first |
+      | t3 | | swap gets 0: lock "held" | |
+      | t4 | | reads `freelist`: still Q (stale) | |
+      | t5 | | sets `freelist = Q->next`, returns Q | |
+      | t6 | | | `freelist = P` finally lands, overwriting hart 1's update |
+
+      After t6 the list starts at P, whose `next` is Q: page Q is on the free list *and* in
+      use as the child's trapframe. The next `kalloc` hands Q out a second time, and two
+      unrelated owners scribble on the same page. Nothing fails at the moment of the bug.
+
+      With the real code, the `fence rw,w` keeps t2 after t1, and the `aq` on hart 1's
+      swap keeps t4 after t3. Mutual exclusion alone (the atomic swap) is not enough; a
+      lock also has to carry the data's *visibility* with it.
+    others: |
+      Hart 0 might be spinning in [[acquire]] for `kmem.lock` too, running `amoswap.w.aq`
+      over and over. Each failed swap writes 1 over 1, which changes nothing, so the spinners
+      do not disturb the holder's data. (On real hardware every swap still claims the cache
+      line, which is why spinning is costly; xv6 accepts that cost.)
+
+  - title: A thread's registers handed across harts
+    file: kernel/swtch.S
+    lines: 1-40
+    focus: 10-23
+    state:
+      hart: 1
+      mode: S
+      proc: sh (pid 2)
+      intr: off
+      satp: kernel
+      locks: ["sh's p->lock"]
+      irq: {noff: 1, intena: 0, note: "intena 0: `yield` was called from a timer interrupt, so SIE was already off at its acquire. `sched` keeps that 0 for `sh` across `swtch`"}
+      stack: [usertrap, yield, sched, swtch]
+      sp: kernel
+    note: |
+      Locks carry more than data structures. Later, the timer interrupts the shell on hart 1
+      while it is in user mode. [[usertrap]] calls [[yield]], which takes `sh`'s `p->lock`,
+      marks it `RUNNABLE` and calls [[sched]], which calls [[swtch]] ([[tour:13]]).
+
+      Lines 10–23 are fourteen ordinary `sd` instructions that save `ra`, `sp` and
+      `s0`–`s11` into `p->context`, in memory. All of them run with `sp` still in `sh`'s
+      kernel stack, and line 11 saves exactly that pointer. The stack itself does not move:
+      its frames (`usertrap → yield → sched`) stay in `sh`'s page at `KSTACK(1)`, and only
+      the 8-byte pointer to them travels to the next hart, through `p->context`. Line 26
+      ([[kernel/swtch.S:26]]) is where hart 1 leaves that stack for its scheduler stack
+      ([[concept:stacks]]). Then `swtch` loads hart 1's scheduler
+      context and returns into [[scheduler]] on hart 1, which releases `sh`'s `p->lock`
+      ([[kernel/proc.c:463]]).
+
+      Those fourteen stores are the "data" of a message-passing protocol, and `p->lock` is
+      its flag. Any hart's scheduler might pick `sh` up next. If that hart could see
+      `RUNNABLE` but read stale values from `p->context`, it would resume `sh` with a stack
+      pointer and return address from an earlier switch: a crash, or worse, silent
+      corruption of another stack.
+
+      The release in [[release]] (its `fence rw,w`) orders the fourteen `sd`s before
+      `locked = 0`.
+
+      The interrupt state travels the same way. [[sched]] keeps this thread's `intena` in a
+      local, which this build holds in `s3`, one of the registers saved here. It is 0:
+      `yield` ran from a timer interrupt, with interrupts already off. When `sh` resumes on
+      hart 0, `sched` writes that 0 into hart 0's `struct cpu`, so the `release` at the end
+      of `yield` leaves interrupts off, as `usertrap` expects ([[concept:locks#sched-intena]]).
+    others: |
+      Hart 0's scheduler is scanning `proc[]` right now. When it reaches `sh`, its
+      [[acquire]] spins until hart 1's scheduler releases `p->lock`. The next step is that
+      acquire.
+
+  - title: Another hart picks the thread up
+    file: kernel/proc.c
+    lines: 443-464
+    focus: 447-453
+    state:
+      hart: 0
+      mode: S
+      proc: none (scheduler)
+      intr: off
+      satp: kernel
+      locks: ["sh's p->lock"]
+      irq: {noff: 1, intena: 0, note: "the scheduler took `p->lock` after `intr_off()` on line 442, so intena is 0; line 456 forces it to 0 again after `swtch` returns"}
+      stack: [scheduler]
+      sp: {"on": scheduler, detail: "hart 0's slice of stack0, top 0x80008890"}
+    note: |
+      Hart 0's [[scheduler]] acquired `sh`'s `p->lock` on line 446, with `amoswap.w.aq`.
+      Because hart 1 released it with `fence rw,w; sw`, and hart 0's swap read that
+      release's 0, everything hart 1 wrote before the release is now visible to hart 0:
+      the new `p->state`, and the fourteen saved registers in `p->context`.
+
+      Line 447 sees `RUNNABLE`. Line 453 calls `swtch(&c->context, &p->context)`, whose
+      fourteen `ld`s read the registers hart 1 saved. One of them is `sp`
+      ([[kernel/swtch.S:26]]): if it were stale, hart 0 would land on the wrong spot of
+      `sh`'s kernel stack, or on another stack altogether. The shell continues on hart 0, inside
+      [[yield]], exactly where it stopped on hart 1.
+
+      | Time | Hart 0 (scheduler) | Hart 1 | Hart 2 |
+      |---|---|---|---|
+      | t1 | | `swtch` saves `sh`'s registers to `p->context` | |
+      | t2 | spins on `sh`'s `p->lock` | scheduler: `release` (`fence rw,w`, `sw 0`) | |
+      | t3 | `amoswap.w.aq` returns 0 | looks for other work | |
+      | t4 | reads `p->state`, `swtch` loads `p->context` | | |
+
+      This is why [[tour:13]] calls it a lock *handed across* a context switch: the lock is
+      both the mutual exclusion that stops two schedulers from running `sh` at once and the
+      memory barrier that makes `sh`'s registers travel safely between harts.
+    others: |
+      Hart 2's scheduler may reach `sh`'s slot a moment later. It spins on the same
+      `p->lock`, and when it gets it, it sees `RUNNING` (set by hart 0 on line 451 under the
+      lock) and moves on. Same lock, same barriers, and so the same view of the state.
+
+  - title: Talking to a device through memory
+    file: kernel/virtio_disk.c
+    lines: 270-298
+    focus: 274-284
+    state:
+      hart: 1
+      mode: S
+      proc: cat (pid 4)
+      intr: off
+      satp: kernel
+      locks: ["README's inode lock (sleep-lock)", "buffer for block 48 (sleep-lock)", disk.vdisk_lock]
+      irq: {noff: 1, intena: 1}
+      stack: [usertrap, syscall, sys_read, fileread, readi, bread, virtio_disk_rw]
+      sp: kernel
+    note: |
+      Now `cat README` (pid 4) reads block 48, the first data block of `README` in this
+      build's `fs.img`. Suppose it is not in the buffer cache. [[virtio_disk_rw]] has filled three
+      descriptors with ordinary stores ([[tour:29]]). Now it must tell the disk, which
+      is a third party with its own view of memory: it reads the rings by [[g:dma]].
+
+      Three things must reach the device in order:
+
+      1. the ring entry naming the descriptor chain (line 275),
+      2. the new `avail->idx`, which says "one more entry is ready" (line 280),
+      3. the write to the `QUEUE_NOTIFY` register (line 284), which tells the device to look.
+
+      If the device saw step 2 before step 1, it would read a stale ring slot and process
+      the wrong descriptors. If it got the notify before the index, it might find nothing
+      new and go back to idle, and the request would never complete. So
+      `io_fence()` sits between each pair:
+
+      ```
+      80005a62:  sh    a0,4(a3)       # avail->ring[...] = idx[0]
+      80005a66:  fence                # io_fence()
+      ...
+      80005a72:  sh    a5,2(a4)       # avail->idx += 1
+      80005a76:  fence                # io_fence()
+      80005a7e:  sw    zero,80(a5)    # *R(QUEUE_NOTIFY) = 0  (0x10001050)
+      ```
+    others: |
+      `disk.vdisk_lock` is a spinlock, so its release and acquire already order these
+      stores for any other *hart* that takes the lock. The device does not take locks.
+      That is why device communication needs explicit fences even inside a critical
+      section.
+
+  - title: io_fence is fence iorw, iorw
+    file: kernel/riscv.h
+    lines: 369-382
+    focus: 370-375
+    state:
+      hart: 1
+      mode: S
+      proc: cat (pid 4)
+      intr: off
+      satp: kernel
+      locks: ["README's inode lock (sleep-lock)", "buffer for block 48 (sleep-lock)", disk.vdisk_lock]
+      irq: {noff: 1, intena: 1}
+      stack: [usertrap, syscall, sys_read, fileread, readi, bread, virtio_disk_rw, io_fence]
+      sp: kernel
+    note: |
+      [[io_fence]] is one instruction, `fence iorw, iorw`. The disassembler prints it as a
+      bare `fence` (encoding `0x0ff0000f`), because "all four kinds before, all four kinds
+      after" is the default.
+
+      RISC-V fences name four kinds of access: `r` and `w` for memory, `i` and `o` for
+      device input and output. The ring and `avail->idx` live in ordinary RAM (`w`); the
+      notify register is memory-mapped I/O (`o`). The first fence orders a memory store
+      before another memory store; the second orders a memory store before a device
+      write. `fence rw,w`, the spinlock's fence, would not cover the second case at all.
+
+      The other half of the definition matters too: `asm volatile(... ::: "memory")`. The
+      `"memory"` clobber tells the compiler that the instruction may read or write any
+      memory. So the compiler must finish all stores before it and reload any value after
+      it. Every fence xv6 writes as inline asm (`sfence_vma`, `io_fence`, `icache_fence`)
+      carries this clobber, so each is also a full compiler barrier; the `__atomic` release
+      and acquire operations are one-way compiler barriers by their own definition.
+
+      Older xv6 releases wrote `__sync_synchronize()` here. With this compiler that is
+      `fence rw,rw`: a full barrier for ordinary memory, but it says nothing about device
+      I/O, so it does not order the ring stores before the `QUEUE_NOTIFY` write. Commit
+      `429989d` ("emit the right kind of fence for MMIO") replaced it with `io_fence()`,
+      which names `iorw` explicitly.
+    others: |
+      The same [[kernel/riscv.h]] also defines `icache_fence()` (`fence.i`, line 379),
+      which nothing in this commit calls; the trampoline writes `fence.i` directly (step
+      19).
+
+  - title: The completion side reads in order
+    file: kernel/virtio_disk.c
+    lines: 300-333
+    focus: 311-320
+    state:
+      hart: 2
+      mode: S
+      proc: none (hart 2's scheduler)
+      intr: off
+      satp: kernel
+      locks: [disk.vdisk_lock]
+      irq: {noff: 1, intena: 0, note: "an interrupt handler: SIE was off at the first push_off, so intena is 0"}
+      stack: [main, scheduler, kernelvec, kerneltrap, devintr, virtio_disk_intr]
+      sp: {"on": scheduler, detail: "hart 2's slice of stack0, with a kernelvec frame on top"}
+    note: |
+      The disk finishes. The device writes the result status, then an entry in the *used*
+      ring, then increments `used->idx`, and raises an interrupt. Hart 2 claims it from the
+      [[g:plic]] and arrives in [[virtio_disk_intr]] holding `disk.vdisk_lock`. Hart 2 was
+      idle, so [[kernelvec]] pushed its register frame onto hart 2's scheduler stack; had it
+      been running a system call, the same frame would have gone onto that process's kernel
+      stack. xv6 has no separate interrupt stack.
+
+      This is message passing again, with the device as writer: `used->idx` is the flag,
+      the ring entry and status byte are the data. The driver must read them in the right
+      order:
+
+      ```
+      80005b4a:  lhu   a5,2(a5)       # used->idx
+      80005b4e:  beq   a4,a5,...      # nothing new? leave
+      80005b52:  fence                # io_fence() (line 319)
+      80005b56:  ...                  # then read used->ring[...].id
+      ```
+
+      The fence on line 319 keeps the load of the ring entry after the load of the index;
+      the same fence also keeps the read of the status byte (line 322), which the device
+      wrote by DMA, after the index. Without it, RVWMO would allow the ring entry to be read
+      *first*, before the device had written it, and paired with a fresh index: the driver
+      could take a stale descriptor id. It might wake the wrong buffer, or dereference a
+      cleared `info[id].b` and crash.
+
+      The fence on line 313 orders the device-register accesses on line 311 (reading
+      `INTERRUPT_STATUS`, writing the acknowledgement) before every later memory access,
+      starting with the load of `used->idx` on line 318. If that load could be performed
+      before the acknowledgement, a completion that the device posted in between would be
+      missed now and never signalled again, and its process would sleep forever.
+
+      `disk.used` is not a `volatile` pointer. What forces the compiler to read `used->idx`
+      from memory each time round the loop? The `"memory"` clobber of `io_fence()` and the
+      call to [[wakeup]], both of which tell the compiler memory may have changed. The
+      compiled loop reloads it at `0x80005b96` on every later pass.
+    others: |
+      Hart 1's `cat` is asleep in [[virtio_disk_rw]] waiting for `b->disk` to become 0.
+      Hart 2 writes `b->disk = 0` and calls [[wakeup]] under `disk.vdisk_lock`; `cat` will
+      read `b->disk` after reacquiring that same lock. The lock's acquire and release order
+      that hart-to-hart handoff, no extra fence needed.
+
+  - title: When volatile alone is enough
+    file: kernel/printk.c
+    lines: 137-146
+    focus: 140-143
+    state:
+      hart: 0
+      mode: S
+      proc: any
+      intr: off
+      satp: kernel
+      locks: []
+      irq: 0
+      stack: [panic]
+      sp: {"on": kernel, detail: "assuming the panic came from a system call; panic runs on whatever stack is current"}
+    note: |
+      [[panic]] sets two flags, both plain [[g:volatile]] `int`s with no atomics
+      ([[kernel/printk.c:18]]): `panicking` (stop taking `pr.lock`, so a panic can print
+      even if the lock is stuck) and `panicked` (freeze every other hart's console output).
+      Other harts read `panicked` in [[uartputc_sync]] ([[kernel/uart.c:108]]) and spin
+      forever once they see it.
+
+      Why is `volatile` enough here when it was not enough for `started`? Because no other
+      data travels with these flags. A hart that sees `panicked == 1` does not go on to read
+      something that `panic` prepared; it stops. If it sees the flag a few instructions
+      late, it prints one more character. `volatile` guarantees the only thing that
+      matters: the readers really re-read the flag, and the writer really writes it.
+
+      (Simplified: the state shown assumes the panic was raised with interrupts off and no
+      locks held; `panic` itself changes neither, and it is sometimes called while holding
+      a lock.)
+
+      The rule of thumb: if seeing a flag means "now go read other memory", use acquire
+      and release (or a lock). If it means only "stop", `volatile` does the job.
+    others: |
+      Another hart could be in the middle of a `printk` holding `pr.lock` when this hart
+      panics. `panic` does not wait for it: with `panicking` set, its own `printk` calls
+      skip the lock, and the two harts' output may interleave. That is a deliberate trade:
+      better garbled output than a panic that cannot print at all.
+
+  - title: fence.i on every return to user space
+    file: kernel/trampoline.S
+    lines: 100-112
+    focus: 105-107
+    state:
+      hart: 0
+      mode: S
+      proc: sh (pid 2)
+      intr: off
+      satp: kernel
+      locks: []
+      irq: 0
+      stack: [userret]
+      sp: {"on": kernel, detail: "sh's kernel stack, empty again: sp = 0x3fffffc000, its top"}
+    note: |
+      Instructions are memory too. The shell, now running on hart 0, is about to return to
+      user mode through [[userret]] (`0x8000609c` in this build), and the first
+      instruction is [[g:insn:fence.i|fence.i]].
+
+      A hart may fetch instructions through a path (an instruction cache) that does not
+      watch data stores. The bytes of a user program are written into memory with ordinary
+      data stores, by [[kexec]] when it loads a program, and a physical page that used to
+      hold data may later hold code. `fence.i` makes this hart's later instruction fetches
+      see every store that is *already visible to this hart*.
+
+      That last phrase is the limit. `fence.i` is local. The RISC-V specification says that
+      to make stores visible to another hart's instruction fetches, the writing hart needs
+      a data fence and the fetching hart needs its own `fence.i`. In xv6 the data side is
+      provided by the locks of the previous steps (the scheduler's `p->lock` handoff, for
+      one, whose `fence rw,w` and `amoswap.w.aq` order everything the process's earlier
+      harts wrote). The fetching side is this instruction.
+
+      xv6 does not track whether this process's code changed or whether it ran on this hart
+      before. It executes `fence.i` on every return to user space, from every hart.
+    others: |
+      Harts 1 and 2 execute the same `fence.i` whenever they return to user mode. It affects
+      only the hart that executes it, so there is nothing to coordinate and no lock.
+
+  - title: What it all cost, and what to remember
+    file: kernel/main.c
+    lines: 31-45
+    focus: 35-36
+    state:
+      hart: 1
+      mode: S
+      proc: none (boot)
+      intr: off
+      satp: bare
+      locks: []
+      irq: 0
+      stack: [main]
+      sp: boot
+    note: |
+      Count the explicit ordering in this tour: one `fence rw,w` and one `fence r,rw` at
+      boot, one `amoswap.w.aq` and one `fence rw,w` per lock acquire/release, four `fence`
+      instructions in the disk driver's two hottest functions, one `sfence.vma` pair per
+      `satp` write, and one `fence.i` per return to user space. That is all. Most of the
+      kernel never mentions memory ordering because it does all its sharing under locks.
+
+      The ideas to keep:
+
+      - **Program order is a single-hart illusion.** Compiler and CPU both reorder; other
+        harts and devices can see the difference.
+      - **Publishing needs two halves.** The writer releases (data before flag); the reader
+        acquires (flag before data). Either half alone is a bug.
+      - **Every lock is a release/acquire pair.** That is why critical sections need no
+        fences for data shared only with other harts, and why a lock can carry a thread's registers between harts.
+      - **Devices and the page-table walker don't take locks.** They need explicit
+        `fence` and `sfence.vma`.
+      - **`volatile` means "really access it", not "in order".** Right for device registers
+        and stop flags, wrong for publishing data.
+
+      The cheapest way to be correct is the one xv6 takes almost everywhere: put shared data
+      under a lock and let [[acquire]] and [[release]] do the ordering.
+locks:
+  - lock: "started (no lock: release/acquire atomics)"
+    where: "[[main]]"
+    protects: "Publishes everything hart 0 built at boot to harts 1 and 2; no lock exists yet, and one writer with a one-way flag needs none"
+  - lock: kmem.lock
+    where: "[[kalloc]], [[kfree]]"
+    protects: "The free-page list; its acquire/release also carry the list's latest contents between harts"
+  - lock: "p->lock (spinlock)"
+    where: "[[yield]], [[scheduler]] (checked in [[sched]])"
+    protects: "`p->state` and, across a context switch, the visibility of the registers saved in `p->context`"
+  - lock: disk.vdisk_lock
+    where: "[[virtio_disk_rw]], [[virtio_disk_intr]]"
+    protects: "The driver's descriptors and rings against other harts; the device itself is ordered with `io_fence()`, not the lock"
+  - lock: "panicking, panicked (no lock: volatile)"
+    where: "[[panic]], [[printk]], [[uartputc_sync]]"
+    protects: "Stop signals that carry no other data, so `volatile` is enough"
+  - lock: "instruction memory (no lock: fence.i)"
+    where: "[[userret]]"
+    protects: "This hart's instruction fetches see stores already visible to it; cross-hart visibility comes from the locks above"
+quiz:
+  - q: "If line 35 of `main.c` used a plain `int started` and `while (started == 0) ;`, what does this compiler actually produce, and what happens on harts 1 and 2?"
+    a: "It loads `started` once and then branches to the same instruction forever (`beqz a5,.`). If the flag was 0 at that first read, which it almost certainly is, harts 1 and 2 never leave `main`'s loop."
+  - q: "Hart 0's release store emits `fence rw,w`. Why is that not enough on its own, so that harts 1 and 2 also need `fence r,rw`?"
+    a: "The release only guarantees that hart 0's data is visible before the flag. RVWMO still lets the reader perform a later load (of `kernel_pagetable`, say) before the load that sees `started == 1`, even across a branch. The acquire's `fence r,rw` forbids that on the reader's side."
+  - q: "Hart 1 has seen `started == 1` with an acquire load. Why does `kvminithart` still execute `sfence.vma` before writing `satp`?"
+    a: "The acquire orders hart 1's ordinary loads, but the page-table walker's implicit reads are not ordinary loads. `sfence.vma` orders stores already visible to this hart before those implicit page-table references, so the walker sees the page table hart 0 built."
+  - q: "`virtio_disk_rw` runs while holding `disk.vdisk_lock`, a spinlock with acquire/release barriers. Why does it still need `io_fence()` before writing `QUEUE_NOTIFY`?"
+    a: "The lock's barriers only order memory for other harts that also take the lock. The disk device never takes it; it reads the rings by DMA after the notify. `fence iorw,iorw` orders the ring and index stores (memory) before the notify (device output), which no lock does."
+  - q: "`panicked` is only `volatile`, but `started` uses atomics. Why is the weaker tool enough for `panicked`?"
+    a: "A hart that sees `panicked` only stops; it reads nothing that `panic` prepared, so it does not matter in what order other memory becomes visible. `started` publishes data (the page table, free list, process table) that the reader goes on to use, so it needs release/acquire ordering."
+  - q: "A process saves its registers in `swtch` on hart 1, and hart 0's scheduler resumes it. Which instructions guarantee that hart 0 loads the registers hart 1 saved, rather than older values?"
+    a: "Hart 1's scheduler releases the process's `p->lock` with `fence rw,w; sw`, ordering the `sd`s in `swtch` before the unlock. Hart 0's `acquire` swaps with `amoswap.w.aq`, so its later loads in `swtch` happen after it sees the unlock. See [[tour:13]]."

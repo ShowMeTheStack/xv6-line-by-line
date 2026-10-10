@@ -1,0 +1,880 @@
+title: Every lock in one ls | wc
+group: Locks and interrupt state
+prerequisites: [13, 15, 16, 17, 18, 40]
+summary: |
+  [[tour:40]] drove `ls | wc` from the keyboard to the answer. This tour drives it again and
+  counts **every lock** on the way: every [[acquire]] of a [[g:spinlock]], every
+  [[acquiresleep]] of a [[g:sleeplock|sleep-lock]], and every extra level of [[push_off]]
+  that is not a lock at all. The result is a census of one real command.
+
+  We booted the unmodified kernel of this build on three harts in QEMU, waited for the `$ `
+  prompt, attached gdb, and put a logging breakpoint on `acquire`, `release`,
+  `acquiresleep`, `releasesleep`, `myproc`, `uartputc_sync`, `devintr`, `syscall`,
+  `swtch`, `sleep`, `sleep_prepare` and `wakeup`. Each hit recorded the hart, the process,
+  `noff`, the caller and the lock. Then we typed `ls | wc`, and cut the log at the shell's
+  write of the next `$ `: **313,522 events**, of which **153,156 are spinlock acquisitions**, for 1,227
+  system calls.
+
+  | Lock | Acquired | Harts | In interrupt handlers | Deepest `noff` |
+  |---|---:|---|---:|---:|
+  | [[concept:locks#lock-proc|p->lock]] (64 of them) | 148,476 | 0, 1, 2 | 7,616 | 2 |
+  | [[concept:locks#lock-sleeplock-lk|lk->lk]] inside sleep-locks | 1,900 | 0, 1, 2 | 0 | 1 |
+  | [[concept:locks#lock-pipe|pi->lock]] | 1,100 | 0, 1, 2 | 0 | 1 |
+  | [[concept:locks#lock-bcache|bcache.lock]] | 914 | 0, 1, 2 | 0 | 1 |
+  | [[concept:locks#lock-kmem|kmem.lock]] | 204 | 0, 1, 2 | 0 | **3** |
+  | [[concept:locks#lock-log|log.lock]] | 164 | 0, 1, 2 | 0 | 1 |
+  | [[concept:locks#lock-itable|itable.lock]] | 162 | 0, 1, 2 | 0 | 2 |
+  | [[concept:locks#lock-tickslock|tickslock]] | 97 | **0 only** | 97 | 1 |
+  | [[concept:locks#lock-ftable|ftable.lock]] | 84 | 0, 1, 2 | 0 | 2 |
+  | [[concept:locks#lock-vdisk|disk.vdisk_lock]] | 24 | 0, 1, 2 | 8 | 1 |
+  | [[concept:locks#lock-cons|cons.lock]] | 16 | 1, 2 | 8 | 1 |
+  | [[concept:locks#lock-wait_lock|wait_lock]] | 12 | 0, 1, 2 | 0 | 1 |
+  | [[concept:locks#lock-pid_lock|pid_lock]] | 3 | 0, 1 | 0 | 2 |
+  | [[concept:locks#lock-pr|pr.lock]] | 0 | | | |
+
+  Sleep-locks: **637** `acquiresleep` calls, 457 on buffers, 168 on inodes, 12 on
+  [[concept:locks#lock-uart|tx_lock]]. Exactly **one** found its lock taken.
+
+  Three facts stand out. **97% of the acquisitions are `p->lock`**, four in five of them from
+  [[wakeup]], which locks all 64 process slots every time. Only **four** kinds of lock were
+  taken inside an interrupt handler. And the deepest nesting is **three**, reached 47 times,
+  in one function. The steps below show where each row comes from. All numbers are from one
+  run; a second run, counted to the same point, gave 142,882 acquisitions, the difference
+  almost all `p->lock` (ticks and idle scans vary). Tracing slowed the machine a great deal
+  (208 seconds of wall time from Enter to the next prompt),
+  so everything driven by the timer is inflated.
+cast: |
+  When the log starts, the shell has printed `$ ` and nothing is running:
+
+  | Hart | What it is doing |
+  |---|---|
+  | 0 | Idle in its [[scheduler]], in `wfi` between timer ticks |
+  | 1 | Idle in its scheduler |
+  | 2 | Idle in its scheduler |
+
+  `sh` (pid 2) is asleep in [[consoleread]] on `&cons.r`; `init` (pid 1, slot `proc[0]`) is
+  asleep in [[kwait]]. The cast, with the slot whose `p->lock` guards each one:
+
+  | pid | Program | Slot | `p->lock` address |
+  |---|---|---|---|
+  | 2 | `sh` | `proc[1]` | `0x8000ff38` |
+  | 3 | `sh` (runs the pipeline) | `proc[2]` | `0x800100a0` |
+  | 4 | `sh` → `ls` | `proc[3]` | `0x80010208` |
+  | 5 | `sh` → `wc` | `proc[4]` | `0x80010370` |
+steps:
+  - title: 153,156 acquisitions, and who made them
+    file: kernel/spinlock.c
+    lines: 19-42
+    focus: 24-26
+    state:
+      hart: 0
+      mode: S
+      proc: ls (pid 4)
+      intr: off
+      satp: kernel
+      locks: []
+      stack: [usertrap, syscall, sys_write, filewrite, pipewrite, acquire]
+      sp: {"on": kernel, detail: "KSTACK(3), ls's kernel stack"}
+      irq: {noff: 1, intena: 1, note: "push_off on line 24 has run; the lock itself is not held yet"}
+    note: |
+      Every row of the census passes through these lines: [[push_off]] first (clear
+      `sstatus.SIE`, count one level, [[concept:locks#noff]]), then the [[holding]] check,
+      then the spin on the atomic swap ([[concept:locks#amoswap]]). Here `ls` is about to take
+      its pipe's lock, the first of 608 times.
+
+      Sort the 153,156 acquisitions by **caller** instead of by lock:
+
+      | Caller | Acquisitions | Share |
+      |---|---:|---:|
+      | [[wakeup]] (1,884 calls × 64 slots) | 120,576 | 79% |
+      | [[scheduler]] scans on idle harts | 24,475 | 16% |
+      | [[killed]] (twice per system call, and in pipe loops) | 3,115 | 2% |
+      | everything else: files, pipe, memory, fork, exit | 4,990 | 3% |
+
+      The work you would call "the command" costs fewer than 5,000 acquisitions. The rest is
+      the price of xv6's simplest designs: `wakeup` keeps no list of sleepers, so it asks
+      every slot, under that slot's lock; an idle scheduler keeps no run queue, so it asks
+      every slot too. Both are correct, and both cost O(NPROC) per call.
+
+      After an acquisition `noff` was 1 in 32,542 cases, 2 in 120,567 and 3 in 47. Two is
+      the common case because `wakeup` is almost always called with another lock held.
+    others: |
+      `wc` is asleep, and harts 1 and 2 run their scheduler loops, each locking and unlocking
+      all 64 slots on every pass: hart 1 made 8,537 such acquisitions in the run, hart 2
+      8,514, hart 0 7,424.
+
+  - title: You press Enter, and cons.lock is taken in an interrupt
+    file: kernel/console.c
+    lines: 146-190
+    focus: 170-184
+    state:
+      hart: 1
+      mode: S
+      proc: "none (hart 1's scheduler)"
+      intr: off
+      satp: kernel
+      locks: [cons.lock]
+      stack: [main, scheduler, kerneltrap, devintr, uartintr, consoleintr]
+      sp: {"on": scheduler, detail: "hart 1's scheduler stack, with a kernelvec frame on it"}
+      irq: {noff: 1, intena: 0}
+    note: |
+      Our script wrote `ls | wc\n` into QEMU's serial input at once. The UART raised one
+      interrupt; harts 1 and 2 both entered [[devintr]], hart 2's claim found nothing, and
+      hart 1's [[uartintr]] drained all **eight** characters in one handler, calling
+      [[consoleintr]] once per character.
+
+      Each call takes [[concept:locks#lock-cons|cons.lock]]. Hart 1 was idle, so the interrupt
+      landed on its scheduler stack with SIE already off: `noff` goes 0 → 1 and `intena`
+      records 0 ([[concept:locks#intena]]). The echo on line 174 reaches [[uartputc_sync]],
+      whose own `push_off` makes `noff` **2** for one byte: eight times in the log, and
+      nowhere else in the run.
+
+      On the newline, line 183 calls `wakeup(&cons.r)` **holding cons.lock**: 64 `p->lock`
+      acquisitions at `noff` 2, inside an interrupt handler, the edge `cons.lock → p->lock`
+      ([[concept:locks#order]]). Safe, because nothing takes `cons.lock` while holding a
+      `p->lock`.
+    others: |
+      Why interrupts off while `cons.lock` is held? [[consoleread]] takes the same lock in
+      process context. If the shell held it on hart 1 with interrupts on and this interrupt
+      arrived on hart 1, `consoleintr` would spin forever on a lock its own hart holds
+      ([[concept:locks#handlers]]).
+
+  - title: The shell drains the line, and killed() takes p->lock twice per call
+    file: kernel/console.c
+    lines: 87-138
+    focus: 95-110
+    state:
+      hart: 1
+      mode: S
+      proc: sh (pid 2)
+      intr: off
+      satp: kernel
+      locks: [cons.lock]
+      stack: [usertrap, syscall, sys_read, fileread, consoleread]
+      sp: {"on": kernel, detail: "KSTACK(1)"}
+      irq: {noff: 1, intena: 1}
+    note: |
+      Hart **2**'s scheduler found the shell first. The shell returned from [[sleep]], took
+      `cons.lock` again at line 107 and copied `l` to user space; then a tick on hart 2 made
+      it [[yield]], and hart 1 picked it up. Here it reads the other seven bytes, one `read`
+      per byte (`gets` reads one character at a time).
+
+      This acquire happens in a system call, after [[usertrap]] turned interrupts on at line
+      66, so `intena` is **1**: the release at line 135 turns them back on.
+
+      Each read also takes the shell's own `p->lock` twice in [[killed]]: `usertrap` checks
+      before the system call (line 57) and after it (line 81), because a `kill` from another
+      hart writes `p->killed` under that lock. Over the run, `killed` made 3,115
+      acquisitions, a line of the census that has nothing to do with `ls` or `wc`.
+
+  - title: "fork: allocproc locks slots until it finds an empty one"
+    file: kernel/proc.c
+    lines: 109-150
+    focus: 114-129
+    state:
+      hart: 1
+      mode: S
+      proc: sh (pid 2)
+      intr: off
+      satp: kernel
+      locks: ["proc[2].lock (the child's p->lock)"]
+      stack: [usertrap, syscall, sys_fork, kfork, allocproc]
+      sp: {"on": kernel, detail: "KSTACK(1)"}
+      irq: {noff: 1, intena: 1}
+    note: |
+      The shell forks. [[allocproc]] walks the table taking each slot's lock: `proc[0]`
+      (`init`, released at line 119), `proc[1]` (the shell, released), `proc[2]`: `UNUSED`.
+      It returns **holding** that lock, so no other hart's `fork` can claim the same slot.
+
+      Under it, two locks nest at `noff` **2**:
+
+      - [[allocpid]] takes [[concept:locks#lock-pid_lock|pid_lock]] for pid 3. All three
+        `pid_lock` acquisitions of the run (pids 3, 4, 5) look like this.
+      - [[kalloc]] takes [[concept:locks#lock-kmem|kmem.lock]] for the trapframe and for
+        each page-table page of [[proc_pagetable]].
+
+      These are the edges `p->lock → pid_lock` and `p->lock → kmem`. Nothing holds
+      `kmem.lock` or `pid_lock` and then asks for a `p->lock`, so they cannot close a cycle
+      ([[concept:locks#order]]).
+    others: |
+      Why one lock per slot rather than one table lock? Hart 2's scheduler is scanning the
+      same table right now, and in the log its acquisitions continue in between
+      `allocproc`'s. Holding one slot's lock blocks only a scan that reaches that slot.
+
+  - title: kfork keeps the child locked through the copy
+    file: kernel/proc.c
+    lines: 258-305
+    focus: 270-292
+    state:
+      hart: 1
+      mode: S
+      proc: sh (pid 2)
+      intr: off
+      satp: kernel
+      locks: ["proc[2].lock (the child's p->lock)"]
+      stack: [usertrap, syscall, sys_fork, kfork]
+      sp: {"on": kernel, detail: "KSTACK(1)"}
+      irq: {noff: 1, intena: 1}
+    note: |
+      [[kfork]] copies with the child's lock held, so no hart can run, reap or inspect a
+      half-built process. Under that lock the log shows:
+
+      | Call | Lock | `noff` | Times |
+      |---|---|---:|---:|
+      | [[uvmcopy]] and `allocproc`'s pages | `kmem.lock` | 2 | 11 |
+      | [[filedup]] for fds 0, 1, 2 | `ftable.lock` | 2 | 3 |
+      | [[idup]] for the current directory | `itable.lock` | 2 | 1 |
+
+      That is why `kmem`, `ftable` and `itable` reach `noff` 2 in the census: the edges
+      `p->lock → ftable` and `p->lock → itable` exist *only* because of this function.
+
+      Then lines 294–302: release the child's lock, take `wait_lock` alone to set
+      `np->parent`, retake the child's lock to mark it `RUNNABLE`. The rule is `wait_lock`
+      before any `p->lock` ([[tour:18]]), the order [[kexit]] and [[kwait]] use, so `kfork`
+      must not ask for `wait_lock` while holding a `p->lock`. The gap is harmless: the
+      child is still `USED`, and no scheduler will run it.
+
+  - title: "wait: wait_lock, each child's lock, then sleep"
+    file: kernel/proc.c
+    lines: 369-419
+    focus: 376-415
+    state:
+      hart: 1
+      mode: S
+      proc: sh (pid 2)
+      intr: off
+      satp: kernel
+      locks: [wait_lock]
+      stack: [usertrap, syscall, sys_wait, kwait]
+      sp: {"on": kernel, detail: "KSTACK(1)"}
+      irq: {noff: 1, intena: 1}
+    note: |
+      [[kwait]] holds [[concept:locks#lock-wait_lock|wait_lock]] for the whole scan and takes
+      each child's `p->lock` (`noff` 2) to read its `state`: here only pid 3, `RUNNABLE`.
+
+      Then the pattern this tree uses everywhere ([[concept:locks#sleep-wakeup]]):
+      [[sleep_prepare]] sets `p->chan` under the shell's own `p->lock` (`noff` 2, `wait_lock`
+      still held), line 415 releases `wait_lock`, and [[sleep]] takes `p->lock` once more and
+      calls [[sched]] with `noff` exactly 1. A child that exits in between clears `p->chan`
+      with its `wakeup(p)`, and `sleep` returns at once.
+
+      The channel is the shell's own `struct proc`, `0x8000ff38`. Pid 2 now sleeps through
+      everything that follows.
+    others: |
+      Why not protect `p->parent` with each process's own lock? An exiting child looks at
+      its parent and reparents its children; a parent looks at all its children. Per-process
+      locks would be taken in both directions. One lock above all `p->lock`s gives a single
+      order.
+
+  - title: The scheduler takes a lock that someone else will release
+    file: kernel/proc.c
+    lines: 428-470
+    focus: 445-453
+    state:
+      hart: 1
+      mode: S
+      proc: "none (hart 1's scheduler)"
+      intr: off
+      satp: kernel
+      locks: ["proc[2].lock (pid 3's p->lock)"]
+      stack: [main, scheduler]
+      sp: {"on": scheduler, switched: "`ld sp, 8(a1)` in [[swtch]], when the shell's sched switched away", detail: "hart 1's slice of stack0"}
+      irq: {noff: 1, intena: 0}
+    note: |
+      Hart 1's [[scheduler]] takes `proc[2]`'s lock, finds pid 3 `RUNNABLE`, and calls
+      [[swtch]] with the lock held. `intena` is **0**: the scheduler turned interrupts off at
+      line 442 before its first acquire.
+
+      Pid 3 starts in [[forkret]], whose first act (line 520) is to release a lock it never
+      acquired: the hand-off of [[concept:locks#handoff]], legal because [[holding]] checks
+      the *hart* (`lk->cpu`). With the scheduler's `intena` of 0, that release leaves
+      interrupts off until `sret`.
+
+      This loop is the census's second line: **24,475** acquisitions, nearly all on harts that
+      found nothing to run, every pass taking all 64 slot locks. The whole run had only 211
+      switches into a process.
+    others: |
+      Hart 0's and hart 2's scans pass `proc[2]` too. One that arrives while hart 1 holds it
+      across `swtch` spins until pid 3 releases it in `forkret`, about a hundred
+      instructions later.
+
+  - title: "pid 3: a pipe, and a lock that did not exist a moment ago"
+    file: kernel/pipe.c
+    lines: 22-56
+    focus: 29-37
+    state:
+      hart: 1
+      mode: S
+      proc: sh (pid 3)
+      intr: on
+      satp: kernel
+      locks: []
+      stack: [usertrap, syscall, sys_pipe, pipealloc]
+      sp: {"on": kernel, detail: "KSTACK(2)"}
+      irq: 0
+    note: |
+      [[pipealloc]] takes [[concept:locks#lock-ftable|ftable.lock]] twice (two
+      [[filealloc]]s) and `kmem.lock` once for the pipe's page, each at `noff` 1 and released
+      before the next. Between them nothing is held and interrupts are on.
+
+      Line 37 creates a spinlock. At boot the kernel had 156 ([[concept:locks#inventory]]);
+      now it has 157. This `pi->lock` sits at the start of a fresh page, `0x87f26000` in our
+      run, and `&pi->nread`, the channel `wc` will sleep on, is `0x87f26218`. It will be
+      acquired 1,100 times and freed with the page in the last [[pipeclose]].
+
+      Then two forks, each repeating steps 4 and 5 with five `filedup`s (fds 0, 1, 2 and both
+      pipe ends): pid 4 gets `proc[3]`, pid 5 `proc[4]`. The first fork ran on hart 1; a tick
+      then made pid 3 yield, pid 4 started on hart 1, and pid 3 made the second fork on hart
+      0. From here on `ls` and `wc` run at the same time on different harts.
+    others: |
+      In the log, pid 3 on hart 0 copies pages for `wc`'s fork while pid 4 on hart 1 reads
+      the root directory: their `kmem.lock` and `bcache.lock` acquisitions interleave event
+      by event. Neither lock is held for more than a few dozen instructions.
+
+  - title: "begin_op and end_op: log.lock, and 54 empty commits"
+    file: kernel/log.c
+    lines: 127-184
+    focus: 131-146
+    state:
+      hart: 1
+      mode: S
+      proc: sh → ls (pid 4)
+      intr: off
+      satp: kernel
+      locks: [log.lock]
+      stack: [usertrap, syscall, sys_exec, kexec, begin_op]
+      sp: {"on": kernel, detail: "KSTACK(3)"}
+      irq: {noff: 1, intena: 1}
+    note: |
+      Pid 4 rewires its descriptors (`ftable.lock` each time) and calls `exec("ls")`.
+      [[kexec]] starts with [[begin_op]]: take [[concept:locks#lock-log|log.lock]], check for
+      a running commit and for room, increment `log.outstanding`, release. The transaction is
+      a counter, not a held lock: `begin_op` returns holding **nothing**, which is what lets
+      a process sleep on the disk inside it.
+
+      `ls | wc` writes nothing to the disk, yet: 55 `begin_op`s (2 `exec`s, 25 `open`s, 25
+      `close`s of files, 3 `exit`s) and 109 `end_op` acquisitions. When the last outstanding
+      operation ends, [[end_op]] sets `committing`, releases `log.lock`, calls [[commit]]
+      (which finds `log.lh.n == 0` and does nothing), retakes the lock at line 178 and calls
+      `wakeup(&log)` under it: 64 `p->lock`s for a commit that wrote nothing. 54 operations
+      ended that way. Once, `ls`'s and `wc`'s operations overlapped, and `end_op` took the
+      `wakeup` on line 170 instead.
+    others: |
+      Line 175's comment is the rule: `commit` may sleep on the disk, so `end_op` must not
+      hold `log.lock` across it. A process calling `begin_op` during a real commit would
+      sleep on `&log` holding no spinlock.
+
+  - title: "A sleep-lock is a spinlock, a flag and a pid"
+    file: kernel/sleeplock.c
+    lines: 21-44
+    focus: 24-33
+    state:
+      hart: 1
+      mode: S
+      proc: sh → ls (pid 4)
+      intr: off
+      satp: kernel
+      locks: ["inode 1's lk->lk (spinlock)"]
+      stack: [usertrap, syscall, sys_exec, kexec, namei, namex, ilock, acquiresleep]
+      sp: {"on": kernel, detail: "KSTACK(3)"}
+      irq: {noff: 1, intena: 1, note: "becomes 2 for a moment on line 32, inside myproc()"}
+    note: |
+      [[namex]] resolves `ls` relative to the current directory, the root, inode 1, and
+      [[ilock]] calls [[acquiresleep]] on its sleep-lock (`0x8001def0`): take the inner
+      spinlock `lk->lk`, see `locked == 0`, set it, record the pid, release `lk->lk`
+      ([[concept:locks#sleep-locks]]). Afterwards the sleep-lock is held and **no spinlock
+      is**: `noff` is back to 0 and interrupts are on.
+
+      Line 32 calls [[myproc]], whose own `push_off` makes `noff` **2** briefly. This
+      push_off-only level appeared 1,548 times: 637 in `acquiresleep`, 625 in
+      [[holdingsleep]] (a check in [[brelse]] and [[iunlock]]), 210 in [[sched]], 65 in
+      `sleep_prepare`, 11 elsewhere. Never deeper than 2.
+
+      The inner spinlock was taken 1,900 times: 638 in `acquiresleep`, 636 in
+      `releasesleep`, 626 in `holdingsleep`, three per use. And each `releasesleep` calls
+      `wakeup(lk)` under `lk->lk`: 636 scans, 40,704 `p->lock` acquisitions, which found a
+      sleeper exactly once (next step).
+    others: |
+      Sleep-locks belong to a **process**: `holdingsleep` compares `lk->pid` with
+      `myproc()->pid`. `ls` is preempted and resumes on other harts while holding inode and
+      buffer sleep-locks, and nothing breaks ([[tour:17]]).
+
+  - title: "wc meets ls on the root directory: the one contended sleep-lock"
+    file: kernel/sleeplock.c
+    lines: 21-44
+    focus: 25-27
+    state:
+      hart: 0
+      mode: S
+      proc: sh → wc (pid 5)
+      intr: off
+      satp: kernel
+      locks: ["inode 1's lk->lk (spinlock)"]
+      stack: [usertrap, syscall, sys_exec, kexec, namei, namex, ilock, acquiresleep]
+      sp: {"on": kernel, detail: "KSTACK(4)"}
+      irq: {noff: 1, intena: 1, note: "2 inside sleep_prepare on line 26"}
+    note: |
+      Pid 5 starts on hart 0 and calls `exec("wc")`. Its [[namex]] needs inode 1, which `ls`
+      on hart 1 still holds while reading directory entries. `acquiresleep` finds
+      `locked == 1`: of 637 sleep-lock acquisitions in the run, **the only one that had to
+      wait**.
+
+      [[sleep_prepare]] registers on the lock's address under `wc`'s `p->lock` (`noff` 2,
+      the edge `lk->lk → p->lock`); line 27 releases `lk->lk`; [[sleep]] parks `wc` with no
+      spinlock held but its own `p->lock` across `swtch`.
+
+      | Time | Hart 0 | Hart 1 |
+      |---|---|---|
+      | 1 | `wc`: takes `lk->lk`, sees `locked = 1` | `ls` holds inode 1, reads block 47 |
+      | 2 | `sleep_prepare(lk)`; release `lk->lk` | |
+      | 3 | `sleep()`: `SLEEPING`, `sched` | |
+      | 4 | idle | `ls`: `iunlock`: `locked = 0`, `wakeup(lk)` |
+      | 5 | | `wc` is `RUNNABLE` |
+
+      A tick then preempted `ls`, and hart 1's scheduler ran `wc`, which retook `lk->lk`,
+      found the lock free and took it. The whole contention cost two context switches, a
+      few short critical sections and one `wakeup` scan.
+    others: |
+      The loop on line 25 matters: another waiter woken by the same `wakeup` could take the
+      lock before `wc` runs. Re-checking `locked` under `lk->lk` makes a wakeup only a hint.
+
+  - title: "bget: bcache.lock, then a buffer's sleep-lock, 418 times on one block"
+    file: kernel/bio.c
+    lines: 57-102
+    focus: 62-68
+    state:
+      hart: 1
+      mode: S
+      proc: sh → ls (pid 4)
+      intr: off
+      satp: kernel
+      locks: ["inode 1 (sleep-lock)", bcache.lock]
+      stack: [usertrap, syscall, sys_exec, kexec, namei, namex, dirlookup, readi, bread, bget]
+      sp: {"on": kernel, detail: "KSTACK(3)"}
+      irq: {noff: 1, intena: 1}
+    note: |
+      [[dirlookup]] reads the directory one 16-byte entry at a time, and each [[readi]] is a
+      [[bread]] of the block holding the entry. The root directory fits in block 47, so
+      `bget` was asked for **block 47 418 times** out of 457 lookups: every `exec` path
+      lookup, every `open` of `ls`'s `stat`s, and `ls`'s reads of `.` scan it.
+
+      Each lookup takes [[concept:locks#lock-bcache|bcache.lock]], finds the buffer, raises
+      `refcnt`, **releases `bcache.lock`**, and only then waits for the buffer's sleep-lock
+      (line 69). Never wait for one buffer while holding the lock everyone needs to find any
+      buffer ([[concept:locks#unusual]]); the raised `refcnt` keeps the buffer from being
+      recycled in the gap. [[brelse]] takes `bcache.lock` again: 914 acquisitions, two per
+      lookup.
+
+      After line 69 `ls` holds two sleep-locks, the directory inode and block 47's buffer
+      (at `0x80019928`). Two was the most any process held at once in this run.
+    others: |
+      `ls` and `wc` both read block 47 during their `exec`s, but never at the same time:
+      scanning the root directory needs the root inode's sleep-lock, so that lock (step 11)
+      serialises them before they reach the buffer. In the log, `ls`'s block-47 lookups and
+      `wc`'s come in separate runs, and block 47's sleep-lock was never contended.
+
+  - title: "A disk read, and a wakeup that arrives before the sleep"
+    file: kernel/virtio_disk.c
+    lines: 270-298
+    focus: 284-288
+    state:
+      hart: 2
+      mode: S
+      proc: ls (pid 4)
+      intr: off
+      satp: kernel
+      locks: ["inode 10 (ls, sleep-lock)", "buffer 301 (sleep-lock)", disk.vdisk_lock]
+      stack: [usertrap, syscall, sys_exec, kexec, readi, bread, virtio_disk_rw]
+      sp: {"on": kernel, detail: "KSTACK(3)"}
+      irq: {noff: 1, intena: 1, note: "2 inside sleep_prepare on line 288"}
+    note: |
+      `kexec` reads the ELF header of `ls` (inode 10), and block 301 is not cached. On hart
+      2 now (`ls` was preempted and migrated), [[virtio_disk_rw]] takes
+      [[concept:locks#lock-vdisk|disk.vdisk_lock]], notifies the device (line 284), and
+      prepares to wait: `sleep_prepare(b)` at `noff` 2 (the edge `vdisk_lock → p->lock`),
+      then release `vdisk_lock`, then `sleep()`.
+
+      What happened next is the reason this tree has `sleep_prepare`. The release on line
+      289 brought `noff` to 0 and, with `intena` 1, turned interrupts on. QEMU had already
+      finished the read, so the disk interrupt was pending, and hart 2 took it **inside
+      `release`**, before line 290. On `ls`'s own kernel stack, [[kerneltrap]] →
+      [[devintr]] → [[virtio_disk_intr]] took `vdisk_lock` and called `wakeup(b)`, which
+      took `ls`'s own `proc[3].lock` (free: `ls` holds no spinlock now), saw `chan == b`,
+      and cleared it. `ls` stayed `RUNNING`.
+
+      Back on line 290, [[sleep]] saw `p->chan == 0` and **returned without sleeping**: the
+      only `sleep` of the run entered with `chan` already 0. The wakeup came first, and it
+      was not lost.
+
+      `ls` and `wc` read 8 blocks from the disk (301 and 305–307 for `ls`; 777 and 781–783
+      for `wc`), each holding the program's inode and the buffer, two sleep-locks, across
+      the wait. That is fine for sleep-locks; with a spinlock, `sched` would panic.
+    others: |
+      After the request, `free_chain` frees three descriptors, and each [[free_desc]] calls
+      `wakeup(&disk.free[0])` with `vdisk_lock` held. Nobody waited for descriptors in this
+      run, so those 24 wakeups (1,536 `p->lock`s) found nobody.
+
+  - title: The disk interrupt on an idle hart, and p->lock in interrupt context
+    file: kernel/virtio_disk.c
+    lines: 300-333
+    focus: 303-332
+    state:
+      hart: 1
+      mode: S
+      proc: "none (hart 1's scheduler)"
+      intr: off
+      satp: kernel
+      locks: [disk.vdisk_lock]
+      stack: [main, scheduler, kerneltrap, devintr, virtio_disk_intr]
+      sp: {"on": scheduler, detail: "hart 1's scheduler stack, with a kernelvec frame on it"}
+      irq: {noff: 1, intena: 0}
+    note: |
+      The next read, block 305, went the usual way: `ls` really slept on hart 2, and the
+      interrupt was taken by **hart 1**, idle in its scheduler. `vdisk_lock` at `noff` 1 with
+      `intena` 0, then `wakeup(b)` taking all 64 `p->lock`s at `noff` 2, inside a handler.
+
+      The `wakeup` raced with `ls`'s `sleep`, and `proc[3].lock` decided it:
+
+      | Time | Hart 1 (interrupt) | Hart 2 (`ls`) |
+      |---|---|---|
+      | 1 | `vdisk_lock`; `wakeup(b)` starts at `proc[0]` | `sleep()`: acquire `proc[3].lock` |
+      | 2 | | `SLEEPING`; `sched` → scheduler |
+      | 3 | `proc[1]`, `proc[2]` | scheduler releases `proc[3].lock` |
+      | 4 | acquire `proc[3].lock`: `chan == b`, `SLEEPING` → `RUNNABLE` | |
+      | 5 | on to `proc[4]` … `proc[63]` | scheduler resumes `ls` |
+
+      Had `wakeup` reached slot 3 at time 2, it would have spun until hart 2's scheduler
+      released the lock, and found `ls` `SLEEPING` all the same. The lock admits only clean
+      orders.
+
+      Only four kinds of lock were taken in interrupt handlers: `p->lock` (7,616 times, all
+      inside `wakeup`), `tickslock` (97), `vdisk_lock` (8) and `cons.lock` (8). The fifth
+      possible one, `pr.lock`, needs a `printk` ([[concept:locks#handlers]]).
+    others: |
+      The [[g:plic|PLIC]] offers a device interrupt to every hart that enabled it, and the
+      first to claim it handles it. Of the 8 disk interrupts here, hart 0 handled 1, hart 1
+      handled 4 and hart 2 handled 3. The handler never cares where the sleeper last ran.
+
+  - title: ls writes one byte into the pipe, under pi->lock
+    file: kernel/pipe.c
+    lines: 76-109
+    focus: 82-106
+    state:
+      hart: 0
+      mode: S
+      proc: ls (pid 4)
+      intr: off
+      satp: kernel
+      locks: ["pi->lock"]
+      stack: [usertrap, syscall, sys_write, filewrite, pipewrite]
+      sp: {"on": kernel, detail: "KSTACK(3)"}
+      irq: {noff: 1, intena: 1, note: "2 inside killed() and wakeup()"}
+    note: |
+      `ls` prints with `printf`, one `write` per character: 608 [[pipewrite]]s, 608
+      acquisitions of [[concept:locks#lock-pipe|pi->lock]]. Each takes the lock, calls
+      [[killed]] (a `p->lock` at `noff` 2), copies one byte, and calls `wakeup(&pi->nread)`
+      **under `pi->lock`**: 64 more `p->lock`s at `noff` 2. Line 105 alone made 38,912
+      acquisitions, a quarter of the census.
+
+      Must that `wakeup` be inside the lock? No: the reader checks the pipe and registers
+      (`sleep_prepare`) in one `pi->lock` critical section and the writer updates `nwrite`
+      in another, so a `wakeup` just after the writer's release would still find a reader
+      that saw the pipe empty. (The same argument holds for older xv6's `sleep(chan, lk)`.)
+      xv6 puts it inside anyway, and that creates the edge `pi->lock → p->lock`. The pipe never filled (`wc` kept up), so the branch on
+      line 88 never ran.
+
+      The very first write shows a real spin. `ls`'s `wakeup` made `wc` `RUNNABLE`, hart 2
+      resumed it at once, and `wc`'s [[piperead]] reached `acquire(&pi->lock)` (line 127)
+      **while `ls` was still scanning**, holding `pi->lock`. Hart 2 spun until hart 0 reached
+      line 106.
+    others: |
+      | Time | Hart 0 (`ls`) | Hart 2 |
+      |---|---|---|
+      | 1 | `pi->lock`; byte stored; `wakeup` starts | idle scheduler |
+      | 2 | reaches `proc[4]`: `wc` `RUNNABLE` | |
+      | 3 | `proc[5]` … | runs `wc`; `sleep` returns |
+      | 4 | … `proc[63]` | `acquire(&pi->lock)`: spins |
+      | 5 | `release(&pi->lock)` | gets the lock |
+
+  - title: wc reads, and sleeps 53 times
+    file: kernel/pipe.c
+    lines: 111-143
+    focus: 118-125
+    state:
+      hart: 2
+      mode: S
+      proc: wc (pid 5)
+      intr: off
+      satp: kernel
+      locks: ["pi->lock"]
+      stack: [usertrap, syscall, sys_read, fileread, piperead]
+      sp: {"on": kernel, detail: "KSTACK(4)"}
+      irq: {noff: 1, intena: 1, note: "2 inside killed() and sleep_prepare()"}
+    note: |
+      `wc` asks for 512 bytes at a time and gets whatever is there, often one byte: **437
+      reads**. [[piperead]] took `pi->lock` 490 times, 437 at line 118 and 53 at line 127
+      after waking. Under it, [[killed]] and [[sleep_prepare]] take `wc`'s own `p->lock`:
+      the edge `pi->lock → p->lock` ([[tour:18]], rule 8).
+
+      `wc` slept 53 times on `&pi->nread`, each time registering, releasing `pi->lock`, then
+      sleeping. All 53 entered `sleep()` with the channel still set: `ls` never wrote in that
+      gap. 52 of the wakeups came from `pipewrite`, the last from `ls`'s `pipeclose`, which
+      gave `wc` its end of file.
+
+      Only `wc` ever slept on the pipe. With a 512-byte buffer drained as fast as bytes
+      arrive, `ls` never waited for room.
+    others: |
+      `wc` ran on all three harts: resumed 30 times on hart 0, 36 on hart 1, 32 on hart 2.
+      Each resumption crossed `swtch` with `proc[4].lock` held by the scheduler and released
+      by `wc` on the same hart ([[concept:locks#handoff]]).
+
+  - title: "wc prints: tx_lock, eleven times, never slept on"
+    file: kernel/uart.c
+    lines: 76-96
+    focus: 84-93
+    state:
+      hart: 2
+      mode: S
+      proc: wc (pid 5)
+      intr: on
+      satp: kernel
+      locks: ["tx_lock (sleep-lock)"]
+      stack: [usertrap, syscall, sys_write, filewrite, consolewrite, uartwrite]
+      sp: {"on": kernel, detail: "KSTACK(4)"}
+      irq: 0
+    note: |
+      `wc` prints `24 96 608 \n`: 11 bytes, 11 `write`s, 11 [[uartwrite]]s of one byte. Each
+      takes [[concept:locks#lock-uart|tx_lock]], a **sleep-lock** (named `"uart"` in the
+      kernel), so writers do not interleave ([[tour:38]]). Then, per byte:
+      `sleep_prepare(&tx_chan)`, check the line status register, write the byte.
+
+      No spinlock guards that check: the condition lives in a device register, so there is
+      nothing in memory to protect. If the UART were busy, the "idle again" interrupt would
+      clear `p->chan` with `wakeup(&tx_chan)`, and the `sleep()` on line 91 would return.
+
+      In our run the `else` branch **never ran**: all 12 `uartwrite`s (11 from `wc`, 1 for
+      the shell's next prompt) found the transmitter idle, as LOCKS measured over a much
+      longer run. QEMU's UART finishes a byte instantly. [[uartintr]] still calls
+      `wakeup(&tx_chan)` with **no lock held**, at `noff` 0: 13 times in the run (two around your
+      typing: one in the input interrupt itself, one when the echo finished), 832
+      `p->lock`s. Several were taken on hart 2 itself the
+      instant `sleep_prepare`'s release turned interrupts on, clearing `wc`'s registration
+      before it had even read the register.
+    others: |
+      A process on another hart writing to the console now would sleep in
+      `acquiresleep(&tx_lock)` until `wc`'s `releasesleep` woke it. Echoes of typed
+      characters go through [[uartputc_sync]] from the interrupt handler and ignore `tx_lock`.
+
+  - title: A tick on hart 0, taken the moment pi->lock was released
+    file: kernel/trap.c
+    lines: 166-180
+    focus: 169-173
+    state:
+      hart: 0
+      mode: S
+      proc: ls (pid 4)
+      intr: off
+      satp: kernel
+      locks: [tickslock]
+      stack: [usertrap, syscall, sys_write, filewrite, pipewrite, release, pop_off, kerneltrap, devintr, clockintr]
+      sp: {"on": kernel, detail: "KSTACK(3), with a kernelvec frame on top of pop_off's"}
+      irq: {noff: 1, intena: 0}
+    note: |
+      Back to `ls`'s first `write`. `pipewrite` released `pi->lock`, [[pop_off]] took `noff`
+      to 0 and turned interrupts on, and hart 0's timer interrupt, already due, was taken at
+      once. This is the invariant at work ([[concept:locks#invariant]]): an interrupt is only
+      taken at `noff` 0, so a handler never finds its own hart inside a critical section.
+
+      [[clockintr]] starts at `noff` 0 with interrupts off, so `acquire(&tickslock)` records
+      `intena` **0**: the release on line 173 will not turn interrupts on inside the
+      handler. Then `wakeup(&ticks)` under `tickslock`: 64 `p->lock`s at `noff` 2, for
+      nobody (no one called `pause`).
+
+      Only hart 0 runs lines 170–173, so [[concept:locks#lock-tickslock|tickslock]] shows up
+      on hart 0 alone, 97 times, all in an interrupt handler. Harts 1 and 2 took 107 and 108
+      ticks and only reprogrammed `stimecmp`. After this tick [[kerneltrap]] made `ls`
+      [[yield]] right there, in the middle of its `write`: one of 143 yields in the run.
+    others: |
+      The 97 `wakeup(&ticks)` calls are 6,208 of the 7,616 `p->lock` acquisitions made in
+      interrupt context, and the most inflated line of the census: a traced run takes far
+      more ticks than a normal one.
+
+  - title: "ls exits: wait_lock, then its own p->lock, then sched"
+    file: kernel/proc.c
+    lines: 325-365
+    focus: 355-358
+    state:
+      hart: 2
+      mode: S
+      proc: ls (pid 4)
+      intr: off
+      satp: kernel
+      locks: [wait_lock, "proc[3].lock (ls's own p->lock)"]
+      stack: [usertrap, syscall, sys_exit, kexit]
+      sp: {"on": kernel, detail: "KSTACK(3)"}
+      irq: {noff: 2, intena: 1}
+    note: |
+      [[kexit]] replays the tour in a few dozen events. Closing `ls`'s three descriptors
+      takes `ftable.lock` three times; for fd 1, the last reference to the pipe's write end,
+      [[pipeclose]] also takes `pi->lock` and calls `wakeup(&pi->nread)`: `wc`'s end of
+      file. Dropping `cwd` takes `log.lock`, `itable.lock`, then `log.lock` twice more for an
+      empty commit and its `wakeup(&log)`.
+
+      Then the family. Line 347 takes `wait_lock`; `wakeup(p->parent)` makes pid 3
+      `RUNNABLE`; line 355 takes `ls`'s own `p->lock`. Now `noff` is 2, as shown, and
+      `ZOMBIE` is set under both locks. Line 360 releases `wait_lock`, and [[sched]] switches
+      away with exactly one lock, its own, for hart 2's scheduler to release.
+
+      Why both? A parent in `kwait` on another hart holds `wait_lock` and reads each child's
+      state under the child's `p->lock`. Holding both here means it sees a running child or
+      a zombie that has stopped using its kernel stack, never something in between
+      ([[tour:21]]).
+    others: |
+      Pid 3 woke on hart 1 almost at once. It needed `wait_lock`, freed at line 360, and
+      `proc[3].lock`, freed by hart 2's scheduler right after `swtch`.
+
+  - title: "kwait frees ls: noff 3, the deepest of the run"
+    file: kernel/proc.c
+    lines: 369-419
+    focus: 384-399
+    state:
+      hart: 1
+      mode: S
+      proc: sh (pid 3)
+      intr: off
+      satp: kernel
+      locks: [wait_lock, "proc[3].lock (the zombie ls's p->lock)"]
+      stack: [usertrap, syscall, sys_wait, kwait]
+      sp: {"on": kernel, detail: "KSTACK(2)"}
+      irq: {noff: 2, intena: 1}
+    note: |
+      Pid 3 returns from `sleep`, retakes `wait_lock` (line 417) and scans. Its first child,
+      `ls`, is a `ZOMBIE`. With `wait_lock` and `ls`'s `p->lock` held, [[freeproc]] gives back
+      the trapframe and the user address space: each [[kfree]] takes `kmem.lock` at **`noff`
+      3**.
+
+      That is the deepest nesting of the run, and the only place it happened: **47** times,
+      10 `kfree`s when pid 3 reaped `ls`, 10 when it reaped `wc`, 27 when the shell reaped pid
+      3, whose image was larger. (The other 3-level path, in [[iput]] when the last reference
+      to a deleted file goes away, never ran: `ls | wc` deletes nothing.
+      [[concept:locks#nesting]].)
+
+      Three levels is safe because `kmem.lock` is a leaf: [[kalloc]] and `kfree` take no
+      other lock while holding it, so no path can hold it and wait for `wait_lock` or a
+      `p->lock` ([[concept:locks#order]]).
+
+      Pid 3 then sleeps again, reaps `wc` the same way and exits; the shell reaps pid 3 and
+      writes `$ ` through `tx_lock`, where our log stops.
+
+  - title: Where the acquisitions went
+    file: kernel/proc.c
+    lines: 574-595
+    focus: 580-594
+    state:
+      hart: 0
+      mode: S
+      proc: ls (pid 4)
+      intr: off
+      satp: kernel
+      locks: ["pi->lock", "p->lock of the slot being checked"]
+      stack: [usertrap, syscall, sys_write, filewrite, pipewrite, wakeup]
+      sp: {"on": kernel, detail: "KSTACK(3)"}
+      irq: {noff: 2, intena: 1}
+    note: |
+      These twenty-two lines made 79% of the spinlock acquisitions in `ls | wc`. The 1,884
+      calls of [[wakeup]], by caller:
+
+      | Caller | Calls | Usually finds |
+      |---|---:|---|
+      | `releasesleep` | 636 | nobody (one sleeper in the run) |
+      | `pipewrite` | 608 | `wc`, 52 times |
+      | `piperead` (writers on `&pi->nwrite`) | 437 | nobody: `ls` never waited |
+      | `clockintr` | 97 | nobody |
+      | `end_op` | 55 | nobody |
+      | `free_desc` | 24 | nobody |
+      | `uartintr` | 13 | `wc`, registered but running |
+      | `virtio_disk_intr` | 8 | the process waiting for that block |
+      | `kexit`, `pipeclose`, `consoleintr` | 6 | a parent, `wc`, the shell |
+
+      Fewer than 80 of the 1,884 calls woke a process that was really asleep. The rest pay
+      for a design with no list of waiters. It is still right for xv6: there is no extra
+      structure to get out of step, and reading each slot's `chan` and `state` under that
+      slot's lock is what makes `sleep_prepare`'s "no lost wakeups" guarantee hold.
+
+      The tour in one sentence: **one command used 13 kinds of spinlock and 3 kinds of
+      sleep-lock on three harts, nested at most three deep, took four kinds inside
+      interrupt handlers, and spent most of its locking asking 64 slots whether anyone was
+      asleep.**
+    others: |
+      What the run did *not* show: no `pr.lock` (no `printk`), no full pipe, no `iput` of a
+      deleted file, and no `sched locks` panic: at all 210 switches out of a process the log
+      shows `noff` exactly 1. Every nested pair of spinlocks in the log follows the order of
+      [[concept:locks#order]].
+locks:
+  - lock: "p->lock (each slot's)"
+    where: "[[wakeup]], [[scheduler]], [[killed]], [[sleep_prepare]], [[sleep]], [[yield]], [[allocproc]], [[kfork]], [[kwait]], [[kexit]]"
+    protects: "`state`, `chan`, `killed`, `xstate`; held across `swtch`. 148,476, of which 7,616 in interrupt handlers"
+  - lock: "lk->lk (inside each sleep-lock)"
+    where: "[[acquiresleep]], [[releasesleep]], [[holdingsleep]]"
+    protects: "The sleep-lock's `locked` and `pid`; 1,900"
+  - lock: "pi->lock"
+    where: "[[pipewrite]], [[piperead]], [[pipeclose]]"
+    protects: "The ring buffer, `nread`, `nwrite`, open flags; 1,100; created by [[pipealloc]]"
+  - lock: "bcache.lock"
+    where: "[[bget]], [[brelse]]"
+    protects: "The buffer list and `refcnt`s; released before waiting for a buffer; 914"
+  - lock: "kmem.lock"
+    where: "[[kalloc]], [[kfree]]"
+    protects: "The free list; a leaf, so it may sit at `noff` 3; 204"
+  - lock: "log.lock"
+    where: "[[begin_op]], [[end_op]]"
+    protects: "`outstanding`, `committing`, the header; not held across `commit`; 164"
+  - lock: "itable.lock"
+    where: "[[iget]], [[idup]], [[iput]]"
+    protects: "In-memory inodes' `ref` and identity; 162"
+  - lock: "tickslock"
+    where: "[[clockintr]] (hart 0 only)"
+    protects: "`ticks`; 97, all in interrupt handlers"
+  - lock: "ftable.lock"
+    where: "[[filealloc]], [[filedup]], [[fileclose]]"
+    protects: "Open files' `ref`; 84"
+  - lock: "disk.vdisk_lock"
+    where: "[[virtio_disk_rw]], [[virtio_disk_intr]]"
+    protects: "Descriptor rings and `info[]`; 24, 8 in interrupts"
+  - lock: "cons.lock"
+    where: "[[consoleintr]], [[consoleread]]"
+    protects: "The console input buffer; 16, 8 in interrupts"
+  - lock: "wait_lock"
+    where: "[[kfork]], [[kwait]], [[kexit]]"
+    protects: "Every `p->parent`; taken before any `p->lock`; 12"
+  - lock: "pid_lock"
+    where: "[[allocpid]]"
+    protects: "`nextpid`; 3, each under a new child's `p->lock`"
+  - lock: "ip->lock (sleep-lock)"
+    where: "[[ilock]], [[iunlock]]"
+    protects: "An inode's contents; 168, 122 on the root; the run's one contended lock"
+  - lock: "b->lock (sleep-lock)"
+    where: "[[bget]], [[brelse]]"
+    protects: "A buffer's data; 457, 418 on block 47; held across 8 disk reads"
+  - lock: "tx_lock (sleep-lock)"
+    where: "[[uartwrite]]"
+    protects: "The transmitter for one write; 12, never slept on in QEMU"
+  - lock: "(push_off only, no lock)"
+    where: "[[myproc]], [[uartputc_sync]]"
+    protects: "Reading `cpus[i].proc`, or sending one echoed byte, without moving harts; 1,556 times at `noff` 2"
+  - lock: "(no lock) the transaction"
+    where: "[[begin_op]] to [[end_op]]"
+    protects: "Nothing is held in between; a counter reserves log space, so the process may sleep"
+quiz:
+  - q: "Four in five spinlock acquisitions came from `wakeup`, almost all finding nobody. Why does it take every slot's `p->lock` instead of peeking at `p->chan` without the lock?"
+    a: "Without it, this interleaving loses a wakeup: `sleep()` reads `chan != 0`; `wakeup` clears `chan`, sees `RUNNING` and does nothing; `sleep()` then sets `SLEEPING` and switches away, with nobody left to wake it. Holding `p->lock` makes `sleep()`'s check-then-`SLEEPING` atomic with respect to `wakeup`'s clear-then-check ([[concept:locks#sleep-wakeup]])."
+  - q: "In step 13 the disk interrupt arrived before `sleep()` ran. What would happen if `wakeup` only changed `SLEEPING` processes and did not clear `p->chan`?"
+    a: "`wakeup` would find `ls` `RUNNING` and do nothing. `sleep()` would then see `chan` still set, mark `ls` `SLEEPING` and switch away, waiting for an interrupt that had already come: `ls` would sleep forever. Clearing `chan` is the record that the wakeup happened."
+  - q: "`tickslock` was used on hart 0 only. Why must it still be taken with interrupts off?"
+    a: "`sys_uptime` and `sys_pause` take it in process context on any hart, including hart 0. If one held it on hart 0 with interrupts on, hart 0's next tick would spin forever in `clockintr` on a lock its own hart holds."
+  - q: "The deepest nesting was `wait_lock` → a child's `p->lock` → `kmem.lock`. Why is it safe to take `kmem.lock` under two other locks?"
+    a: "A deadlock needs a cycle. `kalloc` and `kfree` take no other lock while holding `kmem.lock`, so no path holds it and waits for `wait_lock` or a `p->lock`. A leaf lock can sit under anything."
+  - q: "`ls` held an inode's and a buffer's sleep-locks across a disk read and even moved to another hart meanwhile. Why is that fine for sleep-locks but forbidden for spinlocks?"
+    a: "A spinlock records the hart and keeps interrupts off on it; switching away would leave a hart owning a lock for a thread that is not running, so `sched` panics unless `noff` is 1. A sleep-lock records the pid, holds no spinlock between `acquiresleep` and `releasesleep`, and its waiters sleep instead of spinning."
+  - q: "Only one of 637 `acquiresleep` calls had to wait. Which, and why did it cost so little?"
+    a: "`wc`'s `exec` wanted the root directory's inode lock while `ls`'s `exec` held it during path lookup. `wc` slept on the lock's address holding no spinlock, so hart 0 was free; `ls`'s `iunlock` woke it, and it took the lock after two context switches (out and back in)."

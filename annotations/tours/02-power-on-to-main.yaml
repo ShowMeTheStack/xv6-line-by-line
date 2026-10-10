@@ -1,0 +1,658 @@
+title: Power-on to main, on every hart at once
+group: Boot and build
+prerequisites: [1]
+summary: |
+  QEMU has built a machine with three CPUs ([[g:hart|harts]]), copied `kernel/kernel` into
+  RAM at `0x80000000`, and released all three harts at the same instant. None of them knows
+  it is not alone. They run the same instructions, from the same memory, at the same time,
+  and yet each must end up with its own stack, its own settings and its own identity.
+
+  This tour follows all three harts together, from the first instruction of QEMU's boot ROM
+  at `0x1000`, through [[_entry]] in [[kernel/entry.S]], through the machine-mode setup in
+  [[start]], to the [[g:insn:mret|mret]] that drops each of them into supervisor mode in
+  [[main]].
+
+  The surprise of this tour is what is missing: **there is not a single lock** on this
+  path, even though three CPUs run it simultaneously. Watch why. Almost everything here is
+  done to a hart's *own* registers, and the only shared memory that anyone writes is split
+  so that no two harts ever write the same byte.
+cast: |
+  The machine has three harts, and at the start they are in exactly the same state:
+
+  | Hart | What it is doing |
+  |---|---|
+  | 0 | Just reset: machine mode, `pc = 0x1000`, interrupts off, paging off |
+  | 1 | The same |
+  | 2 | The same |
+
+  Memory already holds the kernel (`0x80000000`–`0x80007860`), and the `.bss` above it
+  (up to `0x80020bb0`) is zero. Memory and the devices are the only things they share.
+steps:
+  - title: Three harts, one memory, pc = 0x1000
+    file: kernel/memlayout.h
+    lines: 1-19
+    focus: 3-13
+    state:
+      hart: [0, 1, 2]
+      mode: M
+      intr: off
+      satp: bare
+      locks: []
+      sp: {"on": none, detail: "`sp = 0` on every hart (gdb): reset left it there"}
+    note: |
+      The comment at the top of [[kernel/memlayout.h]] is a map of QEMU's `virt` machine.
+      At power-on, every hart is in **machine mode**, the most privileged
+      [[g:privilege-mode]], with no address translation and no interrupts enabled, and its
+      program counter at `0x1000`, a small boot ROM that QEMU provides.
+
+      Before releasing the harts, QEMU itself has already copied the kernel's loadable
+      bytes into RAM at `0x80000000` (the source comment on line 11 credits the boot ROM,
+      but the ROM does no loading; it only jumps). Stopping QEMU at its first instruction
+      with `gdb` shows all three harts waiting at the same address:
+
+      ```
+      * 1    Thread 1.1 (CPU#0 [running]) 0x0000000000001000 in ?? ()
+        2    Thread 1.2 (CPU#1 [running]) 0x0000000000001000 in ?? ()
+        3    Thread 1.3 (CPU#2 [running]) 0x0000000000001000 in ?? ()
+      ```
+
+      Each hart has its own complete set of registers: 32 general-purpose registers, a
+      program counter, and its own control and status registers ([[g:csr|CSRs]]). What they
+      share is everything outside the CPU: RAM and the devices.
+
+      One of those registers is the stack pointer `sp`, and right now it points at nothing:
+      `gdb` reads `sp = 0` on all three harts. No hart has a [[concept:stacks|stack]] yet,
+      which is why the strip above says "no usable stack". The ROM's instructions never
+      use one, and the first job of the kernel's first instructions will be to give each
+      hart its own.
+      All three columns of this tour run the same code. As far as the software can tell, the
+      three harts execute simultaneously, and their relative speed is not fixed: in one
+      `gdb` run hart 2 reached [[main]] first, in another hart 0 did. Nothing in the boot path
+      may depend on who gets where first.
+
+  - title: The boot ROM jumps to the kernel
+    file: kernel/kernel.ld
+    lines: 1-13
+    focus: 10-13
+    state:
+      hart: [0, 1, 2]
+      mode: M
+      intr: off
+      satp: bare
+      locks: []
+      sp: {"on": none, detail: "still 0: the boot ROM never uses a stack"}
+    note: |
+      The ROM is six instructions. Disassembled at `0x1000` with `gdb`:
+
+      ```
+      0x1000: auipc t0,0x0          t0 = 0x1000
+      0x1004: addi  a2,t0,40        a2 = 0x1028 (an info record for firmware)
+      0x1008: csrr  a0,mhartid      a0 = this hart's ID
+      0x100c: ld    a1,32(t0)       a1 = 0x87e00000 (QEMU's device-tree blob)
+      0x1010: ld    t0,24(t0)       t0 = 0x80000000
+      0x1014: jr    t0
+      ```
+
+      The data words after the code hold `0x80000000`, the start of RAM. On hart 2, just
+      before the jump, `gdb` shows `a0 = 2, a1 = 0x87e00000, t0 = 0x80000000`.
+
+      The ROM was written for real firmware (such as OpenSBI) that wants its hart ID in
+      `a0` and a description of the hardware in `a1`. xv6 ignores both. It reads the hart
+      ID itself and knows the hardware layout from [[kernel/memlayout.h]]. (QEMU's
+      device-tree blob sits at the top of RAM, in memory xv6 will soon give to its page
+      allocator and overwrite.)
+
+      What matters is the jump to `0x80000000`. Line 10 of the linker script put the
+      kernel there and line 13 (indirectly; see its note) put [[_entry]] first ([[tour:1]]).
+      Three harts arrive at `_entry` at about the same time.
+
+  - title: Every hart starts from the same stack address
+    file: kernel/entry.S
+    lines: 1-21
+    focus: 7-12
+    state:
+      hart: [0, 1, 2]
+      mode: M
+      intr: off
+      satp: bare
+      locks: []
+      stack: [_entry]
+      sp: {"on": none, detail: "`sp = 0x80007890`, the bottom of `stack0`, the same on all three harts"}
+    note: |
+      C code needs a stack: a place for local variables, saved registers and return
+      addresses. Right now `sp` holds whatever reset left there. Before any C function can
+      be called, [[_entry]] must point `sp` at memory that is safe to use.
+
+      Line 12, `la sp, stack0`, loads the address of [[stack0]], an array in the kernel's
+      `.bss`. In this build it assembled to
+
+      ```
+      80000000: auipc sp,0x8
+      80000004: addi  sp,sp,-1904   # 80007890 <stack0>
+      ```
+
+      so all three harts now have `sp = 0x80007890`. That is the *bottom* of `stack0`, so
+      it is still not a usable stack. If they stopped here and called C, the first push
+      would go *below* `stack0`, onto [[ticks]] and the other `.bss` variables at
+      `0x80007860`–`0x8000788f`; all three harts would push onto those same bytes, and each
+      hart's function calls would overwrite the others' return addresses. That is not a
+      hypothetical: it is exactly what the next five instructions exist to prevent.
+
+  - title: Each hart computes its own offset
+    file: kernel/entry.S
+    lines: 7-21
+    focus: 13-16
+    state:
+      hart: [0, 1, 2]
+      mode: M
+      intr: off
+      satp: bare
+      locks: []
+      stack: [_entry]
+      sp: {"on": none, detail: "still `0x80007890` on all three harts"}
+    note: |
+      The goal is `sp = stack0 + (hartid + 1) × 4096`. The only input that differs between
+      harts is [[g:csr:mhartid|mhartid]], a read-only CSR that the hardware sets to the
+      hart's number. Here is the same code, at the same time, on three CPUs:
+
+      | Instruction | Hart 0 | Hart 1 | Hart 2 |
+      |---|---|---|---|
+      | `li a0, 4096` | `a0 = 0x1000` | `a0 = 0x1000` | `a0 = 0x1000` |
+      | `csrr a1, mhartid` | `a1 = 0` | `a1 = 1` | `a1 = 2` |
+      | `addi a1, a1, 1` | `a1 = 1` | `a1 = 2` | `a1 = 3` |
+      | `mul a0, a0, a1` | `a0 = 0x1000` | `a0 = 0x2000` | `a0 = 0x3000` |
+
+      These four instructions use only `a0` and `a1`; `sp` still holds `0x80007890` on all
+      three harts. Nothing is on a stack yet, and nothing needs one: assembly that touches
+      only registers can run without a stack, which is exactly why this code is in assembly
+      and not in C.
+    others: |
+      No lock is needed because nothing is shared yet: `a0` and `a1` are each hart's
+      private registers. Three harts executing `csrr a1, mhartid` at the same instant read
+      three different CSRs and write three different `a1` registers. Registers are the
+      purest form of per-CPU data.
+
+  - title: "add sp: three harts, three stacks"
+    file: kernel/entry.S
+    lines: 7-21
+    focus: 17
+    state:
+      hart: [0, 1, 2]
+      mode: M
+      intr: off
+      satp: bare
+      locks: []
+      stack: [_entry]
+      sp: {"on": boot, switched: "`add sp, sp, a0` in [[_entry]] ([[kernel/entry.S:17]])", detail: "empty; tops `0x80008890`, `0x80009890`, `0x8000a890` for harts 0, 1, 2"}
+    note: |
+      `add sp, sp, a0` is the first instruction that switches a stack, and the only one
+      that runs once per hart per power-on. After it, each hart's `sp` points at the top of
+      its own slice of [[stack0]]:
+
+      | Instruction | Hart 0 | Hart 1 | Hart 2 |
+      |---|---|---|---|
+      | `add sp, sp, a0` | `sp = 0x80008890` | `sp = 0x80009890` | `sp = 0x8000a890` |
+
+      The `sp` values are what `gdb` reports at the first instruction of [[start]].
+
+      Why `hartid + 1`? Stacks grow **down**. A push first subtracts from `sp`, then
+      stores. So the starting `sp` must be the *top* (the end) of the hart's 4096-byte
+      slice. Hart 0's slice is `0x80007890`–`0x80008890`, and its stack starts at the top,
+      empty.
+
+      This is the hart's **boot stack**. It is one of only four instructions in xv6 that
+      move `sp` from one stack to another ([[concept:stacks]]); the other three are in the
+      trap and context-switch code that later tours follow.
+    others: |
+      Three harts executing `add sp, sp, a0` at the same instant affect three different
+      `sp` registers, and from now on each hart pushes onto its own 4 KiB of memory. Each
+      hart has its own `sp` and its own stack for as long as the machine runs: one stack
+      per hart, never shared.
+
+  - title: One array, three slices, no lock
+    file: kernel/start.c
+    lines: 1-12
+    focus: 10-11
+    state:
+      hart: [0, 1, 2]
+      mode: M
+      intr: off
+      satp: bare
+      locks: []
+      stack: [_entry]
+      sp: {"on": boot, detail: "each hart's own 4 KiB slice of `stack0`, still empty"}
+    note: |
+      [[stack0]] is `4096 × NCPU` = 32 KiB. With [[NCPU]] = 8 there is room for 8 harts; this
+      machine uses the first three slices:
+
+      | Slice | Bytes | Used by |
+      |---|---|---|
+      | 0 | `0x80007890`–`0x80008890` | hart 0 |
+      | 1 | `0x80008890`–`0x80009890` | hart 1 |
+      | 2 | `0x80009890`–`0x8000a890` | hart 2 |
+      | 3–7 | up to `0x8000f890` | unused |
+
+      This is the first **shared** memory the harts write: one global array in `.bss`. It
+      needs no lock because the harts never write the same bytes. Each owns one slice,
+      decided by its hart ID, which never changes. A lock protects data that more than one
+      CPU might touch. If ownership is fixed in advance, there is nothing to protect.
+
+      These stacks are not temporary. [[main]], and after it each hart's [[scheduler]],
+      will keep running on this same slice for as long as the machine is up: `main` calls
+      `scheduler` and never returns, so the **boot stack** simply becomes the hart's
+      **scheduler stack** ([[concept:stacks#scheduler]]). No instruction moves `sp` for that;
+      only the role changes.
+
+      Notice also what the table does not have: a gap. Unlike the kernel stacks that
+      processes will get, these slices have no unmapped [[g:guard-page]] between them (paging
+      is off, and nothing could be unmapped anyway). If hart 1 ever pushed more than 4 KiB,
+      it would silently write into hart 0's slice, and hart 0 would run into [[ticks]] and
+      the other variables just below `stack0`.
+    others: |
+      What if two harts did share a slice?
+
+      | Time | Hart 0 | Hart 1 |
+      |---|---|---|
+      | t1 | `start` saves `s0` and `ra` at `0x80008880`–`0x8000888f` | |
+      | t2 | | `start` saves its own `s0` and `ra` at the same addresses |
+      | t3 | later reads one of those slots back and gets hart 1's value | |
+
+      Each would read the other's locals and return addresses. The machine would crash, at a
+      different place each run. The hart ID turns one shared array into three private
+      ones. xv6 uses the same trick for [[cpus]]: each hart only writes `cpus[its own id]`.
+
+  - title: call start
+    file: kernel/entry.S
+    lines: 7-21
+    focus: 18-21
+    state:
+      hart: [0, 1, 2]
+      mode: M
+      intr: off
+      satp: bare
+      locks: []
+      stack: [_entry]
+      sp: {"on": boot, detail: "still empty: `jal` pushes nothing"}
+    note: |
+      Line 19 calls [[start]], the first C function, on each hart's own stack. In the linked
+      kernel it is a single `jal 80000058 <start>`, which saves the return address in `ra`
+      and jumps. A call does not push anything by itself on RISC-V; the first push is
+      `start`'s own prologue, `addi sp,sp,-16`, which stores `ra` and `s0` in a 16-byte
+      frame. On hart 2, `gdb` shows `sp = 0x8000a880` just after it: the boot stack's first
+      16 bytes are in use.
+
+      [[start]] never returns: it ends with `mret`, which leaves for [[main]]. So the loop
+      at `spin` (line 20–21) is a safety net. If `start` ever did return, the hart would
+      spin here forever rather than run off into whatever bytes follow.
+
+      From now on the harts run C code compiled by the RISC-V cross-compiler, but they are still in
+      machine mode with paging off: every address the code uses is a physical address.
+
+  - title: Arrange to leave machine mode
+    file: kernel/start.c
+    lines: 13-21
+    focus: 17-21
+    state:
+      hart: [0, 1, 2]
+      mode: M
+      intr: off
+      satp: bare
+      locks: []
+      stack: [_entry, start]
+      sp: {"on": boot, detail: "`start`'s 16-byte frame; `sp = 0x8000a880` on hart 2"}
+    note: |
+      The kernel is designed to run in **supervisor mode**, one level below machine mode. The
+      usual way down is [[g:insn:mret|mret]], an instruction meant for returning from a
+      machine-mode trap. It switches to the privilege mode stored in the `MPP` field of
+      [[g:csr:mstatus|mstatus]]. No trap happened, so [[start]] writes `MPP` itself: clear
+      the two bits, set them to `01` (supervisor).
+
+      `gdb` shows `mstatus = 0xa00000000` on entry to `start`: only the fields that say
+      user and supervisor mode are 64-bit are set (bits 32–35). `MPP` is 0, and the
+      machine-mode interrupt enable `MIE` is 0.
+
+      This is a read–modify–write: `csrr`, two bit operations, `csrw`. On shared memory
+      that sequence would be a classic [[g:race-condition]]: another CPU could change the
+      value between the read and the write. Here it is safe, because `mstatus` is not
+      shared. Each hart has its own `mstatus`, and only that hart can read or write it.
+    others: |
+      Three harts are executing `csrw mstatus` at roughly the same moment, and none of them
+      can see or disturb the others' `mstatus`. Every CSR in this tour is like that: one
+      copy per hart, accessible only by that hart. That is why [[start]] has no locks, even
+      though it modifies about a dozen pieces of hardware state on three CPUs at once.
+
+  - title: A CSR access is one instruction
+    file: kernel/riscv.h
+    lines: 12-40
+    focus: 19-31
+    state:
+      hart: [0, 1, 2]
+      mode: M
+      intr: off
+      satp: bare
+      locks: []
+      stack: [_entry, start]
+      sp: boot
+    note: |
+      C has no syntax for a CSR, so [[kernel/riscv.h]] wraps each access in a one-line
+      [[g:static-inline]] function containing [[g:inline-asm|inline assembly]]: [[r_mstatus]]
+      is one `csrr`, [[w_mstatus]] one `csrw`. After inlining, `start` compiles into a
+      straight run of CSR instructions.
+
+      `volatile` on the asm tells the compiler not to delete or merge these statements, and
+      to keep them in order relative to each other. It matters most for the readers such as
+      [[r_mstatus]]: the compiler cannot see that reading a CSR twice can give different
+      answers, so without volatile it could reuse an earlier result, or delete a read whose
+      value looks unused. (An asm with no outputs, like the one in [[w_mstatus]], is treated
+      as volatile anyway; xv6 marks every one for clarity.)
+
+      Which CSRs can be touched depends on the current mode. In machine mode, everything is
+      allowed. Once the hart drops to supervisor mode, any attempt to touch an `m...` CSR
+      (including `mhartid`) causes an illegal-instruction exception. So everything that
+      needs machine-mode privilege must be done now, in [[start]]: there is no going back.
+
+  - title: Aim mret at main, and keep paging off
+    file: kernel/start.c
+    lines: 23-28
+    focus: 23-28
+    state:
+      hart: [0, 1, 2]
+      mode: M
+      intr: off
+      satp: bare
+      locks: []
+      stack: [_entry, start]
+      sp: boot
+    note: |
+      `mret` jumps to the address in [[g:csr:mepc|mepc]]. Writing `main`'s address,
+      `0x80000e5e`, there means that each hart will "return" into [[main]].
+
+      [[w_satp]]`(0)` sets [[g:csr:satp|satp]] to Bare mode: in supervisor mode, addresses
+      will be used as physical addresses, untranslated. The kernel's page table does not
+      exist yet. Hart 0 will build it in [[tour:24]], and every hart will then switch on
+      paging for itself by writing its own `satp`.
+
+      Again, each hart writes its own `mepc` and its own `satp`. The values happen to be
+      the same on all three harts, but they are three separate registers.
+
+  - title: Send every trap to supervisor mode
+    file: kernel/start.c
+    lines: 29-33
+    focus: 30-33
+    state:
+      hart: [0, 1, 2]
+      mode: M
+      intr: off
+      satp: bare
+      locks: []
+      stack: [_entry, start]
+      sp: boot
+    note: |
+      By default, every [[g:trap]] on RISC-V goes to machine mode. xv6 has no machine-mode
+      trap handler at all, so it [[g:delegation|delegates]] them:
+      [[g:csr:medeleg|medeleg]] = `0xffff` for exceptions (system calls, page faults, ...)
+      and `mideleg` = `0xffff` for interrupts. Traps will now go to supervisor mode, to
+      whatever [[g:csr:stvec|stvec]] says. Later, [[trapinithart]] will set `stvec` on each
+      hart.
+
+      Line 33 sets two enable bits in [[g:csr:sie|sie]]: supervisor **external** interrupts
+      (devices, via the [[g:plic|PLIC]]) and supervisor **timer** interrupts. These are
+      individual switches. The master switch, `sstatus.SIE`, stays off. No interrupt can
+      reach this hart until [[scheduler]] calls [[intr_on]].
+
+      That matters for the whole boot: interrupts stay off on every hart through `start`,
+      `main` and all of hart 0's initialization. Boot code never has to worry about an
+      interrupt handler running in the middle of it.
+
+  - title: Let supervisor mode reach all of memory
+    file: kernel/start.c
+    lines: 34-41
+    focus: 35-38
+    state:
+      hart: [0, 1, 2]
+      mode: M
+      intr: off
+      satp: bare
+      locks: []
+      stack: [_entry, start]
+      sp: boot
+    note: |
+      [[g:pmp|Physical memory protection]] lets machine mode restrict which physical
+      addresses supervisor and user mode may access. On a hart that implements PMP, an access
+      from those modes that matches no PMP entry fails. Entry 0 is set to cover every address
+      from 0 up to `0x3fffffffffffff × 4` with read, write and execute allowed. In effect: no
+      restriction.
+
+      The PMP registers are **per hart**. If hart 0 configured PMP and hart 1 did not,
+      hart 1's first supervisor-mode access could fault while hart 0 ran fine: a bug that
+      would show up only on some CPUs. Because every hart runs all of [[start]], each sets
+      its own.
+
+      Line 41 enables the [[g:svadu|Svadu]] extension in [[g:csr:menvcfg|menvcfg]], so the
+      hardware sets the accessed and dirty bits in page-table entries itself. Without it,
+      QEMU would raise a page fault the first time each page is used, and xv6 has no code
+      to handle that.
+
+  - title: Each hart sets its own alarm clock
+    file: kernel/start.c
+    lines: 54-66
+    focus: 58-65
+    state:
+      hart: [0, 1, 2]
+      mode: M
+      intr: off
+      satp: bare
+      locks: []
+      stack: [_entry, start, timerinit]
+      sp: boot
+    note: |
+      Line 44 calls [[timerinit]]. It enables the [[g:sstc|Sstc]] extension (a
+      supervisor-mode timer-compare register), lets supervisor mode read the clock and
+      write `stimecmp` ([[g:csr:mcounteren|mcounteren]] bit 1), and schedules the first timer interrupt:
+      `stimecmp = time + 1000000`, about 0.1 seconds from now on QEMU's 10 MHz clock.
+
+      Here is the split between shared and private hardware in one line:
+
+      - [[g:csr:time|time]] is **one** clock for the whole machine. All three harts read
+        the same counter.
+      - [[g:csr:stimecmp|stimecmp]] is **per hart**. Each hart schedules its own interrupts.
+
+      Each hart will get its own timer interrupts, which is what lets each hart's scheduler
+      preempt the process it is running ([[tour:11]]). But not yet: the interrupt can become
+      *pending* in 0.1 s, yet it cannot be *taken* while `sstatus.SIE` is off. A hart that
+      is still booting when its alarm rings simply does not notice until its scheduler
+      turns interrupts on.
+
+  - title: Remember who you are
+    file: kernel/start.c
+    lines: 43-52
+    focus: 46-48
+    state:
+      hart: [0, 1, 2]
+      mode: M
+      intr: off
+      satp: bare
+      locks: []
+      stack: [_entry, start]
+      sp: boot
+    note: |
+      The kernel constantly needs to know which hart it is on: [[mycpu]] finds the hart's
+      entry in [[cpus]], every [[acquire]] records which CPU holds the lock, the PLIC has
+      per-hart registers. The ID is in `mhartid`, but that CSR is readable only in machine
+      mode, and this is the last moment in machine mode.
+
+      So each hart copies its ID into the general-purpose register [[g:reg:tp|tp]] ("thread
+      pointer"). From now on, [[cpuid]] is just "return `tp`". Hart 0 has `tp = 0`, hart 1
+      `tp = 1`, hart 2 `tp = 2`, which `gdb` confirms at the start of [[main]].
+
+      `tp` is just an ordinary register, and the kernel must protect it. User programs may
+      overwrite it, so the trap code saves the hart ID in each process's trapframe on the
+      way out and restores `tp` on the way in ([[tour:7]]).
+
+  - title: mret, and every hart is in supervisor mode
+    file: kernel/start.c
+    lines: 43-52
+    focus: 50-51
+    state:
+      hart: [0, 1, 2]
+      mode: M
+      intr: off
+      satp: bare
+      locks: []
+      stack: [_entry, start]
+      sp: boot
+    note: |
+      [[g:insn:mret|mret]] does several things at once, in hardware:
+
+      | Effect | From |
+      |---|---|
+      | privilege mode becomes supervisor | `mstatus.MPP` = `01` (step 8) |
+      | `pc` becomes `0x80000e5e`, [[main]] | `mepc` (step 10) |
+      | `mstatus.MIE` ← `MPIE`; `MPP` reset to user | the RISC-V rule for `mret` |
+
+      The stack pointer does not change, so [[main]] runs on the same slice of [[stack0]]
+      that `start` used. `start`'s frame is simply abandoned. Neither `mret` nor the change
+      of privilege mode touches `sp`: machine mode and supervisor mode have no separate
+      stack pointers on RISC-V, only one `sp` per hart.
+
+      The state shown above is the moment the `mret` executes, still in machine mode. At the first line of `main`, `gdb`
+      reports `$priv = 1` (supervisor) and `sstatus = 0x200000000`: the `SIE` bit (bit 1)
+      is 0. Interrupts are still off, as promised in step 11.
+
+      None of the three harts will execute in machine mode again. All further traps go to
+      supervisor mode, because [[start]] delegated them.
+
+  - title: Three harts arrive in main
+    file: kernel/main.c
+    lines: 1-45
+    focus: 9-13
+    state:
+      hart: [0, 1, 2]
+      mode: S
+      intr: off
+      satp: bare
+      locks: []
+      stack: [main]
+      sp: {"on": boot, detail: "same slice of `stack0`: `start`'s abandoned frame, then `main`'s"}
+      irq: 0
+    note: |
+      All three harts are now in [[main]], each on its own stack, in supervisor mode, with
+      paging and interrupts off. Each boot stack holds two frames: `start`'s abandoned 16
+      bytes at the top and `main`'s 16 bytes below it.
+
+      ```text
+      hart 0's slice of stack0
+        0x80008890 top
+                   start's frame (abandoned at mret)
+        0x80008880 main's frame
+        0x80008870 ◄─ sp
+                   … free …
+        0x80007890 bottom (no guard page)
+      ```
+
+      For the first time, their paths split. Line 13 asks [[cpuid]], which reads `tp`:
+
+      - Hart 0 takes the `if` branch and initializes the whole kernel: the console, the page
+        allocator, the page table, the process table, the file system tables, the disk, the
+        first process.
+      - Harts 1 and 2 take the `else` branch and wait, spinning on [[started]].
+
+      Why not let all three initialize in parallel? Because initialization writes **shared**
+      tables: the free-page list, the process table, the buffer cache. The simplest safe
+      plan is to let one hart do it alone while the others wait, then let them in. Hart 0 is
+      a safe choice on QEMU, where hart 0 always exists whatever `-smp` says.
+
+      How the others know when it is safe, with a memory flag and no lock, is the subject of
+      [[tour:3]].
+    others: |
+      From this line on, the harts are no longer doing the same thing. Hart 0 starts writing
+      shared kernel data. Harts 1 and 2 read one shared variable, [[started]], over and over.
+      The rule that makes this safe without a lock is "one writer, and the readers do not
+      look at anything else until the writer says so".
+
+      | Time | Hart 0 | Hart 1 | Hart 2 |
+      |---|---|---|---|
+      | t1 | `cpuid()` = 0 | `cpuid()` = 1 | `cpuid()` = 2 |
+      | t2 | [[consoleinit]] … | reads `started`: 0 | reads `started`: 0 |
+      | t3 | [[kinit]] … | reads `started`: 0 | reads `started`: 0 |
+      | … | … [[userinit]] | still 0 | still 0 |
+      | tN | `started = 1` (release) | reads 1 (acquire), continues | reads 1, continues |
+
+  - title: What was shared, what was private
+    file: kernel/main.c
+    lines: 9-45
+    focus: 35-36
+    state:
+      hart: [1, 2]
+      mode: S
+      intr: off
+      satp: bare
+      locks: []
+      stack: [main]
+      sp: boot
+      irq: 0
+    note: |
+      From power-on to [[main]], three CPUs ran a few dozen instructions each, simultaneously,
+      without a single lock. Looking back at why:
+
+      | Thing | Shared or per hart | Why no lock |
+      |---|---|---|
+      | `pc`, `sp`, `a0`, `tp`, all registers | per hart | nobody else can touch them |
+      | `mstatus`, `mepc`, `satp`, `medeleg`, `sie`, PMP, `menvcfg`, `stimecmp` | per hart | CSRs belong to their hart |
+      | `mhartid` | per hart, read-only | never written |
+      | `time` | shared | only read |
+      | kernel code and constants | shared | only read |
+      | [[stack0]] | shared array | each hart writes only its own slice |
+
+      That table is the whole art of lock-free code in miniature: private data, read-only
+      shared data, or shared data partitioned so that ownership never overlaps.
+
+      Lines 35–36 are where that stops for harts 1 and 2; by the time hart 0 reaches line 33
+      it has already turned paging on for itself ([[tour:24]]). In between, hart 0 writes
+      tables that any hart might later read or write, at any time. From [[tour:3]] on, every such table gets a
+      [[g:spinlock]], and the first synchronization between harts is the release store and
+      acquire loads of [[started]] on these lines.
+locks:
+  - lock: "(no lock) registers and CSRs"
+    where: "[[_entry]], [[start]], [[timerinit]]"
+    protects: "Nothing to protect: every register and CSR written on this path belongs to one hart, and no other hart can access it"
+  - lock: "(no lock) stack0"
+    where: "[[_entry]] picks the slice ([[kernel/entry.S:12]]–[[kernel/entry.S:17]]); [[start]] and [[main]] write it"
+    protects: "One shared array, partitioned by hart ID: each hart writes only its own 4096-byte slice"
+  - lock: "(no lock) time"
+    where: "[[timerinit]]"
+    protects: "The machine-wide clock is shared but only read; each hart writes its own `stimecmp`"
+  - lock: "started (release/acquire, not a lock)"
+    where: "[[main]]"
+    protects: "Keeps harts 1 and 2 away from shared kernel data until hart 0 has finished initializing it ([[tour:3]])"
+quiz:
+  - q: "All three harts execute `add sp, sp, a0` in `_entry` at the same moment. Why don't they need a lock?"
+    a: |
+      `sp` and `a0` are registers, and every hart has its own. The three instructions modify
+      three different `sp` registers, so there is no shared data to protect.
+  - q: "Why does `_entry` compute `stack0 + (hartid + 1) * 4096` instead of `stack0 + hartid * 4096`?"
+    a: |
+      Stacks grow down, so `sp` must start at the top (end) of the hart's slice. With
+      `hartid * 4096`, hart 0's stack would start at the bottom of its slice and grow down
+      into whatever lies below `stack0`, and each other hart would grow into its neighbor's
+      slice.
+  - q: "Suppose `start()` set up PMP only when `r_mhartid() == 0`. What would you expect to happen, and why only on some harts?"
+    a: |
+      PMP registers are per hart. Harts 1 and 2 would drop to supervisor mode with no PMP
+      entry allowing access, and on hardware that implements PMP their first memory access
+      in supervisor mode would fault. Hart 0 would boot normally, so the failure would look
+      like a bug in multi-CPU code.
+  - q: "`start()` does a read–modify–write of `mstatus` on three CPUs at once. Why is this not a race condition?"
+    a: |
+      A race needs shared data. `mstatus` is a per-hart CSR: each hart reads and writes only
+      its own copy, so no other hart can change it between the read and the write.
+  - q: "Each hart's first timer interrupt becomes pending about 0.1 s after `timerinit`. Why can't it interrupt hart 0 in the middle of initializing the kernel?"
+    a: |
+      The global enable bit `sstatus.SIE` is 0 at reset on QEMU, and `start` never sets it. A
+      pending interrupt is not taken until the hart's scheduler calls `intr_on()`, after
+      initialization is finished.
+  - q: "Why does the kernel copy the hart ID into `tp` instead of reading `mhartid` whenever it needs it?"
+    a: |
+      `mhartid` can only be read in machine mode, and after `mret` the kernel runs in
+      supervisor mode, where reading it would cause an illegal-instruction exception. `tp`
+      is an ordinary register that supervisor code can read.

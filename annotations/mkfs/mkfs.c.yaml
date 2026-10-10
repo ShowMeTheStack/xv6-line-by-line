@@ -1,0 +1,614 @@
+summary: |
+  `mkfs` ("make file system") builds `fs.img`, the [[g:disk-image]] that xv6 boots with. It
+  is the only C program in the repository that **runs on your computer (macOS or Linux), not
+  inside xv6**. The Makefile compiles it with your ordinary `gcc` ([[Makefile:124]]) and
+  runs it as `mkfs/mkfs fs.img README user/_cat user/_echo ...` ([[Makefile:154]]). It uses
+  the host's C library (`open`, `lseek`, `read`, `printf`), and none of the kernel's code.
+
+  What it shares with the kernel is the **on-disk format**: it includes [[kernel/fs.h]] and
+  [[kernel/param.h]], so the sizes and structs it writes are exactly the ones
+  [[kernel/fs.c]] will read. The job, in order:
+
+  1. compute the size of each region of the [[g:disk-layout]] and fill in the
+     [[g:superblock]];
+  2. zero the whole 2000-block image and write the superblock into block 1;
+  3. create the root directory (inode 1) with its `.` and `..` entries;
+  4. for each file named on the command line, allocate an [[g:inode]], add a directory
+     entry for it in `/`, and copy its bytes in, using direct and
+     [[g:indirect-block|indirect]] blocks;
+  5. write the [[g:free-bitmap]], marking every block used so far.
+
+  mkfs never reuses or frees anything: inodes and blocks are handed out in increasing
+  order, which keeps it short. Almost every number it writes goes through [[xint]] or
+  [[xshort]], which are meant to give the image RISC-V's little-endian
+  [[g:byte-order]]; the conversion is incomplete (see [[xint]]), so in practice the image
+  is right only when the host is little-endian, as nearly all are.
+
+  **Read before:** [[kernel/fs.h]]. **Read next:** [[kernel/fs.c]], which reads this image at
+  boot ([[kernel:fsinit]]) and from then on maintains it.
+
+blocks:
+  - lines: 1-6
+    title: The host's C library
+    note: |
+      These are your computer's own headers, from its C library: `stdio.h` for `printf`
+      and `perror`, `unistd.h` for `lseek`, `read`, `write` and `close`, `fcntl.h` for
+      `open` and its `O_` flags, `assert.h` for `assert`. None of them exist inside xv6;
+      that alone tells you this program is built for the host. `string.h` also brings in
+      the old BSD functions `bzero`, `bcopy` and `index` used below (on both glibc and
+      macOS it includes `strings.h`, where they are declared).
+
+  - lines: 8-12
+    title: Borrow the on-disk format from the kernel
+    note: |
+      [[kernel/types.h]] supplies `uint`, `ushort` and `uchar`; [[kernel/fs.h]] the layout
+      constants and the structs [[superblock]], [[dinode]] and [[dirent]];
+      [[kernel/stat.h]] the inode types `T_DIR` and `T_FILE`; [[kernel/param.h]] the sizes
+      [[FSSIZE]] and [[LOGBLOCKS]]. Because mkfs and the kernel compile the very same
+      definitions, they cannot disagree about where a field sits on disk (as long as the
+      host's `int` is 4 bytes, which line 81 checks).
+
+  - lines: 14-21
+    title: A fallback for static_assert
+    note: |
+      [[g:static-assert|static_assert]] checks a condition at compile time. With C11 or
+      C17, `<assert.h>` defines `static_assert` as a macro for `_Static_assert` (Apple's
+      headers do this even in C23 mode; you can see it with `gcc -E`), so
+      `#ifndef static_assert` is false and lines 15–20 are skipped.
+
+      In C23 `static_assert` became a keyword, and glibc no longer defines a macro for it
+      when GCC 13 or later compiles in C23 mode, which is GCC 15's default. So on a current
+      Linux system (including the Ubuntu CI job) the replacement below is what actually
+      runs, as it also would with a pre-C11 compiler; defining a macro with a keyword's
+      name is allowed, because the preprocessor runs first. The replacement is a
+      classic trick: `switch (0)` with two labels, `case 0:` and `case (a):`. If the
+      condition `a` is true, the second label is `case 1:` and the code compiles (and does
+      nothing when run). If `a` is false, it becomes a second `case 0:`, and duplicate case
+      labels are a compile error ("duplicate case value"), which is the assertion failing.
+      The message `b` is ignored, and because the trick is a statement, it only works
+      inside a function, which is where line 81 uses it. The `do { ... } while (0)` makes the
+      macro behave as one statement followed by a semicolon.
+
+  - lines: 23
+    title: How many inodes
+    note: |
+      The image gets room for 200 [[g:inode|inodes]], so xv6 can hold at most 199 files and
+      directories (inode 0 is never used). This number ends up in the superblock's
+      `ninodes`, which the kernel's [[kernel:ialloc]] uses as its limit.
+
+  - lines: 25-32
+    title: The size of each region
+    note: |
+      The comment lists the regions of the [[g:disk-layout]] in order, the same picture as
+      in [[kernel/fs.h:7]]. These globals compute how many blocks each region needs. With
+      the default parameters:
+
+      | Variable | Formula | Value |
+      |---|---|---|
+      | `nbitmap` | `2000 / 8192 + 1` | 1 bitmap block |
+      | `ninodeblocks` | `200 / 16 + 1` | 13 inode blocks |
+      | `nlog` | `30 + 1` | 31 log blocks |
+
+      Global initializers in C must be constant expressions; these are, because every name
+      in them is a macro. `nmeta` and `nblocks` are computed at run time in [[main]]
+      (lines 96–97).
+
+      The `+ 1` in the first two is a cheap way to round up, but it always adds a block,
+      even when the division is exact. With these numbers nothing is lost except some
+      unused space: 13 inode blocks hold 208 inodes, of which only 200 are counted.
+
+  - lines: 34-38
+    title: The state of the image being built
+    note: |
+      - `fsfd` is the host [[g:file-descriptor]] of the open `fs.img`.
+      - `sb` is the superblock, filled in by [[main]] and also used by [[winode]] and
+        [[rinode]] through [[IBLOCK]], which reads `sb.inodestart`.
+      - `zeroes` is one block of zero bytes (a global array is zero-initialized).
+      - `freeinode` is the next inode number to hand out. It starts at 1, so the first
+        inode allocated, the root directory, gets [[ROOTINO]].
+      - `freeblock` is the next data block to hand out; [[main]] sets it to the first block
+        after the metadata.
+
+      Together `freeinode` and `freeblock` are the whole allocator: mkfs only ever counts
+      upward. That is enough because it creates files once and never deletes anything.
+
+  - lines: 40-47
+    title: Forward declarations
+    note: |
+      Prototypes for the helpers defined after [[main]], so that `main` can call them with
+      their argument types checked. Note that these are mkfs's own [[balloc]] and
+      [[ialloc]], unrelated to the kernel functions of the same names
+      ([[kernel:balloc]], [[kernel:ialloc]]); this is a separate program, so the names do
+      not clash.
+
+  - lines: 49-58
+    title: "xshort: store a 16-bit number in RISC-V byte order"
+    note: |
+      The kernel will read `fs.img` on a little-endian RISC-V machine, so every number
+      mkfs writes must be laid out little-endian: low byte first. See [[g:byte-order]].
+
+      Rather than test which kind of machine it is running on, `xshort` builds the result
+      byte by byte. `a` points at the two bytes of `y`; byte 0 gets the low 8 bits of `x`
+      (the assignment to a `uchar` keeps only those), byte 1 gets the high 8 bits. Whatever
+      the host's own byte order, `y` now *sits in memory* in little-endian order, which is
+      what gets copied into the image.
+
+      On a little-endian host (x86-64, ARM Macs, almost every computer today), `y` ends up
+      equal to `x` and the function changes nothing. On a big-endian host it swaps the two
+      bytes. The same function also converts back: [[iappend]] calls [[xint]] on values read
+      from the image to get host numbers.
+
+  - lines: 60-70
+    title: "xint: store a 32-bit number in RISC-V byte order"
+    note: |
+      The 4-byte version of [[xshort]]: byte 0 of `y` gets bits 0–7 of `x`, byte 1 bits
+      8–15, byte 2 bits 16–23, byte 3 bits 24–31. Swapping is its own inverse, so the same
+      function converts a host number to disk order and a disk number back to host order.
+
+      The conversion is not applied everywhere it would be needed on a big-endian host:
+      `sb.magic` (line 99) is stored without it, and [[IBLOCK]] in [[winode]] and
+      [[rinode]], and `wsect(sb.bmapstart, ...)` in [[balloc]], use the *converted*
+      superblock fields as if they were host numbers. On a big-endian host the image would
+      therefore come out wrong. On the little-endian hosts everyone actually uses, every
+      conversion is the identity and none of this matters.
+
+  - lines: 72-79
+    title: "main: local variables"
+    note: |
+      `argv[1]` is the image to create and `argv[2]` onward are the files to copy into it.
+      `buf` holds one block at a time, `de` one directory entry ([[dirent]]), `din` one
+      on-disk inode ([[dinode]]). `rootino` will be the root directory's inode number,
+      `inum` each file's, `off` a byte offset.
+
+  - lines: 81
+    title: Insist on 4-byte ints
+    note: |
+      The on-disk structures use `uint`, which [[kernel/types.h]] defines as `unsigned
+      int`, and the kernel's `uint` is 4 bytes. If the host's `int` were a different size,
+      [[superblock]] and [[dinode]] would have a different layout in mkfs than in the
+      kernel, and [[xint]] would only handle part of each number. This refuses to compile
+      in that case instead of writing a corrupt image.
+
+  - lines: 83-86
+    title: Check the command line
+    note: |
+      At least the image name is required. With only that, mkfs would build a file system
+      containing nothing but an empty root directory.
+
+  - lines: 88-89
+    title: Inodes and directory entries must tile a block
+    note: |
+      A [[dinode]] is 64 bytes and a [[dirent]] 16, so both divide 1024 evenly: a block holds
+      exactly 16 inodes or 64 directory entries, and none straddles two blocks. [[winode]]
+      and [[rinode]] read one block and index into it, which would break if an inode could
+      cross a block boundary, and the kernel's [[IBLOCK]] makes the same assumption. These
+      are run-time `assert`s, checked when mkfs runs, although the
+      compiler could have checked them too.
+
+  - lines: 91-93
+    title: Create the image file
+    note: |
+      This is the host's `open`: create `fs.img` if it does not exist (`O_CREAT`), empty it
+      if it does (`O_TRUNC`), open it for reading and writing (`O_RDWR`, because
+      [[rsect]] reads back what [[wsect]] wrote). `0666` is the permission for a new file,
+      reduced by your umask (usually to `0644`). On failure [[die]] prints the reason, such
+      as "Permission denied".
+
+  - lines: 95-97
+    title: Count the metadata blocks
+    note: |
+      `nmeta` is everything before the data region: the boot block and superblock (`2`),
+      the log, the inode blocks and the bitmap. With the defaults that is
+      2 + 31 + 13 + 1 = 47, leaving `nblocks` = 2000 − 47 = 1953 data blocks.
+
+      The comment on line 95 is misleading. A file system [[g:block]] is 1024 bytes and
+      the disk device uses 512-byte sectors, so one block is *two* sectors; the kernel's
+      driver multiplies by 2 ([[kernel/virtio_disk.c:218]]). What is true is that mkfs's
+      own helpers, despite being called [[wsect]] and [[rsect]], work in 1024-byte blocks.
+
+  - lines: 99-106
+    title: Fill in the superblock
+    note: |
+      These are the fields [[kernel:readsb]] will read at boot, describing the layout (see
+      [[g:superblock]]). For the default image:
+
+      | Field | Value | Meaning |
+      |---|---|---|
+      | `magic` | `0x10203040` | marks an xv6 file system; [[kernel:fsinit]] checks it ([[kernel/fs.c:45]]) |
+      | `size` | 2000 | blocks in the image |
+      | `nblocks` | 1953 | data blocks |
+      | `ninodes` | 200 | inodes |
+      | `nlog` | 31 | log blocks (header + 30) |
+      | `logstart` | 2 | first log block |
+      | `inodestart` | 33 | first inode block |
+      | `bmapstart` | 46 | the bitmap block |
+
+      Each value is passed through [[xint]] to put it in RISC-V byte order, except `magic`
+      (see the note on [[xint]] for why that is harmless in practice). Running `mkfs` and
+      reading back block 1 of the image gives exactly these numbers.
+
+  - lines: 108-110
+    title: Report the layout
+    note: |
+      mkfs prints one line during `make`:
+
+      ```text
+      nmeta 47 (boot, super, log blocks 31, inode blocks 13, bitmap blocks 1) blocks 1953 total 2000
+      ```
+
+      It is worth reading when you change [[FSSIZE]], [[LOGBLOCKS]] or [[NINODES]]: it
+      shows how the regions moved.
+
+  - lines: 112
+    title: Data allocation starts after the metadata
+    note: |
+      Block 47 is the first data block, so it is the first one [[iappend]] hands out. Since
+      blocks are allocated in order and never freed, after mkfs is done the blocks in use
+      are exactly 0 to `freeblock − 1`, which is what [[balloc]] relies on at the end.
+
+  - lines: 114-115
+    title: Zero the whole image
+    note: |
+      Write 2000 blocks of zeros. This does two jobs. It makes `fs.img` exactly
+      2000 × 1024 = 2,048,000 bytes, the size QEMU presents as the disk. And it gives
+      every block known contents: later, [[rsect]] reads blocks that have not been written
+      yet (a fresh data block, a fresh [[g:indirect-block]]) and relies on them being zero.
+      Without this loop such reads would run past the end of the file, return fewer than
+      1024 bytes, and mkfs would stop with "read". Zero also means "free" everywhere in the
+      format: a zero inode type is a free inode, a zero block address is "no block yet".
+
+      Block 0, the boot block, is left as zeros forever; xv6 does not use it.
+
+  - lines: 117-119
+    title: Write the superblock into block 1
+    note: |
+      The struct is only 32 bytes, but [[wsect]] always writes a whole block, so it is
+      copied into the start of a zeroed 1024-byte buffer first. Copying `sb` straight to
+      the disk would also have written 992 bytes of whatever followed it in memory.
+
+  - lines: 121-122
+    title: Create the root directory's inode
+    note: |
+      The first [[ialloc]] call gets inode number 1, which the kernel expects to be the root
+      directory `/` ([[ROOTINO]]); [[kernel:namex]] starts every absolute path there. The `assert`
+      documents and enforces that ordering: if someone allocated another inode first, mkfs
+      would stop instead of producing an image whose `/` is a regular file.
+
+  - lines: 124-132
+    title: "Give the root its \".\" and \"..\" entries"
+    note: |
+      A [[g:directory]] is a file whose content is an array of [[dirent]] records (a 2-byte
+      inode number and a 14-byte name). Every xv6 directory starts with two entries: `.`,
+      naming the directory itself, and `..`, naming its parent. The root has no parent, so
+      both point at inode 1; `cd ..` in `/` stays in `/`. The kernel creates the same two
+      entries for a new directory in [[kernel:create]] ([[kernel/sysfile.c:302]]), and
+      [[kernel:isdirempty]] skips them when deciding whether a directory can be removed.
+
+      `bzero` clears the whole entry first, so the bytes after the name are zero (the
+      kernel compares names with [[kernel:namecmp]], which stops at a NUL or after 14 bytes).
+      [[xshort]] puts the inode number in disk byte order. [[iappend]] adds the 16 bytes at
+      the end of the root directory's content; the first call allocates block 47 for it.
+
+  - lines: 134-145
+    title: Copy each file into the image
+    note: |
+      The loop handles every remaining argument: `README` and the user programs
+      `user/_cat`, `user/_sh`, and so on ([[build:UPROGS]]).
+
+      Names in the image have no directory part. All files go straight into `/`, because
+      mkfs has no code for creating subdirectories. So the `user/` prefix is dropped, and
+      the `assert` stops mkfs if a name still contains a `/` (for example if someone added
+      `user/tests/_x` to the Makefile). `index` is the old BSD name of `strchr`: it returns
+      a pointer to the first `/`, or 0 if there is none.
+
+      `open(argv[i], 0)` opens the host file read-only (`O_RDONLY` is 0). Note that the
+      original name, with `user/`, is the one opened: only the name written into the image
+      is shortened.
+
+  - lines: 147-154
+    title: Drop the leading underscore
+    note: |
+      As the comment says, the Makefile names the compiled programs `_cat`, `_rm` and so on
+      ([[Makefile:106]]) so that, on your computer, nothing (a shell, a script) mistakes
+      `user/_rm` for the system's `rm`. Inside xv6 the program is called `rm`, so the `_`
+      is removed here. `shortname += 1` moves the pointer past the first character.
+
+      The name must then fit in [[DIRSIZ]] (14) characters, the size of the name field of
+      a [[dirent]]. Exactly 14 is allowed: the name is then stored without a terminating
+      NUL, which the kernel handles (see [[kernel/fs.h:56]]).
+
+  - lines: 156-161
+    title: Allocate the file's inode and link it into /
+    note: |
+      [[ialloc]] creates a regular-file inode (`T_FILE`) with [[g:link-count]] 1: the one
+      directory entry added right after. The entry is built like the `.` and `..` entries
+      and appended to the root directory. `strncpy` copies at most 14 bytes and, because
+      `de` was zeroed, a shorter name is NUL-padded.
+
+      With the default build, the files get inode numbers in command-line order: `README`
+      is 2, `cat` 3, `echo` 4, and so on up to `sync`, 22.
+
+  - lines: 163-167
+    title: Copy the file's contents
+    note: |
+      Read the host file 1024 bytes at a time and append each chunk to the new inode with
+      [[iappend]], until `read` returns 0 (end of file). The last chunk is usually shorter;
+      `cc` is the byte count actually read, so the file's size in the image is exactly its
+      size on your computer. A `read` error (-1) also ends the loop, silently.
+
+  - lines: 169-174
+    title: Round the root directory's size up to a whole block
+    note: |
+      After the loop the root directory holds 2 + 21 entries of 16 bytes, so its `size` is
+      368. These lines round `size` up to the end of its block, 1024. The slots beyond the
+      real entries are zero, and an entry with inode number 0 means "empty slot" to the
+      kernel. So `/` now looks like a directory with 41 free slots, and [[kernel:dirlink]], which
+      scans `0 .. size` for an empty slot before appending ([[kernel/fs.c:633]]), fills them
+      before growing the directory. xv6 does not say why it does this; the kernel would
+      work without it, since it writes at offset `size` when no slot is free.
+
+      The formula always adds a block: if the entries had exactly filled a block, `size`
+      would grow past the blocks actually allocated. With 64 entries per block that does
+      not happen with the default file list.
+
+      [[rinode]] and [[winode]] read and write the inode, and [[xint]] converts the size
+      both ways.
+
+  - lines: 176-179
+    title: Write the free bitmap and finish
+    note: |
+      All allocation is done, so [[balloc]] can mark blocks 0 to `freeblock − 1` as used in
+      the [[g:free-bitmap]]. With the user programs built here mkfs prints
+      `balloc: first 1006 blocks have been allocated`: 47 metadata blocks and 959 blocks of
+      directory, file data and indirect blocks. The exact count depends on how large your
+      compiler makes the programs.
+
+      `exit(0)` closes `fsfd` and tells make that the image was built.
+
+  - lines: 181-188
+    title: "wsect: write one block of the image"
+    note: |
+      Writes 1024 bytes from `buf` as block number `sec`: move the file offset to
+      `sec × 1024` with `lseek` (the `0` is `SEEK_SET`, "from the start of the file"), then
+      `write`. Despite the name, `sec` is a file system [[g:block]] number, not a disk
+      sector. Any failure, including a short write, stops mkfs through [[die]]; there is no
+      point continuing with a damaged image.
+
+      The kernel's equivalent is [[kernel:bwrite]], which goes through the [[g:buffer-cache]] and
+      the disk driver. mkfs needs none of that: the disk is an ordinary file on the host.
+
+  - lines: 190-202
+    title: "winode: write one on-disk inode"
+    note: |
+      An inode is only 64 bytes, but the image is read and written in whole blocks, so
+      writing one inode is read-modify-write: [[IBLOCK]] finds the block holding inode
+      `inum` (`inum / 16 + 33` by default), [[rsect]] reads it, the inode is copied into
+      slot `inum % 16`, and [[wsect]] writes the block back. Reading first is what keeps the
+      other 15 inodes in that block intact.
+
+      `ip` must already be in disk byte order; callers convert the fields with
+      [[xint]]/[[xshort]] before calling. The kernel does the same job in [[kernel:iupdate]].
+
+  - lines: 204-215
+    title: "rinode: read one on-disk inode"
+    note: |
+      The reverse of [[winode]]: read the block that holds inode `inum` and copy the 64
+      bytes of slot `inum % 16` out. The result is still in disk byte order, which is why
+      callers wrap its fields in [[xint]].
+
+  - lines: 217-224
+    title: "rsect: read one block of the image"
+    note: |
+      The reading twin of [[wsect]]: seek to `sec × 1024` and read 1024 bytes into `buf`.
+      A short read means the block lies beyond the end of the file, which cannot happen
+      once [[main]] has zeroed all 2000 blocks; if it did, mkfs stops with "read".
+
+  - lines: 226-238
+    title: "ialloc: hand out the next inode"
+    note: |
+      Takes the next unused inode number and writes a fresh [[dinode]] for it: the given
+      type, [[g:link-count]] 1, size 0, and (from `bzero`) no data blocks and device numbers
+      0. Each field is converted to disk byte order.
+
+      There is no check against [[NINODES]]. A file that got inode number 200 or more
+      would lie beyond the `ninodes` the superblock declares (the kernel's
+      [[kernel:ialloc]] and [[kernel:ireclaim]] only look below it), and from number 208 on its
+      inode would be written into the bitmap block. With 22 inodes used by default this is
+      far away.
+
+      Compare the kernel's [[kernel:ialloc]], which has to *search* the inode blocks for one
+      whose type is 0, because inodes are freed and reused at run time.
+
+  - lines: 240-254
+    title: "balloc: write the free bitmap"
+    note: |
+      Called once, at the end, with the number of blocks used. Because mkfs allocates
+      blocks strictly in order, "used" is exactly the blocks `0 .. used − 1`: the
+      metadata plus everything [[iappend]] handed out. The loop sets bit `i % 8` of byte
+      `i / 8` for each of them, the same bit numbering the kernel's [[kernel:balloc]] and
+      [[kernel:bfree]] use ([[kernel/fs.c:77]]). So the kernel will never allocate a block that
+      already holds metadata or file data.
+
+      Only one bitmap block is written, at `sb.bmapstart` (46). The `assert` checks that
+      one is enough: a block has [[BPB]] = 8192 bits. The rest of the bitmap is zero (free)
+      from the initial zeroing.
+
+      Despite its name, this is not an allocator like the kernel's `balloc`; the
+      allocating is done by `freeblock++` in [[iappend]].
+
+  - lines: 256
+    title: A min macro
+    note: |
+      The smaller of two values, used by [[iappend]]. Each argument is parenthesized so
+      that expressions like `(fbn + 1) * BSIZE - off` are evaluated as a whole. As with any
+      such macro, an argument is evaluated twice, so it must not have side effects.
+
+  - lines: 258-270
+    title: "iappend: add bytes at the end of a file"
+    note: |
+      Appends `n` bytes from `xp` to the end of inode `inum`, allocating blocks as needed.
+      Every write into the image (directory entries and file contents) goes through here.
+
+      It reads the inode once into `din` and works on that copy, updating `din.addrs` as it
+      allocates blocks, and writes it back once at the end. `off` is the current file size,
+      which is where the new bytes go. `indirect` is exactly one block in size (256 four-byte
+      block numbers), so a whole [[g:indirect-block]] can be read into it.
+
+  - lines: 271-289
+    title: Find (or allocate) the block for the current offset
+    note: |
+      Each pass of the loop handles the part of the data that falls in one file block.
+      `fbn` ("file block number") is which block of the *file* the offset `off` is in;
+      the job is to turn it into a block number on the *disk*, `x`. This is the same
+      mapping the kernel's [[kernel:bmap]] does, written for mkfs.
+
+      - **Blocks 0–11** ([[NDIRECT]]) are listed directly in `din.addrs[fbn]`. A 0 entry
+        means the block has not been allocated, so the next free block is taken.
+      - **Blocks 12–267** are listed in the [[g:indirect-block]], whose own number is in
+        `din.addrs[NDIRECT]`. That block is allocated the first time it is needed (it is
+        already zero from the initial zeroing, so it starts out as 256 empty entries). Then
+        it is read, and if entry `fbn − 12` is 0, a data block is allocated and the updated
+        indirect block written back at once.
+
+      The `assert` stops at [[MAXFILE]] = 268 blocks (274,432 bytes), the largest file the
+      format can describe. The biggest program, `usertests`, needs 205 blocks.
+
+      Because of the allocation order, a large file is laid out as 12 data blocks, then its
+      indirect block, then the rest of its data. In the default image, `README` gets blocks
+      48–50, `cat` blocks 51–62, its indirect block is 63, and its remaining data starts at
+      64. Comparing entries with 0 needs no [[xint]], since 0 is 0 in either byte order.
+
+  - lines: 290-297
+    title: Copy into that block
+    note: |
+      `n1` is how many bytes go into this block: all that is left (`n`), or the room up to
+      the end of the block, `(fbn + 1) × 1024 − off`, whichever is smaller. The block is
+      read, the bytes are copied in at offset `off − fbn × 1024` within it, and it is
+      written back. Reading first matters when the append starts in the middle of a block
+      that already holds data, as with the second and later directory entries.
+
+      `bcopy(src, dst, n)` is the old BSD form of `memmove` with the source and destination
+      swapped. Then the counters advance and the loop handles the next block, if any.
+
+  - lines: 298-300
+    title: Save the new size and block list
+    note: |
+      Write the inode back with the new size and any block numbers added to `din.addrs`.
+      (Numbers added to the indirect block were already written by line 286.)
+
+  - lines: 302-307
+    title: "die: report a host error and stop"
+    note: |
+      `perror` prints `s`, a colon and the description of the last failed system call
+      (from `errno`), for example `fs.img: Permission denied`. Exiting with status 1 makes
+      `make` stop and report that building `fs.img` failed. The partly written image is
+      left behind (make deletes a failed target only if the Makefile asks for that with
+      `.DELETE_ON_ERROR`, and xv6's does not). Because that file is newer than its
+      inputs, a second `make` may consider it up to date; `rm fs.img` forces a rebuild.
+
+lines:
+  8: |
+    Rename every later use of the word `stat` to `xv6_stat`. [[kernel/stat.h]] defines a
+    `struct stat`, and the host's headers have their own `struct stat` (and a function
+    `stat`). Since this `#define` comes after the host headers, those keep their name,
+    while the xv6 header, included next, now declares `struct xv6_stat`, so the two no
+    longer collide. mkfs needs that header only for `T_DIR` and `T_FILE`.
+  28: |
+    One bit per block of the whole disk, 8192 ([[BPB]]) bits per bitmap block.
+  29: |
+    16 inodes ([[IPB]]) per block.
+  30: |
+    The log's header block plus [[LOGBLOCKS]] (30) blocks of logged data; see
+    [[kernel/log.c]].
+  81: |
+    A compile-time check; see the block note and [[g:static-assert]].
+  96: |
+    2 is the boot block plus the superblock.
+  99: |
+    Not converted with [[xint]], unlike the other fields; see the note on [[xint]].
+  104: |
+    The log starts right after the superblock.
+  105: |
+    The inodes follow the log: block 33.
+  106: |
+    The bitmap follows the inodes: block 46.
+  115: |
+    [[wsect]] block `i` full of zeros.
+  119: |
+    Block 1 is the superblock; block 0 stays empty.
+  122: |
+    The root must be inode 1 ([[ROOTINO]]).
+  125: |
+    `.` names the directory itself.
+  130: |
+    The root's `..` also names itself: it has no parent.
+  137: |
+    Compare only the first 5 characters: does the name start with `user/`?
+  138: |
+    Skip those 5 characters by moving the pointer.
+  142: |
+    Every file lands in `/`, so the remaining name must not contain a `/`.
+  151: |
+    `_cat` becomes `cat`.
+  154: |
+    The name must fit in a [[dirent]]'s 14-byte name field.
+  159: |
+    The entry points at the new inode, in disk byte order.
+  160: |
+    `strncpy` stops after [[DIRSIZ]] bytes; the rest of `de.name` is already zero.
+  163: |
+    `cc` is the number of bytes read, at most one block.
+  171: |
+    Current size of `/` in host byte order: 16 bytes per entry so far.
+  172: |
+    Round up to the end of the current block (and, if the size is already a multiple of
+    1024, one block further; see the block note).
+  176: |
+    Mark blocks 0 to `freeblock − 1` as in use.
+  184: |
+    Position the file at byte `sec × 1024`. `lseek` returns the new offset, so anything
+    else means failure.
+  186: |
+    Exactly 1024 bytes must be written.
+  197: |
+    Which block holds this inode. [[IBLOCK]] uses `sb.inodestart`, set in [[main]].
+  199: |
+    Treat the block as an array of 16 [[dinode]]s and point at slot `inum % 16`.
+  200: |
+    Struct assignment copies all 64 bytes.
+  213: |
+    Point at this inode's slot in the block that was read.
+  229: |
+    Take the next number and advance the counter (post-increment).
+  234: |
+    One link: the directory entry the caller adds next.
+  247: |
+    All used blocks must fit in a single bitmap block.
+  250: |
+    Set bit `i % 8` of byte `i / 8`: block `i` is in use.
+  253: |
+    Write the bitmap block, at the block number the superblock records.
+  269: |
+    Appending always starts at the current end of the file.
+  272: |
+    Which block of the file the offset falls in.
+  273: |
+    Never go past the 268 blocks an inode can address.
+  276: |
+    Take the next free block for this direct slot (post-increment).
+  281: |
+    The file just grew past 12 blocks: allocate its indirect block.
+  283: |
+    Read the indirect block's 256 entries.
+  285: |
+    Allocate a data block and record it in the indirect block.
+  286: |
+    Write the updated indirect block back at once, so the next pass reads the new entry.
+  288: |
+    `x` is the disk block that holds file block `fbn`.
+  290: |
+    Bytes for this block: the rest of the data, or up to the block's end.
+  292: |
+    Copy `n1` bytes from the caller's data to the right place inside the block.
+  298: |
+    The new size is where the last byte ended.

@@ -1,0 +1,835 @@
+title: A keystroke's journey
+group: Devices and putting it all together
+prerequisites: [5, 9, 16]
+summary: |
+  The shell has printed `$ ` and is waiting. You press `l`, then `s`, then Enter. Within a
+  fraction of a millisecond each letter appears on your screen, and after Enter the shell
+  has the line `"ls\n"` in its buffer. No program put those letters on the screen: the
+  kernel did, from inside an interrupt handler, before any process had seen them.
+
+  This tour follows those three keystrokes from the wire into the shell's memory: the
+  [[g:uart|UART]] raising its interrupt line, the [[g:plic|PLIC]] handing it to one of the
+  three harts, [[kernel:uartintr]] pulling the byte out of the chip, and
+  [[kernel:consoleintr]] echoing it and editing the line under `cons.lock`. Then the line
+  completes, [[kernel:wakeup]] finds the sleeping shell, and [[kernel:consoleread]] copies
+  the bytes out, one per system call.
+
+  The input side of the console is a small producer/consumer problem. The producer is an
+  interrupt handler that may run on **any** hart at **any** moment; the consumer is a
+  process that may run on a different hart. One spinlock and the
+  [[g:sleep-wakeup|sleep/wakeup]] protocol keep them from losing a byte or a wakeup. Output
+  through `write` is the subject of [[tour:5]] and [[tour:38]]; here we only print the echo.
+cast: |
+  The machine has three [[g:hart|harts]]. When the tour starts:
+
+  | Hart | What it is doing |
+  |---|---|
+  | 0 | Running the shell `sh` (pid 2), which has just printed `$ `: the process this tour follows |
+  | 1 | Idle in its [[kernel:scheduler]], waiting in `wfi` |
+  | 2 | Idle in its [[kernel:scheduler]], waiting in `wfi` |
+
+  `init` (pid 1) is asleep in [[kernel:kwait]]. This is the first command typed since boot,
+  so the console's input buffer is empty and its three indices `r`, `w` and `e` are all 0.
+steps:
+  - title: The shell prints its prompt and asks for a line
+    file: user/sh.c
+    lines: 134-143
+    focus: 137-139
+    state:
+      hart: 0
+      mode: U
+      proc: sh (pid 2)
+      intr: on
+      satp: user
+      locks: []
+      stack: [main, getcmd]
+      sp: user
+    note: |
+      [[user:getcmd]] writes the prompt to file descriptor 2 (standard error, which is the
+      console, like 0 and 1). That `write` is the journey of [[tour:5]]. Then it clears the
+      100-byte `buf` and calls [[user:gets]] to fill it with one line.
+
+      The shell has no idea a keyboard exists. Its descriptor 0 is the [[g:console]] device
+      that [[user/init.c]] opened at boot, and every process inherited it. For the shell, a
+      line of typing is whatever `read(0, …)` returns.
+
+      If `gets` comes back with an empty buffer, `getcmd` returns -1 and the shell exits. You
+      will see how the kernel produces that "empty" answer when we reach control-D.
+    others: |
+      Harts 1 and 2 have nothing to run. Each sits in its [[kernel:scheduler]] loop
+      ([[kernel/proc.c:467]]) executing `wfi`, "wait for interrupt", which stops the hart
+      until an interrupt is pending. Keep them in mind: an idle hart is exactly the kind of
+      hart that will end up handling your keystrokes.
+
+  - title: gets reads one byte at a time
+    file: user/ulib.c
+    lines: 69-85
+    focus: 75-78
+    state:
+      hart: 0
+      mode: U
+      proc: sh (pid 2)
+      intr: on
+      satp: user
+      locks: []
+      stack: [main, getcmd, gets]
+      sp: user
+    note: |
+      [[user:gets]] calls `read(0, &c, 1)`: **one byte per system call**. For `"ls\n"` that is
+      three `read` calls, each a full trip into the kernel and back.
+
+      Why not ask for 100 bytes at once? Because `gets` must stop exactly at the newline, and
+      it cannot know where that is in advance. For the console this costs little, because
+      the kernel hands back at most one line per `read` anyway (you will see why). For a
+      file or a pipe it would matter: reading one byte at a time is the simplest way to
+      never consume bytes that belong to the *next* line.
+
+      The `read` stub puts `SYS_read` (5) in `a7` and executes `ecall`
+      ([[user/usys.S:24]]). From here to [[sys_read]] the path is the one in [[tour:5]].
+      If `read` returns less than 1 (0 at end of file, -1 on error), `gets` stops.
+
+  - title: The file layer hands the read to the console driver
+    file: kernel/file.c
+    lines: 104-130
+    focus: 114-119
+    state:
+      hart: 0
+      mode: S
+      proc: sh (pid 2)
+      intr: on
+      satp: kernel
+      locks: []
+      irq: 0
+      stack: [usertrap, syscall, sys_read, fileread]
+      sp: {"on": kernel, switched: "`ld sp, 8(a0)` in `uservec` ([[kernel/trampoline.S:76]]) when the shell executed `ecall`", detail: "sh's kernel stack, the page at 0x3fffffb000 (slot 1)"}
+    note: |
+      [[sys_read]] fetched its arguments and found `ofile[0]`, the shell's console
+      [[g:open-file]]. [[fileread]] sees `FD_DEVICE` with major number 1 ([[CONSOLE]]) and
+      calls `devsw[1].read`, a [[g:function-pointer]] that [[consoleinit]] set to
+      [[consoleread]] at boot ([[kernel/console.c:201]]).
+
+      The first argument, `1`, says "the destination is a *user* address". The same driver
+      function can be called with `0` and a kernel address; here it is the address of the
+      shell's local variable `c` in [[user:gets]].
+
+      No lock is held, and interrupts are on, as they are for most of every system call.
+
+      Hart 0's `sp` now points into the shell's **kernel stack** ([[concept:stacks#kernel]]),
+      the page that belongs to its process slot (slot 1, at 0x3fffffb000 in this build; its
+      top is 0x3fffffc000). It was empty when the shell executed `ecall`; `uservec` loaded its
+      top ([[kernel/trampoline.S:76]]), and it now holds `usertrap`, `syscall`, `sys_read`
+      and `fileread`. The shell's user stack, with `gets`'s `c` on it, waits unchanged.
+    others: |
+      The console's `struct file` is shared by `init` and the shell (it has a reference
+      count of 6: `init` opened it once and [[g:file-descriptor|dup]]'ed it to fds 1 and 2,
+      and the fork that created the shell copied all three). A console file has no offset,
+      so sharing it needs no lock here. The shared state that does need one is the input
+      buffer, next.
+
+  - title: The console's input buffer and its three indices
+    file: kernel/console.c
+    lines: 47-56
+    focus: 47-56
+    state:
+      hart: 0
+      mode: S
+      proc: sh (pid 2)
+      intr: off
+      satp: kernel
+      locks: [cons.lock]
+      irq: {noff: 1, intena: 1, note: "`acquire` found SIE on (the system call ran `intr_on` in `usertrap`), so it saved intena 1 ([[concept:locks#intena]])"}
+      stack: [usertrap, syscall, sys_read, fileread, consoleread]
+      sp: kernel
+    note: |
+      [[consoleread]]'s first act is `acquire(&cons.lock)` ([[kernel/console.c:95]]), so
+      look at what that lock protects. `cons` is one global structure: a 128-byte circular
+      buffer and three ever-increasing indices.
+
+      | Index | Meaning | Advanced by |
+      |---|---|---|
+      | `r` | next byte a reader will take | [[consoleread]] |
+      | `w` | end of the text that is *committed* (a whole line, readable) | [[consoleintr]], at Enter |
+      | `e` | end of the text typed so far, still *editable* | [[consoleintr]], at every key |
+
+      Always `r ≤ w ≤ e`. Bytes between `r` and `w` belong to readers; bytes between `w` and
+      `e` are a line still being edited, which backspace may take back. The indices are
+      `uint`s that only grow; `% INPUT_BUF_SIZE` turns them into array positions, the same
+      trick the pipe uses ([[tour:39]]).
+
+      Right now `r = w = e = 0`: nothing typed. And `cons.lock` is a [[g:spinlock]], so
+      hart 0 now has interrupts **off**. The irq strip shows how: `acquire`'s [[push_off]]
+      found `SIE` on (the system call turned it on in [[usertrap]]), so it recorded
+      `intena = 1` and set `noff` to 1; the release will turn interrupts back on
+      ([[concept:locks#intena]]). Remember that 1: in step 9 an interrupt handler takes the
+      same lock and records a 0.
+    others: |
+      The writer of `e` and `w` is an interrupt handler, which may run on any hart. The
+      reader is the shell. Without `cons.lock`, hart 2 could be storing a byte and moving
+      `w` while hart 0 compares `r` with `w`, and the shell could read a slot before the
+      byte in it is written. Every access to `cons` in [[kernel/console.c]] is made with
+      `cons.lock` held.
+
+  - title: Nothing to read. Register, then let go
+    file: kernel/console.c
+    lines: 87-108
+    focus: 99-104
+    state:
+      hart: 0
+      mode: S
+      proc: sh (pid 2)
+      intr: off
+      satp: kernel
+      locks: [cons.lock]
+      irq: {noff: 1, intena: 1, note: "[[killed]] and [[sleep_prepare]] each take `p->lock` for a moment: noff 2, then back to 1; line 105 drops it to 0 and turns SIE back on"}
+      stack: [usertrap, syscall, sys_read, fileread, consoleread]
+      sp: kernel
+    note: |
+      `cons.r == cons.w`: no committed line. The shell must wait, and it does so with the
+      two-step sleep of this version of xv6 ([[g:sleep-wakeup]]):
+
+      1. If the shell has been killed, give up with -1 instead of waiting for a key that
+         might never come. [[kkill]] both sets `killed` and makes a sleeping victim
+         `RUNNABLE`, so a killed shell gets here again promptly.
+      2. [[sleep_prepare]]`(&cons.r)` records "I am waiting on channel `&cons.r`" in
+         `p->chan`, **while `cons.lock` is still held**.
+      3. Only then release `cons.lock` (line 105) and call [[sleep]] (line 106).
+
+      The channel is the *address* of `cons.r`. Any unique address would do; this one says
+      what is being waited for: `r` to become different from `w`.
+
+      [[killed]] (line 100) and `sleep_prepare` each take the shell's `p->lock` for a moment
+      inside the `cons.lock` critical section. That nesting, `cons.lock` then `p->lock`, is the same
+      order [[consoleintr]] uses when it calls [[wakeup]], so the two can never deadlock
+      ([[tour:18]]).
+    others: |
+      Why register *before* releasing `cons.lock`? Because a key can arrive on another hart
+      at any instant:
+
+      | Time | Hart 0 (sh) | Hart 2 (Enter's interrupt) |
+      |---|---|---|
+      | t1 | sees `r == w` (holding `cons.lock`) | spins on `cons.lock` |
+      | t2 | `sleep_prepare`: `p->chan = &cons.r` | still spinning |
+      | t3 | releases `cons.lock` | gets it, commits the line, `wakeup(&cons.r)` clears `p->chan` |
+      | t4 | `sleep()`: sees `p->chan == 0`, returns at once | |
+
+      The check and the registration happen inside one `cons.lock` critical section, so a
+      wakeup cannot fall between them. A wakeup that falls between the release and
+      `sleep()` clears `p->chan`, and `sleep` does not block. Either way the shell cannot
+      miss its line.
+
+  - title: The shell goes to sleep and hart 0 goes idle
+    file: kernel/proc.c
+    lines: 558-572
+    focus: 567-569
+    state:
+      hart: 0
+      mode: S
+      proc: sh (pid 2)
+      intr: off
+      satp: kernel
+      locks: ["sh's p->lock"]
+      irq: {noff: 1, intena: 1, note: "only `p->lock`, as [[sched]] demands; the 1 came from SIE being on again after line 105, and `sched` saves it across `swtch` ([[concept:locks#sched-intena]])"}
+      stack: [usertrap, syscall, sys_read, fileread, consoleread, sleep]
+      sp: kernel
+    note: |
+      [[sleep]] takes the shell's `p->lock`. `p->chan` is still `&cons.r` (no key yet), so it
+      marks the shell `SLEEPING` and calls [[sched]], which [[swtch|switches]] to hart 0's
+      scheduler thread. [[sched]] insists that `p->lock` is the *only* lock held
+      (`noff == 1`, [[kernel/proc.c:487]]). That is why `cons.lock` had to be released first:
+      a hart that slept holding `cons.lock` would leave every keystroke handler spinning
+      forever.
+
+      The shell is now frozen inside `consoleread`, its kernel stack preserved. It occupies
+      no hart. Hart 0's scheduler releases the shell's `p->lock`, finds nothing `RUNNABLE`,
+      and executes `wfi`, like the others.
+
+      All three harts are idle. The machine is waiting for you.
+
+      Here is what "frozen" means. `swtch` stores the shell's `sp` and `ra` in its
+      `p->context` and loads hart 0's scheduler `sp` ([[kernel/swtch.S:26]]). The shell's
+      frames stay exactly where they were:
+
+      ```text
+      sh's kernel stack (slot 1)            hart 0's scheduler stack (stack0, slice 0)
+        top ─► usertrap                       top ─► start, main (from boot)
+               syscall                               scheduler   ◄─ sp, after swtch
+               sys_read
+               fileread
+               consoleread
+               sleep
+               sched    ◄─ saved in sh's p->context.sp
+      ```
+
+      Nothing runs on the shell's kernel stack until some scheduler `swtch`es back to it.
+    others: |
+      Every scheduler scans the process table taking each `p->lock`. Because the shell sets
+      `SLEEPING` and switches away while *holding* its `p->lock`, no scheduler can see a
+      half-asleep shell, and a [[wakeup]] on another hart sees it either still registered
+      and running, or fully asleep, never in between ([[tour:16]]).
+
+  - title: You press l. Hart 2 takes the interrupt
+    file: kernel/trap.c
+    lines: 182-212
+    focus: 190-199
+    state:
+      hart: 2
+      mode: S
+      proc: none (scheduler)
+      intr: off
+      satp: kernel
+      locks: []
+      irq: 0
+      stack: [scheduler, kernelvec, kerneltrap, devintr]
+      sp: {"on": scheduler, detail: "hart 2's slice of stack0, with a `kernelvec` frame on top"}
+    note: |
+      Your terminal sends the byte `0x6c` (`l`). QEMU's emulated UART puts it in its receive
+      FIFO, sets bit 0 of `LSR` ("data ready"), and, because [[uartinit]] enabled receive
+      interrupts, raises its interrupt line, IRQ 10 ([[UART0_IRQ]]). The [[g:plic|PLIC]] has
+      that IRQ enabled for every hart ([[plicinithart]]), so it signals a supervisor external
+      interrupt to all three.
+
+      All three are in `wfi` with interrupts off. `wfi` still wakes up, because the RISC-V
+      spec says it resumes when a locally enabled interrupt is pending, whatever the global
+      `SIE` bit says. Each woken hart goes round its loop to `intr_on()` ([[kernel/proc.c:441]]).
+      The first to get there takes the trap; a hart that arrives after that hart's claim has
+      lowered the signal takes no trap at all and just rescans (often only one hart traps,
+      [[tour:9]]). Here hart 2 gets there first: [[kernelvec]], [[kerneltrap]]
+      ([[tour:8]]), and [[devintr]].
+
+      `scause` is `0x8000000000000009`, supervisor external interrupt. [[plic_claim]] asks
+      the PLIC which device: 10, the UART. So [[uartintr]] runs, on a hart that has no
+      process at all. Interrupt handlers serve the machine, not whoever happens to be
+      running.
+
+      Which stack does the handler run on? xv6 has no separate interrupt stack
+      ([[concept:stacks]]): `kernelvec` pushes a 256-byte frame of saved registers onto whatever
+      stack `sp` points into ([[kernel/kernelvec.S:14]]). So a keystroke lands on whichever
+      stack the claiming hart happened to be using:
+
+      | The hart was… | Trap path | The handler runs on |
+      |---|---|---|
+      | idle in [[scheduler]] (**this tour**) | `kernelvec` → `kerneltrap` | that hart's **scheduler stack**, above `scheduler`'s frame |
+      | in the kernel for a process, interrupts on | `kernelvec` → `kerneltrap` | that **process's kernel stack**, above its system-call frames |
+      | running a program in user mode | `uservec` → `usertrap` | that **process's kernel stack**, empty until `uservec`'s `ld sp` |
+
+      Here all three harts are idle, so it is the first case:
+
+      ```text
+      hart 2's scheduler stack (its 4 KiB slice of stack0, top 0x8000a890)
+        top ─► start, main      (from boot)
+               scheduler        interrupted in its intr_on()/intr_off() window
+               kernelvec frame  256 bytes: the interrupted code's registers
+               kerneltrap
+               devintr          ◄─ sp
+      ```
+
+      In a gdb run of this build that typed `ls | wc` at an idle machine, all eight keystrokes
+      were handled this way, on harts 0, 1 and 2, and `sp` on entry to `consoleintr` was always
+      496 bytes below the top of that hart's slice (0x8000a6a0 on hart 2), 528 once
+      `consoleintr` had pushed its own 32-byte frame.
+    others: |
+      Harts 0 and 1 may have woken for the same signal; if they reach `intr_on` before hart
+      2's claim, they trap too and their claim returns 0. The PLIC arbitrates the claim
+      itself: a claim atomically returns the highest pending IRQ and clears its pending
+      bit, so exactly one hart gets 10 and any other gets 0, which [[devintr]] treats as
+      "nothing" ([[tour:9]]). No kernel lock is needed. In our traced runs the keystroke
+      interrupts landed on all three harts, varying from key to key.
+
+  - title: uartintr pulls the byte out of the chip
+    file: kernel/uart.c
+    lines: 122-155
+    focus: 141-154
+    state:
+      hart: 2
+      mode: S
+      proc: none (scheduler)
+      intr: off
+      satp: kernel
+      locks: []
+      irq: 0
+      stack: [scheduler, kernelvec, kerneltrap, devintr, uartintr]
+      sp: {"on": scheduler, detail: "hart 2's slice of stack0, with a `kernelvec` frame on top"}
+    note: |
+      The UART has one interrupt line for both directions, so [[uartintr]] does both jobs
+      every time:
+
+      - Reading `ISR` is the "acknowledge" the comment means, but on a 16550 that read only
+        clears a *transmitter-empty* request; a received-data request goes away only when
+        the receive FIFO is emptied, below.
+      - If the transmitter is idle, `wakeup(&tx_chan)` wakes any writer waiting in
+        [[uartwrite]] ([[tour:38]]). Nobody is writing now, so this visits all 64 process
+        slots and finds no one asleep on it. It is harmless, and the simplest correct thing: the handler
+        cannot cheaply tell *why* it was called.
+      - Then a loop: [[uartgetc]] checks `LSR` bit 0 and, while a byte is waiting, reads
+        `RHR`, which removes it from the chip's FIFO. Each byte goes to [[consoleintr]].
+
+      The loop drains the FIFO, so if you typed two keys faster than the interrupt was
+      handled, one interrupt delivers both. Here it delivers one: `0x6c`.
+
+      After `uartintr` returns, [[devintr]] calls [[plic_complete]]`(10)`. Until then the
+      PLIC will not signal IRQ 10 again, which is why a second keystroke can never start a
+      second `uartintr` on another hart while this one runs.
+
+      One comes almost at once anyway: the echo in [[consoleintr]] wrote `THR`, and since
+      [[uartinit]] enabled transmit interrupts, the UART raises a "transmitter empty"
+      request when that byte has gone. The PLIC holds it until `plic_complete(10)` and then
+      signals again. That second `uartintr`, on whichever hart claims it, finds no input:
+      its `ISR` read clears the transmit request, it runs the `wakeup(&tx_chan)` scan, and
+      returns. In a gdb run of this build, every keystroke caused exactly two `uartintr`
+      calls.
+
+  - title: consoleintr echoes l and stores it
+    file: kernel/console.c
+    lines: 146-190
+    focus: 169-177
+    state:
+      hart: 2
+      mode: S
+      proc: none (scheduler)
+      intr: off
+      satp: kernel
+      locks: [cons.lock]
+      irq: {noff: 1, intena: 0, note: "the same `cons.lock` as in step 4, but taken inside a trap handler with SIE already off, so intena is 0 ([[concept:locks#handlers]])"}
+      stack: [scheduler, kernelvec, kerneltrap, devintr, uartintr, consoleintr]
+      sp: {"on": scheduler, detail: "hart 2's slice of stack0, with a `kernelvec` frame on top"}
+    note: |
+      [[consoleintr]] takes `cons.lock`. `l` is not a control character, so it reaches the
+      `default` case:
+
+      - `c != 0` and `e - r < 128`: there is room. A full buffer drops the key silently.
+      - `\r` would become `\n` (Enter, in a moment).
+      - [[consputc]] **echoes** it: the `l` you see on screen comes from here, not from any
+        program. That is [[g:line-editing]]: the kernel shows you what you are typing even
+        though nobody has read it yet.
+      - `cons.buf[0] = 'l'`, and `e` becomes 1.
+
+      `w` does not move. The `l` is typed but not committed, so no wakeup: the shell sleeps
+      on. Apart from control-D and a full buffer (next step), a reader never sees half a
+      line, which is what lets backspace work.
+
+      Compare the irq strip with step 4. Same lock, but this `acquire` ran inside a trap
+      handler, where `SIE` was already off, so it recorded `intena = 0`, and the release on
+      line 189 will leave interrupts off, as [[kerneltrap]] needs. And because `SIE` is
+      always off while `noff > 0`, this interrupt could never have landed on hart 0 while
+      the shell held `cons.lock` there: a handler never spins on a lock held by the code it
+      interrupted ([[concept:locks#invariant]], [[concept:locks#handlers]]).
+    others: |
+      Suppose hart 0 were still inside [[consoleread]] holding `cons.lock` (for example
+      while copying a byte out). Hart 2 would spin here in `acquire`, with interrupts off,
+      until hart 0 released it. The critical sections are a few dozen instructions, so the
+      spin is short. Without the lock, hart 2 could move `e` while hart 0 reads `w` and
+      `buf`, and a reader could see a slot before its byte is stored.
+
+  - title: The echo spins on the UART, interrupts off
+    file: kernel/uart.c
+    lines: 98-120
+    focus: 105-119
+    state:
+      hart: 2
+      mode: S
+      proc: none (scheduler)
+      intr: off
+      satp: kernel
+      locks: [cons.lock]
+      irq: {noff: 2, intena: 0, note: "`cons.lock` plus the push_off in [[uartputc_sync]] ([[concept:locks#noff]])"}
+      stack: [scheduler, kernelvec, kerneltrap, devintr, uartintr, consoleintr, consputc, uartputc_sync]
+      sp: {"on": scheduler, detail: "hart 2's slice of stack0, with a `kernelvec` frame on top"}
+    note: |
+      [[consputc]] sends the byte with [[uartputc_sync]]: spin until `LSR` says the
+      transmitter can take a byte, then write `THR`.
+
+      Why spin rather than sleep like [[uartwrite]]? Because there is nothing to put to
+      sleep. This code runs in an interrupt handler, on whatever stack the hart was using
+      (here the scheduler's; often an unrelated process's kernel stack), with `cons.lock`
+      held. [[sleep]] would need
+      a process of its own and would have to drop every spinlock first. A byte takes about a
+      quarter of a millisecond at 38,400 baud on real hardware, and much less on QEMU, so
+      spinning is the cheap option.
+
+      [[push_off]] here nests: `acquire(&cons.lock)` already did one (`noff` 1), this makes
+      2, and [[pop_off]] brings it back to 1. Interrupts stay off throughout
+      ([[concept:locks#noff]]).
+
+      Note what the echo does *not* take: `tx_lock`, the sleep-lock that orders `write`
+      output. So your echoed letters can land between the bytes of another process's
+      output. [[tour:38]] shows that happening.
+
+  - title: s, and what backspace and control-U would do
+    file: kernel/console.c
+    lines: 146-168
+    focus: 155-167
+    state:
+      hart: 1
+      mode: S
+      proc: none (scheduler)
+      intr: off
+      satp: kernel
+      locks: [cons.lock]
+      irq: {noff: 1, intena: 0}
+      stack: [scheduler, kernelvec, kerneltrap, devintr, uartintr, consoleintr]
+      sp: {"on": scheduler, detail: "hart 1's slice of stack0, with a `kernelvec` frame on top"}
+    note: |
+      You press `s`. This time hart 1 claims the interrupt, and the same path stores
+      `buf[1] = 's'`, `e = 2`, and echoes `s`. Which hart handles a key does not matter: they
+      all share `cons`, and `cons.lock` serializes them.
+
+      Had you mistyped, this is where it would be fixed, before any program sees it:
+
+      - **Backspace** (`^H`, or the Delete key, `0x7f`, which most terminals send): if
+        `e != w`, step `e` back one and erase the character on screen with `\b`, space,
+        `\b`. The test `e != w` stops it at the start of the uncommitted text: a line already
+        handed to a reader cannot be taken back.
+      - **Control-U** (kill line): erase backwards until `e` reaches `w` or the character
+        before `e` is a newline.
+
+      Neither touches `r` or `w`, so neither needs to wake anyone. Erasing is cheap because
+      the line is still entirely the kernel's.
+    others: |
+      Two keys in quick succession could be handled on different harts, but never at the
+      same time. The PLIC will not re-signal IRQ 10 until the first handler's
+      [[plic_complete]], and even if it could, `cons.lock` would make the second
+      [[consoleintr]] wait.
+
+      Hart 1 runs this handler on **its own** scheduler stack, a different 4 KiB slice of
+      `stack0` with its own `sp`, not on hart 2's. Each hart carries its own `sp`; the only
+      thing the two handlers share is `cons`, in global memory.
+
+  - title: Enter commits the line and wakes the reader
+    file: kernel/console.c
+    lines: 169-186
+    focus: 170-184
+    state:
+      hart: 2
+      mode: S
+      proc: none (scheduler)
+      intr: off
+      satp: kernel
+      locks: [cons.lock]
+      irq: {noff: 1, intena: 0}
+      stack: [scheduler, kernelvec, kerneltrap, devintr, uartintr, consoleintr]
+      sp: {"on": scheduler, detail: "hart 2's slice of stack0, with a `kernelvec` frame on top"}
+    note: |
+      You press Enter. The terminal sends `\r` (13), carriage return; our trace of a real run
+      shows exactly `108, 115, 13` arriving. Hart 2 claims it.
+
+      Line 171 turns `\r` into `\n`, so programs see Unix newlines. The echo moves the
+      cursor to the next line, `buf[2] = '\n'`, `e = 3`. Then line 179: a newline completes
+      the line, so `w = e = 3`. The three bytes `l`, `s`, `\n` are now committed, and
+      `wakeup(&cons.r)` tells anyone waiting on that channel.
+
+      Two other conditions also commit: control-D (end of file, below) and a full buffer
+      (`e - r == 128`). The full-buffer rule makes sure a reader can always drain the
+      buffer, so a 200-character line cannot jam the console forever.
+    others: |
+      The wakeup is issued **inside** `cons.lock`. Combined with the shell registering
+      inside the same lock, this gives the shell a clean view: either it saw `r != w` under
+      the lock and never slept, or it registered before this commit and this wakeup will
+      find it.
+
+  - title: wakeup finds the shell
+    file: kernel/proc.c
+    lines: 574-595
+    focus: 580-594
+    state:
+      hart: 2
+      mode: S
+      proc: none (scheduler)
+      intr: off
+      satp: kernel
+      locks: [cons.lock, each p->lock in turn]
+      irq: {noff: 2, intena: 0}
+      stack: [scheduler, kernelvec, kerneltrap, devintr, uartintr, consoleintr, wakeup]
+      sp: {"on": scheduler, detail: "hart 2's slice of stack0, with a `kernelvec` frame on top"}
+    note: |
+      [[wakeup]] visits all 64 slots of the process table. For each it takes `p->lock` (so
+      hart 2 now holds two spinlocks, `cons.lock` then a `p->lock`) and compares `p->chan`
+      with `&cons.r`.
+
+      The shell matches. Its `chan` is cleared and, since it is fully `SLEEPING`, it becomes
+      `RUNNABLE`. A waiter can be in one of three states when the wakeup comes, and each is
+      handled:
+
+      | Shell's state | What wakeup does | What happens next |
+      |---|---|---|
+      | not registered yet | nothing | it will check `r != w` under `cons.lock` and not sleep |
+      | registered, still running | clears `chan` | its `sleep()` returns at once |
+      | `SLEEPING` | clears `chan`, sets `RUNNABLE` | a scheduler will run it |
+
+      Then `consoleintr` releases `cons.lock`, `uartintr` finds no more bytes, and hart 2
+      returns from the trap into its scheduler loop.
+    others: |
+      `p->lock` protects `p->chan` and `p->state` against the shell itself (in
+      [[sleep_prepare]] and [[sleep]]) and against every scheduler. Lock order here is
+      `cons.lock` → `p->lock`, the same as in [[consoleread]] → [[killed]] / [[sleep_prepare]]. If any
+      code took them in the opposite order, two harts could each hold one and wait forever
+      for the other.
+
+  - title: Some hart picks the shell up
+    file: kernel/proc.c
+    lines: 428-470
+    focus: 447-453
+    state:
+      hart: 0
+      mode: S
+      proc: none (scheduler)
+      intr: off
+      satp: kernel
+      locks: ["sh's p->lock"]
+      irq: {noff: 1, intena: 0, note: "the scheduler takes `p->lock` after `intr_off()` (line 442), so intena 0; after `swtch`, [[sched]] gives the shell back its own saved intena 1"}
+      stack: [scheduler]
+      sp: {"on": scheduler, switched: "`ld sp, 8(a1)` in [[swtch]] ([[kernel/swtch.S:26]]), when the shell slept in step 6", detail: "hart 0's slice of stack0"}
+    note: |
+      The shell is `RUNNABLE`, but no hart is told. Schedulers are not notified; each one
+      notices on its next scan of the table. Hart 2 will scan as soon as it returns from the
+      trap. Hart 0 scans whenever its `wfi` ends, on its next timer tick (about every
+      0.1 s) or on an external-interrupt signal like the one that just went to all harts.
+      And one such signal is due: Enter's echo went out before the wakeup, so its
+      "transmitter empty" interrupt re-signals all harts right after `plic_complete`, just
+      after the shell became `RUNNABLE`. That is a likely reason an idle hart picks the
+      shell up within microseconds rather than at the next tick.
+
+      In this telling hart 0 gets there first: it takes the shell's `p->lock`, sees
+      `RUNNABLE`, marks it `RUNNING`, and [[swtch|switches]] to it ([[tour:12]]). The shell
+      resumes inside [[sleep]] on hart 0, and since `sleep` releases `p->lock` on the way
+      out, it returns into [[consoleread]] with no locks. In our traced runs the shell
+      resumed on hart 1 in one run and hart 2 in another: which hart wins is a race, and it
+      does not matter.
+
+      On the stacks, the switch at line 453 is the mirror of step 6. `swtch` saves hart 0's
+      scheduler `sp` in `cpus[0].context` and loads the shell's saved `sp`
+      ([[kernel/swtch.S:26]]), which points into the shell's kernel stack at `sched`'s frame,
+      exactly where step 6 left it. Had hart 1 won the race instead, the same kernel stack would
+      simply have been resumed from hart 1: the stack belongs to the shell's process slot, not to a hart.
+    others: |
+      | Time | Hart 0 | Hart 2 |
+      |---|---|---|
+      | t1 | `acquire(&sh->lock)` | returns from the trap, scanning `init`'s slot |
+      | t2 | `RUNNABLE`: set `RUNNING`, `swtch` | `acquire(&sh->lock)`: spins |
+      | t3 | (shell runs; `sleep` releases its lock) | gets the lock, sees `RUNNING`, moves on |
+
+      The check-and-set of `p->state` is done under `p->lock`, so two harts can never both
+      decide to run the same process.
+
+  - title: consoleread takes one byte and returns
+    file: kernel/console.c
+    lines: 87-138
+    focus: 110-133
+    state:
+      hart: 0
+      mode: S
+      proc: sh (pid 2)
+      intr: off
+      satp: kernel
+      locks: [cons.lock]
+      irq: {noff: 1, intena: 1, note: "`sched` restored the shell's intena 1, `sleep`'s release turned SIE on, and line 107's `acquire` recorded 1 again"}
+      stack: [usertrap, syscall, sys_read, fileread, consoleread]
+      sp: {"on": kernel, switched: "`ld sp, 8(a1)` in [[swtch]] ([[kernel/swtch.S:26]]), in hart 0's scheduler", detail: "sh's kernel stack, the frames from step 6 intact"}
+    note: |
+      Back in [[consoleread]], the shell retakes `cons.lock` (line 107) and checks again.
+      It always re-checks, because a wakeup only means "something may have changed". Now
+      `r = 0`, `w = 3`, so it takes `buf[0]`, `l`, and `r` becomes 1.
+
+      [[either_copyout]] with `user_dst = 1` calls [[copyout]], which walks the shell's page
+      table in software and stores the byte into `c` on the shell's user stack
+      ([[tour:28]]). This happens with `cons.lock` held and interrupts off. That is allowed
+      because `copyout` never sleeps: at worst it allocates a page with [[kalloc]], which
+      only takes another spinlock.
+
+      `n` drops to 0, so the loop ends after one byte (had `gets` asked for more, it would
+      have stopped at the `\n` instead, line 129). `consoleread` releases the lock and
+      returns 1. [[tour:5]]'s return path carries the 1 back to user mode.
+    others: |
+      Now the scenario where keys arrive on one hart while the shell reads on another.
+      Suppose you are quick and type `w` while hart 0 is inside this critical section:
+
+      | Time | Hart 0 (sh, `consoleread`) | Hart 2 (UART interrupt for `w`) |
+      |---|---|---|
+      | t1 | holds `cons.lock`, `c = buf[0]` | `uartintr` → `consoleintr`: `acquire` spins, interrupts off |
+      | t2 | copies `l` to the user, `r = 1` | spinning |
+      | t3 | `release(&cons.lock)` | gets the lock, echoes `w`, `buf[3] = 'w'`, `e = 4` |
+
+      The `w` waits a few microseconds and nothing is lost. It sits uncommitted after the
+      `\n`, the start of your *next* command, and the shell's reads of `s` and `\n` never
+      see it.
+
+  - title: The rest of the line arrives without sleeping
+    file: user/ulib.c
+    lines: 69-85
+    focus: 75-83
+    state:
+      hart: 0
+      mode: U
+      proc: sh (pid 2)
+      intr: on
+      satp: user
+      locks: []
+      stack: [main, getcmd, gets]
+      sp: {"on": user, switched: "`ld sp, 48(a0)` in `userret` ([[kernel/trampoline.S:118]]) and `sret` ([[kernel/trampoline.S:153]])", detail: "sh's kernel stack is empty again"}
+    note: |
+      [[user:gets]] stores `l` and loops. The second `read` finds `r = 1 < w = 3` at once,
+      takes `s`, returns 1. The third takes `\n`, returns 1, and `gets` stops at the
+      newline. `buf` is now `"ls\n"` followed by a 0 byte.
+
+      So typing one command cost: six UART interrupts (three bringing your bytes, and three
+      more raised when the transmitter finished sending each echo), each with a fruitless
+      64-slot `wakeup(&tx_chan)` scan, three echoes, three `read` system calls, and exactly
+      **one** sleep and **one** wakeup of the shell.
+
+      For a longer command the arithmetic is the same: `ls | wc` plus Enter is 8 bytes, so
+      8 one-byte `read` calls: the first sleeps until Enter commits the line, and the other
+      seven return at once.
+
+      On the way out, `userret` loaded the shell's user `sp` from the trapframe
+      ([[kernel/trampoline.S:118]]). From that instruction until `sret` the hart is still in
+      supervisor mode, which cannot use user pages, so it has no usable stack; `sret` makes
+      the user stack usable. After it, the shell's kernel stack holds
+      nothing at all, and each of the next two `read`s starts it again from the top.
+    others: |
+      While the shell is in user mode it holds nothing. Any hart can be in
+      [[consoleintr]] now, appending your next keystrokes after `w`. The shell will not see
+      them until you press Enter again.
+
+  - title: "Control-D: end of file from a keyboard"
+    file: kernel/console.c
+    lines: 99-137
+    focus: 110-119
+    state:
+      hart: 0
+      mode: S
+      proc: sh (pid 2)
+      intr: off
+      satp: kernel
+      locks: [cons.lock]
+      irq: {noff: 1, intena: 1}
+      stack: [usertrap, syscall, sys_read, fileread, consoleread]
+      sp: {"on": kernel, switched: "`ld sp, 8(a1)` in [[swtch]] ([[kernel/swtch.S:26]]): the `read` slept until `^D` committed the line, and a scheduler switched back to the shell"}
+    note: |
+      A keyboard has no end, so the console needs a way to say "end of file". In xv6 it is
+      control-D (byte 4). [[consoleintr]] stores it like a character and commits the line
+      at once ([[kernel/console.c:179]]), even with no newline.
+
+      When `consoleread` meets it:
+
+      - If nothing has been copied yet in this call (`n == target`), the `^D` is consumed
+        and `read` returns **0**, the end-of-file answer.
+      - If some bytes were already copied, `r--` puts the `^D` back, so this `read` returns
+        just those bytes and the *next* one returns 0.
+
+      Type `hi` then control-D to `cat`: its `read(0, buf, 512)` returns 2, the next returns
+      0, and `cat` ends. To the shell, which reads one byte at a time, control-D at the start
+      of a line gives `gets` an empty buffer; `getcmd` returns -1, the shell exits, and
+      `init` prints `init: starting sh` and starts a new one ([[user/init.c]]).
+    others: |
+      Note that `^D` is also echoed by the default case before it is stored: byte 4 goes to
+      your terminal, which normally shows nothing for it.
+
+  - title: "Control-P: a process listing from inside the interrupt"
+    file: kernel/proc.c
+    lines: 673-703
+    focus: 692-701
+    state:
+      hart: 2
+      mode: S
+      proc: none (scheduler)
+      intr: off
+      satp: kernel
+      locks: [cons.lock]
+      irq: {noff: 1, intena: 0, note: "between `printk` calls; inside each one `pr.lock` makes 2 and each character's `uartputc_sync` makes 3, tying the deepest nesting in the kernel ([[concept:locks#nesting]])"}
+      stack: [scheduler, kernelvec, kerneltrap, devintr, uartintr, consoleintr, procdump]
+      sp: {"on": scheduler, detail: "hart 2's slice of stack0, with a `kernelvec` frame on top"}
+    note: |
+      Control-P (byte 16) never reaches `cons.buf`. [[consoleintr]] calls [[procdump]]
+      straight from the interrupt handler, still holding `cons.lock`. That is why it works
+      even when every process is stuck: it needs no process and no scheduler. From one of
+      our runs:
+
+      ```
+      1 sleep  init
+      2 sleep  sh
+      ```
+
+      `procdump` reads `p->state` and `p->name` **without** `p->lock`, on purpose (its
+      comment says so): a debugging tool for a wedged machine must not wait for a lock a
+      stuck process may hold. The price is that a line can be slightly stale.
+
+      Each [[printk]] takes `pr.lock` ([[tour:38]]), so during each call hart 2 holds
+      `cons.lock` then `pr.lock`. Between the two calls of each line (line 700, then 701), it
+      holds only `cons.lock`. Inside each character, [[uartputc_sync]]'s own [[push_off]]
+      adds a third level: `noff` 3, tying the deepest nesting in the kernel, and the only place
+      `cons.lock` → `pr.lock` appears in the lock order ([[concept:locks#nesting]],
+      [[concept:locks#order]]).
+
+      This is the deepest call chain in the tour, and it sits on hart 2's scheduler stack:
+      `kernelvec`'s frame, then `kerneltrap`, `devintr`, `uartintr`, `consoleintr`, `procdump`,
+      `printk` and its helpers. Measured under gdb in this build, the deepest point is 960 bytes
+      below the top, nearly a quarter of the slice's 4096 bytes. The margin matters: a `stack0` slice has no guard page, so
+      an overflow would silently run into hart 1's slice below it.
+    others: |
+      While hart 2 prints the listing with interrupts off, typed keys wait in the UART's
+      FIFO, and any hart that wants `cons.lock` (a reader in [[consoleread]], another
+      [[consoleintr]]) spins. Printing is slow next to everything else in this tour, and
+      this is the one place where a keystroke handler holds `cons.lock` for that long.
+
+  - title: The line reaches the shell, and the next story begins
+    file: user/sh.c
+    lines: 145-176
+    focus: 160-174
+    state:
+      hart: 0
+      mode: U
+      proc: sh (pid 2)
+      intr: on
+      satp: user
+      locks: []
+      stack: [main]
+      sp: {"on": user, switched: "`ld sp, 48(a0)` in `userret` ([[kernel/trampoline.S:118]]) and `sret` ([[kernel/trampoline.S:153]]), at the end of the last `read`"}
+    note: |
+      `getcmd` returns 0. The shell skips leading blanks, sees that the line is not `cd`,
+      forks a child to parse and run it, and waits. What follows (fork, exec, and for
+      `ls | wc` a pipe) is [[tour:40]].
+
+      Look back at what made this work across three harts:
+
+      - **One lock for the shared buffer.** `cons.lock` covers `buf`, `r`, `w` and `e`, for
+        the interrupt handler and the reader alike, on whichever harts they run.
+      - **A handler that never sleeps.** [[consoleintr]] echoes by spinning, with
+        interrupts off, because it has no process to put to sleep.
+      - **Commit on newline.** Only whole lines become readable, so editing is private to
+        the kernel and cheap.
+      - **Register before releasing.** [[sleep_prepare]] inside `cons.lock`, wakeup inside
+        `cons.lock`: no lost wakeup, and the reader always re-checks.
+
+      The shell slept on hart 0 and woke on whichever hart scanned first; your keys were
+      handled on harts 2, 1 and 2. None of that changed what the shell read.
+locks:
+  - lock: cons.lock (spinlock)
+    where: "[[consoleread]], [[consoleintr]]"
+    protects: "The input buffer `cons.buf` and its indices `r`, `w`, `e`"
+  - lock: p->lock (spinlock)
+    where: "[[sleep_prepare]], [[sleep]], [[wakeup]], the schedulers"
+    protects: "`p->chan` and `p->state`: who is waiting on what, who may run. When both are held, `cons.lock` comes first, never the reverse"
+  - lock: pr.lock (spinlock)
+    where: "[[printk]], via [[procdump]] on control-P"
+    protects: "Keeps one `printk` call's output together; taken after `cons.lock`"
+  - lock: "tx_lock (no: not taken by the echo)"
+    where: "[[uartputc_sync]]"
+    protects: "The echo bypasses the writers' sleep-lock, since an interrupt handler cannot sleep; echoed keys can land inside other output"
+  - lock: "PLIC claim (no kernel lock)"
+    where: "[[plic_claim]], [[plic_complete]]"
+    protects: "The PLIC hands each pending IRQ to one claimer and will not re-signal it until completion"
+  - lock: "process table in procdump (no lock)"
+    where: "[[procdump]]"
+    protects: "Deliberately unlocked so control-P works even on a wedged machine; output may be stale"
+quiz:
+  - q: "The shell calls `sleep_prepare(&cons.r)` before releasing `cons.lock`. Describe an interleaving that would lose your Enter if it registered *after* releasing the lock instead."
+    a: "Hart 0 sees `r == w` and releases `cons.lock`. Before it registers, hart 2 handles Enter, sets `w = 3` and calls `wakeup(&cons.r)`, which finds no one registered. Hart 0 then registers and sleeps; no further wakeup comes until another line is committed, so the shell sits asleep with your complete line in the buffer."
+  - q: "Why does `consoleintr` echo with `uartputc_sync` (spinning) instead of `uartwrite` (sleeping)?"
+    a: "It runs inside an interrupt handler, often with no process of its own, and with `cons.lock` held. Sleeping needs a process and must not happen while holding a spinlock other than `p->lock`, so the only option is to spin for the transmitter."
+  - q: "You type `lx`, press backspace, then `s` and Enter. Which bytes does the shell's `read` see, and why could backspace not erase a character from a previous line?"
+    a: "It sees `l`, `s`, `\\n`: backspace moved `e` back over the uncommitted `x`. Backspace only acts while `e != w`; once Enter set `w = e`, those bytes belong to readers and cannot be taken back."
+  - q: "Two keystroke interrupts arrive in quick succession. Can `consoleintr` run on hart 1 and hart 2 at the same moment? What prevents a problem if it could?"
+    a: "Not for the UART: the PLIC does not signal IRQ 10 again until `plic_complete`, after `uartintr` has drained the FIFO. Even if two calls overlapped, `cons.lock` would serialize their updates of `buf` and `e`."
+  - q: "`gets` reads one byte per system call. Why does the shell's first `read` sleep, but the next two return immediately?"
+    a: "The first `read` starts with `r == w` and must wait for Enter to commit the line. After that, `r = 1 < w = 3`, so the next reads find committed bytes under `cons.lock` and return without sleeping."
+  - q: "You press control-D at the start of the line while `cat` is reading the console, and at the start of a line while the shell is waiting. What happens in each case?"
+    a: "For `cat`, `consoleread` consumes the `^D` with nothing copied and returns 0, so `cat`'s loop ends and it exits. For the shell, `gets` gets 0 bytes, `getcmd` returns -1, the shell exits, and `init` starts a new shell."

@@ -1,0 +1,504 @@
+summary: |
+  `grind` is xv6's [[g:randomized-testing|randomized]] [[g:stress-test]]: it runs random
+  system calls in two processes at once, forever. Each process repeatedly draws a
+  pseudo-random number and performs one of 22 operations: create, open, unlink and link
+  files with odd path names such as `/./grindir/./../b`, make and remove directories, read
+  and write, fork (with and without waiting), kill, grow and shrink memory, use pipes, and
+  run a small `echo hi | cat` pipeline. The two processes share the root directory and
+  the names `a`, `b` and `c`, so their operations collide in orders no hand-written test
+  would try.
+
+  Most operations are allowed to fail (unlinking a name the other process already
+  removed is fine). What `grind` checks is that the kernel survives: no
+  [[kernel:panic]], no hang, and a few things that must always work still do (a `fork`
+  succeeds, a freshly created file has the size that was written, the pipeline prints `hi`). It
+  was added in 2019 (commit `16b3b63`, "grind: run parallel system calls forever").
+
+  The structure has three levels: [[main@user/grind.c|main]] starts an iteration
+  ([[iter]]) in a child process, `iter` forks the two workers ([[go]]), and each worker
+  loops forever. Workers only exit when a check fails, so with a correct kernel the first
+  iteration never ends and you see only a growing line of `A` and `B` (one letter per 500
+  operations of each worker). A failure prints a `grind: …` message, after which a new
+  iteration starts with a different random seed. Stop it by quitting QEMU.
+
+  **Read before:** [[user/usertests.c]], whose tests are deterministic. **Read next:**
+  the kernel paths it exercises: [[kernel/sysfile.c]], [[kernel/fs.c]],
+  [[kernel/proc.c]], [[kernel/pipe.c]].
+
+blocks:
+  - lines: 1-13
+    title: Purpose and headers
+    note: |
+      The comment is the whole specification: random system calls, in parallel, forever.
+      [[kernel/stat.h]] supplies `struct stat` and [[kernel/fcntl.h]] the `O_` flags.
+      [[kernel/param.h]], [[kernel/fs.h]], [[kernel/syscall.h]],
+      [[kernel/memlayout.h]] and [[kernel/riscv.h]] are included but nothing from them
+      is used in this file.
+
+  - lines: 15-40
+    title: "do_rand(): the Park–Miller \"minimal standard\" generator"
+    note: |
+      This is a Lehmer pseudo-random number generator, the "minimal standard" proposed by
+      Park and Miller in 1988 and copied here from FreeBSD's C library. Each call computes
+
+      x_new = 16807 × x mod (2³¹ − 1)
+
+      where 16807 = 7⁵ and 2³¹ − 1 = 2147483647 is a prime. For any starting x between 1
+      and 2³¹ − 2, the sequence visits every number in that range before repeating. The
+      numbers are not random, but they are spread out well enough to choose operations.
+      A starting value of 0 would be useless (0 × 16807 is 0 forever), which is why lines
+      29–30 map the stored value into the range 1 … 0x7ffffffe first.
+
+      Lines 31–35 use *Schrage's method* to compute the product modulo 2³¹ − 1 without
+      overflowing 32-bit arithmetic: write 2³¹ − 1 = 127773 × 16807 + 2836 (as the comment
+      says), split x into `hi = x / 127773` and `lo = x % 127773`, and then
+      `16807 * lo - 2836 * hi` equals 16807 × x mod (2³¹ − 1), or that minus 2³¹ − 1 if it
+      is negative. Every intermediate value stays below 2³¹. On xv6's 64-bit RISC-V a
+      `long` is 64 bits, so the direct product would not overflow anyway; the method
+      matters on 32-bit machines, where the code was written.
+
+      The result is shifted down by one (line 37) to the range 0 … 0x7ffffffd, stored back
+      as the new state and returned. The next call adds the 1 back on line 30.
+
+  - lines: 42-48
+    title: "rand(): one shared random stream"
+    note: |
+      `rand_next` is the generator's state (its *seed* at the start). It is a global, so
+      `fork` copies it: every child starts with its parent's current value, and changes in
+      one process do not affect another. [[iter]] and [[main@user/grind.c|main]] change
+      it before and after forking so that each worker gets a different stream.
+
+  - lines: 50-63
+    title: "go(): set up a worker"
+    note: |
+      [[go]] is the body of one worker; `which_child` (0 or 1) only selects the progress
+      letter. Its locals:
+
+      - `fd` is a file descriptor that several operations share: one opens a file into it,
+        others read or write through it, so writes can go to a file that the other worker
+        has meanwhile unlinked. It starts as -1, an invalid descriptor, which is
+        deliberate: `close(-1)`, `read(-1, …)` and `write(-1, …)` must fail cleanly
+        (in [[kernel:argfd]]).
+      - `buf` is `static` so its 999 bytes live in the program's data, not on the
+        one-page user stack. 999 is not a multiple of the 1024-byte block size or of any
+        power of two, so writes start and end in the middle of disk blocks.
+      - `break0` records the size of the process's memory at the start (`sbrk(0)` returns
+        the current end without changing it), so that operation 16 can shrink back to it.
+
+      Lines 58–63 make sure the directory `/grindir` exists (`mkdir` fails harmlessly if
+      it does; both workers try) and that `chdir` into it works, then return to `/`. Every
+      relative path below is relative to `/`.
+
+  - lines: 65-69
+    title: The main loop, and a progress mark
+    note: |
+      Each pass picks one operation. Every 500 passes the worker writes one letter,
+      `A` for worker 0 and `B` for worker 1, with a single `write` so the letters from the
+      two workers never mix within a character. In QEMU at this commit, each worker did
+      about 2000 operations in 90 seconds (four letters each).
+
+      `rand() % 23` gives 0 … 22. Operations 1 to 22 follow; 0 matches no branch, so about
+      one pass in 23 does nothing.
+
+  - lines: 70-82
+    title: "Operations 1–4: create and remove a and b through tangled paths"
+    note: |
+      These create and delete the two shared names `/a` and `/b`, but always through paths
+      with `..` in them. `grindir/../a` is `/a`; `grindir/../grindir/../b` is `/b`. Each
+      such lookup goes through [[kernel:namex]], which follows the `..` entry of
+      `grindir` back to the root, one component at a time, locking each directory in turn.
+
+      1 and 2 create and immediately close a file ([[kernel:sys_open]] →
+      [[kernel:create]], then [[kernel:sys_close]]). 3 unlinks `/a`. 4 changes into
+      `grindir`, unlinks `../b` (resolved from there), and changes back. Only the `chdir`
+      is checked: `grindir` must always exist. The `open`s and `unlink`s may fail, for
+      example if the other worker turned `a` into a directory.
+
+  - lines: 83-92
+    title: "Operations 5–8: keep a file open while others change it"
+    note: |
+      5 and 6 close the shared descriptor and open `/a` or `/b` in it (`/./grindir/./../b`
+      tests `.` components too). 7 writes 999 bytes through it and 8 reads 999 bytes.
+
+      Between these steps, the other worker may unlink the file, recreate a new file under
+      the same name, or link the name to something else. Writing to an open file whose
+      name is gone is legal: the [[g:inode]] stays alive, with [[g:link-count]] 0, until
+      the descriptor is closed, and then the final [[kernel:iput]] frees it. This is
+      exactly the [[g:orphan-inode]] situation that [[user/forphan.c]] tests for crashes;
+      here it is the normal path through [[kernel:filewrite]] → [[kernel:writei]] and
+      [[kernel:fileclose]] → `iput` that gets exercised, thousands of times.
+
+  - lines: 93-100
+    title: "Operations 9–10: a directory with the same name as a file"
+    note: |
+      9 tries to make `/a` a directory, create `/a/a` inside it (through the path
+      `a/../a/./a`), and remove it again. 10 does the same with `/b`, written as `/../b`,
+      which tests that `..` in the root directory leads back to the root (the root's `..`
+      entry points to itself, as [[mkfs/mkfs.c]] creates it).
+
+      Whether these succeed depends on what `a` or `b` currently is. If it is a file,
+      `mkdir` fails and so does the path through it, because a file is not a directory.
+      While such a directory is not empty (the other worker may be between the create and
+      the unlink of this same operation), plain `unlink`s of `a` or `b` fail, because
+      [[kernel:sys_unlink]] refuses to remove a non-empty directory.
+
+  - lines: 101-106
+    title: "Operations 11–12: hard links between a and b"
+    note: |
+      11 removes `/b` and makes it a second name for `/a`; 12 does the reverse. Both use
+      paths that leave the root (`../b` from `/` is `/b`). `link` ([[kernel:sys_link]])
+      fails if the source is a directory or the target name exists, and must undo its
+      link-count increment when it fails ([[kernel:sys_link]]'s `bad:` path). A
+      [[g:hard-link]] means that unlinking `a` no longer frees the file, because the
+      count is still 1 for `b`; a wrong count here would free a file that still has a name
+      or leak one that has none.
+
+  - lines: 107-126
+    title: "Operations 13–14: fork, exit, and orphans"
+    note: |
+      13 is the plain cycle: fork a child that exits at once, and wait for it
+      ([[kernel:kfork]], [[kernel:kexit]], [[kernel:kwait]]). The parent's copy of the
+      memory, open files (including `fd`) and current directory must all be duplicated
+      and then released without leaks.
+
+      14 forks a child that forks twice more, making four processes, and all of them exit
+      without waiting. The worker waits only for its direct child; the grandchildren are
+      orphans that [[kernel:reparent]] hands to `init`, which reaps them
+      ([[user/init.c]]). This exercises the parent-pointer bookkeeping in
+      [[kernel:kexit]], [[kernel:reparent]] and [[kernel:kwait]], now protected by
+      `wait_lock`. In 2019, before `wait_lock` existed, `reparent` could deadlock on
+      per-process locks (fixed in commit `d175bea`, six weeks before `grind` was added).
+
+      A `fork` failure is treated as a real error: with only a handful of processes per
+      worker, the 64-entry process table should never be full, so failure means slots are
+      leaking.
+
+  - lines: 127-131
+    title: "Operations 15–16: grow and shrink memory"
+    note: |
+      15 grows the process's memory by 6011 bytes with `sbrk` ([[kernel:sys_sbrk]] →
+      [[kernel:growproc]] → [[kernel:uvmalloc]]); 6011 is deliberately not a multiple of
+      the 4096-byte page size, so the end of memory moves into the middle of pages. 16
+      shrinks it back to the starting size `break0` ([[kernel:uvmdealloc]]), freeing the
+      pages.
+
+      The result is not checked; in principle an `sbrk` failure would be tolerated, but
+      since operation 16 resets to `break0` just as often, the extra memory stays at a few
+      pages.
+
+  - lines: 132-146
+    title: "Operation 17: kill a child in the middle of a file system call"
+    note: |
+      The child creates `/a`, possibly a slow operation that writes several disk blocks.
+      Meanwhile the parent does a `chdir` through a roundabout path that ends at `/`
+      (checked: it must succeed) and then kills the child. Depending on timing, the
+      child is still inside `open`, has finished, or has already exited.
+
+      [[kernel:kkill]] only sets `p->killed` and, if the child is sleeping, makes it
+      runnable. The child dies the next time it is about to return to user space
+      ([[kernel:usertrap]] calls [[kernel:kexit]]), so a file-system operation is never
+      abandoned half-way through its [[g:transaction]]: a sleeping child woken in
+      [[kernel:begin_op]] checks its condition again and goes back to sleep if needed.
+      A bug here could leave the log's count of outstanding operations wrong, which would
+      hang every later file-system call.
+
+  - lines: 147-156
+    title: "Operation 18: a process kills itself"
+    note: |
+      The child kills itself. The `kill` call returns normally, but on the way back to
+      user space [[kernel:usertrap]] sees the flag and calls `kexit(-1)`, so the
+      `exit(0)` on line 151 is never reached. The parent's `wait(0)` collects a child
+      that died with status -1.
+
+  - lines: 157-179
+    title: "Operation 19: four processes sharing one pipe"
+    note: |
+      The worker creates a [[g:pipe]] and forks a child; the child forks twice, so four
+      processes share both ends. Each writes one byte and then reads one byte. Since every
+      process writes before it reads, there are always at least as many bytes written as
+      read, so no `read` can wait forever.
+
+      This exercises [[kernel:pipewrite]] and [[kernel:piperead]] with several readers and
+      writers on different CPUs, which must take the pipe's lock and use
+      [[g:sleep-wakeup]] correctly, and [[kernel:pipeclose]] when the last reference to
+      each end goes away (each of the four processes holds both ends until it exits; the
+      worker closes its own copies on lines 177–178). The parent waits only for its direct child; the other three become
+      orphans for `init`. A failed read or write prints a message but does not stop the
+      worker.
+
+  - lines: 180-194
+    title: "Operation 20: create a file inside a deleted directory"
+    note: |
+      In a child, so that the `chdir` does not affect the worker: replace `/a` with a new
+      empty directory, move into it, and delete its name (`../a`) while standing in it,
+      the same setup as [[user/dorphan.c]]. The directory now has link count 0 but is
+      still the child's current directory. Then the child tries to create `x` in it.
+
+      At this commit that `open` fails during the path lookup: [[kernel:namex]] refuses
+      to go through a directory whose link count is 0 ([[kernel/fs.c:707]]), so
+      [[kernel:nameiparent]] returns 0 and [[kernel:create]] gives up. `create` has a
+      second check of its own ([[kernel/sysfile.c:269]]) for a directory unlinked in the
+      moment after the lookup. Both checks were added in August 2026 (commit `9da28f5`)
+      after the same kind of sequence caused `panic: ilock: no type`; before them, the new file could be linked into the doomed
+      directory and leak with it. When the child exits, closing its current directory
+      ([[kernel:kexit]] → [[kernel:iput]]) frees the orphaned directory.
+
+      Any step may also fail because the other worker changed `/a` in the meantime; then
+      the child ends up doing something else harmless, such as creating and removing
+      `/x`.
+
+  - lines: 195-222
+    title: "Operation 21: resources must not run out"
+    note: |
+      As the comment says, this must always succeed. It creates `/c`, writes one byte,
+      checks with `fstat` that the size is 1 and the [[g:inode-number]] is sane, and
+      removes it. Unlike most operations, every step except the unlinks is checked.
+
+      Its purpose is to detect *leaks*. After thousands of operations, if any path forgot
+      to free an inode, a block, a file-table entry or a descriptor, the `open` or the
+      `write` would eventually fail (or the kernel would panic, as [[kernel:iget]] does
+      when the in-memory inode table is full). The i-number check catches a corrupted
+      inode: the disk image has 200 inodes (`NINODES` in [[mkfs/mkfs.c]]), and inode 0
+      is never used, so valid numbers are 1–199. Anything above 200 is certainly corrupt
+      (the check is one too generous).
+
+      The other worker may run operation 21 at the same moment. Then both open the same
+      `c`, or one unlinks the other's; each still writes one byte at offset 0 through its
+      own descriptor, so the size is still 1 and the checks still hold.
+
+  - lines: 223-292
+    title: "Operation 22: the pipeline echo hi | cat"
+    note: |
+      This builds by hand what the [[g:shell]] does for `echo hi | cat` (see
+      [[g:shell-pipeline]] and [[g:fork-exec]]), with one extra pipe so the worker can
+      read the result:
+
+      ```
+      echo hi  --aa-->  cat  --bb-->  worker
+      ```
+
+      The first child replaces its standard output with the write end of `aa`
+      (`close(1)` then `dup`, which returns the lowest free descriptor, 1) and runs
+      `/echo` through the path `grindir/../echo`, exercising [[kernel:kexec]] with a
+      path containing `..`. The second child makes `aa`'s read end its standard input and
+      `bb`'s write end its standard output, and runs `/cat`.
+
+      Every process closes the pipe ends it does not use. That is essential: `cat` sees
+      end-of-file only when *every* write end of `aa` is closed, and if the worker or
+      `cat` itself kept one open, `cat` would wait forever and so would the worker's
+      `wait`.
+
+      The worker reads three bytes from `bb`, waits for both children, and checks that
+      both exited with status 0 and that it received exactly `hi\n`. The children exit
+      with distinct statuses (1, 2, 4, 5, 6), which the worker prints, so a failed run
+      tells you which step broke; if a fork fails, the worker itself exits with 3 or 7.
+
+  - lines: 293-294
+    title: The loop never ends
+    note: |
+      [[go]] has no normal way out. A worker ends only by calling `exit(1)` (or another
+      non-zero status) after a failed check, or by being killed by [[iter]].
+
+  - lines: 296-311
+    title: "iter(): start worker 0"
+    note: |
+      One iteration of the test. It first removes `a` and `b` left over from a previous
+      iteration (this fails harmlessly if they are non-empty directories). Then it forks
+      worker 0, which changes its copy of the seed (`rand_next ^= 31`) so it does not
+      replay the same operations as worker 1, and runs [[go]]. The `exit(0)` after `go`
+      is never reached.
+
+      `iter()` uses empty parentheses, an [[g:old-style-decl]]; `iter(void)` would be the
+      modern spelling.
+
+  - lines: 313-322
+    title: "iter(): start worker 1"
+    note: |
+      The same for worker 1, with a different change to the seed (`^= 7177`). Both
+      workers now run concurrently on different CPUs, against the same root directory.
+
+  - lines: 324-334
+    title: "iter(): wait for a failure, then stop the other worker"
+    note: |
+      The first `wait` returns only when one worker exits, which, since workers loop
+      forever, means it found an error. Its status is non-zero, so `iter` kills both
+      workers (the one already reaped has no process left, so that `kill` fails
+      harmlessly), waits for the survivor, and exits. Initialising `st1` to -1 makes the
+      kill happen even if `wait` failed without storing a status.
+
+      With a correct kernel, `iter` stays in the first `wait` forever.
+
+  - lines: 336-351
+    title: "main(): run iterations forever"
+    note: |
+      Each iteration runs in its own child process, so whatever state a failed iteration
+      leaves behind (open files, memory, the current directory) dies with it, and the next
+      starts clean. After an iteration ends, `main` pauses for 20 clock ticks (about two
+      seconds, [[kernel:sys_pause]]), adds 1 to the seed so the next iteration takes a
+      different random path, and starts again. If `fork` fails, it pauses and retries.
+
+      `grind` therefore never exits. A kernel bug shows up as a printed `grind: …`
+      message, a kernel [[kernel:panic]] (which stops xv6), or the stream of `A` and `B`
+      stopping, which means something is stuck: a lost wakeup, a deadlock, or a leaked
+      transaction.
+
+lines:
+  17: |
+    `ctx` points at the generator's state, so the caller decides where the state lives.
+  30: |
+    Map any stored value into 1 … 0x7ffffffe, so that the state is never 0 or 2³¹ − 1,
+    the two values that would make the generator stick at 0.
+  31: |
+    Split x for Schrage's method: 127773 is (2³¹ − 1) / 16807, rounded down.
+  33: |
+    16807 × x mod (2³¹ − 1), possibly minus 2³¹ − 1; no intermediate exceeds 31 bits.
+  34: |
+    Bring a negative result back into range by adding the modulus 2³¹ − 1.
+  37: |
+    Shift the range down to 0 … 0x7ffffffd; line 30 adds 1 back on the next call.
+  42: |
+    The initial seed. `main` adds 1 to it for each new iteration.
+  55: |
+    The current end of the process's memory, used as the floor for shrinking.
+  58: |
+    Create `/grindir` (or fail harmlessly if it exists).
+  59: |
+    `grindir` must exist; many paths below go through it.
+  63: |
+    Work from the root directory.
+  68: |
+    Progress: one letter per 500 operations, `A` or `B`.
+  69: |
+    Pick operation 0 … 22.
+  71: |
+    Create `/a` and close it at once.
+  73: |
+    Create `/b`, going in and out of `grindir` twice.
+  75: |
+    Remove `/a`, if it exists and is not a non-empty directory.
+  81: |
+    Remove `/b`, named relative to `grindir`.
+  84: |
+    Close the shared descriptor; harmless if it is -1 or already closed.
+  85: |
+    Open (or create) `/a` into the shared descriptor.
+  88: |
+    Open (or create) `/b`, through `.` and `..` components.
+  90: |
+    Write 999 bytes, possibly to a file whose name the other worker has removed.
+  92: |
+    Read up to 999 bytes; often returns 0, because after a write the offset is at the end
+    of the file.
+  94: |
+    Try to make `/a` a directory.
+  95: |
+    Create `/a/a` through a path that leaves and re-enters `a`.
+  98: |
+    `/../b` is `/b`: the root's `..` is the root.
+  102: |
+    Remove `/b`, then link it to `/a` on the next line.
+  103: |
+    Make `/b` a second name for `/a` (fails if `a` is a directory or missing).
+  106: |
+    Make `/a` a second name for `/b`.
+  108: |
+    Fork a child that exits at once.
+  115: |
+    Collect it, freeing its process slot.
+  119: |
+    The child forks twice: four processes in all; the three new ones are reparented to
+    `init` as their parents exit.
+  128: |
+    Grow memory by 6011 bytes, not a whole number of pages.
+  130: |
+    Only if memory has grown since the start.
+  131: |
+    Shrink back to the starting size; `sbrk` with a negative argument frees memory.
+  135: |
+    Child: create `/a`, a file-system transaction that the parent may interrupt.
+  141: |
+    `../grindir/..` from `/` is `/`; this must succeed.
+  145: |
+    Kill the child, wherever it is.
+  150: |
+    Kill itself; it dies on the way back to user space, before line 151.
+  165: |
+    Child: two more forks give four processes sharing the pipe.
+  167: |
+    Each of the four writes one byte...
+  170: |
+    ...then reads one byte, which may be its own or another's.
+  177: |
+    The worker closes both ends at once; only the four children use the pipe.
+  183: |
+    Child: remove whatever `/a` is.
+  184: |
+    Make `/a` an empty directory.
+  185: |
+    Stand in it.
+  186: |
+    Delete its name: the current directory is now an orphan.
+  187: |
+    Try to create a file in the deleted directory. At this commit this fails in the path
+    lookup: [[kernel:namex]] refuses to go through a directory with link count 0.
+  188: |
+    Clean up `x` if it was created anyway.
+  196: |
+    Remove any `/c` left over.
+  199: |
+    Create `/c`. Failure means a resource has leaked.
+  204: |
+    Write one byte.
+  209: |
+    Read back the inode's metadata.
+  213: |
+    The file must hold exactly the one byte.
+  217: |
+    Valid inode numbers are 1–199, so anything above 200 is certainly corrupt (the check
+    is one too generous).
+  222: |
+    Remove `/c` again; its inode and block are freed.
+  226: |
+    Pipe `aa` connects `echo` to `cat`.
+  230: |
+    Pipe `bb` connects `cat` to the worker.
+  239: |
+    `echo`: free descriptor 1...
+  240: |
+    ...so that `dup` puts the pipe's write end there: standard output now goes into `aa`.
+  246: |
+    Run `/echo hi`. On success `exec` does not return.
+  247: |
+    Reached only if `exec` failed.
+  257: |
+    `cat`: make `aa`'s read end standard input.
+  264: |
+    Make `bb`'s write end standard output.
+  270: |
+    Run `/cat`, which copies its input to its output until end-of-file.
+  277: |
+    The worker closes every end except `bb`'s read end, so that `cat` can see end-of-file.
+  281: |
+    Read the three expected bytes one at a time; if fewer arrive, the rest stay 0.
+  288: |
+    Both children must succeed and the bytes must be exactly `hi\n`.
+  299: |
+    Clear leftovers from the previous iteration.
+  308: |
+    Give worker 0 its own random stream.
+  319: |
+    Give worker 1 a different random stream.
+  325: |
+    Returns only when a worker has failed.
+  326: |
+    A worker failed: stop both.
+  331: |
+    Collect the other worker.
+  340: |
+    Run one iteration in a child, so its state is discarded afterwards.
+  346: |
+    Wait for the iteration to end (only after a failure).
+  348: |
+    Pause about two seconds before the next iteration.
+  349: |
+    Change the seed so the next iteration differs.

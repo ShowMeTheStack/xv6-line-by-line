@@ -1,0 +1,641 @@
+title: The physical page allocator
+group: Memory
+prerequisites: [3, 15, 24]
+summary: |
+  Every page table, every page of user memory, every kernel stack, trapframe and pipe buffer
+  in xv6 comes from one place: a linked list of free 4096-byte [[g:page|pages]] managed by
+  [[kalloc]] and [[kfree]] in [[kernel/kalloc.c]]. The whole allocator is about fifty lines.
+  It has no size classes and no bitmaps, and it keeps no bookkeeping memory of its own: the
+  list is stored *inside* the free pages themselves.
+
+  This tour watches the allocator twice. First at boot, when hart 0, alone and with paging
+  still off, threads 32,735 pages onto the list one at a time (real numbers from this build's
+  `kernel.sym`). Then in a running system, at the moment when the shell's `fork` on hart 1
+  asks for a page while a freshly exec'd `echo` on hart 2 gives pages back. Both harts reach
+  for the same lock word and the same 8-byte head pointer, at the same instant.
+
+  The stakes are high and the failures are silent. If two harts interleave their list
+  updates, nothing crashes right away: a page is lost forever, or it is handed to two owners
+  who will overwrite each other's data. A single [[g:spinlock]], `kmem.lock`, is all that
+  stands between the system and that bug, and the tour ends with what that one lock costs.
+cast: |
+  The tour has two acts.
+
+  **Act 1, boot.** Only hart 0 is doing real work. Harts 1 and 2 are spinning in [[main]],
+  waiting for hart 0 to set `started`.
+
+  **Act 2, a running system.** You typed `echo hi &`, then `ls`. When the act starts:
+
+  | Hart | What it is doing |
+  |---|---|
+  | 0 | Idle in its [[kernel:scheduler]], or running whatever is runnable |
+  | 1 | The shell, `sh` (pid 2), inside `fork` for `ls`, copying its memory into the new child (pid 5) |
+  | 2 | The background `echo` (pid 4), finishing `exec`, freeing the copy of the shell's memory it inherited |
+
+  (This overlap is invented for illustration: in a real session `echo hi` finishes long
+  before you can type `ls`. The tour pretends they coincide because this collision, one
+  hart allocating while another frees, is exactly what `kmem.lock` exists for, and it
+  happens all the time on a busy machine.)
+steps:
+  - title: Hart 0 sets up memory before anything else
+    file: kernel/main.c
+    lines: 9-34
+    focus: 19
+    state:
+      hart: 0
+      mode: S
+      proc: none (boot)
+      intr: off
+      satp: bare
+      locks: []
+      irq: 0
+      stack: [main]
+      sp:
+        "on": boot
+        switched: "`add sp, sp, a0` in `_entry` ([[kernel/entry.S:17]]), at power-on"
+        detail: "hart 0's 4 KiB slice of `stack0`, `0x80007890`–`0x80008890`, inside the kernel image"
+    note: |
+      [[main]] runs on every hart, but only hart 0 takes the first branch. Right after the
+      console is ready, the very first subsystem it starts is [[kinit]], the physical page
+      allocator. The order is forced: the next line, [[kvminit]], builds the kernel page
+      table, and page-table pages have to come from somewhere. Much of what follows needs
+      pages too: the kernel stacks that `kvminit` maps, the virtio rings
+      ([[virtio_disk_init]]) and the first process ([[userinit]]) all call [[kalloc]].
+
+      Notice the machine state. Paging is still **off** (`satp` is 0, "bare"), so every
+      address is a physical address. Interrupts are off, as they have been since power-on.
+      And hart 0 is alone: harts 1 and 2 are spinning on `started` (line 35) and will not
+      touch the allocator until line 33 releases them.
+    others: |
+      Harts 1 and 2 are executing the loop on line 35, reading `started` again and again.
+      They touch no shared state the allocator uses, so `kinit` could have been written
+      without any lock at all. It takes `kmem.lock` anyway, 32,735 times, because it reuses
+      [[kfree]], which must be safe later when all three harts are running.
+
+  - title: "The raw material: from end to PHYSTOP"
+    file: kernel/memlayout.h
+    lines: 11-44
+    focus: 15-18
+    state:
+      hart: 0
+      mode: S
+      proc: none (boot)
+      intr: off
+      satp: bare
+      locks: []
+      irq: 0
+      stack: [main, kinit]
+      sp: boot
+    note: |
+      QEMU gives the machine 128 MiB of RAM (`-m 128M`), starting at physical address
+      `0x80000000` ([[KERNBASE]]). The kernel image itself was loaded at the bottom of it.
+      Everything above the image, up to [[PHYSTOP]] = `0x88000000`, is free for the
+      allocator.
+
+      Where does the image end? The linker script defines the symbol [[end]] just after the
+      kernel's `.bss` ([[kernel/kernel.ld:44]]). In this build, `kernel/kernel.sym` says:
+
+      | Symbol | Address | Meaning |
+      |---|---|---|
+      | `KERNBASE` | `0x80000000` | start of RAM, start of the kernel |
+      | `etext` | `0x80007000` | end of the kernel's code |
+      | `end` | `0x80020bb0` | end of the kernel's data and `.bss` |
+      | `PGROUNDUP(end)` | `0x80021000` | first whole free page |
+      | `PHYSTOP` | `0x88000000` | end of RAM the kernel uses |
+
+      So the kernel occupies just under 33 pages (33 once rounded up), and the allocator gets
+      `(0x88000000 - 0x80021000) / 4096` = **32,735 pages**, about 127.9 MiB. The 1,104
+      bytes between `end` and the next page boundary are simply never used.
+
+  - title: kinit hands every page to kfree
+    file: kernel/kalloc.c
+    lines: 26-40
+    focus: 29-39
+    state:
+      hart: 0
+      mode: S
+      proc: none (boot)
+      intr: off
+      satp: bare
+      locks: []
+      irq: 0
+      stack: [main, kinit, freerange]
+      sp: boot
+    note: |
+      [[kinit]] names the lock "kmem" (the name shows up only in debugging) and calls
+      [[freerange]] on the range from `end` to `PHYSTOP`.
+
+      `freerange` rounds the start up to a page boundary with [[PGROUNDUP]] (a free page must
+      start on a 4096-byte boundary, because page-table entries can only point at whole
+      pages) and then calls [[kfree]] on each page in turn, from `0x80021000` up to
+      `0x87fff000`. The loop condition `p + PGSIZE <= pa_end` makes sure the last page fits
+      entirely below `PHYSTOP`.
+
+      There is no separate "add page to allocator" function. Building the free list at boot
+      is exactly the same operation as returning a page at run time, so xv6 uses the same
+      function for both. That is why the comment above `kfree` mentions [[kinit]] as the one
+      caller that passes pages [[kalloc]] never handed out.
+
+      Because each `kfree` pushes onto the **front** of the list, and `freerange` walks
+      upward, the last page freed, `0x87fff000`, ends up at the head. The free list runs
+      from the top of RAM downward.
+
+  - title: The list is stored inside the free pages
+    file: kernel/kalloc.c
+    lines: 14-24
+    focus: 17-24
+    state:
+      hart: 0
+      mode: S
+      proc: none (boot)
+      intr: off
+      satp: bare
+      locks: []
+      irq: 0
+      stack: [main, kinit, freerange, kfree]
+      sp: boot
+    note: |
+      Here is the allocator's entire state: [[kmem]], one [[g:spinlock]] and one pointer.
+      In this build `kmem` sits at `0x8000f980`; the lock takes the first 24 bytes and
+      `kmem.freelist` is at `0x8000f998`.
+
+      Where are the list nodes? A free page is 4096 bytes nobody is using, so the allocator
+      uses its first 8 bytes as a [[run]]: a single `next` pointer. After `kinit`, memory
+      looks like this:
+
+      | Address | First 8 bytes hold |
+      |---|---|
+      | `kmem.freelist` | `0x87fff000` |
+      | `0x87fff000` | `0x87ffe000` |
+      | `0x87ffe000` | `0x87ffd000` |
+      | … | … |
+      | `0x80021000` | `0` (end of list) |
+
+      This is a classic trick (see [[g:free-list-allocator]]): the bookkeeping costs no
+      memory, because it lives in memory that is free anyway. The price is that the
+      allocator can only answer "give me *a* page". It cannot find a particular page,
+      count pages quickly, or hand out anything but whole pages.
+
+      Once [[kalloc]] hands a page out, its first 8 bytes belong to the caller, and the
+      `run` interpretation is gone.
+
+  - title: The checks in kfree
+    file: kernel/kalloc.c
+    lines: 42-63
+    focus: 51-52
+    state:
+      hart: 0
+      mode: S
+      proc: none (boot)
+      intr: off
+      satp: bare
+      locks: []
+      irq: 0
+      stack: [main, kinit, freerange, kfree]
+      sp: boot
+    note: |
+      Before touching the list, [[kfree]] checks three things about the address:
+
+      - **Page-aligned** (`pa % PGSIZE == 0`). A pointer into the middle of a page is a bug
+        in the caller.
+      - **Not below `end`**. Freeing a page of the kernel's own code or data would let
+        [[kalloc]] hand the kernel's variables to a user process.
+      - **Below `PHYSTOP`**. Above it is memory the allocator does not manage.
+
+      Any failure is a `panic`: the kernel stops rather than continue with a corrupted
+      memory map.
+
+      Notice what is **not** checked: whether the page is already free. Freeing the same
+      page twice puts it on the list twice. If the two frees happen back to back, it is
+      worse: the second push sets `P->next = P`, a one-page cycle. The next `kalloc` returns
+      `P` but leaves `P` at the head; its junk fill then overwrites `P->next` with
+      `0x0505…`, so the following `kalloc` returns `P` a second time and makes that junk
+      the new head. The third `kalloc` follows a garbage pointer, and the kernel most
+      likely panics on a page fault. Detecting double frees would need a bit per page,
+      which this allocator deliberately does not keep. The junk fill on [[:55]] is the
+      only help it gives.
+
+  - title: Junk in, then push under the lock
+    file: kernel/kalloc.c
+    lines: 46-63
+    focus: 60-61
+    state:
+      hart: 0
+      mode: S
+      proc: none (boot)
+      intr: off
+      satp: bare
+      locks: [kmem.lock]
+      irq: {noff: 1, intena: 0, note: "boot: SIE has been off since power-on, so the push_off in `acquire` records intena 0 and `release` leaves interrupts off ([[concept:locks#intena]])"}
+      stack: [main, kinit, freerange, kfree]
+      sp: boot
+    note: |
+      Line 55, `memset(pa, 1, PGSIZE)`, ran just before this and overwrote the whole page with `0x01` bytes. Any code that
+      keeps using a page after freeing it (a "dangling reference") will now read
+      `0x0101010101010101` instead of plausible old data, and is likely to crash quickly
+      and visibly instead of misbehaving subtly much later.
+
+      The fill happened **before** `acquire`. That is safe, because between the caller's
+      decision to free the page and the push, nobody else knows about this page: it is not
+      on the list yet, and the caller has promised not to use it. Doing 4096 bytes of
+      writes outside the lock keeps the [[g:critical-section]] tiny.
+
+      Then the push, under `kmem.lock` (lines 59–62): make the page point at the old head,
+      then make it the new head. In this build those are three instructions: `ld` the
+      head, `sd` it into the page, `sd` the page into the head
+      ([[kernel/kalloc.c:60]]–61).
+
+      At boot this runs 32,735 times, along with 32,735 `memset`s: about 128 MiB of
+      writes before the first process exists.
+    others: |
+      At boot nobody competes for the lock, so each `acquire` succeeds on the first
+      [[g:insn-amoswap|amoswap]]. The same code will run with three harts competing later
+      in this tour. Interrupts are already off here; [[acquire]] would turn them off anyway
+      ([[push_off]]). Because they were off before the first `push_off`, intena is 0 and the `release` leaves them off ([[concept:locks#intena]]).
+
+  - title: "The first customer: the kernel's page table"
+    file: kernel/vm.c
+    lines: 20-28
+    focus: 26-27
+    state:
+      hart: 0
+      mode: S
+      proc: none (boot)
+      intr: off
+      satp: bare
+      locks: []
+      irq: 0
+      stack: [main, kvminit, kvmmake]
+      sp:
+        "on": boot
+        detail: "still hart 0's slice of `stack0`; the 64 kernel stacks are made later in this same function, by `proc_mapstacks`"
+    note: |
+      The very first [[kalloc]] after `kinit` comes from [[kvmmake]], for the root page of
+      the kernel page table. Since the head of the list is the highest page, it returns
+      `0x87fff000`. (Verified in this build: a breakpoint on line 27 under QEMU and gdb
+      shows `kpgtbl = 0x87fff000`.)
+
+      `kalloc` filled the page with junk (`0x05` bytes, as you will see). A page table full
+      of junk would be a disaster: random entries would look valid. So `kvmmake` clears it
+      with `memset(kpgtbl, 0, PGSIZE)`. Every caller that needs zeros does this itself:
+      [[walk]] for page-table pages, [[uvmalloc]] and [[vmfault]] for user memory. Callers
+      that overwrite the whole page ([[uvmcopy]]'s `memmove`) or initialize every field they
+      will read ([[pipealloc]]) skip it, and so do the kernel stacks and trapframes.
+
+      From here on, boot keeps allocating: page-table pages for the kernel map, one kernel
+      stack for each of the 64 process slots ([[proc_mapstacks]]), the three virtio ring
+      pages. Then line 33 of `main` sets `started`, and three harts share the allocator.
+
+      The kernel stacks deserve a second look ([[concept:stacks#kernel]]). [[proc_mapstacks]]
+      calls `kalloc` 64 times, once per slot in `proc[]`, and maps each page at
+      `KSTACK(slot)` high in the kernel page table, with an unmapped guard page between
+      neighbours. In our gdb run slot 0's stack got physical page `0x87f99000` and slot
+      63's got `0x87f5a000`: 64 consecutive pages, handed out top-down like everything else.
+      Like trapframes, they are not zeroed; they start full of `0x05` junk, which is
+      harmless because a stack is always written before it is read. And they are **never
+      freed**: a kernel stack belongs to a slot, not to a process, and every process that
+      ever uses slot 2 runs on the same page.
+
+      The stack hart 0 is running on right now is not one of them. It is `stack0`, a
+      4 KiB-per-hart array in the kernel's own `.bss` ([[kernel/start.c:11]]), below `end`,
+      so the allocator never sees it. After boot it lives on as the hart's scheduler stack.
+
+  - title: Act 2. The shell forks, with a lock already held
+    file: kernel/proc.c
+    lines: 258-276
+    focus: 270-271
+    state:
+      hart: 1
+      mode: S
+      proc: sh (pid 2)
+      intr: off
+      satp: kernel
+      locks: ["child's p->lock (pid 5)"]
+      irq: {noff: 1, intena: 1}
+      stack: [usertrap, syscall, sys_fork, kfork]
+      sp:
+        "on": kernel
+        switched: "`ld sp, 8(a0)` in [[uservec]] ([[kernel/trampoline.S:76]]), when `sh`'s `fork` trapped in"
+        detail: "`sh`'s kernel stack, one of the 64 pages `proc_mapstacks` took from `kalloc` at boot"
+    note: |
+      Much later. You typed `ls`, and the shell on hart 1 calls `fork`. [[kfork]] gets a
+      fresh process slot from [[allocproc]], which itself calls [[kalloc]] four times already: a
+      page for the child's [[g:trapframe]], the root of its page table, and the two
+      lower-level page-table pages that [[walk]] creates to map the trampoline and
+      trapframe at the top of the address space.
+
+      Look carefully at the lock. `allocproc` returns **with the child's `p->lock` held**
+      (see the comment at [[kernel/proc.c:107]]), and `kfork` does not release it until line
+      294. So the entire memory copy on line 271 runs inside a spinlock critical section,
+      with interrupts **off** on hart 1. The child is half-built, and holding its lock keeps
+      every other hart's scheduler from seeing it as runnable.
+
+      [[uvmcopy]] walks the shell's address space page by page and, for each page, asks
+      for a new one.
+
+      Notice what is not on that list of four: a kernel stack. The child gets the stack its
+      slot was given at boot; [[allocproc]] only points the child's `context.sp` at the top
+      of it ([[kernel/proc.c:147]]), so the child will start on an **empty** kernel stack,
+      not a copy of the shell's. This code itself runs on the shell's own kernel stack.
+    others: |
+      With interrupts off on hart 1 for the whole copy, a timer interrupt cannot preempt
+      the shell here. The other two harts keep running normally. Any of them that scans the
+      process table ([[kernel:scheduler]], [[wakeup]]) will spin briefly on this child's
+      `p->lock` when it reaches the child's slot in `proc[]`.
+
+  - title: uvmcopy asks for one page per page
+    file: kernel/vm.c
+    lines: 298-326
+    focus: 311-315
+    state:
+      hart: 1
+      mode: S
+      proc: sh (pid 2)
+      intr: off
+      satp: kernel
+      locks: ["child's p->lock (pid 5)"]
+      irq: {noff: 1, intena: 1}
+      stack: [usertrap, syscall, sys_fork, kfork, uvmcopy]
+      sp: kernel
+    note: |
+      For every valid page in the parent, [[uvmcopy]] calls [[kalloc]] for a fresh physical
+      page, copies 4096 bytes into it with `memmove`, and maps it in the child at the same
+      virtual address with the same permission bits. Behind the scenes, [[mappages]] →
+      [[walk]] may call `kalloc` again for page-table pages the child does not have yet.
+
+      If `kalloc` returns 0, memory is exhausted. `uvmcopy` does not panic: it unmaps and
+      frees what it already copied ([[uvmunmap]] with `do_free = 1`) and returns -1, and
+      `fork` fails in the parent with -1. Running out of memory is an ordinary error that a
+      user program can see and handle.
+
+      Note that this copy does not need the page zeroed first: `memmove` overwrites all
+      4096 bytes. That is why the zeroing is the caller's job, not `kalloc`'s.
+
+      Among the pages copied is the shell's **user** stack (`0x4000`), and the guard page
+      below it, which keeps its flags and so stays without `PTE_U` in the child. So the
+      child's user stack is a copy of the parent's, frames and all, while its kernel stack
+      (above) is fresh.
+
+  - title: Meanwhile on hart 2, echo frees the shell's old image
+    file: kernel/exec.c
+    lines: 132-140
+    focus: 138
+    state:
+      hart: 2
+      mode: S
+      proc: echo (pid 4)
+      intr: on
+      satp: kernel
+      locks: []
+      irq: 0
+      stack: [usertrap, syscall, sys_exec, kexec]
+      sp:
+        "on": kernel
+        detail: "`echo`'s kernel stack; the user stack being freed is the old image's"
+    note: |
+      In our illustrative scenario, the background job you started a moment ago is
+      finishing `exec` on hart 2. Process 4 began life as a `fork` of a copy of the shell
+      (pid 3, the shell child that ran the `&` command), so it owned a full copy of the
+      shell's memory.
+      [[kexec]] has built the new `echo` image in a new page table and switched to it.
+      Line 138 throws the old one away: [[proc_freepagetable]] → [[uvmfree]] →
+      [[uvmunmap]], which calls [[kfree]] on every user page, then [[freewalk]], which frees
+      the page-table pages themselves.
+
+      Unlike hart 1, hart 2 holds **no** lock here and has interrupts on. `exec` is
+      replacing the process's own memory, which nobody else can see.
+
+      Among the freed pages is the old **user** stack, the shell-copy's page at `0x4000`.
+      `kexec` built `echo`'s new user stack in the new page table first and frees the old one
+      only now, at the end. All of this runs on pid 4's **kernel** stack, which `exec` does
+      not touch: it came from `kalloc` at boot and stays with the slot.
+
+      So at this instant, hart 1 is calling `kalloc` page after page and hart 2 is calling
+      `kfree` page after page. Both will touch `kmem.freelist`, a single 8-byte word at
+      `0x8000f998`.
+
+  - title: "kfree on hart 2: junk first, lock second"
+    file: kernel/vm.c
+    lines: 190-213
+    focus: 207-211
+    state:
+      hart: 2
+      mode: S
+      proc: echo (pid 4)
+      intr: on
+      satp: kernel
+      locks: []
+      irq: 0
+      stack: [usertrap, syscall, sys_exec, kexec, proc_freepagetable, uvmfree, uvmunmap]
+      sp: kernel
+    note: |
+      [[uvmunmap]] takes the physical address out of each leaf [[g:pte]] with [[PTE2PA]],
+      hands it to [[kfree]], and zeroes the PTE.
+
+      Inside `kfree`, the three sanity checks pass, and the `memset` with `0x01` bytes runs
+      with no lock held. Hart 2 can do this at full speed in parallel with hart 1, because
+      the page is private: it was unmapped from a page table that no hart is using (the
+      process already switched to its new one), and it is not yet on the free list.
+
+      Only the push itself needs the lock. That is the general shape of good locking: do
+      the expensive work on private data, and hold the shared lock only for the few
+      instructions that touch shared data.
+    others: |
+      Is it safe to free pages of a page table while some hart might be using it? Here,
+      yes: the old page table belonged only to process 4, and process 4 has already
+      switched its `p->pagetable` to the new one. No hart has the old table in `satp`.
+      (Hart 2 itself is running with the kernel page table.)
+
+  - title: Both harts reach for kmem.lock
+    file: kernel/spinlock.c
+    lines: 19-42
+    focus: 37-38
+    state:
+      hart: 1
+      mode: S
+      proc: sh (pid 2)
+      intr: off
+      satp: kernel
+      locks: ["child's p->lock (pid 5)"]
+      irq: {noff: 2, intena: 1, note: "one level for the child's `p->lock`, one from the `push_off` at the top of this `acquire`, done before the spin starts; intena 1 was recorded when `allocproc` took `p->lock` during the system call ([[concept:locks#noff]])"}
+      stack: [usertrap, syscall, sys_fork, kfork, uvmcopy, kalloc, acquire]
+      sp: kernel
+    note: |
+      Hart 1 calls `acquire(&kmem.lock)` from [[kalloc]] ([[kernel/kalloc.c:73]]). Hart 2
+      calls `acquire(&kmem.lock)` from [[kfree]] ([[kernel/kalloc.c:59]]). Both execute line
+      37: an atomic swap, [[g:insn-amoswap|amoswap.w.aq]], that writes 1 into
+      `kmem.lock.locked` and returns the old value, in one indivisible step.
+
+      The memory system orders the two swaps. One of them, say hart 2's, gets back 0 and
+      owns the lock. Hart 1's swap gets back 1 and it goes around the loop, swapping again
+      and again until hart 2 stores 0 in [[release]]. ([[tour:15]] takes this instruction
+      apart.)
+
+      While it waits, hart 1 already holds one spinlock, the child's `p->lock`; once its
+      swap succeeds it will hold two. That nesting is fine as long as no code ever takes them in the opposite
+      order. Nothing holding `kmem.lock` ever acquires another lock: `kalloc` and `kfree`
+      call nothing while they hold it. A lock that is always innermost cannot be part of a
+      [[g:deadlock]] cycle ([[tour:18]]).
+    others: |
+      | Time | Hart 1 (sh, in kalloc) | Hart 2 (echo, in kfree) |
+      |---|---|---|
+      | t1 | `amoswap` returns 1: busy | `amoswap` returns 0: **owns** `kmem.lock` |
+      | t2 | spins | `ld` head (`A`), `sd A` into page `P` |
+      | t3 | spins | `sd P` into `kmem.freelist` |
+      | t4 | spins | `release`: stores 0 |
+      | t5 | `amoswap` returns 0: owns the lock | continues with the next page |
+      | t6 | `ld` head: `P`; `ld P->next`: `A`; `sd A` into head | `memset` of the next page (no lock) |
+
+      Hart 1 gets page `P`, the page hart 2 freed a moment ago. The list is consistent at
+      every step.
+
+  - title: The race the lock prevents
+    file: kernel/kalloc.c
+    lines: 57-81
+    focus: 60-61
+    state:
+      hart: 2
+      mode: S
+      proc: echo (pid 4)
+      intr: off
+      satp: kernel
+      locks: [kmem.lock]
+      irq: {noff: 1, intena: 1}
+      stack: [usertrap, syscall, sys_exec, kexec, proc_freepagetable, uvmfree, uvmunmap, kfree]
+      sp: kernel
+    note: |
+      Imagine `kalloc` and `kfree` without the lock. Each is a read of the head followed,
+      a few instructions later, by a write of the head. In this build:
+
+      - `kalloc` pop: `ld s1, freelist` · `ld a5, 0(s1)` · `sd a5, freelist`
+        (`0x80000b28`–`0x80000b34`)
+      - `kfree` push: `ld a5, freelist` · `sd a5, 0(s1)` · `sd s1, freelist`
+        (`0x80000a6a`–`0x80000a70`)
+
+      The list starts as `A → B → …`, and hart 2 frees page `P`:
+
+      | Time | Hart 1 (kalloc) | Hart 2 (kfree P) |
+      |---|---|---|
+      | t1 | `r = freelist` = `A` | |
+      | t2 | | `P->next = freelist` = `A` |
+      | t3 | | `freelist = P` |
+      | t4 | `freelist = A->next` = `B` | |
+
+      Hart 2's push is overwritten. `P` is on no list and owned by nobody: it has
+      **leaked**, and 4 KiB of RAM is gone until reboot. Shift the timing slightly and it
+      is worse: if hart 2 reads the head (`A`) before hart 1's pop and writes it after,
+      the list becomes `P → A → B`, with `A` both on the list and in the shell's child.
+      The next `kalloc` pops `P`, and the one after that hands `A` out **again**: two
+      owners writing over each other's memory.
+
+      Neither failure crashes at the moment it happens, which is what makes such races so
+      hard to find. With the lock, the read and the write of the head are one indivisible
+      step as far as other harts can tell.
+
+  - title: kalloc pops, then fills with junk outside the lock
+    file: kernel/kalloc.c
+    lines: 65-82
+    focus: 74-76
+    state:
+      hart: 1
+      mode: S
+      proc: sh (pid 2)
+      intr: off
+      satp: kernel
+      locks: ["child's p->lock (pid 5)", kmem.lock]
+      irq: {noff: 2, intena: 1}
+      stack: [usertrap, syscall, sys_fork, kfork, uvmcopy, kalloc]
+      sp: kernel
+    note: |
+      Hart 1 finally owns `kmem.lock`. The pop is three memory accesses (five instructions in
+      this build, counting the empty-list branch and an `auipc`): read the head, read that
+      page's `next`, store it as the new head. If the list is empty, `r` is 0, the
+      head stays 0, and `kalloc` returns 0 to its caller.
+
+      Then `release`, and only then `memset(r, 5, PGSIZE)`: fill the page with `0x05`
+      bytes. As in `kfree`, the expensive part is done outside the lock, because the page
+      is now private to hart 1.
+
+      Why junk instead of zeros? Zeros would hide bugs. Code that forgets to initialize
+      memory it got from `kalloc` would read zeros, and zeros often look like a valid empty
+      state: a null pointer, an empty string, a count of 0. `0x0505…` looks like nothing, so
+      such a bug shows up fast. Two different fill values (`0x01` on free, `0x05` on alloc)
+      even tell you, in a debugger, whether you are looking at a freed page or a freshly
+      allocated one.
+
+      After line 77, hart 1 is back to holding only the child's `p->lock`, still with
+      interrupts off, and `uvmcopy` copies the shell's page into `r`. That is the counter at work: `release`'s `pop_off` takes noff from 2 to 1, and only a drop to 0 may turn interrupts back on ([[concept:locks#noff]]).
+    others: |
+      Hart 2's next `kfree` may be spinning at this moment, for the handful of instructions the
+      pop takes. `fork` and `exec` contend for the lock on every page; which hart wins each
+      round depends on timing.
+
+  - title: The cost of one global lock
+    file: kernel/kalloc.c
+    lines: 17-31
+    focus: 21-24
+    state:
+      hart: any
+      mode: S
+      proc: any
+      intr: on
+      satp: kernel
+      locks: []
+      irq: 0
+      stack: []
+      sp:
+        "on": kernel
+        detail: "the kernel stack of whichever process calls `kalloc` or `kfree` (at boot, hart 0's boot stack)"
+    note: |
+      What did the allocator cost? Per call, very little: a few instructions inside the lock
+      plus a 4096-byte `memset` outside it. The cost that grows with the machine is
+      **contention**. There is one `kmem.lock` for the whole system, so every `kalloc` and
+      every `kfree` on every hart is serialized through one cache line. Each hart that
+      spins also keeps interrupts off, and each `amoswap` pulls that cache line away from
+      the other harts.
+
+      On three harts running a teaching workload, the lock is rarely contended for long.
+      On a machine with dozens of cores all forking and exiting, it would become a
+      bottleneck. A standard fix (and a well-known xv6 lab exercise) is to give each hart
+      its own free list with its own lock, and to "steal" from another hart's list only
+      when your own is empty. Real kernels go further, with per-CPU page caches and
+      allocators for objects smaller than a page.
+
+      The key ideas of this tour:
+
+      - The free list costs no memory: it lives in the free pages.
+      - One function, `kfree`, builds the list at boot and refills it at run time.
+      - The lock covers only the head pointer. The checks and the 4 KiB fills happen
+        outside it, on pages that are private at that moment.
+      - Junk fills turn silent use-after-free and use-before-init bugs into loud ones.
+      - Without the lock, a pop and a push interleave into a leaked page or a page with
+        two owners, and nothing crashes until much later.
+locks:
+  - lock: "kmem.lock (spinlock)"
+    where: "[[kalloc]], [[kfree]]"
+    protects: "`kmem.freelist`, the head of the free-page list, and the `next` field of each page on it"
+  - lock: "child's p->lock (spinlock)"
+    where: "[[allocproc]] through [[kfork]]"
+    protects: "The half-built child process; held across the whole memory copy, so `kalloc` runs nested inside it with interrupts off"
+  - lock: "no lock: the page being filled with junk"
+    where: "[[kfree]] before `acquire`, [[kalloc]] after `release`"
+    protects: "Nothing needed: a page about to be pushed, or just popped, is reachable by only one hart"
+  - lock: "kmem.lock at boot (never contended)"
+    where: "[[kinit]], [[freerange]]"
+    protects: "Only hart 0 runs; the lock is still taken because `kfree` must work later with all harts running"
+  - lock: "pid_lock (spinlock)"
+    where: "[[allocpid]], inside [[allocproc]]"
+    protects: "`nextpid`; taken and released while the child's `p->lock` is held, before any of the fork's `kalloc` calls"
+quiz:
+  - q: "After `kinit`, which physical page does the first `kalloc` return in this build, and why that one?"
+    a: "`0x87fff000`, the highest page below `PHYSTOP`. `freerange` frees pages from low to high, and each `kfree` pushes onto the front of the list, so the last page freed is at the head."
+  - q: "`kfree` fills the page with `0x01` bytes *before* taking `kmem.lock`. Why is that safe on a three-hart machine, and why is it a good idea?"
+    a: "Until it is pushed, the page is reachable only by the caller, who has promised not to use it, so no other hart can see the writes. Doing the 4096-byte fill outside the lock keeps the critical section to a few instructions, so other harts wait less."
+  - q: "Without `kmem.lock`, hart 1 runs `kalloc` and hart 2 runs `kfree(P)`. Hart 1 reads the head (`A`), then hart 2 completes its whole push, then hart 1 stores `A->next` as the new head. What has happened to `P`?"
+    a: "`P` has leaked. Hart 2 made `P` the head with `P->next = A`, but hart 1 overwrote the head with `B`, so `P` is on no list and nobody owns it. It is lost until reboot."
+  - q: "In `kfork`, `kalloc` is called while the child's `p->lock` is held. Why can't this nesting deadlock against another hart?"
+    a: "A deadlock needs some hart to hold `kmem.lock` and then wait for a `p->lock`. Code holding `kmem.lock` never acquires anything else: `kalloc` and `kfree` call nothing inside the critical section. So `kmem.lock` is always the innermost lock, and no cycle can form."
+  - q: "A buggy caller calls `kfree(P)` twice in a row. What does the free list look like, and what will the next two `kalloc` calls return?"
+    a: "The second push sets `P->next = P` and the head to `P`: a one-page cycle. Both of the next two `kalloc` calls return `P`, so two owners share one page. The first call's junk fill overwrites `P->next`, so the second call leaves `0x0505050505050505` (or whatever the first owner wrote) as the head, and a third `kalloc` would follow that garbage pointer and most likely panic. `kfree` does not detect double frees."
+  - q: "Why doesn't `kalloc` zero the page it returns, given that so many callers need zeros?"
+    a: "Some callers overwrite the whole page anyway (`uvmcopy`'s `memmove`) or set every field they will read (`pipealloc`), and zeroing would hide use-before-initialization bugs. Callers that need zeros (`walk`, `uvmalloc`, `vmfault`, `kvmmake`) clear the page themselves; everyone else gets `0x05` junk that makes mistakes visible."

@@ -1,0 +1,752 @@
+title: Spinlocks and interrupt state
+summary: acquire and release at the instruction level, push_off/pop_off, noff and intena, and why interrupts must be off while a spinlock is held.
+questions:
+  - id: spin-01
+    level: 1
+    type: choice
+    q: |
+      [[acquire]] calls [[push_off]] *before* it tries to take the lock. Why must
+      interrupts be off before the lock is taken, rather than just after?
+    code: kernel/spinlock.c:21-42@24
+    options:
+      - text: So that no interrupt handler on this hart can find the lock held by the very code it interrupted, and spin forever.
+        correct: true
+        why: |
+          If the lock were taken first, there would be an instant when this hart holds it with
+          SIE still on. A timer or device interrupt landing then could run a handler that wants
+          the same lock (for example [[clockintr]] wants `tickslock`). The handler would spin, and
+          the holder can't run again until the handler returns: the hart is stuck for good.
+      - text: Because the atomic swap instruction only works with interrupts disabled.
+        why: |
+          You may have thought `amoswap` needs interrupts off to be atomic. It doesn't: an AMO is
+          a single instruction, atomic with respect to every other hart and to interrupts
+          regardless of SIE. Disabling interrupts protects against *this hart's own handlers*,
+          which is a different problem.
+      - text: To stop other harts from taking the lock at the same time.
+        why: |
+          You may have thought SIE affects other CPUs. It only controls interrupts on *this*
+          hart. Other harts are kept out by the atomic swap itself: only one of them can see the
+          old value 0.
+      - text: It makes no difference; the window between taking the lock and calling push_off would be only a few instructions long.
+        why: |
+          You may have thought a window of a few instructions is too short to matter. An
+          interrupt can arrive between any two instructions, and on a busy machine it
+          eventually will. One unlucky timer tick inside that window freezes the hart for good,
+          so the order is a correctness rule, not a style choice.
+    explain: |
+      The rule is "no instant where this hart holds a spinlock with interrupts on". Taking
+      the lock first would break it for a few instructions, enough for a handler that needs
+      the same lock to deadlock the hart. See [[concept:locks#noff]] and
+      [[concept:locks#invariant]].
+
+  - id: spin-02
+    level: 2
+    type: multi
+    q: |
+      Which of these locks are acquired *inside an interrupt handler* (from [[devintr]] or
+      code it calls) in this kernel?
+    options:
+      - text: "`p->lock`"
+        correct: true
+        why: Every handler that calls [[wakeup]] takes each slot's `p->lock` in turn (the UART, disk and timer handlers all do).
+      - text: "`tickslock`"
+        correct: true
+        why: "[[clockintr]] takes it on hart 0 to increment `ticks` ([[kernel/trap.c:170]])."
+      - text: "`disk.vdisk_lock`"
+        correct: true
+        why: "[[virtio_disk_intr]] takes it to read the used ring ([[kernel/virtio_disk.c:303]])."
+      - text: "`kmem.lock`"
+        why: |
+          You may have thought a handler allocates memory. None does: interrupt handlers here
+          only acknowledge the device, update a counter or buffer, and wake sleepers.
+      - text: "`log.lock`"
+        why: |
+          You may have connected the disk interrupt with the log. The handler only marks the
+          buffer done and wakes its owner; all log bookkeeping happens in process context in
+          [[begin_op]], [[end_op]] and [[log_write]].
+    explain: |
+      Handlers take `p->lock` (through [[wakeup]]), `tickslock`, `disk.vdisk_lock`,
+      `cons.lock` (keyboard input) and `pr.lock` (for Ctrl-P's process listing, or if
+      [[devintr]] prints "unexpected interrupt", [[kernel/trap.c:203]]). Every
+      one of these is also taken by ordinary process code, which is exactly why it must be
+      taken with interrupts off ([[concept:locks#handlers]]).
+
+  - id: spin-03
+    level: 2
+    type: number
+    q: |
+      A process is in [[kwait]] holding `wait_lock` and a zombie child's `p->lock`. It calls
+      [[freeproc]], which calls [[kfree]], which is now inside `acquire(&kmem.lock)` with the
+      lock held. What is `mycpu()->noff` at that moment?
+    answer: 3
+    wrong:
+      2: |
+        You may have counted only the locks [[kwait]] took itself. [[kfree]]'s `kmem.lock` is
+        a third spinlock held at the same time, and each held spinlock is one push_off level.
+      1: |
+        You may have thought noff counts "nested functions" or only the innermost lock. It
+        counts every outstanding push_off on this hart: three spinlocks are held.
+      4: |
+        You may have added a level for [[myproc]]. Its push_off is matched by a pop_off before
+        it returns, so it adds nothing once it has finished.
+    why_wrong: Count the spinlocks this hart is holding right now; each one contributed one push_off that has not been popped yet.
+    explain: |
+      `wait_lock` (1) + the child's `p->lock` (2) + `kmem.lock` (3). noff 3 is the deepest
+      level measured, and this is one of the three paths that reach it
+      ([[concept:locks#nesting]]).
+
+  - id: spin-04
+    level: 2
+    type: order
+    q: |
+      Put the steps of [[acquire]] in the order they happen.
+    code: kernel/spinlock.c:21-42
+    items:
+      - text: "`push_off()`: interrupts off, noff + 1"
+        why: Everything else must happen with interrupts already off, so push_off comes first.
+      - text: "`holding(lk)` check, panic if this hart already holds the lock"
+        why: The self-deadlock check runs before spinning, so a double acquire panics instead of spinning forever.
+      - text: "`amoswap.w.aq` in a loop until the old value is 0"
+        why: The spin only starts after the checks; it is the step that actually takes the lock.
+      - text: "`lk->cpu = mycpu()`"
+        why: The owner is recorded only once the lock is really held; recording it earlier would make holding() lie.
+    why_wrong: Ask for each step what must already be true for it to be safe or meaningful.
+    explain: |
+      Interrupts off → check for self-deadlock → spin until the lock is ours → record the
+      owning hart. [[release]] does the mirror image: check, clear `lk->cpu`, release store,
+      `pop_off` ([[concept:locks#spinlock]]).
+
+  - id: spin-05
+    level: 2
+    type: line
+    q: |
+      In [[pop_off]], click the line that can turn interrupts back on.
+    code: kernel/spinlock.c:105-116
+    answer: 115
+    lines:
+      109: |
+        You may have read `intr_get()` as "interrupts on". It only *reads* SIE, to panic if
+        interrupts are already on (they must be off while noff > 0).
+      113: |
+        Decrementing noff is the bookkeeping, but by itself it changes nothing in hardware.
+        Interrupts come back only through the `intr_on()` call.
+      114: |
+        This line decides whether to turn them on (only if noff reached 0 and intena is 1), but
+        the line that actually sets SIE is the next one.
+    why_wrong: Look for the call that writes sstatus.SIE, not the ones that read or count.
+    explain: |
+      Line 115 calls [[intr_on]], which sets `sstatus.SIE` with `csrsi`. It runs only when the
+      outermost push_off is undone (noff becomes 0) *and* interrupts were on before it (intena
+      is 1) ([[concept:locks#noff]]).
+
+  - id: spin-06
+    level: 2
+    type: state
+    q: |
+      Hart 1 is running `cat`'s [[consoleread]] (a `read` system call). It has just executed
+      line 95, `acquire(&cons.lock)`, and the lock is now held. What is the state of hart 1?
+    code: kernel/console.c:87-108@95
+    state:
+      mode: S
+      stack: kernel
+      satp: kernel
+      sie: off
+      noff: 1
+      intena: 1
+    why:
+      sie: |
+        You may have remembered that [[usertrap]] turns interrupts on for system calls. It does
+        ([[kernel/trap.c:66]]), but [[acquire]]'s push_off just turned them off again; they stay off while
+        any spinlock is held.
+      intena: |
+        intena records SIE as it was *before* the outermost push_off. In a system call after
+        usertrap's `intr_on()`, that was on, so intena is 1. It would be 0 in an interrupt
+        handler.
+      noff: |
+        One spinlock (`cons.lock`) is held and no other push_off is outstanding, so noff is 1.
+      stack: |
+        System calls run on the process's own kernel stack, not the scheduler stack.
+    why_wrong: Go through the path - user ecall, uservec, usertrap (intr_on), syscall, consoleread, acquire - and track each field.
+    explain: |
+      Supervisor mode, on `cat`'s kernel stack, kernel page table; SIE off with noff 1 because
+      of `cons.lock`; intena 1 because interrupts were on when that acquire started. When
+      [[consoleread]] releases `cons.lock`, pop_off will turn interrupts back on
+      ([[concept:locks#intena]]).
+
+  - id: spin-07
+    level: 3
+    type: bits
+    q: |
+      gdb shows `sstatus = 0x200000122` on a hart running kernel code. Decode it.
+    value: "0x200000122"
+    fields:
+      - label: SIE (bit 1)
+        options: ["1 (interrupts enabled)", "0 (interrupts disabled)"]
+        answer: "1 (interrupts enabled)"
+        why: "0x122 = 0b1_0010_0010: bit 1 (value 2) is set."
+      - label: SPIE (bit 5)
+        options: ["1", "0"]
+        answer: "1"
+        why: "Bit 5 has value 0x20, which is part of 0x22: set. SPIE is what sret will copy back into SIE."
+      - label: "SPP (bit 8): where sret returns"
+        options: ["supervisor mode", "user mode"]
+        answer: "supervisor mode"
+        why: "Bit 8 has value 0x100, which is set, and SPP = 1 means sret returns to supervisor mode."
+      - label: Could this hart be holding a spinlock right now?
+        options: ["no", "yes"]
+        answer: "no"
+        why: "SIE is 1, and push_off always clears SIE while noff > 0, so noff must be 0 here: no spinlock is held."
+    explain: |
+      `0x122` sets bits 1 (SIE), 5 (SPIE) and 8 (SPP); `0x200000000` is UXL = 2 (64-bit user
+      mode). With SIE on, the invariant "noff > 0 implies SIE off" tells you no spinlock is
+      held ([[concept:locks#invariant]], [[concept:locks#sie]]).
+
+  - id: spin-08
+    level: 1
+    type: match
+    q: |
+      Match each panic message with the mistake that triggers it.
+    pairs:
+      - left: "`panic: acquire`"
+        right: this hart tried to take a spinlock it already holds
+        why: "[[acquire]]'s `holding()` check turns a self-deadlock into a panic."
+      - left: "`panic: release`"
+        right: this hart released a spinlock it does not hold
+        why: "[[release]] checks `holding()` first; releasing someone else's lock would corrupt it."
+      - left: "`panic: sched locks`"
+        right: a process tried to switch away while holding a spinlock besides its own p->lock
+        why: "[[sched]] requires noff == 1 exactly: sleeping or yielding with another spinlock held could deadlock the system."
+      - left: "`panic: pop_off - interruptible`"
+        right: pop_off found interrupts already on
+        why: "While noff > 0, SIE must be off; finding it on means something enabled interrupts inside a critical section."
+    explain: |
+      Each check catches one misuse by a single hart. None of them checks lock *order*; that
+      is left to the programmer ([[concept:locks#panics]]).
+
+  - id: spin-09
+    level: 3
+    type: tf
+    q: |
+      True or false: [[holding]] tells you whether the *current process* holds the lock.
+    answer: false
+    why_tf: |
+      You may have assumed locks belong to processes. A spinlock records the *hart* that holds
+      it (`lk->cpu`), not a process.
+    reasons:
+      - text: "`holding()` compares `lk->cpu` with `mycpu()`, so it is about the hart; `p->lock` is even acquired by the scheduler and released by the process on the same hart."
+        correct: true
+        why: |
+          That is why the scheduler can acquire `p->lock` and the process it switches to can
+          release it ([[concept:locks#handoff]]): same hart, so `holding()` is satisfied.
+      - text: "`holding()` compares `lk->pid` with `myproc()->pid`."
+        why: |
+          You may be thinking of [[holdingsleep]]: sleep-locks record a pid. Spinlocks have no
+          pid field.
+      - text: Spinlocks have no owner at all; holding() only checks `locked`.
+        why: |
+          It checks `locked` *and* `lk->cpu == mycpu()`; without the second part it couldn't
+          detect a double acquire on the same hart.
+    explain: |
+      A spinlock's owner is a hart (`struct cpu *cpu`). This is what lets `p->lock` be handed
+      across [[swtch]] from one thread to another on the same hart.
+
+  - id: spin-10
+    level: 1
+    type: choice
+    q: |
+      Hart 0 holds a spinlock. Hart 1, inside [[acquire]], executes the swap below with
+      `a5 = 1` and `s1` pointing at the lock's `locked` word. What happens?
+
+      ```text
+      80000c02:  mv     a5,a4
+      80000c04:  amoswap.w.aq  a5,a5,(s1)
+      80000c08:  sext.w a5,a5
+      80000c0a:  bnez   a5,80000c02
+      ```
+    code: kernel/spinlock.c:37-38
+    options:
+      - text: The word is written with 1 (it already held 1), a5 receives the old value 1, and bnez jumps back to try again.
+        correct: true
+        why: |
+          An `amoswap` always writes and always returns the old value. Writing 1 over 1 changes
+          nothing, and the 1 that comes back tells hart 1 that somebody else owns the lock.
+      - text: The instruction stalls inside the hardware until hart 0 stores 0, then completes.
+        why: |
+          You may have imagined the hardware waiting for the lock on hart 1's behalf. It doesn't:
+          the swap finishes at once whatever the value is. The waiting is done in software, by
+          the `bnez` loop that repeats the swap.
+      - text: The instruction raises an exception, because the word is already locked.
+        why: |
+          You may have thought the hardware knows the word is a lock. To the processor it is an
+          ordinary 32-bit word; "1 means held" is only xv6's convention. Swapping 1 into a word
+          that holds 1 is perfectly legal.
+      - text: Hart 1 now also owns the lock, because its swap wrote a 1 into the word.
+        why: |
+          You may have thought that writing the 1 is what takes the lock. What takes it is
+          *finding a 0*: only the swap that returns 0 changed the word from free to held. Hart 1
+          got 1 back, so it owns nothing and loops.
+    explain: |
+      The lock is taken by the one swap that returns 0. Every other swap writes 1 over 1,
+      gets 1 back, and loops. That loop is the "spin" in spinlock
+      ([[concept:locks#amoswap]], [[g:insn-amoswap]]).
+
+  - id: spin-11
+    level: 1
+    type: choice
+    q: |
+      Hart 0 holds `kmem.lock`. A process on hart 1 calls `acquire(&kmem.lock)`. Until hart 0
+      releases it, what is hart 1 doing?
+    options:
+      - text: Running the swap loop in acquire again and again, with its own interrupts off, so it takes no interrupts and runs nothing else.
+        correct: true
+        why: |
+          [[acquire]] called [[push_off]] before the loop, so SIE is 0 on hart 1. The hart does
+          nothing but retry the swap until it returns 0.
+      - text: It puts the current process to sleep and runs another process until the lock is free.
+        why: |
+          You may be thinking of a [[g:sleeplock|sleep-lock]], whose waiters do sleep. A
+          spinlock waiter never gives up the hart; that is why spinlocks are held only for a few
+          instructions.
+      - text: It spins with interrupts on, so a timer tick can still make it yield to another process.
+        why: |
+          You may have thought interrupts are disabled only once the lock is held. `push_off` is
+          the first thing [[acquire]] does, so the waiting itself happens with SIE off: no timer
+          interrupt, no yield.
+      - text: It waits in a wfi instruction until hart 0's release sends it an interrupt.
+        why: |
+          You may have thought release notifies the waiters. It only stores 0 into the lock word;
+          nobody is told. Hart 1 notices because its next swap returns 0.
+    explain: |
+      A spinlock waiter burns its hart: interrupts off, retrying an atomic swap. That is cheap
+      only if the holder lets go within a few instructions, which is the deal every spinlock
+      user in xv6 keeps ([[concept:locks#spinlock]], [[g:spinlock]]).
+
+  - id: spin-12
+    level: 1
+    type: tf
+    q: |
+      True or false: [[push_off]] saves the current value of SIE into `intena` every time it is
+      called.
+    code: kernel/spinlock.c:92-103
+    answer: false
+    why_tf: |
+      You may have pictured `intena` as a stack slot, one saved value per push_off, which each
+      pop_off restores. There is only one `intena` per hart, and it is written only when
+      `noff` is 0.
+    reasons:
+      - text: "Only the outermost push_off (noff 0 → 1) writes it; a nested one finds SIE already 0 and would overwrite the value that matters."
+        correct: true
+        why: |
+          Lines 100-101 test `noff == 0` before writing. In a nested call, SIE was cleared by the
+          outer `push_off`, so recording it would make the last `pop_off` leave interrupts off
+          for good.
+      - text: intena is written by pop_off, not push_off.
+        why: |
+          You may have mixed up the reader and the writer. [[pop_off]] only *reads* `intena`
+          (line 114) to decide whether to turn interrupts back on.
+      - text: push_off never writes intena; acquire writes it after the swap succeeds.
+        why: |
+          [[acquire]] records only `lk->cpu`. The interrupt bookkeeping, `noff` and `intena`,
+          lives entirely in [[push_off]] and [[pop_off]].
+    explain: |
+      `intena` answers one question for the final [[pop_off]]: were interrupts on before this
+      hart started holding things? Only the push_off that takes `noff` from 0 to 1 knows the
+      answer, so only it records it ([[concept:locks#intena]]).
+
+  - id: spin-13
+    level: 1
+    type: number
+    q: |
+      A spinlock is free (`locked` is 0). Three harts execute their `amoswap.w.aq` on its
+      `locked` word at the same instant. How many of the three swaps return 0?
+    answer: 1
+    wrong:
+      3: |
+        You may have thought simultaneous swaps all read the old value before any of them
+        writes. An atomic memory operation is indivisible: the memory system puts the three
+        swaps in some order, and only the first one finds 0.
+      0: |
+        You may have thought simultaneous swaps collide and all fail. They don't fail: each one
+        completes. The first in the memory order reads 0 and writes 1; the other two read that 1.
+      2: |
+        No ordering of three indivisible swaps lets two of them see 0: once the first has run,
+        the word holds 1, and nothing writes 0 again until the winner releases.
+    why_wrong: Put the three swaps in a line, one after the other, and track the value of the word.
+    explain: |
+      Atomicity means "as if one at a time". The first swap in the order reads 0 and takes the
+      lock; the next two read 1 and loop. That is exactly the mutual exclusion a lock needs
+      ([[concept:locks#amoswap]]).
+
+  - id: spin-14
+    level: 1
+    type: choice
+    q: |
+      Why does xv6 hold spinlocks only for short stretches of code, never across a disk read
+      or a wait for input?
+    options:
+      - text: Any other hart that wants the lock spins with interrupts off for the whole time it is held, doing no useful work.
+        correct: true
+        why: |
+          A waiter can't do anything else, and the holder's own hart also runs with interrupts
+          off. A long critical section would freeze both harts.
+      - text: Because acquire gives up and panics if it has spun for more than one timer tick.
+        why: |
+          You may have expected a timeout. There is none: [[acquire]] spins forever if it has
+          to. The only panic in acquire is for a hart that already holds the lock.
+      - text: Because a timer interrupt during a long critical section would make the holder yield and leave the lock held while it is off the CPU.
+        why: |
+          You may have forgotten that the holder has interrupts off. While any spinlock is held,
+          no timer interrupt is taken on that hart, so the holder cannot be preempted at all.
+      - text: Because the lock word is only 32 bits wide and fills up if a lock is held too long.
+        why: |
+          You may have thought `locked` counts something. It holds only 0 or 1; how long it is
+          held doesn't change it.
+    explain: |
+      Spinlocks trade waiting for simplicity: no scheduler involvement, but waiters burn their
+      hart. Long waits (disk, console input, a child's exit) use sleep and wakeup, or a
+      [[g:sleeplock|sleep-lock]], instead ([[concept:locks#sleep-locks]]).
+
+  - id: spin-15
+    level: 1
+    type: choice
+    q: |
+      Why does xv6 count interrupt-disabling with [[push_off]]/[[pop_off]] instead of having
+      [[acquire]] call [[intr_off]] and [[release]] call [[intr_on]]?
+    options:
+      - text: Locks nest; releasing an inner lock must not turn interrupts on while an outer lock is still held.
+        correct: true
+        why: |
+          With plain intr_on in release, [[kwait]] releasing a child's `p->lock` would enable
+          interrupts while it still holds `wait_lock`. The counter turns them on only when the
+          last lock goes ([[kernel/spinlock.c:114]]).
+      - text: Because intr_off and intr_on are much slower than push_off and pop_off.
+        why: |
+          You may have assumed the wrapper is an optimization. [[intr_off]] and [[intr_on]] are
+          one instruction each; push_off and pop_off do *more* work. The reason is correctness.
+      - text: So that other harts can read noff and see how many locks this hart holds.
+        why: |
+          You may have thought noff is shared. Each hart has its own `struct cpu`, and no other
+          hart reads it. noff only tells *this* hart when its last level is gone.
+      - text: Because the counter is what detects a hart acquiring the same lock twice.
+        why: |
+          You may have confused two checks. Self-deadlock is caught by [[holding]] (lk->cpu),
+          not by noff; noff has no idea which locks are held, only how many levels.
+    explain: |
+      The counter makes interrupt-disabling nest like the locks do, and `intena` remembers
+      whether they were on before the first level, so a lock taken where interrupts were
+      already off (in a handler, in the scheduler) leaves them off
+      ([[concept:locks#noff]]).
+
+  - id: spin-16
+    level: 2
+    type: choice
+    q: |
+      [[release]] frees the lock with `__atomic_store_n(&lk->locked, 0, __ATOMIC_RELEASE)`,
+      which compiles to `fence rw,w` followed by `sw zero,0(s1)`. What does the fence
+      prevent?
+    code: kernel/spinlock.c:44-76@73
+    options:
+      - text: Another hart seeing locked == 0 while some of this critical section's stores are not yet visible, or while one of its loads has not yet read its value.
+        correct: true
+        why: |
+          `fence rw,w` orders every earlier read and write of this hart before every later
+          write, including the freeing `sw`. So the next owner, which takes the lock only after
+          seeing 0, also sees all the data the critical section wrote, and every load in the
+          critical section has already read its value, so none of them can see what the next
+          owner writes (the comment on lines 64-69 says both).
+      - text: An interrupt arriving between the fence and the store.
+        why: |
+          You may have thought a fence blocks interrupts. It is about memory ordering only;
+          interrupts are already off here because the lock is still held, and [[pop_off]]
+          handles them afterwards.
+      - text: Other harts' swaps writing to the lock word while this hart is clearing it.
+        why: |
+          You may have thought the fence locks the word. Nothing stops another hart's
+          `amoswap` from hitting the word at any time; that swap just keeps returning 1 until the
+          `sw zero` lands.
+      - text: Nothing on RISC-V; it is there only for other architectures.
+        why: |
+          You may have assumed RISC-V keeps memory accesses in program order. Its memory model,
+          RVWMO, lets other harts observe accesses to different addresses out of order, so the
+          fence is needed on exactly this hardware.
+    explain: |
+      A lock is only useful if the next owner sees what the last owner wrote. `.aq` on the
+      swap keeps the critical section after the acquire; `fence rw,w` keeps it before the
+      release ([[concept:locks#fence]], [[g:memory-barrier]]).
+
+  - id: spin-17
+    level: 2
+    type: choice
+    q: |
+      [[release]] clears `lk->cpu` on line 51 *before* it stores 0 into `lk->locked` on line
+      73. What could go wrong if the two were the other way round?
+    code: kernel/spinlock.c:44-76@51
+    options:
+      - text: Another hart could take the lock in between and record itself in lk->cpu, and this hart's late lk->cpu = 0 would erase the new owner.
+        correct: true
+        why: |
+          Then the new owner's [[holding]] would be false: its own [[release]] would panic with
+          `release`, and a double acquire on that hart would no longer be caught.
+      - text: Nothing; lk->cpu is only for debugging, as the comment in spinlock.h says.
+        why: |
+          You may have trusted the "For debugging" comment in [[kernel/spinlock.h:5]].
+          [[holding]] reads `lk->cpu`, and acquire and release both depend on holding(), so it
+          matters for correctness.
+      - text: The fence would no longer cover the store to lk->cpu, so other harts could see a torn pointer.
+        why: |
+          You may have connected the fence with the pointer. A 64-bit aligned `sd` is never
+          torn; the problem is *which* value ends up in the field, not whether it is half
+          written.
+      - text: This hart's pop_off would panic, because it checks lk->cpu.
+        why: |
+          [[pop_off]] never looks at any lock. It only checks SIE and noff.
+    explain: |
+      Once `locked` is 0 the lock belongs to whoever swaps next, including its `cpu` field.
+      So everything this hart does to the lock must be finished before that store
+      ([[concept:locks#fence]], [[concept:locks#holding]]).
+
+  - id: spin-18
+    level: 2
+    type: line
+    q: |
+      Click the line of [[release]] from which another hart's [[acquire]] can succeed.
+    code: kernel/spinlock.c:44-76
+    answer: 73
+    lines:
+      51: |
+        You may have thought clearing the owner frees the lock. `lk->cpu` is bookkeeping;
+        other harts' swaps look only at `locked`, which is still 1 here.
+      75: |
+        You may have thought the lock is free only when everything is undone. By the time
+        [[pop_off]] runs, the store on line 73 has already made the lock free; pop_off deals
+        only with this hart's interrupts.
+      48: |
+        This is the sanity check that this hart owns the lock. It reads, but changes nothing.
+    why_wrong: Find the line that writes 0 into the word the waiters' swaps read.
+    explain: |
+      Line 73's `sw zero` (after its `fence rw,w`) is the moment of release. A waiting hart's
+      next `amoswap` returns 0. [[pop_off]] on line 75 then runs on a hart that no longer holds
+      the lock, which is fine: it only restores interrupt state
+      ([[concept:locks#spinlock]]).
+
+  - id: spin-19
+    level: 2
+    type: order
+    q: |
+      A system call on hart 0 is in [[sys_uptime]], holding `tickslock`, when hart 0's timer
+      deadline passes. Put the events in order.
+    code: kernel/sysproc.c:104-112
+    items:
+      - text: "acquire's push_off clears SIE on hart 0 and records intena = 1"
+        why: Interrupts go off before anything else in acquire.
+      - text: "the amoswap takes tickslock"
+        why: The lock is taken only after interrupts are off.
+      - text: "the timer deadline passes: the interrupt becomes pending but is not taken"
+        why: With SIE 0 the hart notes the interrupt and keeps running the critical section.
+      - text: "release stores 0 into tickslock.locked"
+        why: The lock is freed before interrupts come back.
+      - text: "pop_off takes noff to 0, sees intena 1, and sets SIE"
+        why: Only the last pop_off with intena 1 turns interrupts on.
+      - text: "the pending timer interrupt is taken, and clockintr acquires tickslock, which hart 0 no longer holds"
+        why: The interrupt is taken right after SIE is set, and by then hart 0 has already freed the lock.
+    why_wrong: Ask at each step whether SIE is on and whether tickslock is held.
+    explain: |
+      This is why interrupts must be off while a spinlock is held: the timer interrupt waits
+      until the lock is free, so [[clockintr]]'s `acquire(&tickslock)` on the same hart can
+      never spin on a lock its own hart holds ([[concept:locks#noff]],
+      [[concept:locks#handlers]]).
+
+  - id: spin-20
+    level: 2
+    type: multi
+    q: |
+      Besides [[acquire]] and [[release]], which of these functions call [[push_off]] and
+      [[pop_off]] directly?
+    options:
+      - text: "[[myproc]]"
+        correct: true
+        why: |
+          It wraps its read of `mycpu()->proc` ([[kernel/proc.c:85-88]]) so the thread cannot
+          move to another hart halfway through. That is why noff can be one higher than the
+          number of locks held.
+      - text: "[[uartputc_sync]]"
+        correct: true
+        why: |
+          It brackets its wait-and-write on the UART ([[kernel/uart.c:105-106]],
+          [[kernel/uart.c:118-119]]), skipping the pair once `panicking` is set.
+      - text: "[[sleep]]"
+        why: |
+          You may have thought sleep manages interrupts itself. It calls [[myproc]],
+          `acquire(&p->lock)` and `release(&p->lock)`; every push_off it causes happens inside
+          those.
+      - text: "[[kerneltrap]]"
+        why: |
+          You may have expected the trap handler to manage noff. It never calls push_off or
+          pop_off itself (only indirectly, through [[myproc]] and [[yield]]): the hardware has
+          already cleared SIE, and kerneltrap restores `sstatus` at the end with `w_sstatus`.
+      - text: "[[scheduler]]"
+        why: |
+          The scheduler uses [[intr_on]] and [[intr_off]] directly at the top of its loop
+          ([[kernel/proc.c:441-442]]), which do not touch noff. Its push_offs come from its
+          `acquire(&p->lock)`.
+    explain: |
+      A push_off level is not always a lock. `myproc` and `uartputc_sync` use the pair to
+      keep interrupts off for a few instructions, so `noff` can briefly exceed the number of
+      spinlocks held ([[concept:locks#noff]]).
+
+  - id: spin-21
+    level: 2
+    type: choice
+    q: |
+      The comment above [[holding]] says "Interrupts must be off." What could go wrong if
+      `holding(lk)` ran with interrupts on?
+    code: kernel/spinlock.c:78-86
+    options:
+      - text: The thread could be preempted between reading lk->cpu and calling mycpu(), resume on another hart, and compare against the wrong hart.
+        correct: true
+        why: |
+          `mycpu()` reads the hart number from `tp`. If a timer interrupt moved the thread to
+          another hart midway, the answer would be about a hart that is not the one the caller
+          was asking about.
+      - text: holding() writes lk->locked, so an interrupt could corrupt the lock word.
+        why: |
+          You may have thought holding() takes the lock. It only reads `locked` and `cpu`; it
+          changes nothing.
+      - text: An interrupt handler could release the lock while holding() is reading it.
+        why: |
+          You may have thought handlers release locks they did not take. A handler releases only
+          locks it acquired itself, so it cannot free a lock this thread holds.
+      - text: The amoswap inside holding() is only atomic with interrupts off.
+        why: |
+          There is no swap in holding(); the swap is in [[acquire]]. And an `amoswap` is atomic
+          whatever SIE says.
+    explain: |
+      Anything that asks "which hart am I?" must not be moved to another hart while it asks.
+      Every caller of holding() already has interrupts off: [[acquire]] after its push_off,
+      [[release]] and [[sched]] because they hold a spinlock ([[concept:locks#holding]]).
+
+  - id: spin-22
+    level: 3
+    type: choice
+    q: |
+      `sh` went to sleep in [[consoleread]] (a system call) on hart 0, so the `p->lock` it
+      took in [[sleep]] was acquired with SIE on and hart 0's `intena` is 1. Suppose line 456
+      (`mycpu()->intena = 0`) were deleted. What goes wrong when hart 0's [[scheduler]]
+      continues after its `swtch`?
+    code: kernel/proc.c:441-464@456
+    options:
+      - text: Its release(&p->lock) on line 463 sees intena 1 and turns interrupts on inside the scheduler loop.
+        correct: true
+        why: |
+          `intena` still holds `sh`'s 1. When noff drops to 0, [[pop_off]] executes `csrsi`,
+          and the scheduler runs on with SIE on, outside the one-instruction window of lines
+          441-442 meant for interrupts.
+      - text: sh would later resume from sched with intena 0 and finish its system call with interrupts off.
+        why: |
+          You may have mixed up the two safeguards. That is what removing line 496 in [[sched]]
+          would do. With 456 gone, `sched` still restores `sh`'s own 1 when it resumes.
+      - text: The scheduler's release would panic with "pop_off - interruptible".
+        why: |
+          That panic needs SIE to be on when pop_off *starts*. Here SIE is off (the scheduler
+          holds `p->lock`); pop_off is the one that turns it on, which raises no panic.
+      - text: Nothing; intena is only ever read by the thread that wrote it.
+        why: |
+          You may have thought intena is per thread. It is a per-hart field. The thread that
+          wrote it (`sh`) is gone, and the scheduler's release reads it next. That is why the
+          scheduler overwrites it.
+    explain: |
+      `intena` lives in `struct cpu`, but it describes a thread. [[sched]] carries each
+      process's value across the switch in a local variable, and the scheduler sets its own
+      value, always 0, on line 456 ([[concept:locks#sched-intena]], [[tour:50]]).
+
+  - id: spin-23
+    level: 3
+    type: multi
+    q: |
+      Which of these can change `sstatus.SIE` from 0 to 1 on a hart in this kernel?
+    options:
+      - text: "[[pop_off]]'s [[intr_on]] ([[kernel/spinlock.c:115]])"
+        correct: true
+        why: When noff reaches 0 and intena is 1, `csrsi sstatus,2` sets SIE.
+      - text: "[[usertrap]]'s [[intr_on]] ([[kernel/trap.c:66]]), for a system call"
+        correct: true
+        why: The hardware cleared SIE on the trap; line 66 turns it on so the system call can be interrupted.
+      - text: "[[scheduler]]'s [[intr_on]] ([[kernel/proc.c:441]])"
+        correct: true
+        why: It opens a one-instruction window in which a pending interrupt is taken, then line 442 closes it.
+      - text: "`sret` at the end of [[kernelvec]], when SPIE is 1"
+        correct: true
+        why: "`sret` copies SPIE into SIE. If the interrupted kernel code had SIE on, it gets it back here."
+      - text: "[[kerneltrap]]'s `w_sstatus(sstatus)` ([[kernel/trap.c:163]])"
+        why: |
+          You may have thought restoring `sstatus` re-enables interrupts. It writes back the
+          value read at entry, whose SIE is 0 (the trap cleared it, and line 146 panics
+          otherwise). Interrupts come back only at the `sret` that follows, via SPIE.
+      - text: "[[prepare_return]]'s `w_sstatus(x)` ([[kernel/trap.c:128]])"
+        why: |
+          You may have read "enable interrupts in user mode" as SIE. Line 127 sets SPIE, not
+          SIE; SIE stays 0 until `userret`'s `sret` copies SPIE into it.
+    explain: |
+      Every path that sets SIE does so at noff 0, which is how the invariant "noff > 0 means
+      SIE is 0" survives ([[concept:locks#invariant]], [[concept:locks#sie]],
+      [[g:sstatus-sie]]).
+
+  - id: spin-24
+    level: 3
+    type: state
+    q: |
+      A process called `exit(0)`. [[kexit]] has just executed line 360,
+      `release(&wait_lock)`, while still holding its own `p->lock` (taken on line 355). What
+      is the state of its hart?
+    code: kernel/proc.c:347-364@360
+    state:
+      mode: S
+      stack: kernel
+      satp: kernel
+      sie: "off"
+      noff: 1
+      intena: 1
+    why:
+      noff: |
+        You may have expected releasing the *outer* lock to undo everything. noff is a counter,
+        not a stack of locks: the release of `wait_lock` removes one level, 2 → 1, and the
+        level that is left belongs to `p->lock`.
+      sie: |
+        noff is still 1, so [[pop_off]] does not turn interrupts on, even though `wait_lock`
+        was the lock whose acquire recorded intena. SIE stays off while `p->lock` is held.
+      intena: |
+        intena was recorded when `acquire(&wait_lock)` took noff from 0 to 1 in a system call,
+        with SIE on: 1. The nested acquires and the out-of-order release did not touch it.
+      stack: |
+        `exit` is a system call, so this runs on the process's own kernel stack. It reaches
+        the scheduler stack only through the `swtch` inside [[sched]].
+    why_wrong: Track noff through acquire(&wait_lock), acquire(&p->lock) and release(&wait_lock), and remember intena is set only at 0 → 1.
+    explain: |
+      Releasing out of order is legal; only the acquire order matters for deadlock. Next,
+      [[sched]] checks noff == 1 (true: only `p->lock`) and SIE off (true), and switches away
+      for good ([[concept:locks#unusual]]).
+
+  - id: spin-25
+    level: 3
+    type: number
+    q: |
+      [[iput]] drops the last reference to an unlinked file. Holding `itable.lock`, it calls
+      `acquiresleep(&ip->lock)` on line 362. Inside [[acquiresleep]], line 32 calls
+      [[myproc]]. Right after `myproc`'s push_off, what is `mycpu()->noff`?
+    code: kernel/sleeplock.c:21-34@32
+    answer: 3
+    wrong:
+      2: |
+        You may have counted only the two spinlocks, `itable.lock` and the sleep-lock's inner
+        `lk->lk`. [[myproc]]'s own push_off is a third level while it runs.
+      4: |
+        You may have counted the sleep-lock `ip->lock` as a level too. Owning a sleep-lock is
+        only `locked = 1` in memory; it never calls push_off.
+      1: |
+        `itable.lock` is still held (iput releases it only on line 363, after acquiresleep
+        returns), and `lk->lk` is held from line 24 to line 33.
+    why_wrong: Count every push_off on this hart that has not been popped yet, locks or not.
+    explain: |
+      `itable.lock` (1) + `lk->lk` (2) + `myproc`'s push_off (3). This is one of the three
+      measured paths to noff 3 ([[concept:locks#nesting]]). The acquiresleep never sleeps here,
+      because `ref == 1` means nobody else holds `ip->lock`.

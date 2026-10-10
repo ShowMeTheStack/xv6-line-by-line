@@ -1,0 +1,1870 @@
+published: true
+title: Direct user access with sstatus.SUM
+area: Memory
+stars: 3
+branch: ext/17-sum
+prerequisites: {tours: [6, 8, 12, 20, 22, 24, 25, 26, 28], concepts: [mode-stack-page-table, stacks, locks]}
+summary: |
+  Every time a system call reads or writes user memory, this tree's [[copyin]] and
+  [[copyout]] translate the user's address in software: [[walkaddr]] walks the process's page
+  table, finds the physical page, and the kernel copies through its own [[g:direct-map]] of
+  RAM. The user pointer itself is never dereferenced. Real kernels (Linux on RISC-V among
+  them) do the opposite: they load and store through the user's virtual address directly, and
+  let the hardware translate it. In this lab you make xv6 do that.
+
+  RISC-V has a bit for exactly this purpose, `SUM` in the [[g:csr-sstatus|sstatus]] register.
+  Setting it turns out to be the easy part. Which page table is in `satp` while a system call
+  runs, and what does it map at a user address? If you put the user's pages into it, what is
+  already there? What becomes of a user pointer that points at the kernel, at a device, or at
+  a page that does not exist yet, now that the hardware, not your code, does the lookup? A
+  page fault inside the kernel has always meant `panic` in this tree: what must it mean now?
+  And is the result actually faster? The think section asks these in the order a designer
+  meets them, and the measure section answers the last one with numbers that may surprise
+  you.
+
+  The reference solution is seven commits. `usertests -q` passes on 3 harts at every one of
+  them, and a new test, `sumtest`, checks direct copies with good and bad pointers.
+learn:
+  - "Which page table the hardware uses while the kernel runs a system call, and what a user address means in it."
+  - "What `sstatus.SUM` permits and forbids, why it is off by default, and what its neighbour `MXR` does."
+  - "How the kernel's address space and a process's address space fit (or do not fit) into one page table."
+  - "How to keep two page tables that describe the same user memory in step, which changes need a TLB flush, and when the hart must stop using a page table that is about to be freed."
+  - "What a user pointer can reach once the hardware translates it, and what the kernel must still check in software."
+  - "How a kernel can survive a page fault taken in its own code, and what problem Linux's exception tables solve."
+  - "How to measure a change honestly on QEMU, and how to take a slowdown apart into its causes."
+spec: |
+  **Behaviour.** For the current process, [[copyin]], [[copyout]] and [[copyinstr]] copy with
+  ordinary loads and stores to the user's virtual address, with `sstatus.SUM` set for the
+  duration of the copy and clear at all other times. They no longer walk the process's page
+  table in software. Everything a system call returns stays the same:
+
+  - A copy of `n` bytes at a user address below `p->sz` succeeds, including into pages that
+    were reserved with `sbrklazy` and never touched (the kernel's own access allocates them).
+  - A copy that touches anything else fails with -1, and the kernel survives: kernel memory,
+    device registers, the stack guard page, a store into program text, anything at or beyond
+    `p->sz`. Bytes of the range that lie before the first bad byte may already have been
+    copied, as before (`usertests partial_write` depends on this).
+  - A stray dereference of a user pointer *outside* the copy functions still panics, as it did
+    before.
+
+  **`usertests`.** If your design cannot give a process everything a test asks for, you may
+  change that test's sizes or targets, but each test must keep its purpose, and you must say
+  exactly what you changed and what the test now exercises.
+
+  **What must not change.**
+
+  - `usertests -q` prints `ALL TESTS PASSED` on 3 harts.
+  - `exec` still works with arguments.
+  - No page leaks: `usertests` counts free pages before and after.
+
+  **The test program**, `sumtest`, prints one line per check:
+
+  ```text
+  $ sumtest
+  sumtest: copy: OK
+  sumtest: lazy: OK
+  sumtest: bad pointers: OK
+  sumtest: shrink: OK
+  sumtest: limit: OK
+  sumtest: fork: OK
+  sumtest: ALL OK
+  ```
+
+  - **copy**: data, stack and heap buffers passed through a pipe and a file, including 6
+    bytes that straddle a page boundary, and `fstat` into the stack.
+  - **lazy**: `read` into, and `write` from, pages reserved with `sbrklazy` that nobody has
+    touched; `open` of a name that lies in such a page.
+  - **bad pointers**: `read`, `write` and `open` with the addresses of kernel text
+    (`0x80000000`), kernel RAM (`PHYSTOP - PGSIZE`), the PLIC (`0x0c000000`), the UART
+    (`0x10000000`), the stack guard page, `sbrk(0)`, the trapframe and `0xffffffffffffffff`
+    must all fail; a `write` from a range that starts one byte below `sbrk(0)` copies at most
+    that byte; `read` into the program's own code fails and `write` from it succeeds.
+  - **shrink**: after `sbrk(-n)`, a `read` into the memory given back fails.
+  - **limit**: memory can grow exactly up to the new top and not one byte further, and the
+    kernel can copy into the last 8 bytes below it.
+  - **fork**: a child can `read` into heap and stack memory it inherited.
+
+  `sumtest time` counts `fstat` calls, 512-byte pipe round trips and 8 KB file reads in 20
+  ticks, for the measure section.
+think:
+  - title: Why can't the kernel just use the pointer?
+    q: |
+      `read(fd, buf, n)` hands the kernel a user virtual address, `buf`. Today [[copyout]]
+      never dereferences it. Suppose a system call simply did `*(int *)buf = 1` in the kernel.
+      Which page table translates that store, and what does that page table have at the
+      address of a typical user buffer, say `0x2000`? At `0x80001000`? Commit to an answer,
+      then work out what [[copyout]] does instead, and what that costs per page.
+    hints:
+      - "Follow `satp` on the way into the kernel: [[kernel/trampoline.S:85]]-[[kernel/trampoline.S:92]] and where `kernel_satp` comes from ([[kernel/trap.c:116]]). Then read the list of mappings in [[kvmmake]]."
+      - "The kernel page table maps devices, the kernel's text and data, all of RAM at its physical address, the trampoline and the kernel stacks. Nothing in it belongs to a process. A fault taken in supervisor mode goes to [[kerneltrap]], which handles only device interrupts ([[kernel/trap.c:149]]-[[kernel/trap.c:154]])."
+      - "Count the work in [[copyout]] per page: [[walkaddr]] (a three-level walk), [[walk]] again for the `PTE_W` test, then a `memmove` to a physical address."
+    answer: |
+      During a system call `satp` holds the **kernel** page table: [[uservec]] loads it from
+      `p->trapframe->kernel_satp` ([[kernel/trampoline.S:85]]-[[kernel/trampoline.S:92]]),
+      which [[prepare_return]] filled with the `satp` the kernel was running on
+      ([[kernel/trap.c:116]]). That page table is built once, by [[kvmmake]], and is the same for
+      every process. It maps nothing at `0x2000`: the store raises a store page fault (`scause`
+      15) in supervisor mode, [[kerneltrap]] does not recognize it, prints `scause`, `sepc` and
+      `stval`, and panics. At `0x80001000` it maps the kernel's own text, so a *load* there
+      would quietly read kernel instructions.
+
+      So the address in `buf` means nothing to the kernel's page table. [[copyout]] therefore
+      translates it in software: per page, [[walkaddr]] walks the user page table (three
+      levels), [[walk]] runs again to check `PTE_W` ([[kernel/vm.c:362]]), and `memmove` writes
+      to the physical address through the kernel's direct map of RAM ([[kernel/vm.c:370]]). The
+      user's PTE is consulted by software only. To use `buf` directly, the page table in `satp`
+      must map the user's pages, and the hardware must let supervisor mode use them. The next
+      two questions take those one at a time.
+    checks:
+      - id: lab17-01
+        level: 1
+        type: choice
+        q: |
+          A buggy system call in the unmodified kernel executes `*(int *)addr`, where `addr` is
+          `0x1000`, the address of a global variable in the calling program. What happens?
+        options:
+          - text: "A load page fault in supervisor mode; kerneltrap prints scause=0xd and panics."
+            correct: true
+            why: |
+              The kernel page table has no mapping at `0x1000`. The fault is taken in
+              S-mode, and [[kerneltrap]] only knows device interrupts. (On this lab's reference
+              branch the same system call panics the same way, `scause=0xd sepc=0x80002d9a
+              stval=0x1000`, but for a different reason: there the page *is* mapped, with
+              `PTE_U`, and the fault comes from `SUM` being clear. Clinic 5.)
+          - text: "It reads the program's variable, because the kernel runs on the process's page table."
+            why: |
+              You may have assumed the kernel shares the user's address space, as Linux does.
+              In this tree [[uservec]] switches `satp` to the kernel page table before any C
+              code runs ([[kernel/trampoline.S:92]]).
+          - text: "usertrap prints unexpected scause and kills the process."
+            why: |
+              That is what happens when *user* code faults. A fault taken while the hart is in
+              supervisor mode goes to `kernelvec` and [[kerneltrap]], not to [[usertrap]].
+          - text: "It reads physical address 0x1000, because the kernel maps RAM at its physical address."
+            why: |
+              The direct map covers RAM, which starts at [[KERNBASE]] (`0x80000000`). Physical
+              `0x1000` is the boot ROM and is not mapped in the kernel page table at all.
+        explain: |
+          A user address only means something in the user page table. While the kernel runs, the
+          kernel page table is in `satp`, and it maps devices, kernel memory and RAM, never a
+          process's pages. See [[tour:6]] and [[tour:28]].
+      - id: lab17-02
+        level: 2
+        type: number
+        q: |
+          On the unmodified kernel, `read` asks [[copyout]] to write 4096 bytes to the user
+          address `0x2010` (not page-aligned; both pages are mapped and writable). How many
+          times does [[copyout]] call [[walk]], directly or through [[walkaddr]]?
+        code: kernel/vm.c:344-377
+        answer: 4
+        wrong:
+          2: |
+            You may have counted one walk per page. Each page costs two: [[walkaddr]] at line
+            355 and [[walk]] again at line 362 for the `PTE_W` test.
+          1: |
+            You may have assumed 4096 bytes fit in one page. Starting at `0x2010`, they cover
+            `0x2010`-`0x2fff` and `0x3000`-`0x300f`: two pages.
+          3: |
+            You may have counted two walks for the first page and one for the second. The loop
+            body is the same for every page.
+        why_wrong: "Two pages are touched; each loop iteration calls walkaddr (which calls walk) and then walk."
+        explain: |
+          Each iteration handles the part of the range in one page and walks twice. A copy of
+          `n` bytes costs two software walks per page touched, plus the `memmove`. That is the
+          work that direct access promises to remove; the measure section finds out what it was
+          worth.
+  - title: What SUM does, and why it is off
+    q: |
+      Suppose `satp` did map the user's pages, with the same PTEs as the user page table,
+      `PTE_U` included. Would a supervisor-mode load from such a page succeed? Find the rule in
+      the RISC-V privileged specification. Then decide why the architects made that the default,
+      and what a kernel should do about it.
+    hints:
+      - "This tree's `riscv.h` defines only some `sstatus` bits ([[kernel/riscv.h:44]]-[[kernel/riscv.h:48]]). Look up the rest of `sstatus` in the privileged spec, near `SUM` and `MXR` (bits 18 and 19)."
+      - "With `SUM` = 0, any supervisor-mode load or store to a page with `U` = 1 raises a page fault. With `SUM` = 1 such loads and stores are allowed. Supervisor mode may never *execute* a `U` page, whatever `SUM` says. And `SUM` says nothing at all about pages without `U`."
+      - "Keep `SUM` clear everywhere except inside the few instructions that copy user memory, and make sure nothing else can run on the hart while it is set without clearing it first."
+    answer: |
+      No: with `sstatus.SUM` clear, a supervisor access to a page whose PTE has `U` set raises a
+      page fault, load (13) or store (15), exactly as if the page were not mapped. Setting `SUM`
+      (bit 18) permits supervisor **loads and stores** to `U` pages. It never permits executing
+      them. Its neighbour `MXR` (bit 19, Make eXecutable Readable) makes loads from pages marked
+      only executable succeed; xv6 maps program text `R|X`, so a copy never needs it.
+
+      Why off by default? Because almost every kernel bug that touches user memory is an
+      accident: a pointer argument used without [[copyin]], a missing check, a confused
+      address. With `SUM` clear, such a bug faults at once instead of silently reading or
+      writing whatever the user arranged to be there, which is how many kernel exploits work.
+      Intel and ARM have the same idea under the names SMAP and PAN. The discipline is: `SUM` is
+      set only around the copy loops, and any other path that runs on the hart (a trap handler,
+      another process after a context switch) must find it clear. Clinic 5 breaks that rule and
+      shows a buggy system call that "works".
+    checks:
+      - id: lab17-03
+        level: 2
+        type: bits
+        q: |
+          On the reference branch, gdb stopped inside the copy loop, during `pipe()` copying the
+          two file descriptors out to `sumtest`, and printed `sstatus`. Decode it.
+        value: "0x200040022"
+        fields:
+          - label: "SIE (bit 1)"
+            options: ["0", "1"]
+            answer: "1"
+            why: "0x22 = 0010 0010: bit 1 is set. This copy runs in a system call with no spinlock held, and usertrap turned interrupts on before calling syscall."
+          - label: "SPP (bit 8)"
+            options: ["0", "1"]
+            answer: "0"
+            why: "0x022 has bit 8 (0x100) clear. SPP records the mode the last trap came from: this system call came from user mode."
+          - label: "SUM (bit 18)"
+            options: ["0", "1"]
+            answer: "1"
+            why: "0x40000 is bit 18. The copy loop set it a few instructions earlier with csrs; supervisor loads and stores may now use PTE_U pages."
+          - label: "MXR (bit 19)"
+            options: ["0", "1"]
+            answer: "0"
+            why: "0x80000 would be bit 19; the value has 0x40000 only. Nothing in this lab sets MXR: xv6 has no execute-only pages to read."
+        explain: |
+          `0x200040022` = `0x2_0000_0000` (the `UXL` field in bits 32-33, value 2: user mode is
+          64-bit) + `0x40000` (`SUM`) + `0x20` (`SPIE`) + `0x2` (`SIE`). On entry to the same
+          copy, before `csrs`, gdb read `0x200000022`: the only difference is `SUM`. See
+          [[g:csr-sstatus]].
+      - id: lab17-04
+        level: 1
+        type: tf
+        q: |
+          True or false: once the page table in `satp` maps a process's pages, setting `SUM`
+          lets supervisor mode load from, store to and execute those pages.
+        answer: false
+        why_tf: |
+          You may have read `SUM` as "supervisor may use user pages" in general. It covers loads
+          and stores only.
+        reasons:
+          - text: "SUM permits supervisor loads and stores to U pages, never instruction fetches from them."
+            correct: true
+            why: Right. Executing user code with supervisor privilege is never allowed.
+          - text: "SUM permits loads only; stores need MXR as well."
+            why: |
+              You may have mixed up the two bits. `MXR` concerns loads from execute-only pages;
+              `SUM` covers both loads and stores.
+          - text: "SUM has no effect while paging is on; it is for bare mode."
+            why: |
+              It is the other way round: `SUM` has no effect when paging is off, because then no
+              PTE (and no `U` bit) exists.
+        explain: |
+          The privileged spec: with `SUM` = 1, supervisor loads and stores to `U` pages are
+          permitted; supervisor instruction fetches from `U` pages always fault. A kernel that
+          could run user code with its own privilege would make every user page a potential
+          kernel routine.
+  - title: Which page table?
+    q: |
+      The previous answers ask for a page table that maps both the kernel and the current
+      process's pages, at their own virtual addresses. Neither table in this tree is that: the
+      user page table has no kernel text, data or stacks, the kernel page table no user pages.
+      Make one that has both. Before choosing how, lay the two address spaces over each other.
+      Where do they collide, and what will you give up to remove the collision?
+    hints:
+      - "Read [[kernel/memlayout.h:21]]-[[kernel/memlayout.h:63]] and [[kvmmake]] side by side with what a process may use: [[growproc]] and [[sys_sbrk]] let it grow up to [[TRAPFRAME]] ([[kernel/sysproc.c:60]])."
+      - "The kernel maps the PLIC at `0x0c000000`, the UART and virtio at `0x10000000`, RAM at `0x80000000`-`0x88000000`, and kernel stacks and the trampoline just below [[MAXVA]]. A user process may today use anything from 0 up to `0x3fffffe000`, which covers all of them. The UART must stay at its physical address: [[consoleinit]] uses it before paging is on."
+      - "One page table per process is allowed to differ from every other one. What is the lowest address the kernel itself needs, and which tests in `usertests` ask a process for more than that?"
+    answer: |
+      Lay them over each other and every kernel mapping below [[TRAPFRAME]] is a collision:
+      the [[g:plic|PLIC]] at `0x0c000000` (64 MB of registers), the UART and the virtio disk at
+      `0x10000000` and `0x10001000`, all of RAM from `0x80000000` to [[PHYSTOP]], and at the top
+      the kernel stacks (from [[KSTACK]]`(63)` up to [[TRAMPOLINE]]). A user page and a kernel
+      mapping cannot share a virtual address in one page table.
+
+      The reference does what the old MIT "pgtbl" lab did:
+
+      - each process gets a **kernel page table of its own** (`p->kpagetable`): the kernel's
+        mappings plus the process's pages; the scheduler puts it in `satp` while that process
+        runs;
+      - user memory now ends at `USERTOP` = [[PLIC]] = `0x0c000000`, **192 MB**, the lowest
+        address the kernel maps. [[growproc]], [[sys_sbrk]] and [[kexec]] enforce it.
+
+      Alternatives, and why not here. Moving the devices to high virtual addresses would free
+      the low range, but the console is used before paging is on and every driver would change.
+      Mapping kernel memory into the *user* page table (Linux's single address space) has the
+      same collision. A hybrid that copies directly below 192 MB and walks in software above
+      would keep two copy paths forever.
+
+      The price is paid by three `usertests`, and commit 1 changes them:
+
+      - `lazy_alloc` and `lazy_unmap` reserved 1 GB with `sbrklazy`. They now reserve 176 MB:
+        less than the cap, still more than all of RAM (128 MB), so the reservation can only
+        work lazily, as before. But they do less: `lazy_alloc` touches 704 pages instead of
+        4,096, and `lazy_unmap` does 11 fork rounds instead of 64.
+      - `lazy_sbrk` grew memory in 1 GB steps towards [[MAXVA]] and checked the last page below
+        [[TRAPFRAME]]; its loop never notices `sbrklazy` failing, so with the cap it would spin
+        forever. It now grows to one page below `USERTOP` in a single call and checks that
+        page. The step loop is gone: below 2 GB one `int` argument suffices.
+
+      Every test keeps its purpose, but a process can no longer test a lazy reservation much
+      larger than RAM. Clinic 3 shows what happens if you forget the cap.
+    checks:
+      - id: lab17-05
+        level: 1
+        type: number
+        q: |
+          With user memory capped at the PLIC's address, how many MB can a process have at
+          most (code, data, stack and heap together)?
+        code: kernel/memlayout.h:30-44
+        answer: 192
+        wrong:
+          2048: |
+            You may have capped it at [[KERNBASE]], the start of RAM. The devices sit lower:
+            the PLIC at `0x0c000000` collides first.
+          256: |
+            You may have used the UART's address, `0x10000000` = 256 MB. The PLIC's 64 MB of
+            registers start below it.
+          128: |
+            You may have used the size of RAM. Virtual and physical sizes are different
+            things; with lazy allocation a process can reserve more than RAM.
+        why_wrong: "0x0c000000 = 12 x 16 MB = 192 MB."
+        explain: |
+          `0x0c000000` = 201,326,592 bytes = 192 MB. In the level-1 page that covers the first
+          gigabyte, that is entries 0 to 95 (2 MB each); entry 96 is the PLIC's first.
+      - id: lab17-06
+        level: 2
+        type: multi
+        q: |
+          Which kernel mappings would a process collide with if its memory could still grow up
+          to [[TRAPFRAME]]?
+        options:
+          - text: "The PLIC's registers at 0x0c000000"
+            correct: true
+            why: "Mapped by kvmmake at its physical address, 64 MB long."
+          - text: "The UART and the virtio disk at 0x10000000 and 0x10001000"
+            correct: true
+            why: "Each one page, mapped by kvmmake."
+          - text: "All of RAM, 0x80000000 to 0x88000000"
+            correct: true
+            why: "The kernel's direct map; it holds kernel text, data and every free page."
+          - text: "The kernel stacks below the trampoline"
+            correct: true
+            why: "64 stacks with guard pages, from KSTACK(63) up to just below TRAMPOLINE; the old user limit is TRAPFRAME, which is above them."
+          - text: "The CLINT at 0x02000000"
+            why: |
+              You may have taken memlayout.h's comment as a list of mappings. The CLINT is in
+              QEMU's physical map, but [[kvmmake]] never maps it: this tree uses Sstc, so the
+              timer is a CSR.
+        explain: |
+          Only what [[kvmmake]] (and [[proc_mapstacks]]) actually map counts. The lowest of
+          them, the PLIC, sets the cap.
+  - title: Building a process's kernel page table
+    q: |
+      A process needs a page table with every kernel mapping and its own user pages. Copying
+      the whole kernel page table for every process would cost dozens of pages. What can be
+      shared with [[kernel_pagetable]], and what must be private? Then: which of the process's
+      PTEs go into it? All of them, or only some? Think about the pages a user PTE can describe.
+    hints:
+      - "An [[g:sv39]] root has 512 entries of 1 GB each. Which of the kernel's gigabytes contain a mapping, and which gigabyte will hold user pages below 192 MB?"
+      - "Supervisor mode ignores `SUM` for pages *without* `U`: it may always access them. Which valid PTEs in a user page table lack `U`? Look at [[kexec]] ([[kernel/exec.c:95]]) and [[proc_pagetable]]."
+      - "Decide, root entry by root entry, whether anything of the process will ever be written below it; only those page-table pages need to be private. For the leaves: which kinds of user PTE would give the kernel more than the user itself has?"
+    answer: |
+      **Sharing.** The kernel's root page has valid entries for gigabyte 0 (the devices), 2
+      (RAM, `0x80000000`) and 255 (trampoline and kernel stacks). A process's kernel page table
+      can point its entries 2 and 255 at the *same* level-1 pages as the kernel: nothing a
+      process does changes them. Gigabyte 0 holds both the devices and, below 192 MB, the user
+      pages, so it needs a private level-1 page. That page starts as a copy of the kernel's,
+      whose entries 96 to 128 point at the kernel's own level-0 pages for the PLIC, UART and
+      virtio: those are shared too. A new process costs two pages (root and level-1), plus one
+      level-0 page per 2 MB region of user memory in use. On the branch, gdb read the shell's
+      kernel page table: root entries 2 and 255 equal the kernel's (`0x21ff7001`,
+      `0x21fe6c01`), entry 0 points at a private level-1 page, and that page's entries 96 and
+      128 equal the kernel's.
+
+      **Which PTEs.** Only leaf PTEs with `PTE_V` **and** `PTE_U`. A user page table has three
+      valid PTEs without `U`: the trampoline and the trapframe ([[proc_pagetable]]), which sit
+      above 192 MB anyway, and the **stack guard page**, which [[kexec]] maps and then strips of
+      `U` with [[uvmclear]] ([[kernel/exec.c:95]]). `SUM` does not protect a page without `U`:
+      the supervisor may always access it. Mirror the guard PTE, and `read(fd, guard, n)` would
+      write into the guard page without a fault. Left out, the guard page is simply not mapped
+      in the kernel's view, and the fault-recovery code of question 7 refuses it.
+
+      The PTE is copied as it is, physical page and flags. The two copies then live separate
+      lives: the hardware sets `A` and `D` in whichever copy it used. gdb shows the shell's
+      text page as `0x21fcd41b` in the user page table and `0x21fcd45b` in its kernel page
+      table, where only the kernel's reads have set `A`.
+    checks:
+      - id: lab17-07
+        level: 2
+        type: bits
+        q: |
+          gdb printed this PTE from the shell's *user* page table, for virtual address
+          `0x3000`. Decode it, and decide whether it belongs in the shell's kernel page table.
+        value: "0x21fccc07"
+        fields:
+          - label: "V (bit 0)"
+            options: ["0", "1"]
+            answer: "1"
+            why: "0x07 = 0111: bit 0 is set, the PTE is valid."
+          - label: "W (bit 2)"
+            options: ["0", "1"]
+            answer: "1"
+            why: "Bit 2 (0x4) is set: the page was mapped writable by uvmalloc, like the stack above it."
+          - label: "U (bit 4)"
+            options: ["0", "1"]
+            answer: "0"
+            why: "0x07 has no 0x10: U is clear. This is the stack guard page; uvmclear removed U."
+          - label: "Mirror it in the kernel page table?"
+            options: ["yes, it is valid", "no, it lacks PTE_U"]
+            answer: "no, it lacks PTE_U"
+            why: "SUM does not restrict pages without U: in the kernel's view a mirrored guard page would be an ordinary writable page, and a read() into it would succeed."
+        explain: |
+          `0x21fccc07 & 0x3ff` = `0x007` = V + R + W. The physical page is
+          `(0x21fccc07 >> 10) << 12` = `0x87f33000`. In the same gdb session the shell's kernel
+          page table had 0 in that slot, between the data page `0x2000` and the stack page
+          `0x4000`, which were both mirrored.
+      - id: lab17-08
+        level: 3
+        type: choice
+        q: |
+          Why can a process's kernel page table share the kernel's level-1 page for RAM (root
+          entry 2) but not the one for the first gigabyte (root entry 0)?
+        options:
+          - text: "User pages below 192 MB go under entry 0; adding them to a shared page would put one process's pages into every page table."
+            correct: true
+            why: |
+              Right. Anything written under entry 0 must be private to the process, so that
+              level-1 page is private, while the device entries inside it still point at shared
+              level-0 pages.
+          - text: "Entry 0 contains the devices, and device mappings may not be shared between page tables."
+            why: |
+              Device mappings are shared on the branch: entries 96 to 128 of every private
+              level-1 page point at the kernel's own level-0 pages.
+          - text: "RAM's mappings never change, but the devices' mappings change at run time."
+            why: |
+              Neither changes after [[kvmmake]]. The difference is that user pages are added
+              under entry 0.
+          - text: "Entry 2 cannot be shared either; the reference copies all 512 entries' subtrees."
+            why: |
+              It copies the root's 512 *entries*, which still point at the kernel's level-1
+              pages. Only entry 0 is replaced. gdb confirmed entries 2 and 255 equal the
+              kernel's.
+        explain: |
+          Share whatever a process can never change; give it private copies of exactly the
+          page-table pages its own mappings go into. Clinic 3 shows what happens when user
+          pages land in a *shared* page.
+  - title: Two page tables, one truth
+    q: |
+      Every user mapping now exists twice. List every place in this tree where a user mapping
+      is created, changed or removed, and say what the process's kernel page table must do at
+      each. Some of those places change the page table the hart is *running on*: which of them
+      need an `sfence.vma`, and which can do without one? And when, exactly, must a hart stop
+      using a process's kernel page table?
+    hints:
+      - "Mappings change in [[uvmcopy]] (fork), [[uvmalloc]] and [[uvmdealloc]] (sbrk, via [[growproc]]), [[vmfault]] (lazy pages, called from [[usertrap]]), and [[kexec]], which builds a whole new user page table. Who frees a page table? [[freeproc]], called by the parent in [[kwait]], and [[kexec]], for the old image."
+      - "A hart may cache a translation in its [[g:tlb]]. Removing a mapping while the hart might still hold it is a bug: the kernel could store into a freed page. Adding a mapping where there was none needs no flush for correctness, but the spec allows the old 'invalid' to be seen until a flush, so a fault right after adding must be retried after one. Every return to user mode and every trap from it flushes ([[kernel/trampoline.S:89]]-[[kernel/trampoline.S:95]], [[kernel/trampoline.S:110]]-[[kernel/trampoline.S:112]])."
+      - "A single operation, 'make this range of the kernel page table agree with the user page table', covers every change. For the lifetime question, find the lock that whoever frees a process's page tables must hold, and make sure no hart is still using the table once that lock can be taken."
+    answer: |
+      The reference adds `kvmsync(pagetable, kpt, start, end)`: for each page in the range, copy
+      the user PTE if it is a valid `PTE_U` leaf, otherwise clear the kernel copy. It is called:
+
+      | where | what changes | flush? |
+      |---|---|---|
+      | [[kfork]], after [[uvmcopy]] | the child's whole image, `[0, sz)` | no: the child's table is not in use |
+      | [[growproc]], growing | `[old sz, new sz)` added | no: added mappings; the return to user mode flushes before any use |
+      | [[growproc]], shrinking | `[new sz, old sz)` cleared | **yes**: this hart is running on that table, and the pages were just freed |
+      | lazy fault from user mode (`uvmfault`) | one page added | no: the return to user mode flushes |
+      | lazy fault inside a kernel copy (question 7) | one page added | **yes**: the copy retries at once |
+      | [[kexec]] | a new image | builds a *new* kernel page table, switches `satp` to it, then frees the old one |
+
+      [[kexec]] deserves a word. It builds the new user page table while the old one is still
+      in use, and copies the arguments into it with [[copyout]], so that copy cannot use the new
+      page table's addresses directly: `copyout` keeps the software walk for any page table that
+      is not the current process's. Then, instead of rewriting the kernel page table in place
+      (which might fail halfway, after the point of no return), [[kexec]] makes a second new
+      one, mirrors the image into it, and swaps both at the commit point. The hart can switch
+      `satp` in the middle of a system call because everything the kernel itself uses (text,
+      data, this kernel stack) is mapped identically in both.
+
+      [[kfork]] has a subtle ordering. `np->sz` must be set *before* the mirror, because if the
+      mirror runs out of memory, [[freeproc]] frees the child's user page table using `np->sz`;
+      with `sz` still 0 it would find pages still mapped and panic in [[freewalk]].
+
+      **When to stop using it.** A process's kernel page table is freed by its parent
+      ([[freeproc]] in [[kwait]]) or by the process itself (the old one in [[kexec]], possibly on
+      another hart). So the scheduler switches to `p->kpagetable` just before [[swtch]] and back
+      to [[kernel_pagetable]] as soon as [[swtch]] returns, before it releases `p->lock`. The
+      parent can only reap a zombie under that lock, and a process can only run (and exec) after
+      the scheduler that runs it took the lock. Clinic 6 leaves the switch back out.
+    checks:
+      - id: lab17-09
+        level: 2
+        type: multi
+        q: |
+          Which of these must flush this hart's TLB (with `sfence.vma`) after updating the
+          process's kernel page table?
+        options:
+          - text: "growproc shrinking memory (sbrk with a negative argument)"
+            correct: true
+            why: "The hart runs on that page table and the pages have been freed; a stale translation would let a later copy write into a page someone else now owns."
+          - text: "kerneltrap mapping a lazy page that a copy loop faulted on"
+            correct: true
+            why: "The copy retries the access immediately; without a flush the hart may still see the old invalid entry, fault again, and the second fault would be refused because the page is now mapped."
+          - text: "growproc growing memory (eager sbrk)"
+            why: |
+              You may have thought every change needs a flush. Adding mappings is safe to do
+              lazily: nothing uses the new pages before the return to user mode, which flushes
+              in [[userret]].
+          - text: "kfork mirroring the child's image"
+            why: |
+              The child's kernel page table is in no hart's `satp` yet; the scheduler flushes
+              when it installs it.
+          - text: "usertrap mapping a lazy page after a user-mode fault"
+            why: |
+              The faulting instruction runs again only after [[userret]], which executes
+              `sfence.vma` around its `csrw satp`.
+        explain: |
+          The rule: flush when a mapping the hart may have cached is removed, or when the hart
+          will use a just-added mapping before it passes through a flush anyway. See
+          [[g:insn-sfence]].
+      - id: lab17-10
+        level: 3
+        type: choice
+        q: |
+          In the reference [[scheduler]], why must `kvminithart()` (back to
+          [[kernel_pagetable]]) come right after [[swtch]] returns and *before*
+          `release(&p->lock)`?
+        options:
+          - text: "Once p->lock is released, p's kernel page table can be freed (by its parent reaping it, or by p itself in exec on another hart) while this hart would still be using it."
+            correct: true
+            why: |
+              Right. The lock is what keeps the page table alive here. Clinic 6 removes the
+              switch: in a recorded run, gdb found two harts trapping on a root page that had
+              become some process's trapframe.
+          - text: "kvminithart takes p->lock internally."
+            why: |
+              It takes no lock: it is two `sfence.vma` and a `csrw satp` ([[kvminithart]]).
+          - text: "Interrupts are off only while p->lock is held, and satp may only be written with interrupts off."
+            why: |
+              Writing `satp` with interrupts on is fine as long as both page tables map the
+              code that runs; [[kexec]] does it in the middle of a system call.
+          - text: "The scheduler's stack is only mapped in kernel_pagetable."
+            why: |
+              The scheduler stack is in `stack0`, in the kernel's data, which every process's
+              kernel page table maps too (root entry 2 is shared).
+        explain: |
+          A page table is like any other shared object: someone must not free it while a hart
+          uses it. Here the hart stops using it under the same lock the freer needs. Compare
+          [[concept:locks#handoff]].
+  - title: SUM is not a bounds check
+    q: |
+      With `SUM` set and `p->kpagetable` in `satp`, a copy loop can use any address the
+      process passes. Which addresses that a process might pass will the hardware *still*
+      accept, although they do not belong to the process? Decide what check the copy functions
+      must make before the loop, and what they should do with a range that starts inside the
+      process's memory and ends outside it.
+    hints:
+      - "List what is mapped in `p->kpagetable` without `PTE_U`. Supervisor mode may load and store all of it, `SUM` or not."
+      - "Look at `usertests copyin` ([[user/usertests.c:33]]) and `partial_write` ([[user/usertests.c:2829]]): the first expects `write(fd, 0x80000000, 8192)` to fail; the second expects a 2-byte `write` whose second byte is past `sbrk(0)` to store the first byte before failing."
+      - "What does the kernel already know about the extent of a process's memory, and which part of a partly-valid range must still be copied?"
+    answer: |
+      Everything the kernel maps is still there: kernel text at `0x80000000`, kernel data and
+      all of RAM up to [[PHYSTOP]], the PLIC, the UART, virtio. None of it has `PTE_U`, so
+      `SUM` is irrelevant: supervisor mode may read and write it. A user who passes
+      `0x80000000` to `write` would make the kernel copy its own code into a file; a `read` into
+      `PHYSTOP - 4096` would write file contents over a kernel page (in this build, the kernel's
+      root page table). That is clinic 4, and it is why `SUM` is called a *permission* bit: it
+      grants, it does not confine.
+
+      So the copy functions check the address range against the process's size first, the
+      software equivalent of the old walk's "is this a user page?". The reference computes how
+      many of the `len` bytes lie below `p->sz` (careful with overflow: it compares
+      `len > sz - va`, never `va + len > sz`), copies those, and returns -1 if that was fewer
+      than `len`. Copying the valid prefix first keeps the old behaviour that
+      `usertests partial_write` checks: the old loop copied page by page and failed at the
+      first bad page, after the earlier ones.
+
+      The check is byte-exact at `p->sz`, slightly stricter than the old page-granular test,
+      which accepted the bytes between `p->sz` and the end of its page. Nothing in `usertests`
+      depends on that.
+    checks:
+      - id: lab17-11
+        level: 2
+        type: choice
+        q: |
+          On a branch where the copy functions *skip* the range check, which `usertests` check
+          fails first?
+        options:
+          - text: "copyin: write(fd, 0x80000000, 8192) returns 8192 instead of -1."
+            correct: true
+            why: |
+              The kernel reads its own text at `0x80000000` (mapped `R|X`, no `U`) and writes
+              8 KB of it into the file. Recorded: `write(fd, 0x0000000080000000, 8192) returned
+              8192, not -1`.
+          - text: "copyout: read(fd, 0x80000000, 8192) succeeds."
+            why: |
+              That one still fails: kernel text has no `W`, so the store faults, and the fault
+              recovery returns -1. Permissions other than `U` still apply in supervisor mode.
+          - text: "None: SUM makes the hardware refuse kernel addresses."
+            why: |
+              `SUM` only concerns pages with `U`. Kernel pages have no `U` and are always
+              accessible to supervisor mode.
+          - text: "The kernel panics in kerneltrap on the first bad address."
+            why: |
+              Reading kernel text does not fault at all; nothing traps.
+        explain: |
+          Supervisor mode is restricted by `R`, `W` and `X` on every page, and by `U` only as
+          `SUM` says. A user pointer is valid only because the process owns the range, which the
+          kernel must check itself. See clinic 4.
+  - title: A page fault inside the kernel
+    q: |
+      Even with the range check, a direct copy can fault: on a page reserved with `sbrklazy`
+      and never touched, on the stack guard page, on a store into program text. The fault is
+      taken in supervisor mode and lands in [[kerneltrap]], which today panics. What should it
+      do in each case, and how does it know the fault came from a copy and not from a kernel
+      bug? Why can the copy loop not simply be `memmove`? Finally: a timer interrupt can arrive
+      in the middle of a copy, with `SUM` set. What must [[kerneltrap]] do about `SUM`, given
+      that it may call [[yield]]?
+    hints:
+      - "Read [[kerneltrap]] ([[kernel/trap.c:137]]-[[kernel/trap.c:164]]): what does it save on entry, and what does it write back before returning? Which of those values decides where execution continues?"
+      - "Which existing function already decides whether a faulting user address is a lazy page? And what do `sepc` and `stval` tell [[kerneltrap]] about where the fault happened and what it touched? Think about what you would need to know about the code that faulted in order to abandon it halfway."
+      - "Make the copy code something whose every instruction address and every register use you control, so that [[kerneltrap]] can recognize a fault in it and know a safe place to continue. Then treat `SUM` like any other piece of per-hart state that a trap handler must not leak."
+    answer: |
+      Three outcomes, chosen by [[kerneltrap]] from `scause`, `sepc` and `stval`:
+
+      - **A lazy page** (below `p->sz`, never touched): map a fresh page in both page tables,
+        exactly as a user-mode fault would, flush the TLB, and return. `sepc` still names the
+        faulting load or store, so it runs again and succeeds.
+      - **A bad page** (the guard page, a store into text, anything the lazy handler refuses):
+        set `sepc` to `ucopyfail`, a four-instruction epilogue that clears `SUM` and returns -1.
+        Because the copy loops are *leaf* assembly routines that never touch the stack or `ra`,
+        resuming at `ucopyfail` returns straight to the caller of `ucopy` with -1, as if the
+        loop had returned it. `memmove` is C: where it keeps its frame and which registers it
+        saved is up to the compiler, so there is no address in it you could resume at safely.
+        Linux solves the same problem with an "exception table" of (faulting instruction, fixup
+        address) pairs; the reference's address range is the smallest version of that.
+      - **Anything else** (a fault anywhere outside the copy loops): panic, as before. A kernel
+        bug that dereferences a user pointer still crashes loudly.
+
+      **`SUM` and traps.** The hardware does not change `SUM` on a trap, so an interrupt in the
+      middle of a copy enters [[kerneltrap]] with `SUM` set. If [[kerneltrap]] calls [[yield]],
+      the scheduler and then another process run on this hart, all with `SUM` set: every one of
+      them could dereference user pointers without a fault. So [[kerneltrap]] clears `SUM` on
+      entry, after saving `sstatus`; the `w_sstatus(sstatus)` at its end puts the saved value
+      back, so the interrupted copy resumes with `SUM` set, possibly on another hart. The
+      invariant becomes: `SUM` is set only while a hart executes a copy loop.
+    checks:
+      - id: lab17-12
+        level: 2
+        type: order
+        q: |
+          `sumtest` calls `read` from a pipe into an untouched `sbrklazy` page. Put the events
+          in order, as gdb recorded them on the reference branch.
+        items:
+          - "piperead calls copyout, which calls ucopy; ucopy sets SUM"
+          - "the sb in ucopy raises a store page fault (scause 15) in supervisor mode"
+          - "kernelvec pushes a frame and calls kerneltrap, which clears SUM"
+          - "uvmfault maps a zeroed page in the user page table and in the kernel page table"
+          - "kerneltrap flushes the TLB and writes back the saved sepc and sstatus (SUM set again)"
+          - "sret returns to the same sb, which now succeeds"
+        why_wrong: "Follow the hardware: the store faults first, then the handler runs, then the same store is retried."
+        explain: |
+          gdb at the fixup branch recorded `scause` 0xf, `sepc` `0x8000593c` (the `sb` in
+          `ucopy`), `stval` `0x800a`, saved `sstatus` `0x200040100` (`SUM` set) and live
+          `sstatus` `0x200000100` (`SUM` cleared), with `pi->lock` held: noff 1.
+      - id: lab17-13
+        level: 3
+        type: tf
+        q: |
+          True or false: [[kerneltrap]] clearing `SUM` on entry is only tidiness; since the
+          interrupted copy's `SUM` is restored at the end, leaving it set during
+          [[kerneltrap]] could not affect anything else.
+        answer: false
+        why_tf: |
+          You may have pictured [[kerneltrap]] as running straight through. A timer interrupt
+          makes it call [[yield]], and other code runs on this hart before it returns.
+        reasons:
+          - text: "kerneltrap may yield; the scheduler and another process would then run on this hart with SUM set."
+            correct: true
+            why: Right. `SUM` belongs to the hart, not to the process.
+          - text: "kerneltrap itself dereferences user pointers when it calls the lazy handler."
+            why: |
+              The lazy handler works on page tables and physical pages through the direct map;
+              it never touches a user address.
+          - text: "The hardware clears SUM on every trap, so there is nothing to clear."
+            why: |
+              It does not: a trap changes `SPP`, `SPIE` and `SIE`, never `SUM`. That is why the
+              kernel must.
+        explain: |
+          `sstatus` is per hart, and [[swtch]] does not save it. Whatever `SUM` holds when a hart
+          switches threads, the next thread inherits. Clinic 5 shows a leaked `SUM` making a
+          buggy system call succeed.
+  - title: Will it be faster?
+    q: |
+      Before you measure, predict. The old path per copy call: two software walks per page,
+      then a byte-copy `memmove`. The new path: a check of the range, setting and clearing
+      `SUM` (two CSR writes), the copy loop. What else did the design add to every call, and to
+      every context switch? On QEMU, which do you expect to win for a 1-byte copy, and for a
+      4096-byte copy? How would you find out *why*?
+    hints:
+      - "`copyout` must tell whether `pagetable` is the current process's ([[myproc]] costs a [[push_off]] and a [[pop_off]], each with CSR accesses). The scheduler now writes `satp` twice per context switch and flushes the TLB around each write."
+      - "On QEMU a CSR access is much more expensive than an ordinary load, and a page-table walk is just a few loads that hit in the host's cache."
+      - "Time the copy functions in the kernel with the `time` CSR, then time each ingredient alone (`myproc`, a `csrs`/`csrc` pair, [[walkaddr]], `memmove`, the copy loop) the same way."
+    answer: |
+      On QEMU the direct path is **slower**, and the measure section shows why. A 1-byte
+      `copyout` took about 180-220 ns on the original kernel and 400-480 ns on the branch; a
+      4096-byte one about 5.5-6.3 us against 8.0-8.7 us. Taken apart:
+
+      - [[myproc]], added to recognize the current page table, costs 280-300 ns by itself,
+        more than a whole old 1-byte copy;
+      - a `csrs`/`csrc` pair on `sstatus` costs about 90 ns, the same for `SUM` as for an
+        unrelated bit (`SPIE`), so QEMU charges nothing special for `SUM`;
+      - the software walks it replaced cost about 90 ns each on the original kernel;
+      - per byte, the assembly loop has 7 instructions (`beqz`, `lbu`, `sb`, three `addi`,
+        `j`) where the compiled `memmove` loop has 5, and the measured per-byte times differ by
+        about the same ratio.
+
+      Real hardware has very different ratios: CSR accesses take a few cycles, while a
+      software walk can miss in the cache three times. We did not measure hardware. The real
+      arguments for direct access are elsewhere: one fault path for lazy (and, in other labs,
+      copy-on-write or swapped-out) pages, and no per-page translation code to get wrong.
+    checks:
+      - id: lab17-14
+        level: 2
+        type: choice
+        q: |
+          In the in-kernel timings on QEMU, the branch's 1-byte `copyout` took 200 to 260 ns
+          longer than the original's. Which single ingredient accounts for most of that?
+        options:
+          - text: "The myproc() call that decides whether pagetable is the current process's"
+            correct: true
+            why: |
+              Measured alone it costs 280-300 ns on the branch: [[push_off]] and [[pop_off]] read and write
+              `sstatus`, and CSR accesses are slow on QEMU.
+          - text: "Setting and clearing SUM"
+            why: |
+              A `csrs`/`csrc` pair costs about 90 ns, the same as toggling `SPIE`. It is part of
+              the difference, not most of it.
+          - text: "A TLB miss on the user address, since the kernel page table is new"
+            why: |
+              The benchmark copies to the same address 100,000 times; after the first, the
+              translation is cached.
+          - text: "The fault-recovery check in kerneltrap"
+            why: |
+              [[kerneltrap]] runs only on traps. A successful copy of a mapped page takes no
+              trap at all.
+        explain: |
+          Measure the parts, not just the whole. The cost here comes from code the design added
+          around the copy, not from the copy itself.
+build: |
+  **Start.**
+
+  ```text
+  git checkout -b my-sum 06aad25
+  ```
+
+  Write `user/sumtest.c` first, with the checks listed in the spec, and add `$U/_sumtest\`
+  to `UPROGS` in the `Makefile`. On the unmodified kernel every check passes except **limit**
+  (`sbrk beyond USERTOP succeeded`): the old kernel already refuses all the bad pointers.
+  `sumtest` guards against breaking that. Define `USERTOP` in milestone 1 before you build it.
+
+  **Milestones, in an order that keeps `usertests -q` passing after each one.**
+
+  1. **The cap.** `USERTOP` in `kernel/memlayout.h`; use it in [[growproc]], [[sys_sbrk]]
+     and [[kexec]] (each segment's end, and the stack). Lower `REGION_SZ` in `usertests.c`
+     and point `lazy_sbrk` at `USERTOP`. Test: `usertests -q` (without the `lazy_sbrk` change
+     it loops forever: its loop ignores `sbrklazy` failing).
+  2. **A kernel page table per process.** `p->kpagetable`; create it in [[allocproc]], free it
+     in [[freeproc]], install it in [[scheduler]] around [[swtch]]. No user pages in it yet.
+     Test: `usertests -q`. Every system call now runs on it (it is what [[prepare_return]]
+     stores as `kernel_satp`), so a mistake in the shared kernel part shows up at once.
+  3. **The mirror.** A function that makes a range of the kernel page table agree with the
+     user page table; call it in [[kfork]], [[growproc]], the user-mode lazy fault path and
+     [[kexec]]. Test: `usertests -q`. Nothing uses the user part yet, so check it with gdb:
+     after `ls`, compare the shell's user and kernel PTEs for `0x0`-`0x4000`.
+  4. **The copy loops.** `SSTATUS_SUM` in `riscv.h`; `ucopy` and `ucopystr` in a new
+     `kernel/uaccess.S` (add it to `OBJS`), with labels marking where the loops end and where a
+     faulting copy resumes. Nothing calls them yet. Test: it builds.
+  5. **Fault recovery.** In [[kerneltrap]]: clear `SUM` on entry; for page faults inside the
+     loops, the lazy handler or the resume label. Test: `usertests -q`.
+  6. **Switch the copy functions.** Range check, then the loops, for the current process;
+     keep the walk for [[kexec]]'s new page table. Test: `sumtest`, `usertests -q`, `sumtest`.
+
+  **Debugging advice.** Start QEMU with `make qemu-gdb`, which waits for gdb on the port it
+  prints: set boot-time breakpoints before the first `continue`; for anything after the shell
+  prompt, let it boot and interrupt gdb (Ctrl-C) when you need it.
+
+  - `scause=0xd` or `0xf` followed by `panic: kerneltrap`: a page fault in supervisor mode that
+    your recovery did not claim. Look up `sepc` in `kernel/kernel.asm`. Inside the copy loops
+    means milestone 5 is missing a case; anywhere else, some kernel code used a user address.
+  - A copy that fails with -1 although the user's page is mapped: compare the PTEs. In gdb,
+    `p/x *walk(p->pagetable, va, 0)` and `p/x *walk(p->kpagetable, va, 0)` should agree on the
+    physical page and on `V`, `R`, `W`, `X`, `U` (the `A` and `D` bits may differ).
+  - A hang with no output: attach gdb, `info threads`, `thread apply all bt`, and print
+    `$satp` on each thread. A hart trapping in `kernelvec` forever, or with a `satp` that is not
+    any live process's `kpagetable`, points at a page table that was freed or damaged (clinics
+    3 and 6).
+  - `p/x $sstatus` inside the loops should show bit 18 (`0x40000`); anywhere else it should
+    not.
+clinic:
+  - bug: No fault recovery in kerneltrap
+    change: |
+      Commit 5's new branch in [[kerneltrap]] is missing (the line that clears `SUM` is kept):
+
+      ```diff
+      -  if ((scause == 13 || scause == 15) && sepc >= (uint64)ucopy &&
+      -      sepc < (uint64)ucopyend) {
+      -    // a page fault in a user copy: map a lazily-allocated
+      -    // page and retry, or make the copy return -1.
+      -    if (uvmfault(myproc(), r_stval(), scause == 13) != 0)
+      -      sfence_vma(); // so that the retry sees the new PTE
+      -    else
+      -      sepc = (uint64)ucopyfail;
+      -  } else if ((which_dev = devintr()) == 0) {
+      +  if ((which_dev = devintr()) == 0) {
+      ```
+    symptom: |
+      $ usertests -q
+      usertests starting
+      test copyin: OK
+      test copyout: scause=0xf sepc=0x800058ec stval=0x0
+      panic: kerneltrap
+
+      (another boot)
+      $ sumtest
+      sumtest: copy: OK
+      scause=0xf sepc=0x800058ec stval=0x800a
+      panic: kerneltrap
+    why: |
+      In this build `0x800058ec` is the `sb` in `ucopy`. Both panics are store page faults
+      (`scause` 15) taken by the copy loop, which [[kerneltrap]] now treats like any other
+      unknown trap.
+
+      - `usertests copyout` calls `read(fd, 0, 8192)` ([[user/usertests.c:92]]). Address 0 is
+        below `p->sz` and passes the range check; it is the program's text, mapped `R|X|U`, so
+        the store faults on the missing `W`. The old [[copyout]] refused it in software
+        ([[kernel/vm.c:364]]); the new one relies on the fault.
+      - `sumtest lazy` reads into a page reserved with `sbrklazy`: `stval` `0x800a` is
+        `p + PGSIZE + 10` with `p` = `0x7000`. The page is legitimately part of the process
+        and should simply have been allocated.
+
+      `copyin` passed because its bad addresses (`0x80000000` and above) are all at or beyond
+      `p->sz`: the range check refuses them before the loop runs. So the range check and the
+      fault recovery cover different cases, and a correct kernel needs both.
+  - bug: growproc does not update the kernel page table when memory grows
+    change: |
+      [[growproc]] mirrors a shrink but forgets the grow case:
+
+      ```diff
+           if ((sz = uvmalloc(p->pagetable, sz, sz + n, PTE_W)) == 0) {
+             return -1;
+           }
+      -    if (kvmsync(p->pagetable, p->kpagetable, p->sz, sz) < 0) {
+      -      uvmdealloc(p->pagetable, sz, p->sz);
+      -      kvmsync(p->pagetable, p->kpagetable, p->sz, sz);
+      -      return -1;
+      -    }
+         } else if (n < 0) {
+      ```
+    symptom: |
+      init: starting sh
+      $ echo hi
+      exec echo failed
+      $ ls
+      exec ls failed
+      $ cat README
+      exec cat failed
+      $ cd /
+      $
+
+      # gdb, the same kernel, typing echo hi:
+      === growproc: pid 3 sh n=65536 sz=0x5000
+      === kerneltrap ucopy fault: hart 2 pid 3 sh
+      $1 = 0xd
+      $2 = 0x14f58
+      $3 = 0x15000
+      [...]
+      === ucopyfail: pid 3
+      #0  ucopyfail () at kernel/uaccess.S:65
+      #1  0x000000008000166e in copyin (pagetable=<optimized out>, psz=86016, dst=dst@entry=0x3fffff9de0 "\005\005\005\005\005\005\005\005XO\001", srcva=srcva@entry=85848, len=len@entry=8) at kernel/vm.c:486
+      #2  0x0000000080002a4a in fetchaddr (addr=85848, ip=ip@entry=0x3fffff9de0) at kernel/syscall.c:18
+      #3  0x0000000080005714 in sys_exec () at kernel/sysfile.c:474
+      [...]
+    why: |
+      The gdb script printed `scause`, `stval` and `p->sz` at the recovery branch, and the
+      backtrace at `ucopyfail`. The system boots, and every command fails, except `cd`, which the shell runs itself. The
+      chain:
+
+      1. The shell forks; the child (pid 3) parses the command line ([[user:parsecmd]]), and
+         `malloc` asks for 64 KB with an eager `sbrk`: `growproc` maps `0x5000`-`0x15000` in the
+         user page table, but not in the child's kernel page table.
+      2. The child calls `exec("echo", argv)`. `argv` lives in that heap. [[sys_exec]] fetches
+         each pointer with [[fetchaddr]] → [[copyin]], whose loop loads from `0x14f58`.
+      3. The kernel page table has no mapping there: load page fault. The recovery asks the
+         lazy handler, which refuses because the page *is* mapped in the user page table. So
+         the copy resumes at `ucopyfail` and returns -1, `exec` fails, and the shell prints
+         `exec echo failed`.
+
+      `init` and the shell themselves work because their memory came from [[kexec]] and
+      [[kfork]], which do mirror. Nothing panics: the two page tables simply disagree, and the
+      kernel's copies see only their own. The same check in the old kernel was impossible to
+      get wrong, because there was only one page table.
+  - bug: User memory may still grow up to TRAPFRAME
+    change: |
+      Commit 1 is left out: [[growproc]], [[sys_sbrk]] and [[kexec]] still allow memory up to
+      [[TRAPFRAME]], and `usertests.c` is the original one. Everything else is the reference.
+    symptom: |
+      $ usertests lazy_alloc
+      usertests starting
+      test lazy_alloc: OK
+      FAILED -- lost some free pages 32003 (out of 32386)
+      $ usertests lazy_unmap
+      usertests starting
+      test lazy_unmap:
+      [... no more output; after several minutes, gdb:]
+        Id   Target Id                    Frame
+      * 1    Thread 1.1 (CPU#0 [halted ]) s_sstatus (x=2) at kernel/riscv.h:69
+        2    Thread 1.2 (CPU#1 [halted ]) s_sstatus (x=2) at kernel/riscv.h:69
+        3    Thread 1.3 (CPU#2 [running]) kernelvec () at kernel/kernelvec.S:14
+      [...]
+      # thread 3: p/x $scause, $stval, $sepc, $sp
+      $1 = 0xf
+      $2 = 0x1ec2130ef0
+      $3 = 0x800058a2
+      $4 = 0x1ec2130ef0
+      [...]
+      # the kernel's level-0 page-table pages for the UART/virtio page and the
+      # PLIC's first pages:
+      0x87ffd000:	0x0000000000000000	0x0000000000000000
+      0x87ffc000:	0x0000000000000000	0x0000000000000000
+      0x87ffb000:	0x0000000000000000	0x0000000000000000
+    why: |
+      `lazy_alloc` reserves 1 GB with `sbrklazy` and touches one page in every 64. Most of
+      those pages lie above `0x0c000000`, in the part of the first gigabyte that the kernel uses
+      for devices. Each touch is a user-mode lazy fault, and the mirror then writes into the
+      process's kernel page table at that address:
+
+      - **Where the level-1 entry is empty** (above the devices), the mirror allocates a
+        level-0 page in the process's private level-1 page. But `kvmfree` only frees the
+        level-0 pages below `USERTOP`, so all of those leak when the process exits. The
+        touched region from `0x0c000000` to `0x40000000` spans 416 entries of 2 MB; 33 of them
+        (96 to 128) already point at the kernel's device pages and allocate nothing. 416 - 33
+        = **383**, exactly the `32386 - 32003` pages that `usertests` reports lost.
+      - **Where the entry is one of 96 to 128**, the level-0 page is the *kernel's own*,
+        shared by every page table in the system. The mirror writes the user's PTE into it,
+        over a device mapping.
+
+      `lazy_unmap` reserves the gigabyte again and forks. [[kfork]] mirrors the child's whole
+      image, `[0, sz)`, and the mirror clears every kernel PTE it finds where the user page
+      table has nothing. Inside the shared level-0 pages that means the PLIC's, the UART's and
+      virtio's entries, in [[kernel_pagetable]] itself. (The child's `sbrklazy(-1 GB)` would
+      clear them again.) An instrumented copy of this kernel confirmed the
+      culprit: the first call to leave the UART's PTE at 0 was [[kfork]]'s mirror in
+      pid 4, before any child ran. This is also the place where a caller breaks the promise
+      that the mirror is only used below `USERTOP`. gdb confirms the damage: on the reference branch the
+      UART's PTE reads `0x40000c7` (physical `0x10000000`, `V|R|W|A|D`); here the UART and
+      virtio PTEs, and every PLIC PTE we printed (the first pages under level-1 entries 96 and
+      97, which include hart 0's claim register), are 0 in [[kernel_pagetable]]'s pages, and
+      therefore in every process's too.
+
+      From there the machine dies quietly. Without a UART mapping, the next console output
+      faults; [[kerneltrap]] tries to print `scause=...`, which faults again, and so on. Each
+      nested trap pushes a 256-byte `kernelvec` frame; the kernel stack overflows into its
+      guard page, and from then on every push faults too. gdb found hart 2 at the first store
+      in `kernelvec` with `stval` = `sp`, and two snapshots 5 s apart showed `sp` falling from
+      `0x14ac6da3f0` to `0x13390802f0`: the hart takes one fault per 256 bytes, forever, and
+      prints nothing, because there is no UART left to print with. (We did not trace which
+      access faulted first; the chain above is reasoned from the backtrace and the zeroed
+      PTEs.)
+
+      The cap is not a detail of the design: it is what keeps the user's mirror out of the
+      kernel's shared page-table pages.
+  - bug: The copy functions trust the user's range
+    change: |
+      The range check is left out; the loops get the whole range:
+
+      ```diff
+      -    n = ulen(dstva, len, psz);
+      -    if (ucopy((char *)dstva, src, n) < 0 || n < len)
+      -      return -1;
+      -    return 0;
+      +    return ucopy((char *)dstva, src, len);
+      ```
+
+      and the same in [[copyin]] and [[copyinstr]] (which passes `max` unchanged).
+    symptom: |
+      $ usertests -q
+      usertests starting
+      test copyin: write(fd, 0x0000000080000000, 8192) returned 8192, not -1
+      FAILED
+      SOME TESTS FAILED
+      $
+
+      (another boot)
+      $ sumtest
+      sumtest: copy: OK
+      sumtest: lazy: OK
+      sumtest: write(pipe, 0x0000000080000000) from kernel text (KERNBASE) returned 16
+      sumtest: read(fd, 0x0000000087FFF000) into kernel RAM (PHYSTOP - PGSIZE) returned 16
+      scause=0panic:
+
+      # gdb, attached afterwards (another boot of the same test, which stopped
+      # printing in the middle of the same line):
+      0x87fff000:	0x6120736920367678	0x6c706d692d657220
+      0x87fff000:	"xv6 is a re-impl\001p\377!"
+    why: |
+      `write(fd, 0x80000000, 8192)` reads 8 KB of the kernel's own code into a file: kernel
+      text is mapped `R|X` without `U`, and supervisor mode may read it, `SUM` or not. Nothing
+      faults, nothing panics, and a user program now holds a copy of kernel memory.
+
+      `sumtest` goes further. `read(fd, PHYSTOP - 4096, 16)` *stores* 16 bytes of README into
+      the last page of RAM, mapped `R|W` for the kernel. In this build that page is the root of
+      [[kernel_pagetable]] (`0x87fff000`): it is the first page [[kalloc]] hands out, and
+      [[kvmmake]] takes it. gdb shows README's first 16 bytes there: "xv6 is a re-impl". Those
+      bytes are now root entries 0 and 1; `0x78` and `0x20` are even, so both are *invalid*
+      PTEs, and gigabyte 0, the devices, has vanished from the kernel page table.
+
+      `sumtest`'s own kernel page table has a private root (copied when it was created), so in
+      principle it could go on, but in every boot output stopped at or just after the `read`
+      into `PHYSTOP - 4096`; in one of them a panic message broke off after `scause=0`
+      (followed by an unprintable byte). We did not trace the collapse step by step. When gdb
+      attached, hart 2 was in a nested panic inside `printk`, hart 1 was spinning in
+      [[acquire]] in its scheduler, and hart 0 was in `kernelvec` with `satp` =
+      `0x8000000000000000`, a page table at physical address 0. What the bytes at `0x87fff000` show is enough: the kernel's own page table
+      was overwritten from user space.
+
+      A missing range check is a security hole that the test suite only catches by luck (here,
+      one `usertests` line). Any user program could overwrite any kernel page.
+  - bug: ucopystr leaves SUM set when it finds the '\0'
+    change: |
+      An early return that forgets to clean up, the classic mistake:
+
+      ```diff
+       2:
+      -        csrc sstatus, t0
+               li a0, 0
+               ret
+      ```
+
+      To see the effect, both this kernel and the reference got a deliberately buggy system
+      call, `kpeek(int *addr)`, that returns `*(int *)addr`, a user pointer used without
+      [[copyin]]. The test program calls `open("README", ...)` (a [[copyinstr]] that finds the
+      `'\0'`), then `kpeek(&secret)` with `secret = 42`, then prints two lines with
+      `printf`, then calls `kpeek` again.
+    symptom: |
+      # the reference branch plus kpeek:
+      $ peektest
+      peektest: secret is at 0x0000000000001000
+      scause=0xd sepc=0x80002d9a stval=0x1000
+      panic: kerneltrap
+
+      # with the bug:
+      $ peektest
+      peektest: secret is at 0x0000000000001000
+      peektest: right after open(), kpeek returned 42
+      peektest: and after these printf()s?
+      scause=0xd sepc=0x80002d9a stval=0x1000
+      panic: kerneltrap
+    why: |
+      `0x80002d9a` is the `lw a0,0(a5)` of `return *(int *)addr` in `sys_kpeek`.
+
+      On the reference, the stray dereference faults at once: `SUM` is clear outside the copy
+      loops, the page at `0x1000` has `U`, and the kernel panics. That is `SUM` doing its job,
+      turning a kernel bug into a loud crash.
+
+      With the bug, `open` leaves `SUM` set on this hart, and the very next system call's stray
+      dereference succeeds and returns the user's 42. Then `printf` calls `write` once per
+      character, each a [[copyin]] through `ucopy`, which clears `SUM` on its way out. So the
+      *second* `kpeek`, the same buggy line, panics. Whether the bug shows depends on which
+      copy ran last on this hart, and, since `SUM` is per hart, on which hart the process is
+      running. A kernel built this way passes `usertests -q` and `sumtest`: nothing in a test
+      suite of correct system calls notices that the safety net is gone.
+  - bug: The scheduler stays on the process's kernel page table
+    change: |
+      The switch back after [[swtch]] is missing:
+
+      ```diff
+               kvmswitch(p->kpagetable);
+               swtch(&c->context, &p->context);
+      -
+      -        // back to the kernel's own page table: p's may be
+      -        // freed once p->lock is released.
+      -        kvminithart();
+      ```
+    symptom: |
+      init: starting sh
+      $ usertests -q
+      [... no more output for 900 seconds]
+
+      (another boot)
+      init: starting sh
+      $
+      [... the typed command is never echoed; gdb:]
+        Id   Target Id                    Frame
+      * 1    Thread 1.1 (CPU#0 [running]) kernelvec () at kernel/kernelvec.S:14
+        2    Thread 1.2 (CPU#1 [halted ]) s_sstatus (x=2) at kernel/riscv.h:69
+        3    Thread 1.3 (CPU#2 [running]) kernelvec () at kernel/kernelvec.S:14
+      [...]
+      Thread 3 (Thread 1.3 (CPU#2 [running])):
+      $1 = 0x8000000000087f52
+      Thread 2 (Thread 1.2 (CPU#1 [halted ])):
+      $2 = 0x8000000000087f31
+      Thread 1 (Thread 1.1 (CPU#0 [running])):
+      $3 = 0x8000000000087f52
+      [...]
+      0x87f52000:	0x8000000000087f31	0x0000003fffffc000
+      0x87f52010:	0x00000000800027ee	0x0000000000000ca4
+    why: |
+      The three `$` values are each hart's `satp`. Harts 0 and 2 are still using `0x87f52000`
+      as their root page table, and gdb (reading through hart 1, which is on the shell's table
+      `0x87f31000`) shows what that page holds now: `0x8000000000087f31`, `0x3fffffc000`,
+      `0x800027ee` (`usertrap`), `0xca4`. Those are the first fields of a **trapframe**:
+      `kernel_satp`, `kernel_sp`, `kernel_trap`, `epc`. The page was some process's kernel
+      page table, was freed, and was handed out again as a trapframe, while two idle harts kept
+      it in `satp`.
+
+      How it happens without the switch back: an idle hart keeps whatever page table the last
+      process it ran left in `satp`. That process may exit and be reaped, or `exec` on another
+      hart and free its old kernel page table. The idle hart's TLB hides the problem for a
+      while; at its next miss the hardware walks the freed page, finds garbage, and faults; [[kerneltrap]] faults again,
+      and the hart never gets out of `kernelvec`. With two harts gone, the console falls
+      silent. In the first boot it happened as soon as `usertests` started; in the second,
+      before the shell could echo the command.
+
+      The rule from question 5: a hart must stop using a page table before anyone can free it.
+      The scheduler holds `p->lock` across the switch back, and the freer needs that lock.
+reveal:
+  - title: A cap on user memory
+    commit: 1
+    file: kernel/memlayout.h
+    lines: 52-68
+    focus: 59-68
+    diff: true
+    state:
+      hart: any
+      proc: "(a definition: used by sbrk, growproc and exec)"
+      locks: []
+    note: |
+      The story in this tour, recorded with gdb attached on three harts: you type `sumtest`,
+      the shell forks pid 3, pid 3 calls `exec`, and `sumtest` (still pid 3) runs its checks:
+      copies through pipes and files, a `read` into a lazy page, bad pointers, `fork`.
+
+      A note on the state boxes: the tour schema knows only three page tables, so on this
+      branch `satp: kernel` means *the running process's own kernel page table*
+      (`p->kpagetable`), except in the scheduler, where the details say which.
+
+      Commit 1 makes room. A process's kernel page table (commit 2) will map the process's
+      pages at their user addresses, next to everything the kernel maps. The kernel's lowest
+      mapping is the [[g:plic|PLIC]], at `0x0c000000` (192 MB); the UART and virtio come next,
+      at `0x10000000`. So user memory now ends at `USERTOP` = [[PLIC]] instead of
+      [[TRAPFRAME]]. [[growproc]] (eager `sbrk`) and [[sys_sbrk]] (lazy) test against it, and
+      [[kexec]] refuses a program whose segments or stack would end above it.
+
+      The [[TRAPFRAME]] and [[TRAMPOLINE]] pages stay where they were, above `USERTOP`: they
+      have no `PTE_U` and will never be mirrored.
+  - title: Two usertests that asked for a gigabyte
+    commit: 1
+    file: user/usertests.c
+    lines: 2620-2636
+    focus: 2623-2625
+    diff: true
+    state:
+      hart: any
+      proc: "(user code, before it runs)"
+      locks: []
+    note: |
+      `lazy_alloc` and `lazy_unmap` reserve `REGION_SZ` bytes with `sbrklazy` and touch one
+      page in every 64 (`lazy_unmap` one in every 4096, each in a new child). With a 192 MB
+      ceiling, a 1 GB reservation fails and both tests would print `sbrklazy() failed`. 176 MB
+      fits below the ceiling and is still more than all of RAM, so only a lazy reservation can
+      succeed. The tests do less than before, though: `lazy_alloc` touches 704 pages instead
+      of 4,096, and `lazy_unmap` runs 11 rounds instead of 64.
+
+      `lazy_sbrk` changed too (in the same commit): it grew memory in 1 GB steps towards
+      [[MAXVA]] and checked the top page below [[TRAPFRAME]]. Its loop never notices that
+      `sbrklazy` failed, so with the new cap it would spin forever. It now grows to one page
+      below `USERTOP` in a single call; the step loop and its comment are gone. These are the
+      only changes to `usertests`, and every check is kept.
+  - title: A kernel page table that shares almost everything
+    commit: 2
+    file: kernel/vm.c
+    lines: 84-123
+    focus: 92-107
+    diff: true
+    state:
+      hart: 0
+      mode: S
+      proc: sumtest (pid 3), forking pid 4
+      intr: "off"
+      satp: kernel
+      locks: ["np->lock (pid 4's)"]
+      irq: {noff: 1, intena: 1}
+      stack: [usertrap, syscall, sys_fork, kfork, allocproc, kvmcreate]
+      sp: {"on": kernel, detail: "pid 3's kernel stack"}
+    note: |
+      `kvmcreate` builds one process's kernel page table in two pages:
+
+      - a **root** that starts as a copy of [[kernel_pagetable]]'s 512 entries, so entries 2
+        (RAM) and 255 (trampoline, kernel stacks) point at the kernel's own level-1 pages,
+        shared;
+      - a **private level-1 page** for gigabyte 0, a copy of the kernel's, whose entries 96 to
+        128 still point at the kernel's level-0 pages for the PLIC, UART and virtio. Entries 0
+        to 95, below `USERTOP`, are empty: the user pages go there (commit 3).
+
+      gdb read the shell's (pid 2's) kernel page table on the finished branch:
+
+      ```text
+                     kernel_pagetable   sh's kpagetable
+      root[0]        0x21fff801         0x21fcc001    private level-1 page
+      root[2]        0x21ff7001         0x21ff7001    shared (RAM)
+      root[255]      0x21fe6c01         0x21fe6c01    shared (trampoline, kstacks)
+      level-1[96]    0x21fff001         0x21fff001    shared (PLIC)
+      level-1[128]   0x21fff401         0x21fff401    shared (UART, virtio)
+      ```
+
+      `kvmcreate` is called from [[allocproc]] with the new process's `p->lock` held: when
+      `sumtest` forks, that is pid 4's lock, noff 1, and intena 1, because the system call
+      turned interrupts on before the [[acquire]]. ([[allocproc]]'s lock state is reasoned
+      from the code; gdb recorded noff 1, intena 1 a few lines later in [[kfork]], under the
+      same lock.)
+    others: |
+      The kernel's shared pages are written only by [[kvmmake]], at boot, before the other
+      harts start. Afterwards every hart only reads them, through the page-table walker, so
+      sharing them needs no lock. The private pages belong to one process; only the hart
+      running that process, or its parent during `fork`, touches them.
+  - title: Freeing exactly what is private
+    commit: 2
+    file: kernel/vm.c
+    lines: 109-132
+    focus: 112-123
+    state:
+      hart: any
+      mode: S
+      proc: "the parent, reaping a zombie"
+      intr: "off"
+      satp: kernel
+      locks: [wait_lock, "the zombie's p->lock"]
+      irq: {noff: 2, intena: 1}
+      stack: [usertrap, syscall, sys_wait, kwait, freeproc, kvmfree]
+      sp: {"on": kernel}
+    note: |
+      `kvmfree` frees the private level-1 page, the level-0 pages under its entries 0 to 95
+      (`PX(1, USERTOP)` = 96), and the root. It does not touch the leaf PTEs: the user pages
+      belong to the user page table, which [[proc_freepagetable]] frees, and the shared
+      kernel pages belong to the kernel.
+
+      That loop bound is a promise: nothing is ever mapped in entries 96 and above of the
+      private level-1 page. Commit 1's cap keeps it. Clinic 3 breaks the cap, and this loop
+      then leaks exactly the level-0 pages it does not know about (383 of them in that run).
+
+      [[freeproc]] calls it from [[kwait]] with `wait_lock` and the zombie's `p->lock` held
+      (state reasoned from the code). [[kfree]] only takes `kmem.lock`, briefly.
+  - title: The scheduler installs the process's page table
+    commit: 2
+    file: kernel/proc.c
+    lines: 440-486
+    focus: 462-465
+    diff: true
+    state:
+      hart: 0
+      mode: S
+      proc: "scheduler, choosing sumtest (pid 3)"
+      intr: "off"
+      satp: kernel
+      locks: ["sumtest's p->lock"]
+      irq: {noff: 1, intena: 0}
+      stack: [main, scheduler]
+      sp: {"on": scheduler, detail: "hart 0's slice of stack0, sp = 0x80008860"}
+    note: |
+      The scheduler has chosen `sumtest` and holds its `p->lock`. Before [[swtch]] it now
+      calls `kvmswitch(p->kpagetable)`: `sfence.vma`, `csrw satp`, `sfence.vma`. gdb on hart 0:
+
+      ```text
+      before kvmswitch   satp = 0x8000000000087fff   (kernel_pagetable 0x87fff000)
+      after kvmswitch    satp = 0x8000000000087f10   (sumtest's kpagetable 0x87f10000)
+      noff 1, intena 0, sstatus 0x200000020, sp 0x80008860
+      ```
+
+      The hart keeps running the scheduler, on the scheduler stack, after `satp` changed: the
+      code, the stack (`stack0` in the kernel's data) and `proc[]` are mapped identically in
+      both page tables. From [[swtch]] on, `sumtest` runs with its own kernel page table, and
+      [[prepare_return]] will store it as `kernel_satp` ([[kernel/trap.c:116]]), so every
+      later trap from user mode lands on it too.
+
+      intena is 0: the scheduler's `intr_on(); intr_off();` window left interrupts off before
+      this [[acquire]].
+    others: |
+      Each hart has its own `satp`. Hart 1 may be running the shell on the shell's kernel
+      page table while hart 0 runs `sumtest` on its own, and hart 2 sits in its scheduler on
+      [[kernel_pagetable]]. No lock covers `satp`: it is per-hart state.
+  - title: And switches back before letting go
+    commit: 2
+    file: kernel/proc.c
+    lines: 456-486
+    focus: 465-469
+    state:
+      hart: 0
+      mode: S
+      proc: "scheduler, after sumtest (pid 3) gave up the hart"
+      intr: "off"
+      satp: kernel
+      locks: ["sumtest's p->lock"]
+      irq: {noff: 1, intena: 0}
+      stack: [main, scheduler]
+      sp:
+        "on": scheduler
+        switched: "`ld sp, 8(a1)` in [[swtch]] ([[kernel/swtch.S:26]])"
+    note: |
+      When `sumtest` gives up the hart (it yields, sleeps or exits), [[swtch]] returns here
+      with its `p->lock` still held. The first thing the scheduler does is
+      [[kvminithart]]: back to [[kernel_pagetable]].
+
+      The order matters. After `release(&p->lock)`:
+
+      - if `sumtest` is a zombie, its parent's [[kwait]] can take the lock and [[freeproc]]
+        frees its kernel page table;
+      - if it is runnable, another hart can run it, and its `exec` frees the old kernel page
+        table.
+
+      Either way, a hart that were still using that page table would walk a freed page at its
+      next TLB miss. Clinic 6 leaves this line out: gdb found two harts whose root page table
+      had become a trapframe.
+
+      (The state shown is reasoned: the line runs right after [[swtch]] returns, under the
+      lock the process handed back.)
+  - title: Mirroring the user's pages
+    commit: 3
+    file: kernel/vm.c
+    lines: 134-156
+    focus: 145-154
+    diff: true
+    state:
+      hart: any
+      proc: "(called from fork, sbrk, lazy faults and exec)"
+      locks: []
+    note: |
+      `kvmsync` makes one range of a process's kernel page table agree with its user page
+      table. For each page: if the user PTE is a valid leaf with `PTE_U`, copy it (allocating
+      level-0 pages in the private level-1 page as needed); otherwise clear the kernel copy, if
+      there is one.
+
+      The `PTE_U` test keeps the **stack guard page** out. gdb, the shell's PTEs for
+      `0x0`-`0x4000` on the finished branch:
+
+      ```text
+      va       user page table   kernel page table
+      0x0000   0x21fce05b        0x21fce01b    text (R|X|U)
+      0x1000   0x21fcd41b        0x21fcd45b    text
+      0x2000   0x21fcd0d7        0x21fcd017    data (R|W|U)
+      0x3000   0x21fccc07        0x0           guard page: no U, not mirrored
+      0x4000   0x21fcc8d7        0x21fcc817    stack
+      ```
+
+      Same physical pages, same permissions, but different `A` (`0x40`) and `D` (`0x80`) bits:
+      the hardware sets them in whichever copy it used. The user ran its text and wrote its
+      data and stack; the kernel only read `0x1000`. Nothing in xv6 reads `A` or `D`, but a
+      kernel that did (to choose pages to swap out, for example) would have to combine both
+      copies.
+
+      The function only *writes* the private part of the kernel page table, and only for
+      addresses below `USERTOP`: its callers guarantee that.
+  - title: sbrk in both directions
+    commit: 3
+    file: kernel/proc.c
+    lines: 244-272
+    focus: 253-269
+    diff: true
+    state:
+      hart: 0
+      mode: S
+      proc: sumtest (pid 3)
+      intr: "on"
+      satp: kernel
+      locks: []
+      irq: 0
+      stack: [usertrap, syscall, sys_sbrk, growproc]
+      sp: {"on": kernel, detail: "pid 3's kernel stack"}
+    note: |
+      Growing: [[uvmalloc]] maps the new pages in the user page table, `kvmsync` mirrors them.
+      If the mirror runs out of memory for a level-0 page, both are undone and `sbrk` fails.
+      No TLB flush: the hart has never seen these addresses mapped, and before user code can
+      touch them, the return to user mode flushes ([[kernel/trampoline.S:110]]).
+
+      Shrinking: [[uvmdealloc]] unmaps and frees the pages, `kvmsync` clears their kernel
+      copies, and then `sfence.vma`, because this hart is running on this very page table and
+      may hold the freed pages in its [[g:tlb]]. Without the flush, a copy later in the same
+      system call could still reach a page that [[kfree]] has handed to someone else.
+
+      gdb caught `sumtest` here three times (the `copy` check giving its 2 pages back, and the
+      `lazy` check twice): hart 0, `satp` `0x8000000000087f10` (its own kernel page table), noff 0.
+      [[usertrap]] turned interrupts on for the system call, and no lock is held.
+  - title: fork mirrors the child's whole image
+    commit: 3
+    file: kernel/proc.c
+    lines: 274-302
+    focus: 288-301
+    diff: true
+    state:
+      hart: 0
+      mode: S
+      proc: sumtest (pid 3), forking pid 4
+      intr: "off"
+      satp: kernel
+      locks: ["np->lock (pid 4's)"]
+      irq: {noff: 1, intena: 1}
+      stack: [usertrap, syscall, sys_fork, kfork]
+      sp: {"on": kernel}
+    note: |
+      After [[uvmcopy]] fills the child's user page table, `kvmsync` copies all of `[0, sz)`
+      into the child's kernel page table. gdb, in `sumtest`'s `fork` check: hart 0, child pid
+      4, `sz` 32768, noff 1 (pid 4's lock, held since [[allocproc]]), intena 1, the parent's
+      `satp` `0x8000000000087f10`, the child's new kernel page table at `0x87f42000`.
+
+      The mirror is placed after line 294 (`np->sz = p->sz`, unchanged base code) on purpose.
+      If the mirror fails,
+      [[freeproc]] frees the child's user page table with [[uvmfree]]`(pagetable, np->sz)`. With
+      `np->sz` still 0 it would unmap nothing and [[freewalk]] would find leaf PTEs and panic
+      `freewalk: leaf`. In the original code the order did not matter, because [[uvmcopy]]
+      cleans up after itself on failure.
+
+      No flush: no hart is using the child's page table yet. The scheduler flushes when it
+      installs it.
+  - title: exec swaps both page tables at once
+    commit: 3
+    file: kernel/exec.c
+    lines: 126-165
+    focus: 137-153
+    diff: true
+    state:
+      hart: 0
+      mode: S
+      proc: sumtest (pid 3)
+      intr: "on"
+      satp: kernel
+      locks: []
+      irq: 0
+      stack: [usertrap, syscall, sys_exec, kexec]
+      sp: {"on": kernel, detail: "pid 3's kernel stack"}
+    note: |
+      The shell's child (pid 3) has loaded `sumtest` into a new user page table. Before the
+      point of no return, [[kexec]] also builds a **new kernel page table** for the new image
+      (`kvmcreate` + `kvmsync`); if either fails, `exec` fails cleanly and the old image is
+      untouched.
+
+      At the commit it swaps both, then `kvmswitch` puts the new kernel page table in `satp`
+      and only then frees the old ones. gdb at line 151, on hart 0:
+
+      ```text
+      satp before    0x8000000000087f51   (the kernel page table pid 3 got from fork)
+      kpagetable     0x87f10000           (new)
+      oldkpagetable  0x87f51000
+      noff 0, intena 1, sstatus 0x200000022 (SIE on)
+      ```
+
+      Switching `satp` with interrupts on, in the middle of a system call, is safe: the code,
+      this kernel stack and all kernel data are mapped the same way in both tables. If a timer
+      interrupt preempts the process between line 147 and line 151, it resumes (perhaps on
+      another hart) with the scheduler installing `p->kpagetable`, already the new one.
+
+      The argument copies just above ([[kernel/exec.c:106]], [[kernel/exec.c:117]]) go into the
+      new *user* page table while the old one is current: those copies cannot use the new
+      addresses directly, which is why commit 6 keeps the software walk in [[copyout]] for any
+      page table that is not the current process's.
+  - title: A lazy fault fills both tables
+    commit: 3
+    file: kernel/vm.c
+    lines: 552-568
+    focus: 555-567
+    diff: true
+    state:
+      hart: any
+      mode: S
+      proc: a process that touched a lazy page in user mode
+      intr: "off"
+      satp: kernel
+      locks: []
+      irq: 0
+      stack: [usertrap, uvmfault]
+      sp: {"on": kernel}
+    note: |
+      [[usertrap]]'s lazy-allocation branch now calls `uvmfault(p, va, read)` instead of
+      [[vmfault]] ([[kernel/trap.c:72]] on this commit): [[vmfault]] maps the zeroed page in
+      the user page table, `kvmsync` adds it to the kernel page table. If that second step
+      runs out of memory, the first is undone, so the invariant "a `PTE_U` page is mapped in
+      both or in neither" survives even out of memory.
+
+      No flush here: the fault came from user mode, and the faulting instruction runs again
+      only after [[userret]], whose `sfence.vma` comes with the switch to the user page table.
+
+      Between this commit and commit 6, [[copyin]] and [[copyout]] still walk the user page
+      table and may allocate lazy pages through [[vmfault]] without mirroring them. Nothing
+      reads the kernel page table's user part yet, so this does no harm; commit 6 removes that
+      path for the current process. (The state is reasoned: a page fault from user mode leaves
+      interrupts off, and no lock is held.)
+  - title: The copy loop, with SUM set for exactly its duration
+    commit: 4
+    file: kernel/uaccess.S
+    lines: 1-35
+    focus: 19-35
+    diff: true
+    state:
+      hart: 0
+      mode: S
+      proc: sumtest (pid 3)
+      intr: "on"
+      satp: kernel
+      locks: []
+      irq: 0
+      stack: [usertrap, syscall, sys_pipe, copyout, ucopy]
+      sp: {"on": kernel, detail: "pid 3's kernel stack, sp = 0x3fffff9f10"}
+    note: |
+      `ucopy(dst, src, n)` is seven instructions per byte, between `csrs sstatus, t0`, which
+      sets bit 18 (`SUM`), and `csrc sstatus, t0`, which clears it. The constant comes from an
+      `.equ`, since `riscv.h`'s `SSTATUS_SUM` sits inside `#ifndef __ASSEMBLER__`; commit 4
+      adds `SSTATUS_SUM` and `SSTATUS_MXR` there for the C code.
+
+      gdb, an early copy in `sumtest` (`pipe()` storing a file descriptor at `0x6e48`):
+
+      ```text
+      at ucopy:          sstatus 0x200000022   satp 0x8000000000087f10   noff 0
+      after csrs:        sstatus 0x200040022
+      ```
+
+      The only difference is `0x40000`. `dst` is a plain user address, `0x6e48`; with
+      `sumtest`'s kernel page table in `satp` and `SUM` set, `sb t1, 0(a0)` stores straight
+      into its page.
+
+      The loop is a **leaf**: no stack frame, no use of `ra`, nothing saved. That is what will
+      let commit 5 abandon it halfway through and return from it anyway.
+  - title: Strings, and where a failed copy resumes
+    commit: 4
+    file: kernel/uaccess.S
+    lines: 36-68
+    focus: 40-68
+    state:
+      hart: any
+      proc: "(code: used from commit 6 on)"
+      locks: []
+    note: |
+      `ucopystr` copies up to and including a `'\0'`, at most `max` bytes, and returns 0 if it
+      copied the `'\0'`, -1 if it ran out. It has two exits, and both clear `SUM`. Forget one
+      and `SUM` stays on for whatever the hart does next: clinic 5.
+
+      `ucopyend` marks the end of the code whose faults the kernel may forgive. `ucopyfail`,
+      after it, is where such a fault resumes: clear `SUM`, return -1. Since neither loop
+      touched `sp` or `ra`, its `ret` returns to whoever called `ucopy` or `ucopystr`, with -1,
+      as if the loop had returned it.
+  - title: kerneltrap learns to forgive one kind of fault
+    commit: 5
+    file: kernel/trap.c
+    lines: 137-179
+    focus: 152-163
+    diff: true
+    state:
+      hart: 0
+      mode: S
+      proc: sumtest (pid 3)
+      intr: "off"
+      satp: kernel
+      locks: [pi->lock]
+      irq: {noff: 1, intena: 1}
+      stack: [usertrap, syscall, sys_read, fileread, piperead, copyout, ucopy, kernelvec, kerneltrap]
+      sp: {"on": kernel, detail: "a `kernelvec` frame on pid 3's kernel stack, sp = 0x3fffff9d60"}
+    note: |
+      `sumtest lazy` reads 6 bytes from a pipe into `p + PGSIZE + 10`, an `sbrklazy` page
+      nobody has touched. [[piperead]] copies one byte at a time with `pi->lock` held; the
+      first `sb` faults. gdb at line 160:
+
+      ```text
+      scause 0xf   sepc 0x8000593c (the sb in ucopy)   stval 0x800a
+      saved sstatus 0x200040100 (SUM set)   live sstatus 0x200000100 (SUM cleared)
+      noff 1, intena 1, p->sz 40960
+      ```
+
+      Line 154 cleared `SUM` first: from here on, nothing on this hart may use user memory
+      until the copy resumes. Then the new branch: a load or store page fault whose `sepc` lies
+      between `ucopy` and `ucopyend`. `uvmfault` maps a zeroed page at `0x8000` in both page
+      tables, `sfence.vma` makes sure the retry cannot see a stale "invalid", and the function
+      returns. `w_sstatus(sstatus)` at line 178 restores `SUM`, `sret` returns to the same
+      `sb`, and the copy continues.
+
+      This fault was taken with `pi->lock` held and interrupts off. `uvmfault` only takes
+      `kmem.lock` inside [[kalloc]], never sleeps, and so is safe here: the same reasoning that
+      allowed [[copyout]] to call [[vmfault]] before.
+    others: |
+      The writer of the pipe, the same process here, is not running. In general a writer on
+      another hart would spin on `pi->lock` in [[pipewrite]] for the whole fault, including a
+      [[kalloc]] and the zeroing of a page: a longer critical section than before, but bounded.
+      Timer interrupts cannot preempt this hart now: the trap left `SIE` clear, and noff 1
+      keeps it clear until [[piperead]] releases the lock.
+  - title: A fault nobody can fix
+    commit: 5
+    file: kernel/trap.c
+    lines: 152-179
+    focus: 156-169
+    state:
+      hart: 0
+      mode: S
+      proc: sumtest (pid 3)
+      intr: "off"
+      satp: kernel
+      locks: ["README's inode sleep-lock (sleep-lock)", "the block's buffer sleep-lock (sleep-lock)"]
+      irq: 0
+      stack: [usertrap, syscall, sys_read, fileread, readi, either_copyout, copyout, ucopy, kernelvec, kerneltrap]
+      sp: {"on": kernel, detail: "sp = 0x3fffff9d20"}
+    note: |
+      `sumtest bad pointers` reads README into its stack guard page, `0x5000`. The address is
+      below `p->sz`, so the range check lets it through; the guard page has no `PTE_U` and was
+      never mirrored, so the `sb` faults. gdb: `scause` 0xf, `sepc` `0x8000593c`, `stval`
+      `0x5000`, noff 0.
+
+      `uvmfault` → [[vmfault]] refuses, because the page *is* mapped in the user page table
+      ([[ismapped]]). So line 163 sets `sepc` to `ucopyfail`. gdb's next stop is there, with
+      the stack the hardware left behind:
+
+      ```text
+      #0  ucopyfail () at kernel/uaccess.S:65
+      #1  copyout (..., dstva=20480, ..., len=16) at kernel/vm.c:440
+      #2  either_copyout (...)
+      #3  readi (..., dst=20480, off=0, n=16) at kernel/fs.c:526
+      ```
+
+      [[readi]] sees -1 and returns -1; `read` fails. A store into text (`stval` `0x116`, the
+      code of `fail()` in `sumtest`) ends the same way.
+
+      Everything else that is not a device interrupt still reaches the `panic` at line 168: a
+      fault outside the copy loops is a kernel bug, and the kernel says so.
+
+      Here [[readi]] holds the inode's and the buffer's **sleep-locks**, which do not count in
+      noff: noff is 0, and interrupts are off only because this is a trap.
+  - title: copyout uses the user's address
+    commit: 6
+    file: kernel/vm.c
+    lines: 413-473
+    focus: 413-445
+    diff: true
+    state:
+      hart: 0
+      mode: S
+      proc: sumtest (pid 3)
+      intr: "off"
+      satp: kernel
+      locks: [pi->lock]
+      irq: {noff: 1, intena: 1}
+      stack: [usertrap, syscall, sys_write, filewrite, pipewrite, copyin]
+      sp: {"on": kernel, detail: "sp = 0x3fffff9e80 in ucopy"}
+    note: |
+      `ulen` returns how many of the `len` bytes at `va` lie below `sz`. It compares
+      `len > sz - va` (after checking `va < sz`), so a huge `len` cannot overflow into a small
+      sum. [[copyout]] for the current process: copy those bytes with `ucopy`, and fail if
+      they were not all of them. No walk, no `memmove`, no physical address.
+
+      Whether `pagetable` is the current process's decides the path. [[kexec]] is the only
+      caller with another page table; it keeps the old loop below line 445, which is now
+      reached only for a page table that is not in `satp`.
+
+      The state shown is [[copyin]]'s, the twin a few lines below, which gdb recorded from
+      [[pipewrite]] in `sumtest copy`: one byte per call from `0x2000`, `0x2001`, ..., with
+      `pi->lock` held (noff 1, intena 1) and `satp` `0x8000000000087f10`. [[pipewrite]] calls
+      [[copyin]] once per byte: 100 calls for a 100-byte write, each now paying for the
+      [[myproc]] at line 436 and two CSR writes. The measure section shows what that costs.
+    others: |
+      `pi->lock` makes the reader on another hart wait in [[piperead]]'s [[acquire]] while
+      these bytes go in. The copy itself touches only this process's pages and this hart's
+      `sstatus`; no other lock is needed.
+  - title: copyin and copyinstr have only one path
+    commit: 6
+    file: kernel/vm.c
+    lines: 475-502
+    focus: 478-502
+    state:
+      hart: any
+      mode: S
+      proc: any process in a system call
+      intr: "on"
+      satp: kernel
+      locks: []
+      irq: 0
+      stack: [usertrap, syscall, sys_open, argstr, fetchstr, copyinstr]
+      sp: {"on": kernel}
+    note: |
+      Every caller of [[copyin]] and [[copyinstr]] ([[fetchaddr]], [[fetchstr]], [[pipewrite]],
+      [[either_copyin]]) passes the current process's page table, so the software walk is gone
+      from both; a call with any other page table now panics instead of quietly doing the
+      wrong thing.
+
+      [[copyinstr]] passes `ulen(srcva, max, psz)` as the limit: a string may not run past
+      `p->sz`. If the `'\0'` is not found before that limit, `ucopystr` returns -1, as the old
+      loop did. And `sumtest lazy` opens a name inside an untouched lazy page: the first
+      `lbu` in `ucopystr` faults, commit 5 maps the page, and the name turns out to be `""`,
+      the current directory.
+
+      Commit 6's message names the one behavioural difference: the old copies were
+      page-granular, so the bytes between `p->sz` and the end of its page were readable; now
+      the limit is `p->sz` itself. Copying the valid prefix before failing keeps
+      `usertests partial_write`, which writes 2 bytes of which only the first is valid,
+      passing.
+  - title: sumtest's bad pointers
+    commit: 7
+    file: user/sumtest.c
+    lines: 112-186
+    focus: 121-130
+    diff: true
+    state:
+      hart: 0
+      mode: U
+      proc: sumtest (pid 3)
+      intr: "on"
+      satp: user
+      locks: []
+      stack: [main, badtest]
+      sp: {"on": user}
+    note: |
+      Each address is tried three ways: `read` (a [[copyout]]), `write` to a pipe (a
+      [[copyin]]) and `open` (a [[copyinstr]]). Which mechanism refuses each one:
+
+      | address | refused by |
+      |---|---|
+      | `0x80000000`, `PHYSTOP - 4096`, the PLIC, the UART | the range check: at or above `p->sz` |
+      | `sbrk(0)`, the trapframe, `0xffffffffffffffff` | the range check |
+      | the stack guard page | a fault in the loop, refused by the lazy handler (mapped, no `PTE_U` copy) |
+      | `read` into the code of `fail()` | a store fault on a page without `W` |
+
+      The first group is the dangerous one: the kernel page table maps all of those addresses,
+      without `PTE_U`, and only the range check stands between a user pointer and kernel
+      memory (clinic 4). On the original kernel every one of these was already refused, by the
+      software walk; `sumtest` makes sure the new kernel refuses them too.
+
+      The final line of `sumtest` reports only what it checked: `ALL OK` means all six checks
+      passed. Nothing in it is checked by eye.
+verify: |
+  On the branch (`ext/17-sum`, 7 commits), built with the project toolchain and run on 3 harts
+  (`-smp 3 -m 128M`), in one boot:
+
+  ```text
+  $ sumtest
+  sumtest: copy: OK
+  sumtest: lazy: OK
+  sumtest: bad pointers: OK
+  sumtest: shrink: OK
+  sumtest: limit: OK
+  sumtest: fork: OK
+  sumtest: ALL OK
+  $ usertests -q
+  usertests starting
+  test copyin: OK
+  test copyout: OK
+  [...]
+  test MAXVAplus: usertrap(): unexpected scause 0xf pid=6519
+  [...]
+  test lazy_alloc: OK
+  [...]
+  test lazy_sbrk: OK
+  test partial_write: OK
+  test unlinkcwd: OK
+  ALL TESTS PASSED
+  $ sumtest
+  sumtest: copy: OK
+  sumtest: lazy: OK
+  sumtest: bad pointers: OK
+  sumtest: shrink: OK
+  sumtest: limit: OK
+  sumtest: fork: OK
+  sumtest: ALL OK
+  $ ls | wc
+  29 116 722
+  ```
+
+  The `usertrap()` lines inside `usertests` are expected kills (`MAXVAplus`, `nowrite` and
+  others store where they may not, on purpose). `usertests -q` passing shows that the bad-pointer
+  tests (`copyin`, `copyout`, `copyinstr1`, `lazy_copy`), lazy allocation through system calls
+  (`lazy_copy`, `lazy_copyinstr`), partial copies (`partial_write`), `exec` with arguments and the
+  free-page count all behave as before.
+
+  `usertests -q` also printed `ALL TESTS PASSED` on 3 harts at each of commits 1 to 6, each built
+  on its own. Another boot of the head also ran `sumtest` a third time after `ls | wc`: `ALL OK`.
+
+  The same `sumtest` on the original kernel (`USERTOP` defined just for the build) passes every
+  check except `limit`, which prints `sbrk beyond USERTOP succeeded` and
+  `read() across USERTOP did not stop at USERTOP`: the old kernel already refused all the
+  bad pointers, by walking the page table. The point of `sumtest` is that the new kernel, which no
+  longer walks, refuses them too.
+measure: |
+  All numbers are from QEMU 10.2.1, 3 harts, measured while the computer was busy with other
+  work (your times will differ), so the two kernels were alternated run by run and the tables
+  report ranges. The timing instrumentation is not on the branch: a scratch system call ran
+  [[copyout]] or [[copyin]] 100,000 times (2,000 for 512 and 4096 bytes) on a user buffer and
+  returned the elapsed `time` CSR ticks (10 MHz, 100 ns each).
+
+  **Per call, in the kernel** (two quietest pairs of runs, ns per call):
+
+  | | original | direct (SUM) |
+  |---|---|---|
+  | `copyout`, 1 byte | 179-220 | 395-479 |
+  | `copyout`, 4096 bytes | 5,496-6,289 | 8,022-8,659 |
+  | `copyin`, 1 byte | 144-168 | 400-435 |
+  | `copyin`, 4096 bytes | 5,356-6,085 | 8,379-8,870 |
+
+  Over all 11 pairs of runs (some noisier than others) the direct path was slower for 1, 8 and
+  64 bytes in every pair, about 2x. For 512 and 4096 bytes it was slower in 39 of 44
+  comparisons, about 1.4x; the 5 exceptions came from runs where the original kernel's own
+  times jumped by half.
+
+  **Where the time goes** (the same scratch system call timing one ingredient at a time; runs 9
+  and 10, both kernels):
+
+  | ingredient | ns |
+  |---|---|
+  | [[myproc]] (in the new [[copyout]], [[copyin]], [[copyinstr]]) | 279-315 |
+  | `csrs` + `csrc` of `SUM` | 82-94 |
+  | `csrs` + `csrc` of `SPIE`, for comparison | 83-96 |
+  | [[walkaddr]] (twice per page in the old path), original kernel | 86-98 |
+  | [[walkaddr]], branch kernel, for comparison | 47 |
+  | `memmove` of 4096 bytes, kernel to kernel | 5,051-6,131 |
+  | `ucopy` of 4096 bytes to the user buffer | 7,647-8,341 |
+
+  So the fixed cost of a direct copy on QEMU is mostly [[myproc]], a [[push_off]] and
+  [[pop_off]] whose CSR accesses are expensive under emulation, plus about 90 ns to set and
+  clear `SUM`, which costs no more than toggling any other `sstatus` bit. The per-byte cost is
+  the loop: 7 instructions per byte in `ucopy` against 5 in the compiled `memmove`
+  (`kernel/kernel.asm`), close to the measured ratio of about 1.5. The two walks it saves cost
+  less than the [[myproc]] it adds.
+
+  **From user mode** (`sumtest time`, operations in 20 ticks, 6 runs each):
+
+  | | original | direct (SUM) |
+  |---|---|---|
+  | `fstat` (one 24-byte copyout) | 36,170-45,920 | 30,740-46,140 |
+  | `write` + `read` of 512 bytes through a pipe | 2,990-4,110 | 2,340-3,040 |
+  | `open` + 8 KB `read` + `close` | 1,320-1,720 | 1,240-1,670 |
+
+  `fstat` and file reads are dominated by the system call and the file system: no difference
+  beyond the noise. Pipes copy one byte per [[copyin]] or [[copyout]] call, 1,024 calls per
+  round trip, and in every pair of runs the direct kernel completed 21 to 27% fewer round trips
+  (27 to 37% more time per round trip).
+
+  **Memory.** At the first shell prompt, with `init` and `sh` running, gdb counted the pages on
+  `kmem.freelist`: 32,545 on the original kernel and 32,539 on the branch, out of 32,735 pages
+  between the kernel's `end` and [[PHYSTOP]] in both builds (two separate counts agreed).
+  That is 190 pages in use against 196 on
+  the branch. That is 3 pages for each of `init` and `sh`: a root, a private level-1 page, and
+  one level-0 page for their first 2 MB. A process with a 100 MB heap would need another 50
+  level-0 pages (reasoned, not measured).
+
+  **Context switches** now write `satp` (with two `sfence.vma`) before [[swtch]] and again
+  after it. We did not measure that cost separately.
+
+  The honest conclusion: on QEMU, direct user access makes copies slower, because the
+  ingredients the design adds (a [[myproc]] call per copy, two CSR writes) cost more under
+  emulation than the page walks they replace. We have no hardware numbers.
+further: |
+  - **Drop `myproc()` from the hot path.** Give `copyin` and `copyout` a signature without a
+    page table (as Linux's `copy_to_user` has) and let [[kexec]] call a separately named walking
+    copy. Re-measure: how much of the slowdown is left?
+  - **Copy eight bytes at a time.** Align, then use `ld`/`sd` in `ucopy`, with a byte loop
+    for the ends. The fault recovery still works, since a faulting `ld` is just another
+    instruction between the labels. Which sizes get faster on QEMU?
+  - **One page table per process.** Instead of mirroring user pages into a second table, put
+    the kernel's mappings into each *user* page table without `PTE_U` (as Linux does), and drop
+    the trampoline's `satp` switches. What becomes of the trampoline, and of the 192 MB cap?
+  - **An exception table.** Replace the single address range with a table of (faulting
+    instruction, resume address) pairs, so that C code can contain individual user accesses
+    (`get_user`/`put_user` in Linux). What must the compiler guarantee for that to be safe?
+  - **Faults on the kernel's side of a copy.** The recovery range also catches a fault on the
+    *kernel* pointer inside `ucopy` (a kernel bug) and turns it into -1 instead of a panic.
+    Make [[kerneltrap]] check that `stval` is a user address below `p->sz` before it forgives a
+    fault, and panic otherwise.
+  - **A and D bits.** After lab 16 (swapping), a kernel needs to know whether a page was
+    accessed or written; with two PTEs per page, combine them. Where would that code go?

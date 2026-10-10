@@ -1,0 +1,804 @@
+title: One complete time slice on three harts
+group: The dance of privilege
+prerequisites: [5, 11, 13, 16, 41]
+summary: |
+  This tour follows one complete **time slice** on one hart, from start to finish, and at
+  every step it answers the master question ([[concept:mode-stack-page-table]]): **which mode,
+  which stack, which page table?** It also asks which process, and which locks.
+
+  The plot has four acts. Process **A** is preempted by the timer. The scheduler picks process
+  **B**. B returns to user mode, makes system calls, and finally makes one that sleeps. The
+  scheduler then resumes A, which returns to user mode exactly where it was interrupted. Every
+  one of the eight transitions of [[tour:41]] shows up except boot (T8), user exceptions (T2) and
+  device interrupts taken in user mode (T3), and we count each one literally.
+
+  The story is not invented. We ran `usertests preempt` on three harts in a copy of the kernel
+  that logs every trap, `swtch` and sleep into a memory buffer, and this exact sequence
+  happened on **hart 2**. The stack addresses come from gdb on the unmodified kernel of this
+  build. [[tour:11]] followed the code of a preemption, and [[tour:13]] the lock handed across
+  `swtch`. Here the code is familiar, and the point is the **state**: we build a *grand state
+  table* one row per step, and at the end we read it whole.
+cast: |
+  `usertests preempt` ([[user/usertests.c:856]]) has forked three children that spin forever
+  and a pipe that the third child wrote one byte into. In our run, when the tour starts:
+
+  | Hart | What it is doing |
+  |---|---|
+  | 0 | Running pid 7 in user mode: it wrote `"x"` into the pipe, closed it, and now spins |
+  | 1 | Running pid 6 in user mode, spinning |
+  | 2 | Running pid 5 in user mode, spinning. **Pid 5 is A.** |
+
+  **Pid 4 is B.** It is the test itself, in slot `proc[3]`. It was asleep in `read` on the
+  empty pipe; pid 7's write woke it, so it is `RUNNABLE`, frozen inside [[sleep]]. All three
+  harts are busy, so B can run only when some hart's timer frees one. `usertests` (pid 3), the
+  shell (pid 2) and `init` (pid 1) are asleep in `wait`.
+
+  Slots and stacks in this build: A is `proc[4]` with kernel stack `KSTACK(4)` at
+  `0x3fffff5000`–`0x3fffff6000`; B is `proc[3]` with `KSTACK(3)` at
+  `0x3fffff7000`–`0x3fffff8000`. Hart 2's scheduler stack is its slice of [[stack0]],
+  `0x80009890`–`0x8000a890`.
+steps:
+  - title: A spins, and hart 2 is entirely A's
+    file: user/usertests.c
+    lines: 855-870
+    focus: 866-868
+    state:
+      hart: 2
+      mode: U
+      proc: usertests child (pid 5, "A")
+      intr: on
+      satp: user
+      locks: []
+      stack: [preempt]
+      sp: {"on": user, detail: "A's user stack, sp = 0x11e80"}
+    note: |
+      Pid 5 is the first child of `preempt`. Its whole remaining program is line 867: in the
+      binary, the 2-byte instruction `j 0x3a7a` at user address `0x3a7a`, which jumps to
+      itself.
+
+      Start the table. Each row records one moment on hart 2:
+
+      **Row 1** · hart 2 · **U** · A's user stack (`0x11e80`) · A's page table
+      (`satp = 0x800000000008003a` in our run) · process A · locks: none
+
+      Everything a hart can be "in" is A's right now: its registers hold A's values, `satp`
+      names A's page table, `sp` points into A's user stack. Even `tp`, which the kernel uses
+      for the hart number, holds A's own value now (`0x0505050505050505`: junk A inherited and
+      never uses). What is *not* A's are a few supervisor CSRs that A cannot read: `stvec`,
+      which points at [[uservec]] in the [[g:trampoline]] because the kernel prepared A's last
+      return to user mode, and `stimecmp`, the hart's alarm clock, set at the last tick.
+
+      In user mode, a pending supervisor interrupt that is enabled in `sie` is always taken,
+      whatever `sstatus.SIE` says ([[start]] enabled the timer and external bits,
+      [[kernel/start.c:33]]). That is the whole basis of preemption: A cannot switch it off.
+    others: |
+      Harts 0 and 1 are in the same state with different processes: pid 7 and pid 6, each on
+      its own user stack, each with its own page table in its own `satp`. Three harts, three
+      user stacks, three page tables, and no lock held anywhere. In our trace neither hart
+      trapped even once during the whole slice we are about to follow: a spinner makes no
+      system calls, and their timers did not fire in that window.
+    figure: t45-timeline
+    caption: |
+      The slice we follow, on all three harts (schematic, not to scale). Each lane shows the
+      privilege level (upper band S, lower band U) and is coloured by the stack `sp` points
+      into: user, kernel, or the hart's scheduler stack. Only hart 2 moves; harts 0 and 1 stay
+      in user mode on their own user stacks the whole time.
+
+  - title: "T4: the tick arrives, and only three things change"
+    file: kernel/trampoline.S
+    lines: 16-38
+    focus: 22-37
+    state:
+      hart: 2
+      mode: S
+      proc: usertests child (pid 5, "A")
+      intr: off
+      satp: user
+      locks: []
+      irq: 0
+      stack: [uservec]
+      sp: {"on": none, detail: "still A's user value 0x11e80"}
+    note: |
+      Hart 2's `time` passes its `stimecmp`, the hart sets `sip.STIP`, and because A is in
+      user mode the interrupt is taken before the next `j`. This is transition **T4**. The
+      hardware writes `sepc = 0x3a7a` (the jump that has *not* run yet), `scause =
+      0x8000000000000005` (interrupt, code 5: supervisor timer), copies `SIE` into `SPIE`,
+      clears `SIE`, sets `SPP = 0` (came from U), switches to **S-mode**, and jumps to
+      `stvec`.
+
+      **Row 2** · hart 2 · **S** · no usable stack (`sp` still `0x11e80`) · A's page table ·
+      process A · locks: none
+
+      Compare with row 1: the **mode** changed, the **pc** changed, and interrupts are off.
+      The stack and the page table did not. The hardware never touches `sp` or `satp` on a
+      trap, which is why the very first instructions must come from a page that is mapped in
+      the user page table: the trampoline. `sp` still holds A's user value, a number the
+      kernel must not trust, so for now this hart has no stack it can use
+      ([[concept:stacks#none]]).
+
+      The tick went to S-mode, not M-mode, because [[start]] delegated supervisor timer
+      interrupts with `mideleg` and turned on the Sstc extension ([[tour:46]]).
+
+  - title: uservec saves A's registers, and loads a stack it cannot use yet
+    file: kernel/trampoline.S
+    lines: 39-98
+    focus: 76-91
+    state:
+      hart: 2
+      mode: S
+      proc: usertests child (pid 5, "A")
+      intr: off
+      satp: user
+      locks: []
+      irq: 0
+      stack: [uservec]
+      sp: {"on": none, switched: "`ld sp, 8(a0)` ([[kernel/trampoline.S:76]]) loads the kernel stack address, but A's page table does not map it", detail: "sp = 0x3fffff6000, top of KSTACK(4)"}
+    note: |
+      [[uservec]] stores 31 registers into A's [[g:trapframe]] through the address
+      `TRAPFRAME`, mapped only in A's page table. Then it loads the four kernel values that
+      [[prepare_return]] left in the trapframe the last time A returned to user mode:
+
+      | Register | Value | From |
+      |---|---|---|
+      | `sp` | `0x3fffff6000` | `kernel_sp`, the top of `KSTACK(4)` |
+      | `tp` | 2 | `kernel_hartid` |
+      | `t0` | `0x800025ca` | `kernel_trap`, the address of [[usertrap]] |
+      | `t1` | `0x8000000000087fff` | `kernel_satp`, the one kernel page table |
+
+      `sp` now holds a real stack address, but A's page table has no mapping for it. Until
+      `csrw satp` on line 92, a push would fault. So the row still says "no usable stack":
+
+      **Row 3** · hart 2 · S · none (`sp = 0x3fffff6000`, unmapped) · A's page table ·
+      process A · locks: none
+
+      Then line 92 installs the kernel page table between two `sfence.vma`, and `jalr t0`
+      on line 98 enters `usertrap`. That `csrw satp` is the first of this slice's
+      page-table switches. Keep a count; it will be large.
+
+  - title: usertrap on an empty kernel stack
+    file: kernel/trap.c
+    lines: 37-53
+    focus: 42-52
+    state:
+      hart: 2
+      mode: S
+      proc: usertests child (pid 5, "A")
+      intr: off
+      satp: kernel
+      locks: []
+      irq: 0
+      stack: [usertrap]
+      sp: {"on": kernel, switched: "usable from `csrw satp` ([[kernel/trampoline.S:92]]), which mapped what `ld sp` loaded", detail: "KSTACK(4), empty until usertrap's prologue"}
+    note: |
+      Now every answer is "kernel": S-mode, A's **kernel stack**, the **kernel page table**.
+
+      **Row 4** · hart 2 · S · A's kernel stack (top `0x3fffff6000`) · kernel page table ·
+      process A · locks: none
+
+      The kernel stack was **empty** a moment ago. It always is when a process is in user
+      mode, because `kernel_sp` is always the top of the page ([[kernel/trap.c:117]]). Its
+      first contents are `usertrap`'s own 32-byte frame, and the very first word pushed is
+      the return address `0x3ffffff09c`: [[userret]], at its trampoline address, because
+      `uservec` reached `usertrap` with a `jalr` from that page. `usertrap` will "return" into
+      the trampoline.
+
+      Then two writes that change where the next trap goes and what survives it. `stvec`
+      becomes [[kernelvec]] (line 47), so a trap taken from here on lands on this stack instead
+      of in the trampoline. And `sepc`, `0x3a7a`, is copied to `trapframe->epc` (line 52)
+      before anything can overwrite it.
+    others: |
+      Harts 0 and 1 are still spinning in user mode. Each has its own `stvec`, `sepc` and
+      `satp`; nothing hart 2 writes here is visible to them. That is why no lock appears in
+      this row: everything touched is either a hart's own register or A's own trapframe.
+
+  - title: devintr says "timer", and A decides to yield
+    file: kernel/trap.c
+    lines: 54-95
+    focus: 69-86
+    state:
+      hart: 2
+      mode: S
+      proc: usertests child (pid 5, "A")
+      intr: off
+      satp: kernel
+      locks: []
+      irq: {noff: 0, note: "between `killed`'s brief hold of A's `p->lock` (line 81) and `yield`'s"}
+      stack: [usertrap]
+      sp: {"on": kernel, detail: "usertrap's frame on KSTACK(4)"}
+    note: |
+      `scause` is not 8, so [[devintr]] runs. It recognizes `0x8000000000000005`, calls
+      [[clockintr]], and returns 2. `clockintr` on hart 2 does **not** increment `ticks`, since
+      only hart 0 counts time ([[kernel/trap.c:169]]), so `tickslock` is not taken here. It
+      writes `stimecmp = time + 1000000`, which both clears the pending bit and sets the next
+      alarm about 0.1 s ahead.
+
+      Line 81 asks [[killed]], taking and releasing A's `p->lock` for a moment: A has not been
+      killed. Line 85: `which_dev == 2`, so [[yield]].
+
+      **Row 5** · hart 2 · S · A's kernel stack · kernel page table · process A · locks:
+      none (between the two `p->lock` sections)
+
+      Notice what has not happened: interrupts are still **off**. A timer or device trap
+      enters the kernel with `SIE = 0`, and `usertrap` turns interrupts on only for system
+      calls (line 66). This whole path, from the tick to the `swtch`, runs with interrupts
+      off.
+
+  - title: yield takes A's lock and sched checks the rules
+    file: kernel/proc.c
+    lines: 479-508
+    focus: 485-495
+    state:
+      hart: 2
+      mode: S
+      proc: usertests child (pid 5, "A")
+      intr: off
+      satp: kernel
+      locks: ["A's p->lock (pid 5)"]
+      irq: {noff: 1, intena: 0, note: "`yield` acquired with SIE off (a timer trap), so A's intena is 0; `sched` keeps it in `s3`"}
+      stack: [usertrap, yield, sched]
+      sp: {"on": kernel, detail: "sp = 0x3fffff5f90 at the swtch call: 112 bytes used"}
+    note: |
+      [[yield]] acquires A's `p->lock` and marks A `RUNNABLE`. [[sched]] then checks four
+      rules and calls `swtch(&p->context, &mycpu()->context)`. In our build the stack holds
+      three frames at that call:
+
+      ```text
+      KSTACK(4), top 0x3fffff6000
+        usertrap   0x3fffff5fe0–0x3fffff6000   ra = 0x3ffffff09c (userret)
+        yield      0x3fffff5fc0–0x3fffff5fe0
+        sched      0x3fffff5f90–0x3fffff5fc0   ◄─ sp
+      ```
+
+      **Row 6** · hart 2 · S · A's kernel stack (`0x3fffff5f90`) · kernel page table ·
+      process A · locks: **A's `p->lock`**
+
+      The lock makes A `RUNNABLE` but untouchable. Any other hart may now see `RUNNABLE`, but
+      only after it acquires this same lock, and hart 2 holds it until it is completely off
+      A's stack. [[tour:13]] tells that story in full; the `noff == 1` and `intr_get()` checks
+      are the subject of [[tour:48]].
+    others: |
+      Suppose hart 1's timer fires now. Its scheduler scans the table and reaches `proc[4]`:
+      [[acquire]] spins, because hart 2 holds A's lock. When hart 2's scheduler releases it,
+      A's registers are already saved, and hart 1 may legitimately take A. Without the lock,
+      hart 1 could load A's context while hart 2 is still pushing onto A's stack, and two
+      harts would share one stack.
+
+  - title: "T6, swtch #1: from A's stack to hart 2's scheduler stack"
+    file: kernel/swtch.S
+    lines: 8-41
+    focus: 26-40
+    state:
+      hart: 2
+      mode: S
+      proc: "none (hart 2's scheduler; c->proc still says pid 5)"
+      intr: off
+      satp: kernel
+      locks: ["A's p->lock (pid 5)"]
+      irq: {noff: 1, intena: 0, note: "noff stays 1 across `swtch`; the hart's intena is still A's 0 until line 456"}
+      stack: [main, scheduler]
+      sp: {"on": scheduler, switched: "`ld sp, 8(a1)` in [[swtch]] ([[kernel/swtch.S:26]])", detail: "sp = 0x8000a810, hart 2's slice of stack0"}
+    note: |
+      Lines 10–23 store 14 registers into `proc[4].context`. Lines 25–38 load 14 from
+      `cpus[2].context`, and line 26 is the instant hart 2 stops being A: `sp` becomes
+      `0x8000a810`, inside hart 2's slice of [[stack0]]. `ret` jumps to `0x80001df0`, the
+      instruction after the scheduler's own `swtch` call. This is **T6**, the first of four
+      in this slice.
+
+      **Row 7** · hart 2 · S · **scheduler stack** (`0x8000a810`) · kernel page table · no
+      process · locks: A's `p->lock`
+
+      `swtch` changed no CSR: not the mode, not `satp`, not `sstatus`. The page table is the
+      same because every kernel thread, process or scheduler, uses the one kernel page table.
+      The scheduler stack is the boot stack hart 2 got at power-on; `main` called
+      [[scheduler]], which never returned, so that memory took on its second job
+      ([[concept:stacks#scheduler]]).
+
+      And look at the lock column. The lock was acquired by A's thread on A's stack. It is
+      now held by the scheduler thread on another stack. A lock belongs to a hart, not to a
+      stack.
+
+  - title: The scheduler lets go of A and scans on
+    file: kernel/proc.c
+    lines: 444-464
+    focus: 455-460
+    state:
+      hart: 2
+      mode: S
+      proc: "none (hart 2's scheduler)"
+      intr: off
+      satp: kernel
+      locks: ["A's p->lock (pid 5)"]
+      irq: {noff: 1, intena: 0, note: "line 456 forces intena to 0 before line 463's `release` drops noff to 0"}
+      stack: [main, scheduler]
+      sp: {"on": scheduler, detail: "0x8000a810"}
+    note: |
+      The scheduler resumes inside the loop iteration that once picked A, with `p` still
+      pointing at `proc[4]`. Line 456 sets `intena = 0` so that releasing the lock keeps
+      interrupts off ([[concept:locks#sched-intena]]); here it was A's 0 already. Line 460 clears `c->proc`: from here, [[myproc]] on hart 2 returns 0,
+      so a timer taken in the scheduler will not call `yield`. Line 463 releases A's
+      `p->lock`.
+
+      **Row 8** · hart 2 · S · scheduler stack · kernel page table · no process · locks: none
+      after line 463
+
+      Only now may another hart run A. Its registers are in `proc[4].context` and its
+      trapframe, and no hart is using its kernel stack.
+
+      The scan continues from `proc[5]`: pid 6 is `RUNNING` on hart 1, pid 7 `RUNNING` on
+      hart 0, the remaining slots are unused. Each is locked and unlocked in turn, one lock
+      at a time. `found` is 1, so no `wfi`; the outer loop opens its one-instruction
+      interrupt window (lines 441–442) and starts again at `proc[0]`.
+    others: |
+      The table scan holds at most one `p->lock` at a time. Hart 0's or hart 1's scheduler
+      could be scanning the same table at the same moment, and they could only meet on a
+      single lock, briefly, never in a cycle. [[tour:12]] follows three schedulers sharing
+      one table.
+
+  - title: The scheduler picks B
+    file: kernel/proc.c
+    lines: 444-464
+    focus: 446-453
+    state:
+      hart: 2
+      mode: S
+      proc: "none (hart 2's scheduler)"
+      intr: off
+      satp: kernel
+      locks: ["B's p->lock (pid 4)"]
+      irq: {noff: 1, intena: 0, note: "acquired after `intr_off()` on line 442: intena 0"}
+      stack: [main, scheduler]
+      sp: {"on": scheduler, detail: "0x8000a810"}
+    note: |
+      `proc[0]` (init), `proc[1]` (sh) and `proc[2]` (usertests) are `SLEEPING`. `proc[3]` is
+      pid 4, **B**, `RUNNABLE`. Hart 2 takes its lock, sets `RUNNING`, sets `c->proc`, and
+      calls `swtch(&c->context, &p->context)`.
+
+      **Row 9** · hart 2 · S · scheduler stack · kernel page table · B (assigned, not yet
+      running) · locks: **B's `p->lock`**
+
+      What hart 2 is about to load is not where B's user program was, nor where a fresh
+      process starts. B's `context` was saved by `swtch` when B fell asleep in a `read`:
+      `ra = 0x80001e9c`, the instruction after the `swtch` call in [[sched]], and
+      `sp = 0x3fffff7eb0`, 336 bytes down `KSTACK(3)`. A process preempted by the timer, like
+      A, would resume in `yield`; B resumes in `sleep`. To the scheduler it makes no
+      difference: every suspended process is suspended at the same instruction, inside
+      `sched`, and `swtch` neither knows nor cares how it got there.
+    others: |
+      Hart 2 holds B's lock until B's own code releases it. If hart 0 and hart 2 both
+      reached `proc[3]` at once, the atomic swap in [[acquire]] would let exactly one in; the
+      other would then see `RUNNING` and skip B.
+
+  - title: "T6, swtch #2: onto B's kernel stack, deep inside a read"
+    file: kernel/proc.c
+    lines: 558-572
+    focus: 569-571
+    state:
+      hart: 2
+      mode: S
+      proc: usertests (pid 4, "B")
+      intr: off
+      satp: kernel
+      locks: ["B's p->lock (pid 4)"]
+      irq: {noff: 1, intena: 1, note: "line 496 has put back B's own intena, 1: B went to sleep inside a system call with interrupts on"}
+      stack: [usertrap, syscall, sys_read, fileread, piperead, sleep]
+      sp: {"on": kernel, switched: "`ld sp, 8(a1)` in [[swtch]] ([[kernel/swtch.S:26]]), called by hart 2's scheduler", detail: "KSTACK(3), sp = 0x3fffff7eb0 inside sched, then up"}
+    note: |
+      The second `swtch` loads B's 14 registers. `sp` jumps from `0x8000a810` to
+      `0x3fffff7eb0`, and `ret` lands in [[sched]] after its `swtch` call. `sched` restores
+      B's `intena` and returns into [[sleep]], which releases B's `p->lock` at line 571: the
+      lock hart 2's scheduler took a moment ago.
+
+      B's saved `intena` is **1**: B called `sleep` from inside a system call, with
+      interrupts on. So the `release` at line 571, which takes `noff` from 1 to 0, turns
+      interrupts back on, while A's resumption in row 17 will leave them off. The flag
+      travels with the thread, not the hart ([[concept:locks#sched-intena]]; [[tour:50]]
+      follows `noff` and `intena` through a sleep, a yield and an interrupt).
+
+      **Row 10** · hart 2 · S · **B's kernel stack** (`KSTACK(3)`) · kernel page table · B ·
+      locks: B's `p->lock`, released at line 571
+
+      B's stack has been waiting, untouched, since B slept:
+
+      ```text
+      KSTACK(3), top 0x3fffff8000          (gdb, this build)
+        usertrap  ra → userret
+        syscall
+        sys_read
+        fileread
+        piperead  (pipe.c:127, after sleep())
+        sleep
+        sched     ◄─ sp 0x3fffff7eb0
+      ```
+
+      Now B unwinds. [[piperead]] re-takes `pi->lock`, finds one byte, copies `'x'` to the
+      user buffer with [[copyout]], and returns 1. The frames pop one by one up to
+      [[usertrap]]. The stack shrinks back toward its empty state.
+
+  - title: B's way out, prepared with interrupts off
+    file: kernel/trap.c
+    lines: 97-132
+    focus: 108-131
+    state:
+      hart: 2
+      mode: S
+      proc: usertests (pid 4, "B")
+      intr: off
+      satp: kernel
+      locks: []
+      irq: {noff: 0, note: "`sleep`'s `release` turned SIE back on (intena 1); line 108 turns it off at noff 0"}
+      stack: [usertrap, prepare_return]
+      sp: {"on": kernel, detail: "KSTACK(3), two frames"}
+    note: |
+      B's `read` was a system call, so `usertrap` had turned interrupts on before it slept,
+      and they came back on with B's `intena` when `sleep` released its lock. [[prepare_return]]
+      turns them **off** again first: line 112 is about to point `stvec` at the trampoline,
+      and a kernel interrupt from then on would land in user-trap code ([[tour:48]] breaks
+      this).
+
+      Then it writes the four kernel fields of B's trapframe for B's *next* trap:
+      `kernel_satp`, `kernel_sp = 0x3fffff8000`, `kernel_trap`, and `kernel_hartid = 2`.
+      B slept on hart 2 and woke on hart 2 in this run, so `2` overwrites `2`; had it woken
+      elsewhere, this line would be what keeps its next `tp` right. Finally `sstatus` gets
+      `SPP = 0`, `SPIE = 1`, and `sepc` gets `0x5772`, the `ret` just after `read`'s `ecall`
+      in the binary.
+
+      **Row 11** · hart 2 · S · B's kernel stack · kernel page table · B · locks: none ·
+      `stvec` = [[uservec]] already
+
+      `usertrap` returns B's `satp` value, `0x8000000000080022` in our run, in `a0`, and
+      returns into the trampoline.
+
+  - title: "T5: userret, and the moment with no stack"
+    file: kernel/trampoline.S
+    lines: 100-153
+    focus: 111-117
+    state:
+      hart: 2
+      mode: S
+      proc: usertests (pid 4, "B")
+      intr: off
+      satp: user
+      locks: []
+      irq: 0
+      stack: [userret]
+      sp: {"on": none, switched: "`csrw satp, a0` ([[kernel/trampoline.S:111]]) unmapped the kernel stack under `sp`", detail: "sp = 0x3fffff8000, not mapped in B's page table"}
+    note: |
+      [[userret]] runs `fence.i`, then switches to B's page table with `csrw satp, a0`
+      between two `sfence.vma`: the slice's second page-table switch. `sp` still holds
+      `0x3fffff8000`, the top of B's kernel stack, but B's page table does not map it. From
+      here until `sret` hart 2 again has no usable stack: for a few instructions this
+      address, then B's user `sp`, which supervisor code cannot use.
+
+      **Row 12** · hart 2 · S · none (`sp = 0x3fffff8000`, unmapped) · **B's page table** ·
+      B · locks: none
+
+      This row is the mirror of row 3. On the way in, `uservec` changed `sp` first and `satp`
+      second. On the way out, `userret` changes `satp` first and `sp` second. The order is
+      forced by the trapframe: both `ld sp` instructions read through `TRAPFRAME`, which only
+      user page tables map. As a consequence, the user's `sp` value is never paired with the
+      kernel page table, and the kernel's C code
+      never runs with a user page table. The trampoline covers both gaps, and it uses no
+      stack at all.
+
+  - title: ld sp, sret, and B is in user mode
+    file: kernel/trampoline.S
+    lines: 114-153
+    focus: 118-153
+    state:
+      hart: 2
+      mode: S
+      proc: usertests (pid 4, "B")
+      intr: off
+      satp: user
+      locks: []
+      irq: 0
+      stack: [userret]
+      sp: {"on": none, switched: "`ld sp, 48(a0)` ([[kernel/trampoline.S:118]]) loads B's user `sp`", detail: "0x11e80, B's user stack pointer; supervisor code cannot use it until `sret`"}
+    note: |
+      Line 118 loads B's user `sp`, `0x11e80`, from the trapframe; lines 117–146 restore the
+      other user registers, and line 149 loads `a0` last: the value 1, `read`'s result. Then
+      `sret`: the mode becomes U (from `SPP = 0`), `SIE` becomes 1 (from `SPIE`), and `pc`
+      becomes `sepc = 0x5772`. That is **T5**. Between line 118 and the `sret`, `sp` already
+      holds B's user stack pointer, but the hart is still in supervisor mode, which cannot use
+      user pages, so there is no usable stack (the state above); the `sret` makes it B's user
+      stack.
+
+      **Row 13** · hart 2 · S → **U** at `sret` · B's user stack (`0x11e80`) · B's page
+      table · B · locks: none
+
+      Seven rows ago hart 2 was all A's. Now it is all B's: B's registers, B's page table,
+      B's user stack, and an `sepc` that pointed into B's code. Only `stvec` and `stimecmp`
+      are the hart's again. Between rows 1 and 13, hart 2 stood on four different stacks:
+      A's user stack, A's kernel stack, its own scheduler stack and B's kernel stack. It is now
+      on a fifth, B's user stack.
+    others: |
+      A is `RUNNABLE` and in no hart's hands. If hart 0's or hart 1's timer fired now, its
+      scheduler would find A at `proc[4]` and take it: that is the branch [[tour:11]] followed.
+      In this run neither timer fired during B's slice, so A waits for hart 2.
+
+  - title: B's twenty quick system calls
+    file: user/usertests.c
+    lines: 885-908
+    focus: 899-904
+    state:
+      hart: 2
+      mode: U
+      proc: usertests (pid 4, "B")
+      intr: on
+      satp: user
+      locks: []
+      stack: [preempt]
+      sp: {"on": user, switched: "`sret` ([[kernel/trampoline.S:153]]) returned to user mode, making the user stack usable", detail: "0x11e80, plus printf's frames"}
+    note: |
+      `read` returned 1, so B goes on: `close`, `printf("kill... ")`, three `kill`s,
+      `printf("wait... ")`. User-space `printf` writes **one byte per `write` call**
+      ([[user/printf.c:12]]), so that is 1 + 8 + 3 + 8 = **20 system calls**, none of which
+      slept in our run. Each is a complete T1 and T5, exactly like [[tour:5]]:
+
+      | Per system call | Count |
+      |---|---|
+      | `ecall` (U → S) and `sret` (S → U) | 2 privilege changes |
+      | `csrw satp` in `uservec` and in `userret` | 2, with 4 `sfence.vma` |
+      | `ld sp` in `uservec` and in `userret` | 2 stack switches |
+
+      **Row 14** (×20) · hart 2 · U ↔ S · B's user stack ↔ B's kernel stack · B's page table
+      ↔ kernel page table · B · locks: various, all released before `sret`
+
+      In our run, each of the 16 one-byte writes was followed by a UART interrupt that hart 2
+      took **inside** that `write`, with interrupts on: transition **T7**, a 256-byte
+      [[kernelvec]] frame pushed onto B's kernel stack and popped again, with no change of
+      mode, stack or page table. The 3 `kill`s set `killed = 1` in A, pid 6 and pid 7, under
+      each one's `p->lock` ([[kkill]]). A is `RUNNABLE`, not `SLEEPING`, so `kill` does not
+      change A's state.
+    others: |
+      A UART interrupt is routed by the PLIC to any hart that claims it. In our trace hart 2
+      took all 16, and harts 0 and 1 never even trapped. That is not something xv6 arranges.
+      In our run it happened every time, probably because under QEMU hart 2's own store to
+      the UART raises the interrupt and hart 2 claims it within a few instructions. On real
+      hardware another hart could take it.
+
+      Two of the `kill`s are aimed at processes running on harts 0 and 1. They do not stop them: a
+      running process notices `killed` only at its next trap ([[tour:23]]).
+
+  - title: wait sleeps, and swtch #3 leaves B's stack
+    file: kernel/proc.c
+    lines: 558-572
+    focus: 566-569
+    state:
+      hart: 2
+      mode: S
+      proc: usertests (pid 4, "B")
+      intr: off
+      satp: kernel
+      locks: ["B's p->lock (pid 4)"]
+      irq: {noff: 1, intena: 1, note: "`sleep` took B's `p->lock` with SIE on (inside `wait`), so B's `sched` saves intena 1"}
+      stack: [usertrap, syscall, sys_wait, kwait, sleep, sched]
+      sp: {"on": kernel, detail: "KSTACK(3), sp = 0x3fffff7f00 at swtch: 256 bytes"}
+    note: |
+      The 21st system call is `wait(0)`. [[kwait]] scans for B's children under `wait_lock`.
+      Pid 5, 6 and 7 have been killed, but none is a `ZOMBIE` yet: each must first reach a
+      trap. So B registers on its own address as a channel ([[sleep_prepare]]), releases
+      `wait_lock`, and calls [[sleep]], which takes B's `p->lock`, sets `SLEEPING`, and calls
+      [[sched]]. `swtch` #3 moves `sp` from `0x3fffff7f00` to `0x8000a810`.
+
+      **Row 15** · hart 2 · S · B's kernel stack → scheduler stack · kernel page table · B →
+      none · locks: B's `p->lock` (handed to the scheduler)
+
+      The frames left behind on `KSTACK(3)` are different from last time: `usertrap`,
+      `syscall`, [[sys_wait]], `kwait`, `sleep`, `sched`, 256 bytes in our build. A kernel
+      stack is a record of *why* a process stopped, and this one now says "waiting for a
+      child".
+
+      B entered the kernel with `ecall` (T1) and will not return to user mode in this slice.
+      That is the one system call without its T5.
+    others: |
+      Why can't a child's exit be lost between the scan and the sleep? Its [[kexit]] needs
+      `wait_lock` to call `wakeup(p->parent)`, and B held `wait_lock` until after it had
+      registered. [[tour:21]] covers that ordering.
+
+  - title: "T6, swtch #4: the scheduler resumes A, where it left off"
+    file: kernel/proc.c
+    lines: 444-464
+    focus: 446-453
+    state:
+      hart: 2
+      mode: S
+      proc: "none (hart 2's scheduler)"
+      intr: off
+      satp: kernel
+      locks: ["A's p->lock (pid 5)"]
+      irq: {noff: 1, intena: 0, note: "`swtch` #3 came back with B's intena 1 in `cpus[2]`; line 456 reset it to 0 before B's lock was released, and A's lock was taken with SIE off"}
+      stack: [main, scheduler]
+      sp: {"on": scheduler, switched: "`ld sp, 8(a1)` in [[swtch]] ([[kernel/swtch.S:26]]), called by B's [[sched]]", detail: "0x8000a810"}
+    note: |
+      Hart 2's scheduler returns from the `swtch` that started B, inside the iteration with
+      `p = proc[3]`. It clears `c->proc` and releases B's lock. This is the case line 456
+      exists for: `swtch` came back with B's `intena`, 1, in `cpus[2]`, and without the reset
+      that `release` would have turned interrupts on in the middle of the scan
+      ([[concept:locks#sched-intena]]). Then the `for` loop simply
+      continues to the next slot, `proc[4]`: **A**, still `RUNNABLE`. The scheduler takes A's
+      lock, marks it `RUNNING`, and calls `swtch` #4.
+
+      **Row 16** · hart 2 · S · scheduler stack · kernel page table · A (assigned) · locks:
+      A's `p->lock`
+
+      A is the only `RUNNABLE` process at this moment, so any scan would find it; the slot
+      order only decides how long the scan takes. Another hart could have taken A first only
+      if its timer had fired during B's slice, and then hart 2 would have run someone else
+      next.
+
+      The scheduler's stack held the same frames at the same addresses (`start`'s abandoned 16
+      bytes, `main`, `scheduler`) through rows 7–9 and 15–16. While B ran, nothing used it: it is reserved for
+      the moments when hart 2 runs no process at all.
+
+  - title: A wakes up inside sched, as if nothing happened
+    file: kernel/proc.c
+    lines: 479-508
+    focus: 496-507
+    state:
+      hart: 2
+      mode: S
+      proc: usertests child (pid 5, "A")
+      intr: off
+      satp: kernel
+      locks: ["A's p->lock (pid 5)"]
+      irq: {noff: 1, intena: 0, note: "line 496 restores A's intena, 0, so line 507's `release` leaves interrupts off"}
+      stack: [usertrap, yield, sched]
+      sp: {"on": kernel, switched: "`ld sp, 8(a1)` in [[swtch]] ([[kernel/swtch.S:26]])", detail: "KSTACK(4), sp = 0x3fffff5f90 again"}
+    note: |
+      `swtch` loads `proc[4].context`, saved in row 7: `sp = 0x3fffff5f90`, `ra = 0x80001e9c`.
+      The three frames A left (`usertrap`, `yield`, `sched`) are exactly where they were.
+      `sched` restores A's `intena` (0, since A came in through a timer trap), returns to
+      [[yield]], and `yield` releases the lock the scheduler took.
+
+      **Row 17** · hart 2 · S · A's kernel stack · kernel page table · A · locks: A's
+      `p->lock`, released at line 507
+
+      Something did change while A was frozen: B set `A->killed = 1`. A will not notice yet.
+      After `yield` returns, [[usertrap]] goes straight to `prepare_return` (lines 85–94):
+      there is no `killed` check after the yield. So A goes back to user mode, killed or not,
+      and dies at its next trap.
+
+  - title: "T5 again: A runs its jump"
+    file: kernel/trap.c
+    lines: 80-95
+    focus: 88-94
+    state:
+      hart: 2
+      mode: S
+      proc: usertests child (pid 5, "A")
+      intr: off
+      satp: kernel
+      locks: []
+      irq: 0
+      stack: [usertrap]
+      sp: {"on": kernel, detail: "KSTACK(4), usertrap's frame only"}
+    note: |
+      [[prepare_return]] repeats row 11 for A: interrupts off, `stvec` = trampoline, the
+      trapframe's kernel fields (`kernel_sp = 0x3fffff6000`, `kernel_hartid = 2`), `SPP = 0`,
+      `SPIE = 1`, `sepc = 0x3a7a`. `usertrap` returns A's `satp` (`0x800000000008003a`), and
+      [[userret]] does rows 12 and 13 for A: `csrw satp`, no stack, `ld sp` = `0x11e80`,
+      `sret`.
+
+      **Row 18** · hart 2 · **U** · A's user stack (`0x11e80`) · A's page table · A · locks:
+      none
+
+      Row 18 is row 1 again: every register A can see holds exactly the value it held in row
+      1, restored from the trapframe. Only CSRs that A cannot read (`stimecmp`, `scause`,
+      `sscratch`) remember that anything happened. A executes
+      `j 0x3a7a`, the jump the tick interrupted. From A's point of view one instruction took
+      a little longer than usual; in our trace, about 51 ms. In our run A's next tick came
+      about 60 ms later: `usertrap` saw `killed`, and A exited ([[tour:21]]).
+
+  - title: The grand state table, read whole
+    file: user/usertests.c
+    lines: 855-870
+    focus: 866-868
+    state:
+      hart: 2
+      mode: U
+      proc: usertests child (pid 5, "A")
+      intr: on
+      satp: user
+      locks: []
+      stack: [preempt]
+      sp: {"on": user, detail: "0x11e80"}
+    note: |
+      | Row | What | Mode | Stack | Page table | Process | Lock held |
+      |---|---|---|---|---|---|---|
+      | 1 | A spins | U | A user | A | A | none |
+      | 2 | tick, `uservec` | S | none | A | A | none |
+      | 3 | `ld sp` | S | none | A | A | none |
+      | 4–5 | `usertrap`, `devintr` | S | A kernel | kernel | A | none |
+      | 6 | `yield`, `sched` | S | A kernel | kernel | A | A's |
+      | 7–8 | `swtch` #1, scan | S | scheduler | kernel | none | A's, then none |
+      | 9 | pick B | S | scheduler | kernel | B | B's |
+      | 10–11 | `swtch` #2, unwind | S | B kernel | kernel | B | B's, then none |
+      | 12 | `userret` | S | none | B | B | none |
+      | 13 | `sret` | U | B user | B | B | none |
+      | 14 | 20 system calls | U↔S | B user ↔ B kernel | B ↔ kernel | B | various |
+      | 15 | `wait`, `swtch` #3 | S | B kernel → scheduler | kernel | B → none | B's |
+      | 16 | pick A, `swtch` #4 | S | scheduler | kernel | A | A's |
+      | 17 | A in `sched`, `yield` | S | A kernel | kernel | A | A's, then none |
+      | 18 | `sret` | U | A user | A | A | none |
+
+      Counted literally, on hart 2, from A's tick to A's `sret`: **T4** 1, **T1** 21, **T5**
+      22, **T6** 4 (`swtch` calls), **T7** 16 (UART, in our run), **T2**, **T3** and **T8**
+      0. That is 44 privilege changes (22 up, 22 down), 44 `csrw satp`, 88 `sfence.vma`, 22
+      `fence.i`, and 48 stack switches: 22 + 22 `ld sp` in the trampoline and 4 in `swtch`
+      ([[kernel/swtch.S:26]]). It used 5 stacks and 3 page tables. And the four lock hand-offs
+      across `swtch` were the only moments a lock was held while `sp` moved.
+
+      Which of these were *forced*? Each `csrw satp` is forced by xv6's design: the kernel is
+      not mapped in user page tables, and the hardware changes the mode but never the page
+      table. Many kernels map themselves into every process's page table and skip this
+      switch. Each stack switch is forced
+      too: by a new page table (the trampoline) or by a new thread (`swtch`). The privilege
+      level never changed without the page table following it within a few instructions.
+      That pairing is the dance.
+    others: |
+      Harts 0 and 1 spent the entire slice in user mode: 0 rows to their tables. On a
+      multiprocessor, the "time slice" is a per-hart idea. Times from our trace (measured on
+      the 10 MHz `time` counter, from A's tick):
+
+      | Time | Hart 0 | Hart 1 | Hart 2 |
+      |---|---|---|---|
+      | 0 | pid 7 spins (U) | pid 6 spins (U) | A's tick (T4), `swtch` #1 |
+      | 0.1 ms | | | picks B, `swtch` #2 |
+      | 1.2 ms | | | B back in user mode (T5) |
+      | 51.0 ms | | | B sleeps in `wait` (`swtch` #3); picks A (`swtch` #4); A in user mode |
+      | 62.5 ms | | pid 6's tick: `killed`, [[kexit]], wakes B | |
+      | 77.8 ms | pid 7's tick: `killed`, so [[usertrap]] heads for [[kexit]] | | |
+      | 111.2 ms | | | A's next tick: `killed`, exits |
+
+      Most of B's 50 ms were pauses of the emulator on the host (one `write` took 28.7 ms, and
+      B sat 16 ms in user mode between two `printf` characters), not the cost of 20 system
+      calls.
+
+      While hart 2 went through 18 rows and 4 stacks, pid 6 and pid 7 each ran one
+      instruction, over and over, never knowing; B's three `kill`s took effect only at each
+      victim's own next tick, on its own hart.
+locks:
+  - lock: "A's p->lock (pid 5)"
+    where: "[[killed]] in [[usertrap]]; [[yield]] → released by hart 2's [[scheduler]]; re-acquired by the scheduler, released by `yield`; [[kkill]] from B"
+    protects: "A's `state` and `killed`: no hart may start A until hart 2 has left A's stack"
+  - lock: "B's p->lock (pid 4)"
+    where: "hart 2's [[scheduler]] → released in [[sleep]]; [[sleep_prepare]] and [[sleep]] in [[kwait]] → released by the scheduler"
+    protects: "B's `state` and `chan` across both of B's switches"
+  - lock: "pi->lock"
+    where: "[[piperead]] after B wakes"
+    protects: "The pipe's buffer and counters"
+  - lock: "wait_lock"
+    where: "[[kwait]]"
+    protects: "Parent links; keeps a child's exit from slipping between B's scan and B's sleep"
+  - lock: "tx_lock (sleep-lock) and its tx_lock.lk"
+    where: "[[uartwrite]], through [[acquiresleep]] and [[releasesleep]], in each of B's 16 `write`s"
+    protects: "The UART transmitter: one writer at a time"
+  - lock: "ftable.lock, then pi->lock"
+    where: "B's `close(pfds[0])`: [[fileclose]] → [[pipeclose]]"
+    protects: "The open file's reference count, then the pipe's `readopen` flag"
+  - lock: "B's p->lock, briefly, per byte"
+    where: "[[sleep_prepare]] in [[uartwrite]] (16 times)"
+    protects: "B's `chan`, registered before the UART is checked"
+  - lock: "every p->lock, in turn"
+    where: "[[kkill]] (3 times, from B); [[wakeup]] in [[uartintr]] (16 UART interrupts)"
+    protects: "Each process's `killed`, `chan` and `state`"
+  - lock: "tickslock (not taken here)"
+    where: "[[clockintr]] on hart 0 only"
+    protects: "`ticks`. Hart 2's tick skips it entirely"
+  - lock: "(no lock) stvec, sepc, satp, stimecmp"
+    where: "[[usertrap]], [[prepare_return]], the trampoline"
+    protects: "Per-hart registers: other harts cannot see them, so no lock is needed"
+quiz:
+  - q: "Rows 3 and 12 both say \"no usable stack\", yet in row 3 (after `ld sp`) and in row 12 (from `csrw satp` until `ld sp`) `sp` holds a valid kernel-stack address. Why is it unusable, and why is the order of `ld sp` and `csrw satp` reversed between the two?"
+    a: "The address is mapped only in the kernel page table, and in both rows `satp` names a user page table. The order is forced by the trapframe: `ld sp, 8(a0)` and `ld sp, 48(a0)` both read through `TRAPFRAME`, which only the user page table maps. So `uservec` must load the kernel `sp` before switching to the kernel table, and `userret` must switch to the user table before it can load the user `sp`. A consequence is that the user's `sp` value is never paired with the kernel page table. The trampoline uses no stack in either stretch, nor after `userret` loads the user `sp`: that becomes usable only at `sret` (row 13)."
+  - q: "In row 16 the scheduler picked A rather than going back to `proc[0]`. What in the code makes it continue from `proc[4]`, and what would have happened if B had been in `proc[5]` instead of `proc[3]`?"
+    a: "The scheduler's `for` loop resumes after the `swtch` that ran B, with `p = proc[3]`, and simply moves on to `p + 1`. If B were in `proc[5]`, the scan would continue at `proc[6]` (pid 7, running), reach the end of the table, wrap around, and find A at `proc[4]` a little later. A would still run, just after a longer scan."
+  - q: "B's `read` was entered on hart 2 with interrupts on, and A's tick entered with interrupts off. When each resumed in `sched`, what decided whether interrupts would come back on, and where is that value kept while the process is suspended?"
+    a: "`sched` saves `mycpu()->intena` in a local variable before `swtch` and restores it after ([[kernel/proc.c:494-496]]). The local lives on the process's own kernel stack (or in a callee-saved register that `swtch` saves in `p->context`), so it travels with the thread, not the hart. A's was 0 and B's was 1."
+  - q: "B killed A in row 14, yet A returned to user mode in row 18 and executed more instructions. Point to the line that lets this happen, and explain why it is harmless."
+    a: "[[usertrap]] checks `killed` at line 81, before `yield`, and not again after `yield` returns; it goes straight to `prepare_return`. It is harmless because A gets no further than its next trap: any trap runs `usertrap`, which checks `killed` and calls [[kexit]]. A process can only be removed while it is in the kernel, so delaying it by one tick costs nothing but time."
+  - q: "Count the `csrw satp` instructions hart 2 executed in this slice without looking back, using only the T-numbers: T4 1, T1 21, T5 22, T6 4, T7 16."
+    a: "Every entry from user mode (T1–T4) executes one in `uservec`, and every T5 executes one in `userret`: 1 + 21 + 22 = 44. T6 (`swtch`) and T7 (`kernelvec`) execute none, because they stay in the kernel page table."
+  - q: "Hart 0's timer fires during B's slice (row 14). Describe what changes in this tour's ending, and which lock makes the outcome safe either way."
+    a: "Hart 0's scheduler would take A at `proc[4]` (as in [[tour:11]]) and resume it on hart 0, using the same kernel stack `KSTACK(4)` from hart 0. Later, hart 2's scan would reach `proc[4]`, find `RUNNING`, and skip it. A's `p->lock` makes the claim indivisible: only one scheduler can change A from `RUNNABLE` to `RUNNING`."

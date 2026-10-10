@@ -1,0 +1,1125 @@
+summary: |
+  The process manager: the code that creates, schedules, puts to sleep, wakes, kills and
+  destroys [[g:process|processes]]. It is also the place where xv6's concurrency is hardest,
+  because several CPUs run this code at the same time and each process's state is touched
+  by its own CPU, by other CPUs and by interrupt handlers.
+
+  The life of a process, and where to read about each step:
+
+  1. [[allocproc]] claims an `UNUSED` slot in [[proc]] and gives it a [[g:pid]], a trapframe,
+     a page table and a fresh kernel context that starts in [[forkret]].
+  2. [[kfork]] (or, for the very first process, [[userinit]]) fills it in and marks it
+     `RUNNABLE`.
+  3. Each CPU's [[scheduler]] picks `RUNNABLE` processes and runs them with [[swtch]]. A
+     process gives the CPU back through [[sched]]: from [[yield]] (timer interrupt), from
+     [[sleep]] (waiting for an event, until [[wakeup]]), or from [[kexit]].
+  4. [[kexit]] makes the process a [[g:zombie]]; the parent's [[kwait]] collects its exit
+     status and calls [[freeproc]], which returns the slot to `UNUSED`.
+
+  Locks used here, and the order they must be taken in (see [[g:deadlock]]):
+
+  - [[wait_lock]] (one global lock) protects every `p->parent` and makes "check for exited
+    children, then sleep" atomic in [[kwait]]. Always taken **before** any `p->lock`.
+  - `p->lock` (one per process) protects `state`, `chan`, `killed`, `xstate` and `pid`,
+    and is held across every [[g:context-switch]] of that process.
+  - [[pid_lock]] protects [[nextpid]]; nothing else is taken while it is held.
+  - Condition locks of other subsystems (such as `tickslock`) are taken before `p->lock`,
+    because [[sleep_prepare]] and [[wakeup]] take `p->lock` while their caller holds one.
+  - `p->lock` is not always innermost: [[pid_lock]], `kmem.lock` (inside [[kalloc]] and
+    [[kfree]]) and, in [[userinit]], `itable.lock` are taken while holding it. None of these
+    ever takes a `p->lock`, so the order stays consistent.
+
+  **Read before:** [[kernel/proc.h]], [[kernel/spinlock.c]], [[kernel/swtch.S]].
+  **Read next:** [[kernel/trap.c]] (how processes enter and leave the kernel) and
+  [[kernel/exec.c]].
+
+blocks:
+  - lines: 1-7
+    title: Headers
+    note: |
+      The usual kernel headers. [[kernel/spinlock.h]] must come before [[kernel/proc.h]],
+      because `struct proc` contains a `struct spinlock`.
+
+  - lines: 9-16
+    title: The global tables
+    note: |
+      - [[cpus]]: one `struct cpu` per [[g:hart]], indexed by hart ID.
+      - [[proc]]: the process table, a fixed array of [[NPROC]] (64) slots. xv6 never
+        allocates a `struct proc` dynamically; a "new process" is a free slot being reused,
+        so there can never be more than 64 processes.
+      - [[initproc]]: the first process, which runs `/init`. Orphaned children are handed
+        to it ([[reparent]]).
+      - [[nextpid]] and [[pid_lock]]: the counter that hands out [[g:pid|PIDs]], and the
+        lock that protects it ([[allocpid]]).
+
+      All of these except [[nextpid]] are in [[g:bss|.bss]] and start zeroed, so every slot
+      starts with `state == UNUSED` (0). [[nextpid]] is initialized to 1 and lives in
+      [[g:data|.data]].
+
+  - lines: 18-21
+    title: Declarations of things defined elsewhere
+    note: |
+      [[forkret]] and [[freeproc]] are used before their definitions further down.
+      `trampoline` is the label at the start of [[kernel/trampoline.S]]. Declaring it as a
+      `char` array lets C code use its address (`trampoline` alone is the address of the
+      first byte) without pretending there is a C object there.
+
+  - lines: 23-27
+    title: wait_lock, and the first lock-ordering rule
+    note: |
+      [[wait_lock]] protects every process's `parent` field, and is the condition lock for
+      [[kwait]]'s sleep. The comment's two remarks mean:
+
+      - "wakeups of wait()ing parents are not lost": [[kexit]] wakes its parent and becomes a
+        `ZOMBIE` inside one `wait_lock` critical section, and [[kwait]] checks for zombies
+        and registers to sleep inside another. So the parent can never check (finding no
+        zombie) and then miss the child's wakeup. See [[kwait]] below.
+      - "must be acquired before any p->lock": this is the global lock order. [[kexit]] and
+        [[kwait]] hold `wait_lock` and then take `p->lock`s. If any code held a `p->lock`
+        and then waited for `wait_lock`, two CPUs could [[g:deadlock]]. This is why
+        [[kfork]] releases the child's lock before taking `wait_lock` ([[:294]]).
+
+  - lines: 29-44
+    title: "proc_mapstacks(): a kernel stack for every slot"
+    note: |
+      Called once at boot by [[kvmmake]] ([[kernel/vm.c:50]]), while the kernel page table is
+      being built. For each of the 64 slots it allocates one 4096-byte page with [[kalloc]]
+      and maps it at [[KSTACK]]`(i)`, high in the kernel's address space, readable and
+      writable but not executable and not accessible from user mode.
+
+      [[KSTACK]] spaces the stacks two pages apart (`TRAMPOLINE - (i+1)*2*PGSIZE`), and only
+      one page of each pair is mapped. The unmapped page below each stack is a
+      [[g:guard-page]]: a kernel stack overflow hits it and causes a page fault and a kernel
+      panic, instead of silent corruption (though `kernelvec`'s attempts to handle the fault
+      can still write a few words into the next stack first; see [[concept:stacks#guards]]).
+
+      These stacks are permanent. A slot keeps its [[g:kernel-stack]] for the whole time the
+      system runs; freeing a process never frees it. A new process in a reused slot runs on
+      the same page and starts at its top.
+
+      The stacks exist only in the kernel page table; no user page table maps them, which is
+      why [[uservec]] must switch to the kernel page table before using one. Physically the
+      64 pages are ordinary pages from [[kalloc]], side by side (in one boot of this build,
+      `0x87f99000` for slot 0 down to `0x87f5a000` for slot 63); the guard gaps exist only
+      among the virtual addresses. This function itself runs on hart 0's boot stack
+      ([[concept:stacks#kernel]]).
+
+  - lines: 46-59
+    title: "procinit(): initialize the process table"
+    note: |
+      Called once from [[main]] on hart 0, before any process exists. It names and
+      initializes the two global locks and each slot's `p->lock`, marks every slot
+      `UNUSED`, and records each slot's kernel stack address, which never changes after
+      this. No locks are needed: no other hart is running kernel code yet (they wait for
+      `started` in [[main]]).
+
+  - lines: 61-69
+    title: "cpuid(): which hart am I on?"
+    note: |
+      Returns the hart ID that [[start]] put in [[g:reg:tp|tp]] ([[kernel/start.c:48]]); the
+      trap code keeps `tp` correct while user code runs.
+
+      The comment's warning is about time, not about `tp`: the answer is only useful while
+      the code cannot move to a different CPU. With interrupts on, a timer interrupt right
+      after this function returns could make the process [[yield]], and it might resume on
+      a different hart, still holding the old ID.
+
+  - lines: 71-79
+    title: "mycpu(): this hart's struct cpu"
+    note: |
+      `&cpus[id]`. The build computes it as `cpus + (id << 7)`, since `struct cpu` is 128
+      bytes. Same warning as [[cpuid]]: callers keep interrupts off for as long as they use
+      the pointer ([[push_off]], [[acquire]] and the [[scheduler]] all do).
+
+  - lines: 81-90
+    title: "myproc(): the process running on this CPU"
+    note: |
+      Reads `c->proc` with interrupts off ([[push_off]]/[[pop_off]]), so the process cannot
+      be moved to another CPU between [[mycpu]] and the read.
+
+      Unlike [[mycpu]]'s result, the returned pointer stays correct after interrupts come
+      back on: if the process later moves to another CPU, it is still the same
+      `struct proc`. That is why almost all kernel code calls [[myproc]] freely. It returns
+      0 when called from the [[scheduler]] or during boot, when no process is running.
+
+  - lines: 92-103
+    title: "allocpid(): the next process ID"
+    note: |
+      Two CPUs running [[kfork]] at the same moment could otherwise both read the same
+      `nextpid` and hand out the same PID (a [[g:race-condition]]), so the read and the
+      increment happen under [[pid_lock]]. The critical section takes no other lock, so
+      [[pid_lock]] can safely be taken while holding a `p->lock`, as [[allocproc]] does.
+
+  - lines: 105-122
+    title: "allocproc(): find a free slot"
+    note: |
+      Scans the table for an `UNUSED` slot. Each slot's lock is held while its `state` is
+      checked, because another CPU may be claiming or freeing slots at the same time. If
+      the lock were not held, two CPUs could both see the same slot as `UNUSED` and both
+      take it.
+
+      Only one slot lock is held at a time: a used slot's lock is released before moving
+      on. On finding a free slot the code jumps to `found` *still holding its lock*, so no
+      other CPU can claim it. If the scan ends without finding one, all 64 slots are in
+      use and [[allocproc]] returns 0; `fork` then fails.
+
+  - lines: 124-126
+    title: Claim the slot
+    note: |
+      With the slot's lock held: give it a new [[g:pid]] and mark it `USED`, meaning "taken,
+      but not ready to run". The [[scheduler]] only runs `RUNNABLE` processes, so a `USED`
+      process cannot be scheduled while it is being built.
+
+  - lines: 128-133
+    title: The trapframe page
+    note: |
+      Every process needs a page for its [[g:trapframe]]. If [[kalloc]] finds no free page,
+      [[freeproc]] undoes the work so far (it sets the slot back to `UNUSED`), the lock is
+      released, and [[allocproc]] returns 0.
+
+  - lines: 135-141
+    title: The page table
+    note: |
+      [[proc_pagetable]] creates a user [[g:page-table]] that maps only the
+      [[g:trampoline]] and this trapframe; there is no user memory yet. [[kfork]] will copy
+      the parent's memory into it, and for the first process [[kexec]] replaces it with one
+      holding `/init`. On failure, the same cleanup as above (and [[freeproc]] frees the
+      trapframe page).
+
+  - lines: 143-150
+    title: Make the new process start in forkret
+    note: |
+      This is how a process that has never run gets its first turn on a CPU. The
+      [[scheduler]] starts a process with `swtch(&c->context, &p->context)`, and [[swtch]]
+      ends with `ret`, which jumps to `context.ra`. So:
+
+      - `context.ra = forkret`: the first `ret` lands at the start of [[forkret]], as if
+        [[forkret]] had been called.
+      - `context.sp = p->kstack + PGSIZE`: [[forkret]] runs on the top of this process's own
+        empty [[g:kernel-stack]] (stacks grow down, so the top is the end of the page).
+
+      The other saved registers are zeroed by the `memset`; a function starting from scratch
+      does not depend on them. The slot is returned with `p->lock` still held, as the comment
+      on line 107 promises.
+
+  - lines: 152-171
+    title: "freeproc(): return a slot to UNUSED"
+    note: |
+      Frees what [[allocproc]] and the process's life allocated: the trapframe page, the user
+      memory and page table ([[proc_freepagetable]]). Then it resets the fields that
+      identify the process and marks the slot `UNUSED`, so [[allocproc]] can reuse it.
+      Clearing `pid` matters: [[kkill]] finds processes by PID, and a stale PID on a free slot
+      must not match.
+
+      Callers: [[kwait]], on a zombie child; [[allocproc]] and [[kfork]], to undo a
+      half-built process. In every case `p->lock` is held, as the comment requires, and the
+      process cannot be running (it is either a zombie that has switched away for good or
+      one that never ran).
+
+      Some fields are not touched here because they were already handled: `ofile` and
+      `cwd` by [[kexit]], `parent` by [[kwait]]. `kstack` is permanent, and `context` is
+      reinitialized by [[allocproc]].
+
+  - lines: 173-183
+    title: "proc_pagetable(): an empty user page table"
+    note: |
+      Builds the page table every process starts with, used by [[allocproc]] and by
+      [[kexec]] (which builds a whole new one for the new program). [[uvmcreate]] allocates
+      one zeroed page-table page, meaning no mappings yet.
+
+  - lines: 185-193
+    title: Map the trampoline
+    note: |
+      The [[g:trampoline]] page holds the code ([[uservec]], [[userret]]) that switches
+      between user and kernel page tables. It must be mapped at the same virtual address,
+      [[TRAMPOLINE]] (the highest page), in the kernel's page table and in every user page
+      table, so that the instruction after `csrw satp` is still mapped after the switch.
+
+      It maps the physical page that holds the kernel's own copy of that code, readable and
+      executable. Without `PTE_U` user code cannot touch it; only supervisor mode, on its
+      way into or out of the kernel, executes it. If [[mappages]] fails, the page-table pages
+      allocated so far are freed and 0 returned.
+
+  - lines: 195-202
+    title: Map the trapframe
+    note: |
+      The process's trapframe page goes at [[TRAPFRAME]], one page below the trampoline,
+      readable and writable, again without `PTE_U`. [[uservec]] saves user registers there
+      before it has switched to the kernel page table, so it must be reachable through the
+      user page table.
+
+      On failure, the trampoline mapping is removed first (without freeing the page, which
+      belongs to the kernel), because [[uvmfree]] refuses to free page-table pages that still
+      contain mappings: [[freewalk]] panics on a leaf.
+
+  - lines: 204-215
+    title: "proc_freepagetable(): free a user address space"
+    note: |
+      The reverse of [[proc_pagetable]] plus everything added since. First unmap the
+      trampoline and trapframe pages *without* freeing them (the last argument 0): the
+      trampoline is kernel code shared by everyone, and the trapframe page is freed by
+      [[freeproc]] (or, in [[kexec]], kept for the new image). Then [[uvmfree]] frees the
+      user memory in `[0, sz)` and the page-table pages themselves. The two unmaps must come
+      first because [[freewalk]] panics if it finds a mapping still present.
+
+  - lines: 217-231
+    title: "userinit(): the first process"
+    note: |
+      Called once by [[main]] on hart 0. It creates process 1, but gives it no user memory
+      at all: there is no built-in user program image in this version of xv6. The process's
+      first act, in [[forkret]], is to load `/init` from the disk with [[kexec]], which
+      cannot be done here because reading the disk requires sleeping, and [[main]] is not a
+      process.
+
+      [[allocproc]] cannot fail here (the table is empty and memory is plentiful), so the
+      result is not checked. [[namei]]`("/")` returns a reference to the root directory's
+      [[g:inode]] without reading the disk: for the path `"/"` it only calls [[iget]], which
+      fills in an in-memory slot. That matters, because `p->lock` is held and no disk I/O
+      may happen while holding a spinlock.
+
+      Setting `RUNNABLE` under `p->lock` publishes the process; once the lock is released
+      any CPU's [[scheduler]] may pick it.
+
+  - lines: 233-254
+    title: "growproc(): change the size of user memory"
+    note: |
+      Called from [[sys_sbrk]] when memory must be allocated right away (`SBRK_EAGER`) or
+      when it shrinks (`n < 0`). The default lazy `sbrk` does not come here; it only
+      raises `p->sz` and lets [[vmfault]] allocate pages when they are first touched.
+
+      - Growing: refuse to grow into [[TRAPFRAME]], where the trapframe and trampoline pages
+        live, then let [[uvmalloc]] allocate zeroed pages and map them readable, writable and
+        user-accessible. On failure it has already undone its partial work.
+      - Shrinking: [[uvmdealloc]] unmaps and frees the pages above the new size. (If `n` is
+        more negative than the size, the unsigned sum wraps to a huge value and
+        [[uvmdealloc]] leaves the size unchanged.)
+
+      No lock: `sz` and `pagetable` belong to this process, and only it changes them.
+
+  - lines: 256-268
+    title: "kfork(): get a slot for the child"
+    note: |
+      The kernel side of `fork`, called from [[sys_fork]]. It creates a child that is a copy
+      of the calling process and returns the child's PID to the parent; the child, when it
+      first runs, returns 0 from the same `fork` call.
+
+      [[allocproc]] returns the child `np` in state `USED` with `np->lock` held. Nothing can
+      run the child until it becomes `RUNNABLE` at the end.
+
+  - lines: 270-276
+    title: Copy user memory
+    note: |
+      [[uvmcopy]] gives the child its own copy of every page of the parent's memory below
+      `p->sz` (pages not yet allocated by lazy `sbrk` are skipped), with the same
+      permissions. If memory runs out, [[uvmcopy]] frees what it copied, and [[freeproc]] and
+      `release` throw away the half-built child.
+
+      Holding `np->lock` during this copy is not needed for the copy itself (the child is
+      `USED` and invisible to the scheduler); it is simply still held from [[allocproc]].
+
+  - lines: 278-282
+    title: Copy the registers, and make fork return 0 in the child
+    note: |
+      The struct assignment copies all 288 bytes of the parent's [[g:trapframe]]: every user
+      register as it was when the parent executed `ecall`, including `epc`, which
+      [[usertrap]] has already advanced past the `ecall`. So the child will resume at the
+      same place as the parent, just after the call to `fork`.
+
+      The only difference is `a0`, the register that carries a system call's return value:
+      0 for the child. The parent gets the child's PID, because [[syscall]] stores
+      [[kfork]]'s return value in the parent's `a0`.
+
+  - lines: 284-290
+    title: Share open files and the working directory
+    note: |
+      The child gets the same open files as the parent. [[filedup]] does not copy a file; it
+      increments the open file's [[g:reference-count]], so parent and child share it, read
+      offset included. That sharing is what makes shell pipelines and redirection work. In
+      the same way [[idup]] adds a reference to the current directory's [[g:inode]]. Finally
+      the child inherits the parent's name, for [[procdump]].
+
+  - lines: 292-305
+    title: Publish the child
+    note: |
+      The order here is driven by locks:
+
+      1. Read `np->pid` while still holding `np->lock`.
+      2. Release `np->lock` *before* taking [[wait_lock]]: the lock order is
+         `wait_lock` first, then `p->lock`. Holding `np->lock` while waiting for `wait_lock`
+         could deadlock against a [[kexit]] on another CPU, whose [[wakeup]] acquires every
+         `p->lock`, `np->lock` included, while holding `wait_lock`.
+      3. Set `np->parent` under [[wait_lock]], which protects every `parent` field.
+      4. Only then make the child `RUNNABLE`, under `np->lock`.
+
+      Step 4 must come after step 3. Once `RUNNABLE`, the child may run on another CPU at
+      once, and might even call `exit` immediately; [[kexit]] reads `p->parent` to wake
+      the parent, so the link must already exist.
+
+  - lines: 307-320
+    title: "reparent(): give orphans to init"
+    note: |
+      When a process exits, its children (running or already zombies) still need someone
+      to [[kwait]] for them, or their slots would never be freed. [[reparent]] makes
+      [[initproc]] their parent, and `/init` loops calling `wait` forever
+      ([[user/init.c]]) to collect them.
+
+      The caller must hold [[wait_lock]], which protects every `parent` field read and
+      written here. [[wakeup]]`(initproc)` wakes init in case it is sleeping in [[kwait]]
+      (whose channel is init's own `struct proc`) and the new child is already a zombie that
+      no other wakeup would announce. Calling [[wakeup]] while holding `wait_lock` respects
+      the lock order: [[wakeup]] takes `p->lock`s.
+
+  - lines: 322-345
+    title: "kexit(): release files and the working directory"
+    note: |
+      The kernel side of `exit`, called from [[sys_exit]], and from [[usertrap]] for a
+      killed process. It never returns.
+
+      [[initproc]] must never exit: it is where orphans go, and its `wait` loop is what
+      frees them.
+
+      The first part releases resources that need no locks, because they belong to this
+      process: every open file ([[fileclose]] drops a reference and, for the last one,
+      closes the pipe, device or inode), then the current directory. [[iput]] may write to
+      disk (if this was the last reference to a file that has been deleted), so it runs
+      inside a file-system [[g:transaction]], [[begin_op]] to [[end_op]]. These calls may
+      sleep, which is why no spinlock is held yet.
+
+  - lines: 347-365
+    title: "kexit(): become a zombie and switch away for good"
+    note: |
+      Every step from here on happens under [[wait_lock]]:
+
+      1. [[reparent]] the children to init.
+      2. Wake the parent, which may be sleeping in [[kwait]] on the channel `p->parent`.
+      3. Take this process's own `p->lock` (correct order: `wait_lock` first), record the
+         exit status and set `ZOMBIE`.
+      4. Release [[wait_lock]] and call [[sched]], which requires holding exactly `p->lock`.
+
+      Waking the parent (step 2) before becoming a zombie (step 3) looks backwards but is
+      safe: the parent needs `wait_lock` to look at its children again, and it cannot get it
+      until step 4. If `wait_lock` were released *before* step 3, the parent could look,
+      find no zombie, and go back to sleep, and this process's only wakeup would be lost.
+
+      `p->lock` stays held into [[sched]] and is released by the [[scheduler]] only after
+      [[swtch]] has finished saving this process's registers. A parent in [[kwait]] must
+      take that lock to look at the zombie, so it cannot free the slot (and let it be reused,
+      kernel stack and all) while this process is still running on it.
+
+      The process's memory and page table are not freed here; the parent's [[kwait]] does
+      that in [[freeproc]]. [[sched]] never returns to a zombie, so the panic on line 364 is
+      only a safety net.
+
+  - lines: 367-377
+    title: "kwait(): wait for a child to exit"
+    note: |
+      The kernel side of `wait`, called from [[sys_wait]]. `addr` is a user address at
+      which to store the child's exit status, or 0 if the caller does not want it.
+
+      The whole function runs with [[wait_lock]] held, except while sleeping. That lock
+      protects the `parent` fields being scanned, and it is the condition lock for the
+      sleep: [[kexit]] holds it while waking the parent and becoming a zombie.
+
+  - lines: 378-405
+    title: Scan for children, and reap a zombie
+    note: |
+      For every slot whose `parent` is this process (a read protected by [[wait_lock]]):
+
+      - Take the child's `pp->lock`, which protects its `state`. The comment's "isn't still
+        in exit() or swtch()" refers to the hand-off described in [[kexit]]: a child that
+        has set `ZOMBIE` still holds its lock until it has switched away, so acquiring it here
+        waits until the child is truly gone from its CPU. Taking `pp->lock` while holding
+        `wait_lock` follows the lock order.
+      - If the child is a `ZOMBIE`: copy its exit status to user memory (if requested), clear
+        its `parent` and free the slot with [[freeproc]]. Return its PID.
+
+      [[copyout]] runs while two spinlocks are held. That is allowed because it never
+      sleeps (for a lazily allocated page it may allocate one with [[kalloc]], which only
+      takes another spinlock). If it fails, `wait` returns -1 and the zombie stays, to be
+      collected by a later `wait`.
+
+      Clearing `pp->parent` matters: [[freeproc]] leaves `parent` alone, so without this
+      line the free slot would still look like this process's child, `havekids` would stay 1,
+      and a later `wait` with no real children would sleep forever.
+
+  - lines: 407-411
+    title: Give up if there is nothing to wait for
+    note: |
+      Without any children, no exit will ever come, so return -1 instead of sleeping
+      forever. Also give up if this process has been killed ([[killed]] takes `p->lock`,
+      which is allowed while holding `wait_lock`); it should go back towards user space,
+      where [[usertrap]] makes it exit.
+
+  - lines: 413-419
+    title: Sleep until a child exits
+    note: |
+      The [[g:sleep-wakeup]] pattern, with [[wait_lock]] as the condition lock and this
+      process's own `struct proc` address as the channel. That is the channel [[kexit]]
+      wakes (`wakeup(p->parent)`) and [[reparent]] wakes for init (`wakeup(initproc)`).
+
+      [[sleep_prepare]] registers on the channel while `wait_lock` is still held. Any child
+      that exits after the scan above must take `wait_lock` to call [[wakeup]], so its
+      wakeup comes after the registration and cannot be lost: either it clears `p->chan`
+      before [[sleep]] (which then returns at once) or it makes the sleeping process
+      `RUNNABLE`. After waking, retake `wait_lock` and scan again.
+
+  - lines: 421-434
+    title: "scheduler(): each CPU's endless loop"
+    note: |
+      Every hart calls [[scheduler]] at the end of [[main]] and never leaves it. The
+      scheduler is a thread of its own, running on the hart's boot stack, with its registers
+      saved in `c->context` while a process runs.
+
+      `c` is computed once: the scheduler thread never moves to another CPU. `c->proc = 0`
+      records that no process is running yet.
+
+  - lines: 435-442
+    title: Let pending interrupts in, briefly
+    note: |
+      Each pass of the loop opens a short window with interrupts enabled, then closes it.
+
+      - Why enable them at all? The scheduler holds no locks here. If every process is
+        sleeping, they wait for an interrupt (a disk read completing, a key press, a timer
+        tick) whose handler will call [[wakeup]]. With interrupts permanently off, those
+        handlers would never run and nothing would ever become runnable. (The comment's
+        "most recent process may have had interrupts turned off" refers to the state the
+        CPU is in after a process switches back.)
+      - Why turn them off again? To close the race with `wfi` below. If interrupts were on
+        while the loop found nothing to run, a device interrupt could arrive after the scan
+        but before `wfi`, make a process `RUNNABLE`, and be finished; `wfi` would then wait
+        for the *next* interrupt (at worst this hart's next timer tick, about 0.1 s later)
+        while a process sat ready to run. With interrupts off, an
+        interrupt that arrives in that gap stays pending, `wfi` does not stop the hart (a
+        pending enabled interrupt wakes `wfi` even while `SIE` is 0), and the next
+        `intr_on()` handles it.
+
+      The build has `csrsi sstatus,2` immediately followed by `csrci sstatus,2`; a pending
+      interrupt is taken between the two.
+
+  - lines: 444-464
+    title: Run every RUNNABLE process once
+    note: |
+      The scan visits every slot in order, so in one pass each `RUNNABLE` process gets one
+      turn: simple round-robin.
+
+      For each slot it takes `p->lock` to read `state` reliably. If the process is
+      `RUNNABLE`:
+
+      1. Mark it `RUNNING` and record it in `c->proc` (so [[myproc]] finds it).
+      2. [[swtch]] saves the scheduler's registers in `c->context` and loads the process's.
+         The process now runs, still holding `p->lock`, which the scheduler acquired.
+      3. Eventually the process calls [[sched]] (from [[yield]], [[sleep]] or [[kexit]]),
+         holding `p->lock` again, and `swtch` returns here.
+      4. Clear `c->proc`, note that something ran, and release `p->lock`.
+
+      This "lock hand-off" is the key idea. `p->lock` is held during both halves of every
+      switch, so another CPU cannot see the process as `RUNNABLE` and start running it while
+      this CPU is still on its kernel stack, between setting the state and saving the
+      registers. The lock is acquired by one thread and released by another, which is fine
+      because [[holding]] checks the CPU, and both threads are on the same CPU at that
+      moment.
+
+  - lines: 465-470
+    title: Nothing to run, so pause the hart
+    note: |
+      If a whole pass found nothing runnable, [[g:insn:wfi|wfi]] lets the hart idle until an
+      interrupt is pending, instead of rescanning the table millions of times a second. When
+      `wfi` finishes, the loop starts over and `intr_on()` lets the pending interrupt be
+      handled. If something did run, the loop goes straight into another pass.
+
+  - lines: 472-478
+    title: "sched(): the only way back to the scheduler"
+    note: |
+      Every process that gives up the CPU goes through here. The caller must hold
+      `p->lock` (and no other lock) and must already have changed `p->state` away from
+      `RUNNING`.
+
+      The comment's point about `intena`: [[push_off]] records in `struct cpu` whether
+      interrupts were on before the outermost lock was taken. But that fact belongs to *this
+      process's* code path, which took `p->lock` with interrupts on or off. While the
+      process is switched out, other code on this CPU overwrites `cpu->intena`, and the
+      process may resume on another CPU anyway. So [[sched]] keeps its own copy across the
+      switch. Ideally both `noff` and `intena` would live in `struct proc`, but locks are
+      also taken when no process exists (in the scheduler, during boot), so they stay per-CPU.
+      `noff` does not need saving: it is exactly 1 on both sides of every switch.
+
+  - lines: 479-492
+    title: Four sanity checks
+    note: |
+      Each check catches a bug that would otherwise corrupt the system silently:
+
+      - Not holding `p->lock`: the [[scheduler]] would release a lock nobody acquired, and
+        another CPU could start running this process while it is still on this one.
+      - `noff != 1`, meaning another spinlock is held: that lock would stay locked for as
+        long as this process is switched out, and anything else that needs it would spin.
+        (It also keeps the `intena` bookkeeping valid.)
+      - `state == RUNNING`: the caller forgot to change the state. The scheduler looks only
+        for `RUNNABLE`, so the process would never run again.
+      - Interrupts on: with `p->lock` held they must be off. This would mean someone
+        enabled them inside a critical section.
+
+  - lines: 494-497
+    title: Switch to the scheduler, and later come back
+    note: |
+      [[swtch]] saves this process's registers in `p->context` and resumes the scheduler
+      thread right after *its* call to [[swtch]] (line 453). For this process, the call to
+      [[swtch]] returns only when some scheduler picks it again, possibly much later and
+      possibly on a different CPU.
+
+      That is why line 496 calls [[mycpu]] again rather than reusing a pointer from before
+      the switch: the process may now be on another hart. (In the build the local `intena`
+      lives in the callee-saved register `s3`, which [[swtch]] saved and restored.)
+
+  - lines: 499-508
+    title: "yield(): give up the CPU, stay runnable"
+    note: |
+      Called on a timer interrupt, from [[usertrap]] ([[kernel/trap.c:86]]) and from
+      [[kerneltrap]] ([[kernel/trap.c:158]]). This is what makes scheduling preemptive: a
+      process that never makes a system call still loses the CPU every tick.
+
+      Take `p->lock`, mark the process `RUNNABLE` (any CPU may now pick it, but not before
+      [[scheduler]] releases this lock after the switch), and call [[sched]]. When [[sched]]
+      returns, the process has been chosen again; the `p->lock` released on line 507 is the
+      one the new [[scheduler]] acquired before switching back to it.
+
+  - lines: 510-520
+    title: "forkret(): a new process's first instructions"
+    note: |
+      Every new process starts here, not in the middle of [[sched]] like a process that has
+      run before, because [[allocproc]] set `context.ra` to [[forkret]].
+
+      The [[scheduler]] acquired `p->lock` before switching here. A process that resumes in
+      [[sched]] releases it in [[yield]] or [[sleep]]; a new process has to release it
+      itself, first thing. Interrupts stay off after the release: the scheduler's
+      [[acquire]] found them off, so `intena` is 0.
+
+      `userret` is the label in [[kernel/trampoline.S]] where the return to user space
+      begins.
+
+  - lines: 522-536
+    title: The first process loads /init
+    note: |
+      Only the first process ever to run [[forkret]] does this: process 1, from
+      [[userinit]]. `first` is a `static` local variable, so it keeps its value between
+      calls; after the first call it is 0 for everyone. No lock is needed, because when
+      process 1 runs this code no other process exists yet.
+
+      [[fsinit]] reads the file system's [[g:superblock]] and recovers the
+      [[g:write-ahead-log|log]] ([[g:crash-recovery]]), and reclaims inodes left orphaned by
+      a crash ([[ireclaim]]), which can write the disk. It reads the
+      disk, and waiting for the disk means calling [[sleep]], which needs a current
+      process. That is why it runs here and not in [[main]], as the comment says.
+
+      Then [[kexec]] ([[g:exec]]) replaces process 1's empty address space with the program
+      `/init`.
+      `(char *[]){"/init", 0}` is a C99 [[g:compound-literal]]: an unnamed array of two `char *`
+      values, `"/init"` and a null pointer, used as [[g:argv]]. [[kexec]] returns `argc` (here 1)
+      or -1, and the value is stored in the trapframe's `a0`, where `main(argc, argv)` in
+      `/init` will find its first argument; [[kexec]] already put `argv` in `a1`. Without
+      `/init` the system cannot do anything useful, so failure is a panic.
+
+  - lines: 538-543
+    title: Jump to user space
+    note: |
+      The same exit path as the end of a system call ([[usertrap]] returning into
+      [[userret]]), done by hand:
+
+      - [[prepare_return]] turns interrupts off, points [[g:csr:stvec|stvec]] at [[uservec]],
+        fills in the trapframe's `kernel_*` fields, and sets up [[g:csr:sstatus|sstatus]] and
+        [[g:csr:sepc|sepc]] so that `sret` enters user mode at `trapframe->epc`.
+      - `satp` is the value that selects this process's page table ([[MAKE_SATP]]).
+      - `userret` is linked at an address in the kernel image, but it must run from the
+        [[g:trampoline]] page, because it switches to the user page table, where only the
+        trampoline mapping of this code exists. So the address is translated:
+        `TRAMPOLINE + (userret - trampoline)`.
+      - The last line casts that number to a [[g:function-pointer|pointer to a function]]
+        taking one `uint64` and calls it, which puts `satp` in `a0` as [[userret]] expects. [[userret]] ends in
+        `sret` and never returns.
+
+      For a forked child, `epc` and all registers are the parent's, except `a0 = 0`: the
+      child "returns" from `fork` with 0.
+
+  - lines: 545-556
+    title: "sleep_prepare(): register on a wait channel"
+    note: |
+      The first half of [[g:sleep-wakeup]]. It records the channel (any address that the
+      sleeper and the waker agree on, such as `&ticks` or a buffer's address) in `p->chan`.
+      In the usual pattern the caller holds the lock that protects the condition it is
+      waiting for, and calls this *before* releasing it. [[uartwrite]] uses a variant without
+      a condition lock: it registers first and then tests the device; a wakeup arriving after
+      the registration clears `p->chan`, so [[sleep]] returns at once.
+
+      `p->lock` is taken because [[wakeup]], running on another CPU or in an interrupt
+      handler, reads and clears `p->chan` under that lock.
+
+      Channel 0 is forbidden because `p->chan == 0` means "not waiting", and [[sleep]] would
+      treat the registration as already woken.
+
+  - lines: 558-572
+    title: "sleep(): give up the CPU unless already woken"
+    note: |
+      The second half. If `p->chan` is still set, no [[wakeup]] for this channel has happened
+      since [[sleep_prepare]]: mark the process `SLEEPING` and switch to the scheduler. If it
+      is 0, the wakeup already came (between the caller's release of its condition lock and
+      this point), so return at once. This is xv6's answer to the lost-wakeup problem: the
+      wakeup is remembered in `p->chan` even when the process was not yet asleep.
+
+      The check and the state change happen under `p->lock`, and [[wakeup]] needs that lock
+      too, so no wakeup can slip in between them. `p->lock` stays held into [[sched]] and is
+      released by the scheduler only after the switch, so a wakeup cannot make the process
+      `RUNNABLE` (and let another CPU run it) while it is still on this CPU.
+
+      When [[sched]] returns, the process has been woken and picked to run. It releases the
+      `p->lock` that the scheduler acquired for it. The caller then re-checks its condition.
+
+      `p->chan` is not always 0 when a process stops waiting. [[kkill]] makes a sleeper
+      `RUNNABLE` without clearing it, and some callers register and then find they do not
+      need to sleep ([[uartwrite]]). The stale value is harmless: every [[sleep]] is preceded
+      by a fresh [[sleep_prepare]], and a later [[wakeup]] on the old channel only clears it.
+
+  - lines: 574-595
+    title: "wakeup(): wake every process waiting on a channel"
+    note: |
+      Visits every slot, taking each `p->lock` in turn, and for every process registered on
+      `chan`:
+
+      - clears `p->chan`, which tells a process that has registered but not yet called
+        [[sleep]] that its wakeup has come;
+      - if it is already `SLEEPING`, makes it `RUNNABLE`.
+
+      The comment on lines 587–588 says "set it back to RUNNING"; that is wrong. The code
+      sets `RUNNABLE`: the process becomes eligible to run, and a [[scheduler]] will later
+      make it `RUNNING`.
+
+      Callers usually hold the condition lock (for example [[clockintr]] holds `tickslock`
+      around `ticks++` and `wakeup(&ticks)`). That is why the rule is condition lock first,
+      `p->lock` second, matching [[sleep_prepare]]. The caller must not hold *any*
+      `p->lock`: the loop acquires every slot's lock, so it would panic on its own lock
+      ([[acquire]]'s re-acquire check) or risk deadlock on another's.
+
+      Wakeups are not targeted: everyone on the channel wakes, and each must re-check its
+      condition. The cost is one pass over all 64 slots per wakeup.
+
+  - lines: 597-622
+    title: "kkill(): mark a process as killed"
+    note: |
+      The kernel side of `kill`, from [[sys_kill]]. It does not stop the victim directly
+      (the victim may be running on another CPU, or in the middle of a kernel operation that
+      must finish). It only sets `killed` and, if the victim is sleeping, makes it runnable so
+      that it gets a chance to notice.
+
+      The victim checks the flag with [[killed]] and exits at safe points:
+
+      - in [[usertrap]], when entering the kernel for a system call and before returning to
+        user space ([[kernel/trap.c:57]], [[kernel/trap.c:81]]);
+      - in sleep loops that can wait indefinitely, such as reading the console or a pipe,
+        [[sys_pause]] and [[kwait]], which return an error when killed.
+
+      Sleeps that end on their own (disk I/O, [[acquiresleep]]) do not check: their loop
+      re-checks the condition and sleeps again, and the process exits later.
+
+      PID 0 is rejected because every free slot has `pid` 0 ([[freeproc]]); without the
+      check, `kill(0)` would set `killed` on an unused slot, and since [[allocproc]] does not
+      clear `killed`, the next process created in that slot would start out killed. The search holds one slot lock at a time,
+      because `pid`, `killed` and `state` are all protected by `p->lock`.
+
+  - lines: 624-641
+    title: "setkilled() and killed(): the flag, under the lock"
+    note: |
+      `killed` is written by [[kkill]] on whatever CPU runs `kill`, and read by the victim on
+      its own CPU, so both sides take `p->lock`. The lock makes the read see a definite,
+      current value, consistent with the [[g:memory-barrier|ordering]] that
+      [[acquire]]/[[release]] provide.
+
+      [[setkilled]] is used by [[usertrap]] when a user program causes an unexpected
+      exception (for example an illegal instruction): the process is marked and exits a few
+      lines later ([[kernel/trap.c:81]]).
+
+  - lines: 643-656
+    title: "either_copyout(): copy to user or kernel memory"
+    note: |
+      Some kernel functions copy data to a destination that may be either in user memory or
+      in kernel memory, depending on who called them. [[readi]] is the main example: for a
+      `read` system call the destination is a user address; for [[kexec]] reading a
+      program's headers, or for a directory lookup, it is a kernel buffer.
+
+      `user_dst` says which. A user address must go through [[copyout]], which translates it
+      with the process's page table, checks that it is writable user memory (allocating a
+      lazily-allocated page if needed, which is why it receives `p->sz`) and returns -1 for
+      a bad address. A kernel address can be used directly with [[memmove]]. (The comment
+      calls the flag `usr_dst`; the parameter is `user_dst`.)
+
+  - lines: 658-671
+    title: "either_copyin(): copy from user or kernel memory"
+    note: |
+      The mirror image, used by [[writei]] and [[consolewrite]]: the source is a user address
+      ([[copyin]], with the same checks) or a kernel address ([[memmove]]). The comment's
+      `usr_src` is the parameter `user_src`.
+
+  - lines: 673-691
+    title: "procdump(): print the process table, for debugging"
+    note: |
+      Typing Ctrl-P on the console calls this from [[consoleintr]]
+      ([[kernel/console.c:152]]). It prints one line per used slot: PID, state and name.
+
+      It deliberately takes no locks. If the machine is stuck because some CPU holds a
+      `p->lock` forever, a `procdump` that tried to acquire it would hang too, and you would
+      learn nothing. The price is that a line may mix values from before and after a
+      concurrent change.
+
+      `states` uses [[g:designated-initializer|designated initializers]]: `[SLEEPING] = "sleep "` puts that string at
+      index `SLEEPING` (2), whatever order the lines are written in. The strings are padded
+      to six characters so the columns line up. The `clang-format` comments only tell the
+      code formatter to leave this table's alignment alone.
+
+  - lines: 692-703
+    title: One line per process
+    note: |
+      Free slots are skipped. The state name is looked up only if `p->state` is a valid index
+      with a string; [[NELEM]] gives the array's length. Since this code reads without a
+      lock, it guards against a garbage value instead of trusting it.
+
+lines:
+  9: |
+    One `struct cpu` per hart, [[NCPU]] = 8 entries.
+  11: |
+    The process table: [[NPROC]] = 64 slots.
+  13: |
+    The first user process; set by [[userinit]], never changes.
+  15: |
+    The next PID to hand out. The first process gets 1.
+  16: |
+    Protects [[nextpid]].
+  27: |
+    Protects every `p->parent`; condition lock for [[kwait]]'s sleep.
+  38: |
+    One physical page for this slot's kernel stack.
+  41: |
+    The virtual address of slot `i`'s stack. `p - proc` is pointer subtraction: the index of
+    `p` in the array.
+  42: |
+    Map it in the kernel page table: one page, read/write, no `PTE_U` and no `PTE_X`.
+  52: |
+    The lock for [[nextpid]], named `"nextpid"`.
+  53: |
+    The global lock for `parent` fields.
+  55: |
+    Each slot's own lock.
+  57: |
+    Fixed kernel stack address for this slot, mapped earlier by [[proc_mapstacks]].
+  67: |
+    The hart ID kept in `tp`; [[r_tp]] is one `mv` instruction.
+  85: |
+    Interrupts off, so this code cannot move to another CPU between the next two lines.
+  87: |
+    The process this CPU is running, or 0.
+  97: |
+    Only one CPU at a time may read and advance the counter.
+  115: |
+    Lock the slot so its `state` cannot change while it is checked (and, if free, claimed).
+  117: |
+    Free slot found: keep its lock and go to `found`.
+  119: |
+    In use: release and try the next slot.
+  125: |
+    A unique [[g:pid]] ([[allocpid]] takes [[pid_lock]] while this slot's lock is held).
+  126: |
+    Taken, not yet runnable.
+  129: |
+    One page for the [[g:trapframe]]. The cast turns [[kalloc]]'s `void *` into the struct
+    pointer.
+  136: |
+    User page table with only the trampoline and trapframe mapped.
+  145: |
+    Zero all 14 saved registers.
+  146: |
+    The first [[swtch]] into this process "returns" to [[forkret]].
+  147: |
+    Its kernel stack starts empty: `sp` at the top of the stack page.
+
+    This does not move `sp` now. It is the value [[swtch]] will load
+    ([[kernel/swtch.S:26]]) when a [[scheduler]] first picks this process, so [[forkret]]
+    starts on this slot's empty kernel stack. A forked child gets no copy of its parent's
+    kernel frames.
+  159: |
+    Free the trapframe page.
+  162: |
+    Remove the two special mappings (without freeing their pages), then free user memory
+    and the page-table pages.
+  170: |
+    The slot is free; [[allocproc]] may hand it out again.
+  181: |
+    One empty, zeroed page-table page.
+  189: |
+    Map the [[g:trampoline]] at [[TRAMPOLINE]]: one page, readable and executable, not user.
+  191: |
+    Undo: free any page-table pages [[mappages]] created. Size 0: there is no user memory.
+  197: |
+    Map this process's trapframe at [[TRAPFRAME]]: readable and writable, not user.
+  199: |
+    Remove the trampoline mapping (do not free the page), so [[uvmfree]] can free the table.
+  212: |
+    Unmap, without freeing, the shared trampoline page.
+  213: |
+    Unmap the trapframe; [[freeproc]] frees that page itself.
+  214: |
+    Free user pages in `[0, sz)` and then every page-table page.
+  223: |
+    A slot with PID 1, a trapframe and a nearly empty page table, returned with `p->lock`
+    held.
+  224: |
+    Remember it: orphans are reparented to it, and it must never exit.
+  226: |
+    The root directory becomes its working directory. No disk access happens here.
+  228: |
+    Ready to run. Its first instructions will be in [[forkret]].
+  230: |
+    Release the lock [[allocproc]] returned with; now a scheduler can pick it.
+  243: |
+    Do not let user memory reach the trapframe and trampoline pages at the top.
+  246: |
+    Allocate and map zeroed pages for `[sz, sz+n)`, user-accessible and writable.
+  250: |
+    Unmap and free the pages above the new size.
+  252: |
+    Record the new size.
+  263: |
+    The parent: the process calling `fork`.
+  266: |
+    A fresh slot for the child, returned locked and `USED`.
+  271: |
+    Copy every allocated user page into the child's page table.
+  276: |
+    Same size as the parent.
+  279: |
+    Copy all the parent's saved user registers.
+  282: |
+    The child's `fork` returns 0.
+  287: |
+    Share the open file and add one to its reference count.
+  288: |
+    Share the working directory.
+  290: |
+    Same name as the parent. [[safestrcpy]] always 0-terminates.
+  292: |
+    Read the PID while the lock still protects it.
+  294: |
+    Release before taking [[wait_lock]], to keep the lock order.
+  297: |
+    The calling process is the child's parent. Protected by [[wait_lock]].
+  301: |
+    Now the child may be picked by any CPU's scheduler.
+  304: |
+    The parent's `fork` returns the child's PID.
+  315: |
+    One of the exiting process's children (any state, including zombie).
+  316: |
+    Init adopts it.
+  317: |
+    Wake init in case this child is already a zombie waiting to be collected.
+  330: |
+    If init exited, orphans would have no one to collect them.
+  337: |
+    Drop this process's reference to the open file; the last reference closes it.
+  343: |
+    Drop the reference to the working directory, inside a transaction because it may write
+    to disk.
+  347: |
+    Lock out [[kwait]] and other exits while children and the parent link are handled.
+  350: |
+    Children go to init.
+  353: |
+    The parent may be sleeping in [[kwait]] on the channel equal to its own `struct proc`.
+  355: |
+    Take this process's lock (after `wait_lock`, as the order requires). It stays held into
+    [[sched]].
+  357: |
+    Exit status, for the parent's [[kwait]].
+  358: |
+    Now a [[g:zombie]]: the parent may free it, but only after getting `p->lock`.
+  360: |
+    The parent can now look at its children again.
+  363: |
+    Switch away for good. The scheduler will release `p->lock` after the switch.
+  364: |
+    Unreachable: no one ever switches back to a zombie.
+  374: |
+    The caller.
+  376: |
+    Held for the whole scan.
+  382: |
+    Is `pp` a child of this process? `parent` is protected by `wait_lock`, held.
+  384: |
+    Lock the child to read its `state`, and to wait until it has fully switched away.
+  387: |
+    A child that has exited.
+  390: |
+    The caller asked for the status (`addr != 0`): copy the child's `xstate` (an `int`)
+    to that user address.
+  397: |
+    No longer anyone's child, so a reused slot is not mistaken for one.
+  398: |
+    Free its memory and return the slot to `UNUSED`.
+  401: |
+    `wait` returns the dead child's PID.
+  403: |
+    This child is still alive. Release and keep looking.
+  408: |
+    No children at all, or this process has been killed.
+  414: |
+    Register on the channel `p` while `wait_lock` is held. The `//DOC:` comment is a
+    marker used by the xv6 book, not an instruction.
+  416: |
+    Sleep until a child's [[kexit]] (or [[reparent]]) calls `wakeup(p)`.
+  417: |
+    Retake the lock and scan again.
+  432: |
+    This hart's `struct cpu`. Interrupts are off here (they have never been on yet).
+  434: |
+    No process is running on this CPU.
+  441: |
+    Interrupts on: any pending interrupt is handled right now.
+  442: |
+    Interrupts off again for the scan and the `wfi` check.
+  446: |
+    Lock the slot to read `state`. Stays held across the switch if the process is run.
+  447: |
+    Only `RUNNABLE` processes are run.
+  451: |
+    It is about to run.
+  452: |
+    So that [[myproc]] on this CPU returns it.
+  453: |
+    Run the process. Returns only when the process calls [[sched]].
+  456: |
+    The process's `intena` was left in `struct cpu`; force 0 so the [[release]] on line
+    463 does not turn interrupts on in the middle of the scan.
+  460: |
+    No process is running on this CPU any more.
+  463: |
+    Release the lock: either the one taken on line 446, or for a process that ran, the
+    lock the process re-acquired before switching back.
+  467: |
+    Idle until an interrupt is pending.
+  483: |
+    The process giving up the CPU.
+  485: |
+    The caller must hold `p->lock`.
+  487: |
+    And no other spinlock.
+  489: |
+    The caller must already have changed `state`.
+  491: |
+    Interrupts must be off.
+  494: |
+    Keep this process's `intena` safe while other code uses this CPU.
+  495: |
+    Save this process's registers, resume the scheduler. Returns when this process is
+    scheduled again.
+  496: |
+    Restore `intena` on whichever CPU this process is now running on.
+  504: |
+    Needed to change `state` and to call [[sched]].
+  505: |
+    Still ready to run; just giving others a turn.
+  506: |
+    Switch to the scheduler; returns at this process's next turn.
+  507: |
+    Release the lock that the scheduler acquired before switching back here.
+  515: |
+    The label in [[kernel/trampoline.S]], declared here as a `char` array to get its
+    address.
+  516: |
+    `static` keeps the value across calls: 1 only for the very first call.
+  517: |
+    The new process.
+  520: |
+    The scheduler acquired it before switching here.
+  523: |
+    No later process will repeat the initialization.
+  528: |
+    Read the superblock, recover the log and reclaim orphaned inodes ([[ireclaim]]). Needs a
+    process, because it sleeps on the disk.
+  532: |
+    Load `/init` with `argv = {"/init", 0}` into this process; the return value, `argc`,
+    becomes `a0` in user space.
+  534: |
+    Without `/init` there is nothing to run.
+  539: |
+    Set up `stvec`, the trapframe, `sstatus` and `sepc` for the return to user mode.
+  540: |
+    The `satp` value for this process's user page table.
+  541: |
+    Where `userret` is mapped: in the trampoline page, at the same offset as in the kernel
+    image.
+  542: |
+    Call `userret(satp)` through a function-pointer cast. It switches to the user page
+    table and executes `sret`; it never returns.
+  549: |
+    The process registering itself.
+  551: |
+    [[wakeup]] on another CPU reads `p->chan` under this lock.
+  552: |
+    0 means "not waiting", so it cannot be a channel.
+  554: |
+    Registered: from now on a [[wakeup]]`(chan)` will clear this.
+  564: |
+    The process going to sleep.
+  566: |
+    Freeze `chan` and `state`: no [[wakeup]] can run for this process until the lock is
+    released.
+  567: |
+    Still registered, so no wakeup has happened yet.
+  568: |
+    Mark it asleep; the scheduler will skip it until a [[wakeup]] or [[kkill]].
+  569: |
+    Switch to the scheduler. Returns once woken and scheduled again.
+  571: |
+    Release the `p->lock` taken on line 566 or, after a sleep, the one the scheduler
+    acquired for this process.
+  581: |
+    Each process's `chan` and `state` are protected by its own lock.
+  582: |
+    Registered on this channel (sleeping or about to sleep).
+  585: |
+    Tell it the wakeup happened, even if it has not reached [[sleep]] yet.
+  589: |
+    Already asleep?
+  590: |
+    Then make it eligible to run again.
+  605: |
+    Free slots have `pid` 0; never match them.
+  609: |
+    `pid`, `killed` and `state` are protected by this lock.
+  611: |
+    The victim will exit at its next safe point.
+  612: |
+    If sleeping, wake it so it notices (the slept-on condition may still be false; its loop
+    handles that).
+  614: |
+    Make it runnable. `p->chan` is left as it was.
+  628: |
+    Set the flag under the lock.
+  638: |
+    Read the flag under the lock.
+  650: |
+    The destination is a user virtual address.
+  651: |
+    Translate through the process's page table; -1 if `dst` is not valid writable user
+    memory.
+  653: |
+    The destination is a kernel address: copy directly.
+  665: |
+    The source is a user virtual address.
+  666: |
+    Translate and copy; -1 if `src` is not valid user memory.
+  668: |
+    The source is a kernel address: copy directly.
+  692: |
+    Start on a fresh line (Ctrl-P may arrive in the middle of a line).
+  694: |
+    Skip free slots.
+  696: |
+    Guard against an out-of-range or unnamed state.
+  700: |
+    For example `1 sleep  init`. [[printk]] is the kernel's `printf`.

@@ -1,0 +1,782 @@
+title: Crash recovery
+group: File system
+prerequisites: [29, 30, 31]
+summary: |
+  You type `echo hi > f` on a freshly made disk, and the power goes out. Not before the
+  command, not after it: in the middle of the kernel writing its changes to the disk. When
+  the machine comes back, is there a file `f`? Is there half of one: an inode that is
+  marked used but that no directory names, or a directory entry pointing at an inode that
+  is still free?
+
+  This tour answers that question for every moment the power could fail. It follows the
+  first [[g:transaction]] of `echo hi > f`, the one that creates `f`, through the four
+  stages of [[commit]], and for each stage it says exactly what the disk holds. Then it
+  cuts the power (for real, in QEMU), boots again, and watches [[recover_from_log]] and
+  [[install_trans]] repair the disk before any process gets to look at it. Finally it
+  follows [[ireclaim]], which cleans up the one kind of damage the log cannot prevent: a
+  file deleted while it was still open.
+
+  The log itself (how [[begin_op]], [[log_write]] and group commit work) is the subject of
+  [[tour:31]]. Disk I/O and the buffer cache are [[tour:29]] and [[tour:30]]. This tour is
+  about what happens when everything is cut off halfway.
+cast: |
+  The machine has three [[g:hart|harts]]. The disk is a fresh `fs.img`; on the first boot
+  `init` has already created `console` as inode 23. When the tour starts:
+
+  | Hart | What it is doing |
+  |---|---|
+  | 0 | Idle in its [[kernel:scheduler]] |
+  | 1 | Running `sh` (pid 3), the child the shell forked to run `echo hi > f`: the process this tour follows |
+  | 2 | Idle in its scheduler, or taking a disk interrupt |
+
+  The parent shell (pid 2) is asleep in [[kernel:kwait]]. Block numbers in this tour come
+  from this build's `mkfs` (`nmeta 47`: block 1 is the superblock, the log is blocks 2–32,
+  inodes 33–45, the bitmap 46, data from 47) and from a traced copy of the kernel.
+steps:
+  - title: The shell opens f before echo even exists
+    file: user/sh.c
+    lines: 83-91
+    focus: 85-89
+    state:
+      hart: 1
+      mode: U
+      proc: sh (pid 3)
+      intr: on
+      satp: user
+      locks: []
+      stack: [main, runcmd]
+      sp: user
+    note: |
+      The shell parsed `echo hi > f` into a redirection wrapped around an `echo` command,
+      and forked. The child, pid 3, is still running the shell's code. It closes
+      descriptor 1 and opens `f` with `O_WRONLY|O_CREATE|O_TRUNC` ([[user/sh.c:395]]), so
+      the new file gets the lowest free descriptor, 1. Only then does it `exec` `echo`.
+
+      For the disk, this command is three [[g:transaction|transactions]] that change the
+      disk (the `close`, `exec` and `exit` calls also open transactions, but they log no
+      blocks). A
+      traced kernel printed them (block numbers in the order [[log_write]] first saw them):
+
+      | Transaction | System call | Blocks |
+      |---|---|---|
+      | 1 | `open` creates `f` | 34 (inode 24), 47 (root directory data), 33 (root inode) |
+      | 2 | `write(1, "hi", 2)` | 46 (bitmap), 1006 (new data block), 34 |
+      | 3 | `write(1, "\n", 1)` | 1006, 34 |
+
+      This tour cuts the power during transaction 1. That is the interesting one: it changes
+      an inode and a directory, two structures that must agree.
+
+  - title: sys_open starts a transaction and creates the file in memory
+    file: kernel/sysfile.c
+    lines: 328-348
+    focus: 341-344
+    state:
+      hart: 1
+      mode: S
+      proc: sh (pid 3)
+      intr: on
+      satp: kernel
+      locks: []
+      irq: 0
+      stack: [usertrap, syscall, sys_open]
+      sp:
+        "on": kernel
+        switched: "`ld sp, 8(a0)` in [[uservec]] ([[kernel/trampoline.S:76]]), after the `ecall`"
+        detail: "the shell child's (pid 3's) kernel stack, empty a moment ago"
+    note: |
+      [[sys_open]] calls [[begin_op]] and then [[create]] (followed step by step in
+      [[tour:35]]). By the time `create` returns, three buffers in the
+      [[g:buffer-cache]] have changed:
+
+      - **Block 34**, which holds inodes 16–31: [[ialloc]] found inode 24 free, set its
+        type to `T_FILE`, and [[create]] set `nlink = 1`.
+      - **Block 47**, the root directory's only data block: [[dirlink]] wrote the entry
+        `{24, "f"}` into the first empty slot, at byte offset 384.
+      - **Block 33**, which holds inode 1 (the root): [[writei]] always ends with
+        [[iupdate]], so the root's inode block is logged although its bytes did not change.
+
+      None of these changes is on the disk yet. Each was handed to [[log_write]], which only
+      writes down the block number. Then the `O_TRUNC` branch calls [[itrunc]], which logs
+      block 34 again (absorbed: it is already in the list).
+
+      So the in-memory log header now reads `n = 3, block = {34, 47, 33}`, and the disk is
+      exactly as it was before the command.
+    others: |
+      If hart 0 were running another file-system call at this moment, it would have called
+      [[begin_op]] too, and its blocks would join the same transaction ([[tour:31]]). The
+      shared counters `log.outstanding` and `log.lh` are protected by `log.lock`. In this
+      scenario no one else is using the file system, so pid 3 is alone in the transaction.
+
+  - title: log_write records a block number, not a write
+    file: kernel/log.c
+    lines: 223-244
+    focus: 234-242
+    state:
+      hart: 1
+      mode: S
+      proc: sh (pid 3)
+      intr: off
+      satp: kernel
+      locks: ["inode 1 lock (sleep-lock)", "inode 24 lock (sleep-lock)", "buf 33 (sleep-lock)", log.lock]
+      irq: {noff: 1, intena: 1}
+      stack: [usertrap, syscall, sys_open, create, dirlink, writei, iupdate, log_write]
+      sp: kernel
+    note: |
+      This is the third distinct block, logged by [[iupdate]] of the root inode. At this
+      moment pid 3 holds the root directory's inode lock, the new inode 24's lock (which
+      [[create]] took before calling [[dirlink]]), and the buffer for block 33;
+      `log_write` adds `log.lock`.
+
+      The loop looks for 33 among the blocks already listed (34 and 47). It is not there,
+      so it is appended at index 2, `n` becomes 3, and [[bpin]] raises the buffer's
+      reference count.
+
+      The pin is what makes the plan work. The changed bytes exist only in this buffer. If
+      the cache recycled it for another block before the commit, the change would be lost,
+      and a later [[bread]] of block 33 would fetch the old contents from disk. A pinned
+      buffer has `refcnt > 0`, and [[bget]] never recycles such a buffer.
+    others: |
+      `log.lock` is a [[g:spinlock]], so interrupts are off on hart 1 for these few
+      instructions. A process on hart 2 calling `log_write` for its own block at this
+      moment spins on `log.lock`; without it, both could read the same `n` and write their
+      block numbers into the same slot, and one change would never be committed.
+
+  - title: end_op sees it is the last one out and commits
+    file: kernel/log.c
+    lines: 152-184
+    focus: 174-177
+    state:
+      hart: 1
+      mode: S
+      proc: sh (pid 3)
+      intr: on
+      satp: kernel
+      locks: []
+      irq: 0
+      stack: [usertrap, syscall, sys_open, end_op]
+      sp: kernel
+    note: |
+      [[sys_open]] finishes its work and calls [[end_op]]. Under `log.lock` (lines
+      159–172), `log.outstanding` drops from 1 to 0, so pid 3 is the last operation in the
+      transaction. It sets `log.committing = 1` and `do_commit = 1`, then releases the lock.
+
+      Line 177 calls [[commit]] **without** `log.lock`: committing means waiting for the
+      disk, which means sleeping, and a process must not sleep holding a spinlock. The
+      `committing` flag takes the lock's place: it keeps every other process out of the
+      log until the commit is over.
+
+      So the commit is done by the system call that happens to finish last, on its own
+      kernel stack. Here that is `open`, on behalf of a shell that has not yet become
+      `echo`.
+    others: |
+      Suppose hart 0 runs `ls` and calls [[begin_op]] right now. It takes `log.lock`, sees
+      `log.committing == 1` (line 133), and goes to sleep on `&log`. It cannot join this
+      transaction, which is already closed, and it must not start changing buffers that
+      `commit` is about to copy. It will be woken at line 181, when the commit is over:
+
+      | Time | Hart 1 (pid 3, `open`) | Hart 0 (`ls`) |
+      |---|---|---|
+      | t0 | `end_op`: `outstanding` 1 → 0, `committing = 1`, release `log.lock` | |
+      | t1 | `commit` → `write_log` (sleeps on the disk) | `begin_op`: acquire `log.lock`, sees `committing`, `sleep_prepare(&log)`, release, `sleep` |
+      | t2 | `write_head`, `install_trans`, `write_head` | asleep |
+      | t3 | acquire `log.lock`, `committing = 0`, `wakeup(&log)` | made `RUNNABLE` |
+      | t4 | | re-acquires `log.lock`, `outstanding = 1`, new transaction |
+
+      Without `committing`, `ls`'s [[log_write]] could append to `log.lh` while
+      `write_log` iterates it: its block landing in the log slots but not in this commit's
+      header, or joining a transaction already being installed.
+
+  - title: Four stages, and what the disk holds after each
+    file: kernel/log.c
+    lines: 202-212
+    focus: 205-211
+    state:
+      hart: 1
+      mode: S
+      proc: sh (pid 3)
+      intr: on
+      satp: kernel
+      locks: []
+      irq: 0
+      stack: [usertrap, syscall, sys_open, end_op, commit]
+      sp: kernel
+    note: |
+      [[commit]] is four disk operations in a fixed order. Each one waits for the disk to
+      finish before the next starts. Here is what the disk holds if the power fails during
+      or after each stage:
+
+      | Power fails during… | Header (block 2) says | Home blocks 34, 47, 33 | After reboot |
+      |---|---|---|---|
+      | 1. [[write_log]] | `n = 0` | old | no `f`: the half-written log is ignored |
+      | 2. [[write_head]] (before it completes) | `n = 0` | old | no `f` |
+      | 2→3, between them | `n = 3: 34 47 33` | old | `f` exists: recovery installs all three |
+      | 3. [[install_trans]] | `n = 3` | some new, some old | `f` exists: recovery installs all three again |
+      | 4. clearing the header | `n = 3` or `n = 0` | new | `f` exists |
+
+      There is no row with a file half-created. Before the header write, the home blocks
+      are untouched; after it, recovery will finish the job. The single write of block 2
+      decides which world the disk is in (assuming the header's sector is written
+      atomically, step 7).
+
+      The next four steps take each stage in turn, and for three of them we cut the power
+      for real.
+
+  - title: "Stage 1: copy the changed blocks into the log"
+    file: kernel/log.c
+    lines: 186-200
+    focus: 195-196
+    state:
+      hart: 1
+      mode: S
+      proc: sh (pid 3)
+      intr: on
+      satp: kernel
+      locks: ["buf 3 (sleep-lock)", "buf 34 (sleep-lock)"]
+      irq: 0
+      stack: [usertrap, syscall, sys_open, end_op, commit, write_log]
+      sp:
+        "on": kernel
+        detail: "pid 3's kernel stack; each `bwrite` parks `… end_op (with commit and write_log inlined) · bwrite · virtio_disk_rw · sleep · sched` here"
+    note: |
+      For each listed block, [[write_log]] reads the log slot (`log.start + tail + 1`, so
+      blocks 3, 4, 5), copies the cached block into it, and writes it with [[bwrite]]. The
+      cached block 34 goes to log block 3, 47 to 4, 33 to 5.
+
+      `bwrite` returns only when the disk has finished the write. While it waits, pid 3
+      sleeps holding the two buffers' [[g:sleeplock|sleep-locks]]: allowed, and the reason
+      buffers have sleep-locks rather than spinlocks.
+
+      **Cut the power here.** We built a copy of the kernel that stops dead at the end of
+      this stage (an infinite loop standing in for a power failure), killed QEMU, and
+      inspected the image: inode 24 has `type 0`, the root directory ends with `console`,
+      and the header says `n= 0`. Booting the unmodified kernel:
+
+          $ ls f
+          ls: cannot open f
+
+      The three log blocks hold new data, but nothing points at them. They are garbage
+      that the next transaction overwrites.
+    others: |
+      The disk write completes with an interrupt, and the [[g:plic|PLIC]] may deliver it to
+      any hart: hart 2 can run [[virtio_disk_intr]] and wake pid 3, and hart 0 can be the
+      one that resumes it. The buffer sleep-locks belong to pid 3, not to a hart, so they
+      stay held across the move. See [[tour:29]].
+
+  - title: "Stage 2: one block write is the commit"
+    file: kernel/log.c
+    lines: 101-116
+    focus: 108-114
+    state:
+      hart: 1
+      mode: S
+      proc: sh (pid 3)
+      intr: on
+      satp: kernel
+      locks: ["buf 2 (sleep-lock)"]
+      irq: 0
+      stack: [usertrap, syscall, sys_open, end_op, commit, write_head]
+      sp: kernel
+    note: |
+      [[write_head]] copies the in-memory header into block 2 (`n = 3`, then 34, 47, 33)
+      and writes it. When this `bwrite` completes, the transaction is **committed**: no
+      matter what happens next, `f` will exist after the next boot.
+
+      Why can one write decide? Because it is assumed to be all-or-nothing. The header's
+      meaningful bytes (4 for `n`, 4 per block number: 16 here, at most 124) sit in the
+      first 512-byte sector of the block. xv6 **assumes**, without saying so in the code,
+      that the disk writes such a sector all-or-nothing; the other sector of block 2 holds
+      nothing that matters, so its tearing is harmless. Real disks generally give this
+      guarantee for a single sector; QEMU plus a host file gives it only as far as the
+      host's write path does.
+
+      In QEMU, by the time the device reports a write complete, QEMU has written it into
+      `fs.img`, so killing QEMU cannot lose it. xv6 also leaves `VIRTIO_BLK_F_FLUSH`
+      unnegotiated (xv6 commit `0024d4b`); under the virtio spec (§5.2.6.2) that obliges
+      the device to make each write stable before reporting it complete, and QEMU does so
+      by running the disk in writethrough mode. Whether "stable" survives a crash of the
+      *host* computer depends on the host OS and drive; this tour only simulates a crash
+      of the guest machine.
+
+      **Cut the power right after this write.** The image now holds the old home blocks
+      (inode 24 still free, no `f` in the root directory) and a header reading
+      `n= 3 (34, 47, 33)`. Rebooting the unmodified kernel prints:
+
+          recovering tail 0 dst 34
+          recovering tail 1 dst 47
+          recovering tail 2 dst 33
+          init: starting sh
+          $ ls f
+          f              2 24 0
+
+  - title: "Stage 3: install the blocks at home"
+    file: kernel/log.c
+    lines: 66-85
+    focus: 78-81
+    state:
+      hart: 1
+      mode: S
+      proc: sh (pid 3)
+      intr: on
+      satp: kernel
+      locks: ["buf 3 (sleep-lock)", "buf 34 (sleep-lock)"]
+      irq: 0
+      stack: [usertrap, syscall, sys_open, end_op, commit, install_trans]
+      sp: kernel
+    note: |
+      [[install_trans]] with `recovering = 0` writes each block to its real place. It reads
+      the log copy and the home block, copies one onto the other, and writes the home block.
+      Both are normally still in the cache (the log blocks were just written by
+      `write_log`), so normally no disk reads happen. [[bunpin]] then drops the
+      pin that [[log_write]] added: the buffer may be recycled again.
+
+      This stage is the dangerous one if there were no log. **Cut the power after the first
+      home write** (block 34) and look at the image:
+
+      - inode 24: `type 2` (file), `nlink 1`, size 0;
+      - the root directory: still ends with `console`. No entry names inode 24.
+
+      That is an inode marked in use that no path reaches. Without a log it would be lost
+      for good, and note that [[ireclaim]] could not save it either, because it looks only
+      for `nlink == 0`. But the header still says `n = 3`, so the next boot installs all
+      three blocks again, and `ls f` shows `f 2 24 0` exactly as before.
+
+      Installing block 34 a second time is harmless. The log holds whole new block
+      contents (a "redo" log), so writing them again gives the same result: recovery is
+      **idempotent**. It can even crash and be rerun.
+
+  - title: "Stage 4: erase the transaction, and let the others in"
+    file: kernel/log.c
+    lines: 202-212
+    focus: 209-210
+    state:
+      hart: 1
+      mode: S
+      proc: sh (pid 3)
+      intr: on
+      satp: kernel
+      locks: []
+      irq: 0
+      stack: [usertrap, syscall, sys_open, end_op, commit]
+      sp: kernel
+    note: |
+      With every block at home, the log is no longer needed. `log.lh.n = 0` and a second
+      [[write_head]] put `n = 0` on disk.
+
+      This write must come *after* installation and *before* the next transaction writes
+      the log. If the header still said `n = 3` when the next commit overwrote log blocks
+      3–5 with other data, a crash at that point would make recovery install the wrong
+      contents into blocks 34, 47 and 33.
+
+      Then [[commit]] returns to [[end_op]], which takes `log.lock`, clears
+      `log.committing`, counts the commit in `log.ncommit` and wakes everyone sleeping on
+      `&log` ([[kernel/log.c:181]]).
+
+      The bill for creating one file: 3 log writes, 2 header writes, 3 home writes, eight
+      synchronous disk writes, where a file system without a log would do three. That is
+      the price of never having a half-created file.
+    others: |
+      The `ls` that went to sleep on hart 0 in step 4 is now made `RUNNABLE` by the
+      [[wakeup]] at [[kernel/log.c:181]]. It re-takes `log.lock`, sees `committing == 0`,
+      and joins a fresh transaction. Any hart may run it.
+
+  - title: The power cut, as test-xv6.py does it
+    file: test-xv6.py
+    lines: 64-71
+    focus: 65-71
+    state:
+      proc: test-xv6.py on the host computer
+    note: |
+      There is no power switch on QEMU, but there is something just as abrupt: killing it.
+      `crash()` finds QEMU (the child of `make qemu`) and sends it `SIGKILL`. QEMU gets no
+      chance to finish anything. The disk image file keeps exactly the writes that QEMU
+      had already made to it, which is the state a real disk would be in after a power
+      failure.
+
+      For the experiments in the previous steps we did the same thing by hand, after
+      making a modified copy of the kernel stop at a chosen line of [[commit]]. (On macOS,
+      `crash()` fails as written: its `ps --ppid` is a Linux option that macOS's `ps`
+      lacks. Change that call to `pgrep -P` in your copy of the script.)
+
+      Everything in the kernel's memory is now gone: the buffer cache, the inode table,
+      `log.lh`, the processes. Only the 2000 blocks of `fs.img` remain.
+
+  - title: The next boot, in the first process
+    file: kernel/proc.c
+    lines: 512-536
+    focus: 522-528
+    state:
+      hart: any
+      mode: S
+      proc: init (pid 1)
+      intr: off
+      satp: kernel
+      locks: []
+      irq: {noff: 0, note: "noff just went from 1 to 0 at line 520, but the intena recorded with that `p->lock` was 0 (the scheduler took it with SIE off), so `pop_off` did not turn interrupts on ([[concept:locks#intena]])"}
+      stack: [forkret]
+      sp:
+        "on": kernel
+        switched: "`ld sp, 8(a1)` in [[swtch]] ([[kernel/swtch.S:26]]), the scheduler's first switch to pid 1"
+        detail: "pid 1's kernel stack, `KSTACK(0)` = `0x3fffffd000`; empty when `forkret` began"
+    note: |
+      Recovery does not happen in [[main]]. It happens the first time any process runs:
+      the very first process (pid 1), in [[forkret]], before it becomes `/init`.
+
+      The source comment gives the reason. Reading the disk means waiting for it, and
+      waiting means [[sleep]], which needs a process to put to sleep. `main` runs on hart
+      0's boot stack with no process at all.
+
+      So when [[userinit]] has made pid 1 runnable, whichever hart's scheduler picks it up
+      first lands here, releases `p->lock` (taken by the scheduler), and, because
+      `first` is 1, calls [[fsinit]]. Interrupts are still **off**: the scheduler acquired
+      `p->lock` with interrupts already disabled, so `release` does not turn them back on,
+      and nothing on the way to `/init` does either. Pid 1 cannot be preempted by a timer
+      while it repairs the disk; disk-completion interrupts are taken by a hart sitting in
+      its scheduler loop, including this one while pid 1 sleeps. Only after the disk is repaired does
+      [[kexec]]`("/init")` read anything from it.
+
+      The stack is part of that reason ([[concept:stacks]]). To sleep, a thread must leave
+      its call chain somewhere that survives while the hart does other work. A process has
+      such a place, its kernel stack; `main`'s boot stack is the hart's own and becomes the
+      scheduler stack, which the hart needs while pid 1 sleeps. Pid 1's kernel stack,
+      `KSTACK(0)`, was empty when the scheduler's [[swtch]] loaded `p->context.sp`, set to
+      the top of that page by [[allocproc]] ([[kernel/proc.c:147]]), and "returned" into
+      `forkret` through `context.ra`. So `forkret` is the bottom frame. There is no
+      `usertrap` below it: pid 1 has never been in user mode.
+    others: |
+      Pid 1 is the only process in the system. The other two harts loop in their
+      schedulers and find nothing to run. No other file system call can possibly race with
+      recovery, because no other process exists to make one. (`first` is a plain `int`:
+      only the first scheduling of pid 1 ever sees it as 1.)
+
+  - title: fsinit checks the superblock, then repairs, then reclaims
+    file: kernel/fs.c
+    lines: 29-49
+    focus: 44-48
+    state:
+      hart: any
+      mode: S
+      proc: init (pid 1)
+      intr: off
+      satp: kernel
+      locks: []
+      irq: 0
+      stack: [forkret, fsinit]
+      sp: kernel
+    note: |
+      [[fsinit]] reads block 1, the [[g:superblock]], into the global `sb`, and refuses to
+      go on if its magic number is wrong. The superblock tells the kernel where everything
+      is: `logstart = 2`, `inodestart = 33`, `bmapstart = 46`, `ninodes = 200`.
+
+      Then, in this order:
+
+      1. [[initlog]]: set up the log and **recover** it.
+      2. [[ireclaim]]: free inodes orphaned by the crash.
+
+      The order matters. `ireclaim` reads inode blocks to decide which inodes are orphans.
+      Before recovery those blocks may be stale, like block 34 in the stage 2 experiment,
+      which still showed inode 24 as free. And `ireclaim` itself runs transactions, which
+      must not start while an old committed transaction is still sitting in the log.
+
+  - title: initlog reads the header
+    file: kernel/log.c
+    lines: 87-125
+    focus: 118-121
+    state:
+      hart: any
+      mode: S
+      proc: init (pid 1)
+      intr: off
+      satp: kernel
+      locks: []
+      irq: 0
+      stack: [forkret, fsinit, initlog, recover_from_log]
+      sp:
+        "on": kernel
+        detail: "pid 1's kernel stack, with `forkret` at the very bottom: no `usertrap` frame"
+    note: |
+      [[initlog]] ([[kernel/log.c:55]]) records where the log starts and calls
+      [[recover_from_log]], which calls [[read_head]]: read block 2 and copy `n` and the
+      block numbers into `log.lh`.
+
+      In the "power cut after stage 1" experiment, this reads `n = 0`, and recovery does
+      nothing. In the stage 2 and stage 3 experiments, it reads `n = 3` and the list 34,
+      47, 33, the very list that pid 3's `log_write` calls built in memory before the
+      crash. The in-memory header died; its copy on disk survived. That is why the header
+      on disk holds block numbers and not only a flag.
+
+  - title: install_trans, in recovery mode
+    file: kernel/log.c
+    lines: 66-85
+    focus: 76-79
+    state:
+      hart: any
+      mode: S
+      proc: init (pid 1)
+      intr: off
+      satp: kernel
+      locks: ["log block 3+tail (sleep-lock)", "home block (sleep-lock)"]
+      irq: 0
+      stack: [forkret, fsinit, initlog, recover_from_log, install_trans]
+      sp: kernel
+    note: |
+      The same function that ran as stage 3 of the commit runs again, with
+      `recovering = 1`. Two differences:
+
+      - It prints a line per block. These are the lines you saw after the stage 2 cut:
+        `recovering tail 0 dst 34` and so on.
+      - It skips [[bunpin]]. The pins were taken by [[log_write]] in the previous boot; in
+        this boot's freshly initialized cache nothing was ever pinned, and unpinning would
+        drive `refcnt` below its true value.
+
+      Here, unlike in a normal commit, the [[bread]] calls really go to the disk: the cache
+      is empty after a boot. So recovery of `n` blocks costs `2n` reads and `n` writes.
+
+      Each of those disk operations parks pid 1 on its kernel stack, exactly as `cat` was
+      parked in [[tour:29]], but with a different bottom:
+
+      ```text
+      pid 1's kernel stack (KSTACK(0)), sleeping during recovery
+        top ─► forkret
+               fsinit · initlog (recover_from_log is inlined into it) · install_trans
+               bread or bwrite · virtio_disk_rw · sleep · sched   ← p->context.sp
+      ```
+
+      Because pid 1 runs with interrupts off, no [[kernelvec]] frame is ever pushed onto
+      this stack: every disk interrupt during recovery lands on some hart's scheduler stack.
+    others: |
+      Each [[bwrite]] sleeps until the disk interrupt arrives. Any hart may take it (not
+      while pid 1 is running on it, since pid 1 runs with interrupts off): the
+      [[g:plic|PLIC]] offers the virtio interrupt to every hart, and the one that claims it
+      runs [[virtio_disk_intr]] and wakes pid 1. Pid 1 may then continue on a different
+      hart from the one it slept on.
+
+  - title: Clear the log, and the disk is consistent again
+    file: kernel/log.c
+    lines: 118-125
+    focus: 122-124
+    state:
+      hart: any
+      mode: S
+      proc: init (pid 1)
+      intr: off
+      satp: kernel
+      locks: []
+      irq: 0
+      stack: [forkret, fsinit, initlog, recover_from_log]
+      sp: kernel
+    note: |
+      After installing, `log.lh.n = 0` and [[write_head]] erase the transaction, just as
+      stage 4 of a normal commit does. If the power fails during recovery itself, the next
+      boot finds the same header and installs the same blocks again. Idempotence, from
+      step 8, is what makes that safe.
+
+      Look at what `ls f` printed after the stage 2 cut: `f 2 24 0`. The file exists, but
+      it is **empty**. The `hi` was going to be written by transactions 2 and 3, which
+      never started. The log promises *atomicity* (each transaction entirely or not at
+      all), not that the last thing you typed survives. A program that needs its data on
+      disk must wait for its own transaction to commit; `sync` ([[sys_sync]]) is the
+      system call that waits for that.
+
+  - title: How an orphan is made, on purpose
+    file: user/forphan.c
+    lines: 12-40
+    focus: 20-39
+    state:
+      hart: 1
+      mode: U
+      proc: forphan (pid 3)
+      intr: on
+      satp: user
+      locks: []
+      stack: [main]
+      sp:
+        "on": user
+        switched: "`ld sp, 48(a0)` in [[userret]] ([[kernel/trampoline.S:118]]) and `sret` ([[kernel/trampoline.S:153]])"
+    note: |
+      The log keeps each system call atomic, but some states are perfectly consistent and
+      still wasteful after a crash. `forphan` builds one. It creates `file0` (inode 24 on
+      a fresh disk), then unlinks it while the descriptor is still open.
+
+      [[kernel:sys_unlink]] removes the directory entry and drops `nlink` to 0, all in one
+      committed transaction. But the inode is not freed: the open file still holds a
+      reference, and [[kernel:iput]] frees an inode only when the last reference **and** the
+      last link are gone ([[tour:33]]). On a running system that happens at `close` or
+      `exit`.
+
+      `forphan` never closes. Kill QEMU now, and the disk holds inode 24 with `type 2`,
+      `nlink 0`: allocated, reachable by no name, and with no process left to close it.
+      [[user/dorphan.c]] does the same with a directory: it `chdir`s into `dd` and unlinks
+      it as `../dd`, so its current-directory reference is the last one.
+    others: |
+      Nothing here is a bug or a race; it is the Unix rule that a deleted file lives until
+      it is closed. The crash just takes away the close.
+
+  - title: ireclaim scans every inode for orphans
+    file: kernel/fs.c
+    lines: 388-408
+    focus: 393-398
+    state:
+      hart: any
+      mode: S
+      proc: init (pid 1)
+      intr: off
+      satp: kernel
+      locks: ["buf 34 (sleep-lock)"]
+      irq: 0
+      stack: [forkret, fsinit, ireclaim]
+      sp:
+        "on": kernel
+        switched: "back to the boot story: pid 1's kernel stack, as in steps 11–15 (each disk sleep leaves and returns via [[swtch]], [[kernel/swtch.S:26]])"
+    note: |
+      [[ireclaim]] reads every inode, 1 to 199, from the 13 inode blocks. An inode with
+      `type != 0` and `nlink == 0` is an orphan: allocated, but no directory entry names
+      it. After the `forphan` crash, the boot prints
+
+          ireclaim: orphaned inode 24
+          init: starting sh
+
+      and `ls file0` finds nothing, as before; the inode and its blocks are free again.
+      The `dorphan` crash produces the same line for its directory, also inode 24.
+
+      Notice the order on lines 397–399: [[iget]] takes a reference (no disk access), then
+      [[brelse]] releases block 34, and only then does the next step lock the inode.
+      [[ilock]] will read block 34 itself, and a process that tried to take a buffer
+      sleep-lock it already holds would wait for itself forever.
+
+  - title: The orphan gets the close it never had
+    file: kernel/fs.c
+    lines: 349-378
+    focus: 365-366
+    state:
+      hart: any
+      mode: S
+      proc: init (pid 1)
+      intr: off
+      satp: kernel
+      locks: ["inode 24 lock (sleep-lock)"]
+      irq: 0
+      stack: [forkret, fsinit, ireclaim, iput]
+      sp: kernel
+    note: |
+      For each orphan, [[ireclaim]] opens a transaction and replays a final close:
+      [[ilock]] (which reads the inode, so `valid = 1`), [[iunlock]], [[iput]].
+
+      In `iput`, `ref == 1`, `valid == 1` and `nlink == 0`, so `last` is true. It locks the
+      inode, [[itrunc]] frees its data blocks in the bitmap (`file0` never had any), then `ref` drops to 0 and
+      [[ifree]] sets the on-disk type to 0. All of that is in one transaction, committed
+      by [[end_op]] at [[kernel/fs.c:405]]. If the power fails *during* `ireclaim`, the next
+      boot finds the orphan either untouched (and reclaims it again) or fully freed.
+
+      One detail of `iput` is unusual: line 362 calls `acquiresleep` while still
+      holding the spinlock `itable.lock` (noff 2 inside it, 3 for a moment in its `myproc()`). That is legal only because
+      `ref == 1` means nobody else can hold the inode's lock, so it never sleeps
+      ([[concept:locks#unusual]]).
+
+      This is the same code path a normal `close` of a deleted file takes. Recovery does
+      not need special repair code: it re-creates the missing event.
+    others: |
+      Still no other process exists, so nobody can be waiting for inode 24 or for
+      `itable.lock`. The locking in `iput` is written for the general case, which
+      [[tour:33]] follows with three harts.
+
+  - title: The test that does all of this twenty times
+    file: test-xv6.py
+    lines: 131-178
+    focus: 131-147
+    state:
+      proc: test-xv6.py on the host computer
+    note: |
+      `./test-xv6.py crash` automates the experiment. `crash_log` builds a fresh image,
+      runs `logstress f0 f1 f2 f3 f4 f5` (six processes, each trying to write 250 × 2000
+      bytes to its own file, more than an xv6 file can hold, but the kill comes long
+      before that) and kills QEMU after 2 seconds. `recover_log` boots again and passes
+      if a `recovering` line appears. A kill only catches a committed-but-not-cleared
+      log some of the time, so `test_log` retries up to 20 times. Our run (3 harts) needed three tries:
+
+          kill 33894
+          log attempt  1
+          kill 35387
+          log attempt  2
+          kill 36439
+          recovering tail 0 dst 1176
+          recovering tail 1 dst 46
+          …
+          recovering tail 13 dst 1186
+          f5             2 29 20000
+          OK
+
+      Fourteen blocks from several processes' writes, data blocks and the bitmap together:
+      one group-committed transaction. The orphan tests then look for `^ireclaim`. In our
+      run the harness's `monitor('wait')` in `forphan()` ([[test-xv6.py:152]]) timed out
+      (its `re.match` is anchored at the start of a line), because the program's message
+      arrived on the same line as the shell prompt (`$ wait for kill…`); running the same
+      steps by hand gave the `ireclaim: orphaned inode 24` shown in step 17.
+
+  - title: What it cost, and what it bought
+    file: kernel/log.c
+    lines: 10-31
+    focus: 24-31
+    state:
+      proc: none
+      locks: []
+      stack: []
+    note: |
+      Step back and count. Every transaction writes each changed block twice (log, then
+      home) and the header twice, all synchronously, in order. Creating `f` cost eight disk
+      writes for three blocks' worth of change. A boot after a crash costs one header
+      read, then `2n` reads and `n + 1` writes, then a scan of all 13 inode blocks.
+
+      What that buys is a short list of facts that hold whenever the power fails:
+
+      - Each transaction is on disk entirely or not at all. The decision is one block
+        write, the header, whose meaningful bytes all lie in one sector that is assumed to
+        be written atomically.
+      - Nothing reaches a home block before its transaction is committed (the
+        [[log_write]] pin keeps it in memory), so recovery only ever has to redo, never
+        undo.
+      - Redoing is idempotent, so a crash during recovery is harmless.
+      - Files deleted while open are reclaimed at boot by [[ireclaim]], by replaying the
+        missing final [[iput]].
+
+      What it does not buy: system calls that had not finished when the power failed, and
+      ones whose shared transaction had not yet committed because other calls were still
+      in it. A call that runs alone is committed before it returns; when other calls keep
+      the transaction open, `sync` ([[sys_sync]]) waits for the next commit.
+locks:
+  - lock: "log.lock (spinlock)"
+    where: "[[begin_op]], [[end_op]], [[log_write]]"
+    protects: "`log.outstanding`, `log.committing`, `log.lh` (the in-memory list of logged blocks)"
+  - lock: "log.committing (a flag, not a lock)"
+    where: "[[end_op]] sets it; [[begin_op]] waits on it"
+    protects: "Keeps new operations out of the log while [[commit]] runs without `log.lock` (it must sleep on the disk)"
+  - lock: "buffer sleep-locks"
+    where: "[[bread]] / [[brelse]] in [[write_log]], [[write_head]], [[install_trans]], [[read_head]]"
+    protects: "Each block's cached contents while it is copied and written"
+  - lock: "bcache.lock (spinlock)"
+    where: "[[bpin]], [[bunpin]], [[bget]], [[brelse]]"
+    protects: "Buffer reference counts: a pinned buffer is never recycled before its commit"
+  - lock: "log.lh without log.lock during recovery"
+    where: "[[recover_from_log]], [[read_head]], [[install_trans]]"
+    protects: "Nothing else can touch `log.lh` yet: pid 1 is the only process and no [[begin_op]] has run. (The buffer, bcache and disk locks are still taken as usual.)"
+  - lock: "disk.vdisk_lock (spinlock)"
+    where: "[[virtio_disk_rw]], [[virtio_disk_intr]]"
+    protects: "The virtio descriptor ring and the in-flight request table; released before the requester sleeps, so no spinlock is held across the disk wait (see [[tour:29]])"
+  - lock: "p->lock (spinlock)"
+    where: "[[sleep]], [[wakeup]] (disk waits, `begin_op` waiting on `&log`)"
+    protects: "`p->chan` and `p->state`, so a wakeup from the disk interrupt or from [[end_op]] is never lost"
+  - lock: "inode sleep-lock, itable.lock"
+    where: "[[ireclaim]] → [[ilock]], [[iput]]"
+    protects: "The orphan's inode while it is truncated and freed (see [[tour:33]])"
+quiz:
+  - q: "The power fails after `write_log` has written log blocks 3 and 4 but not 5. What does the next boot do with blocks 3 and 4, and why is that safe?"
+    a: "Nothing. The header on disk still says `n = 0`, because `write_head` had not run, so `recover_from_log` installs no blocks. Blocks 3 and 4 are unreferenced garbage that the next commit overwrites, and the home blocks were never touched."
+  - q: "Why must `commit` clear the header (stage 4) before the next transaction's `write_log` runs?"
+    a: "If the header still listed blocks 34, 47, 33 while `write_log` overwrote log blocks 3–5 with a new transaction's data, a crash at that moment would make recovery copy the new, uncommitted data into the old home blocks, corrupting them."
+  - q: "In the stage 3 experiment, inode 24 was allocated with `nlink 1` but no directory named it. Why could `ireclaim` not have fixed this if there were no log?"
+    a: "`ireclaim` looks only for inodes with `type != 0` and `nlink == 0`. This inode claims one link, so it does not look like an orphan; only a full scan of every directory could prove that no entry names it. The log prevents the state from ever surviving a reboot instead."
+  - q: "Why does `install_trans` skip `bunpin` when `recovering` is 1?"
+    a: "The pins came from `log_write` calls in the previous boot, whose buffer cache no longer exists. In the new cache nobody pinned these buffers, so unpinning would decrement `refcnt` below the true number of users and could let a buffer in use be recycled."
+  - q: "Why is the file system recovered in `forkret` instead of in `main`?"
+    a: "Recovery reads and writes the disk, and each disk operation sleeps until the interrupt arrives. Sleeping requires a process; `main` runs on the boot stack with no process. `forkret` runs in pid 1, before it executes `/init`, so recovery completes before any program can look at the disk."
+  - q: "After the stage 2 crash, `f` exists but is empty, though the user typed `echo hi > f`. Is that a failure of the log?"
+    a: "No. The `hi` belonged to transactions 2 and 3, which never started. The log guarantees each transaction is applied entirely or not at all, so the disk is consistent; it does not guarantee that operations still in progress at the crash survive."

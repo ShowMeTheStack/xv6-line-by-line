@@ -1,0 +1,253 @@
+summary: |
+  The data structures behind processes and CPUs. Four structs and one enum:
+
+  - `struct context`: the registers [[swtch]] saves when a kernel thread is switched out.
+  - `struct cpu`: per-CPU state, one entry per [[g:hart]] in [[cpus]].
+  - `struct trapframe`: the page where a process's *user* registers are saved when it
+    enters the kernel ([[g:trapframe]]).
+  - `enum procstate`: the [[g:process-state|states]] a process moves through.
+  - `struct proc`: everything the kernel knows about one [[g:process]], one entry per slot in
+    the [[proc]] table.
+
+  The most important thing to learn here is which lock protects which field. The source
+  states it in comments on `struct proc`; the notes below check those comments against how
+  [[kernel/proc.c]] and the rest of the kernel actually use each field.
+
+  **Read before:** [[kernel/spinlock.h]]. **Read next:** [[kernel/proc.c]] and
+  [[kernel/swtch.S]].
+
+blocks:
+  - lines: 1-19
+    title: The registers saved by a context switch
+    note: |
+      A kernel thread that is not running is described completely by its stack and these
+      14 values. [[swtch]] stores them in the `old` context and loads them from the `new`
+      one, at offsets 0, 8, ..., 104, which must match the `sd`/`ld` offsets in
+      [[kernel/swtch.S]].
+
+      `ra` is where the thread resumes and `sp` is its stack. `s0`–`s11` are the
+      *callee-saved* registers: under the [[g:calling-convention]] a called function must
+      preserve them, so the code that called `swtch` may still need their values. The other
+      registers are not here because the caller of `swtch` cannot rely on them surviving
+      any function call anyway. See [[kernel/swtch.S]] for the full argument.
+
+      Each process has one (`p->context`) and each CPU has one for its scheduler thread
+      (`c->context`).
+
+  - lines: 21-27
+    title: "struct cpu: per-CPU state"
+    note: |
+      One per hart, in [[cpus]], indexed by the hart ID that [[cpuid]] reads from
+      [[g:reg:tp|tp]]. [[mycpu]] returns the current one.
+
+      None of these fields has a lock, and none needs one: each CPU only ever touches its
+      own entry, and always with interrupts off, so nothing else can run on that CPU in the
+      middle of an update.
+
+      - `proc`: the process running on this CPU, or 0 while the [[scheduler]] itself runs.
+        Set and cleared by [[scheduler]]; read through [[myproc]].
+      - `context`: the scheduler thread's saved registers. [[sched]] switches to it.
+      - `noff`, `intena`: the nesting depth of [[push_off]] and the interrupt state before
+        the outermost one ([[g:interrupts-and-locks]]).
+
+      In the build, `sizeof(struct cpu)` is 128 bytes: [[mycpu]] computes
+      `cpus + (id << 7)`.
+
+  - lines: 29
+    title: The CPU array
+    note: |
+      Declares the array defined in [[kernel/proc.c:9]], so that other files can see it.
+      [[NCPU]] is 8, the most harts xv6 supports.
+
+  - lines: 31-39
+    title: What the trapframe is for
+    note: |
+      When a user program traps into the kernel (a system call, an interrupt, a fault),
+      [[uservec]] in [[kernel/trampoline.S]] must save all 31 user registers before it can
+      run any C code, and it needs a few kernel values to get into the kernel at all. The
+      [[g:trapframe]] holds both. Each process has its own trapframe page, allocated in
+      [[allocproc]]; it is mapped at [[TRAPFRAME]], just below the
+      [[g:trampoline]] page, in every user page table ([[proc_pagetable]]).
+
+      The comment is accurate for this version: [[uservec]] saves the user registers and
+      loads `kernel_sp`, `kernel_hartid` and `kernel_satp`, then jumps to the address in
+      `kernel_trap` ([[usertrap]]). On the way out, [[prepare_return]] fills in the
+      `kernel_*` fields and [[userret]] restores the user registers. The kernel reaches the
+      same page through `p->trapframe`, a physical address, which works because the kernel
+      maps RAM at equal virtual and physical addresses.
+
+  - lines: 40-45
+    title: Values the trap entry code needs
+    note: |
+      The first five slots are not user registers; they are filled in by the kernel for
+      [[uservec]]'s benefit:
+
+      - `kernel_satp`: the kernel page table, to load into [[g:csr:satp|satp]];
+      - `kernel_sp`: the top of this process's [[g:kernel-stack]];
+      - `kernel_trap`: the address of [[usertrap]];
+      - `epc`: the user program counter. [[usertrap]] copies [[g:csr:sepc|sepc]] here, and
+        [[prepare_return]] copies it back before `sret`. It is kept here and not only in
+        `sepc` because `sepc` would be overwritten by the next trap taken in the kernel, or
+        by another process if this one is switched out.
+      - `kernel_hartid`: the hart ID, reloaded into `tp` because user code may have changed
+        `tp`.
+
+      The `/* 0 */`, `/* 8 */` comments are the byte offsets that [[kernel/trampoline.S]]
+      hard-codes; changing the order here would break it.
+
+  - lines: 46-77
+    title: The saved user registers
+    note: |
+      All 31 general-purpose registers except `zero`, in register-number order (`ra` is
+      `x1`, `sp` `x2`, ..., `t6` `x31`), at offsets 40 to 280. The whole struct is 288 bytes,
+      far less than its 4096-byte page.
+
+      The kernel reads and writes these slots to talk to the user program: a system call's
+      arguments come from `a0`–`a5` and its number from `a7` ([[g:syscall-arguments]]); its
+      return value is written to `a0`. [[kfork]] copies the whole trapframe to the child and
+      then sets the child's `a0` to 0; [[kexec]] sets `sp`, `epc` and `a1` for the new
+      program.
+
+  - lines: 79
+    title: The process states
+    note: |
+      The [[g:process-state]] machine, in the order the enum numbers them (0 to 5):
+
+      - `UNUSED`: a free slot. Static storage starts zeroed, and `UNUSED` is 0, but
+        [[procinit]] sets it explicitly anyway.
+      - `USED`: claimed by [[allocproc]] and being filled in; not yet allowed to run.
+      - `SLEEPING`: waiting in [[sleep]] for a [[wakeup]].
+      - `RUNNABLE`: ready; any CPU's [[scheduler]] may pick it.
+      - `RUNNING`: currently executing on some CPU.
+      - `ZOMBIE`: has exited; waits for its parent's [[kwait]] (see [[g:zombie]]).
+
+  - lines: 81-83
+    title: "struct proc, and its lock"
+    note: |
+      One slot of the process table [[proc]] ([[NPROC]] = 64 slots). The build has
+      `sizeof(struct proc)` = 360 bytes.
+
+      `lock` is a [[g:spinlock]] that protects the fields on lines 86–90, and it does a
+      second job: it is held across every [[g:context-switch]] of this process. The
+      scheduler acquires it before switching to the process, and the process holds it when
+      it switches back (see [[scheduler]], [[sched]] and [[yield]]). That keeps another CPU
+      from picking the process while its registers are still being saved.
+
+  - lines: 85-90
+    title: Fields protected by p->lock
+    note: |
+      These fields are read or written by *other* processes and other CPUs: the scheduler
+      looks at `state`, [[wakeup]] at `chan`, [[kkill]] writes `killed`, the parent reads
+      `xstate` and `pid`. So every access normally holds `p->lock`.
+
+      The comment is true for every write. A few reads skip the lock, safely:
+
+      - A process reads its *own* `pid` without the lock ([[sys_getpid]],
+        [[acquiresleep]]). `pid` changes only in [[allocproc]] (before the process first
+        runs) and [[freeproc]] (after it has exited for good), so it cannot change under a
+        running process.
+      - [[procdump]] reads `state` and `pid` with no lock at all, on purpose (it is a
+        debugging aid that must work even when locks are stuck).
+
+  - lines: 92-93
+    title: The parent pointer, protected by wait_lock
+    note: |
+      `parent` is protected by the global [[wait_lock]], not by `p->lock`. Every write
+      holds it: [[kfork]] sets the child's parent, [[reparent]] hands orphans to init, and
+      [[kwait]] clears it. Every read does too: [[kwait]] scans for its children and
+      [[kexit]] reads `p->parent` to wake it.
+
+      Why a separate lock? A parent's [[kwait]] has to examine many children's `parent`
+      fields and sleep without missing the moment one of them exits; one lock covering all
+      parent links makes that check-then-sleep atomic. [[kernel/proc.c:23]] explains the
+      lock order this implies.
+
+  - lines: 95-104
+    title: Fields private to the process
+    note: |
+      These are used by the process itself, so it needs no lock to touch them. The comment
+      is right, with the understanding that "private" also allows two other parties at
+      times when the process cannot be running:
+
+      - [[kfork]] fills in a new child's fields while it is still `USED` (not yet runnable).
+      - The parent's [[kwait]] calls [[freeproc]] on a `ZOMBIE` child, which frees
+        `trapframe` and `pagetable` and resets `sz` and `name`. The child will never run
+        again.
+      - [[procdump]] reads `name` with no lock (debug output only).
+
+      `context` is special: it is written by [[swtch]] when the process is switched out,
+      and that always happens with `p->lock` held.
+
+lines:
+  3: |
+    Return address: where the thread resumes when [[swtch]] executes `ret`. For a new
+    process, [[allocproc]] sets it to [[forkret]].
+  4: |
+    Stack pointer. Points into the process's [[g:kernel-stack]], or into the CPU's boot
+    stack for a scheduler context.
+  23: |
+    The current process on this CPU, or null when the scheduler is running. [[myproc]]
+    returns it.
+  24: |
+    The scheduler thread's saved registers. [[sched]] does `swtch(&p->context,
+    &mycpu()->context)` to return to [[scheduler]].
+  25: |
+    How many [[push_off]] calls are not yet matched by [[pop_off]]; normally the number of
+    spinlocks this CPU holds.
+  26: |
+    1 if interrupts were enabled before the outermost [[push_off]]. [[pop_off]] uses it to
+    decide whether to turn them back on; [[sched]] saves and restores it.
+  41: |
+    The kernel's [[g:csr:satp|satp]] value. Written by [[prepare_return]] before every
+    return to user space.
+  42: |
+    Top of this process's kernel stack, `p->kstack + PGSIZE`. [[uservec]] loads it into
+    `sp`.
+  43: |
+    The address of [[usertrap]], so that [[uservec]] can jump to it.
+  44: |
+    Saved user program counter. On a system call [[usertrap]] adds 4 so the program
+    continues after the `ecall`.
+  45: |
+    The hart ID; [[uservec]] restores it into `tp` so [[cpuid]] works in the kernel.
+  79: |
+    The six process states. `UNUSED` is 0, so a zeroed `struct proc` is a free slot.
+  83: |
+    The per-process [[g:spinlock]], named `"proc"` by [[procinit]].
+  86: |
+    Current [[g:process-state]]. The [[scheduler]] reads it on every pass.
+  87: |
+    The [[g:sleep-wakeup|wait channel]]: non-zero after [[sleep_prepare]] until a
+    [[wakeup]] on the same address clears it. Can be left non-zero after the process stops
+    waiting (see [[sleep]]); that is harmless.
+  88: |
+    Set by [[kkill]] or [[setkilled]]. Read with [[killed]]; the process exits next time
+    it passes through [[usertrap]].
+  89: |
+    The exit status passed to [[kexit]], kept until the parent's [[kwait]] copies it out.
+  90: |
+    The [[g:pid]]; 0 for a free slot.
+  93: |
+    The process that created this one with `fork` (or init, after [[reparent]]). Protected
+    by [[wait_lock]].
+  96: |
+    Virtual address of the lowest byte of this process's [[g:kernel-stack]], `KSTACK(i)` for slot
+    `i`. Set once by [[procinit]] and never changed.
+  97: |
+    Size of the user address space in bytes: user memory is `[0, sz)`. With lazy `sbrk`,
+    not every page below `sz` is necessarily allocated yet.
+  98: |
+    The user [[g:page-table]], built by [[proc_pagetable]] and replaced by [[kexec]].
+  99: |
+    Kernel pointer to this process's trapframe page (a physical address, usable directly
+    because of the kernel's [[g:direct-map]]).
+  100: |
+    Saved kernel registers while the process is not running; see `struct context` above.
+  101: |
+    Open files, indexed by [[g:file-descriptor]] number; 0 means the descriptor is not
+    in use. [[NOFILE]] is 16.
+  102: |
+    The current working directory, an in-memory [[g:inode]] reference.
+  103: |
+    Program name for [[procdump]]: the last path element given to [[kexec]], at most 15
+    characters plus the terminating 0.

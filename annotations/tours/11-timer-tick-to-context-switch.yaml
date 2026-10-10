@@ -1,0 +1,781 @@
+title: From a timer tick to a context switch
+group: Time and scheduling
+prerequisites: [5, 7]
+summary: |
+  A program that never makes a system call never asks the kernel for anything. So how does
+  the kernel ever get the CPU back from it? This tour answers that by following one tick of
+  the clock on hart 1, from the moment the hart's timer fires, through the kernel, until a
+  different process is running on hart 1 and the interrupted program has been picked up by
+  hart 0.
+
+  The victim is pid 5, a child created by `usertests preempt`
+  ([[user/usertests.c:856]]; its comment says it is meant for at most two CPUs, and with
+  three harts it still passes, because every tick sends one spinner back to the table).
+  Its whole program is `for (;;) ;`: one 2-byte jump instruction that jumps to itself. Without a timer it would own hart 1 forever.
+
+  You will see the [[g:timer-interrupt]] arrive through the same [[g:trampoline]] as a
+  system call ([[tour:5]]), [[kernel:clockintr]] counting time on hart 0 only, and
+  [[kernel:yield]] handing the CPU to [[kernel:scheduler]] through [[kernel:sched]] and
+  [[kernel:swtch]]. Watch one lock in particular: pid 5's `p->lock`. It is acquired by
+  pid 5's kernel thread on hart 1 and released by hart 1's scheduler, and while it is held
+  no other hart may touch pid 5. That hand-off is what makes preemption safe on a machine
+  with three CPUs.
+cast: |
+  The machine has three [[g:hart|harts]]. `usertests preempt` has been typed at the shell
+  (pid 2), which started `usertests` (pid 3), which forked the test process (pid 4), which
+  forked three children. On a fresh boot they occupy process-table slots in order:
+  `proc[4]` is pid 5, `proc[5]` pid 6, `proc[6]` pid 7. When the tour starts:
+
+  | Hart | What it is doing |
+  |---|---|
+  | 0 | Running pid 6 in user mode: another `for (;;) ;` spinner |
+  | 1 | Running pid 5 in user mode, spinning: the process this tour follows |
+  | 2 | Running pid 7 in user mode: it wrote one byte into a pipe and now spins too |
+
+  Pid 4 (in `proc[3]`) was asleep in `read` on that pipe. Pid 7's write woke it, so it is
+  `RUNNABLE`, but all three harts are busy with spinners. It can run only if one of them is
+  taken off its CPU.
+steps:
+  - title: A program that never gives up the CPU
+    file: user/usertests.c
+    lines: 855-872
+    focus: 866-868
+    state:
+      hart: 1
+      mode: U
+      proc: pid 5 (usertests child)
+      intr: on
+      satp: user
+      locks: []
+      stack: [main, drivetests, runtests, run, preempt]
+      sp: user
+    note: |
+      Pid 5 is the first child forked by [[preempt]]. `fork` returned 0 to it, so it entered
+      `for (;;) ;`. In the build (`user/usertests.asm`) that loop is one compressed
+      instruction at address `0x3a7a`: `a001`, which is `j 3a7a`, a jump to itself.
+
+      Pid 5 executes that jump millions of times and never executes `ecall`. If xv6 waited
+      for programs to enter the kernel on their own, hart 1 would belong to pid 5 forever,
+      and so would harts 0 and 2 to its siblings. Pid 4, `RUNNABLE` and waiting, would never
+      run, and the test would hang.
+
+      The only way out is an event the program cannot prevent: an [[g:interrupt]]. Every hart
+      has a timer that interrupts it about ten times a second. User code cannot turn it off:
+      the interrupt-enable bit `sstatus.SIE` and the timer register `stimecmp` are
+      supervisor registers, and user mode cannot touch them.
+    others: |
+      Harts 0 and 2 are doing exactly the same thing with pids 6 and 7. They share no data
+      with hart 1 right now: each spinner touches only registers. Nothing needs a lock until
+      one of them enters the kernel.
+
+  - title: "Flashback: each hart set its own alarm at boot"
+    file: kernel/start.c
+    lines: 54-66
+    focus: 58-65
+    state:
+      hart: 1
+      mode: M
+      proc: none (booting)
+      intr: off
+      satp: bare
+      locks: []
+      stack: [start, timerinit]
+      sp: boot
+    note: |
+      At boot, every hart ran [[start]] in machine mode, and [[timerinit]] set up its timer
+      with the [[g:sstc|Sstc]] extension:
+
+      - Setting `menvcfg.STCE` lets supervisor mode use [[g:csr:stimecmp|stimecmp]].
+      - Setting bit 1 of `mcounteren` lets supervisor mode read [[g:csr:time|time]].
+      - `stimecmp = time + 1000000` asks for the first interrupt.
+
+      The rule is simple: a supervisor timer interrupt is **pending** whenever
+      `time >= stimecmp`. `time` counts at 10,000,000 per second on QEMU's `virt` machine, so
+      1,000,000 is 0.1 seconds.
+
+      Two other lines of [[start]] matter: it delegated all interrupts to supervisor mode
+      (`mideleg`, [[kernel/start.c:32]]), so the timer interrupt goes to the kernel's
+      supervisor-mode code rather than to machine mode, and it set `sie.STIE`
+      ([[kernel/start.c:33]]), which enables the timer interrupt locally.
+    others: |
+      `time` is one clock shared by all harts, but `stimecmp` is a per-hart register. Each
+      hart armed its own alarm at a slightly different moment, so the three harts' ticks are
+      not synchronized: hart 1's tick may come at any point relative to hart 0's.
+
+  - title: The tick arrives, and hart 1 lands in the trampoline
+    file: kernel/trampoline.S
+    lines: 16-38
+    focus: 22-37
+    state:
+      hart: 1
+      mode: S
+      proc: pid 5 (usertests child)
+      intr: off
+      satp: user
+      locks: []
+      stack: [uservec]
+      sp: {"on": none, detail: "`sp` still holds pid 5's user stack pointer; the trap does not touch it"}
+      irq: 0
+    note: |
+      `time` passes hart 1's `stimecmp`. The timer interrupt is pending, `sie.STIE` is set,
+      and the hart is in user mode. In user mode, supervisor interrupts are taken no matter
+      what `sstatus.SIE` says (the RISC-V rule is that interrupts for a higher privilege mode
+      than the current one are always globally enabled). So between two executions of
+      `j 3a7a`, the hardware traps:
+
+      | Register | Becomes |
+      |---|---|
+      | `scause` | `0x8000000000000005`: top bit = interrupt, code 5 = supervisor timer |
+      | `sepc` | `0x3a7a`, the jump that was about to execute and has **not** run |
+      | `sstatus.SPP` | 0, came from user mode |
+      | `sstatus.SPIE`, `SIE` | old `SIE` saved, interrupts **off** |
+      | `pc` | `stvec`, which points at [[uservec]] |
+
+      From here the path is the one [[tour:5]] follows for a system call: [[uservec]] saves
+      all 31 user registers in pid 5's [[g:trapframe]], switches to the kernel page table and
+      jumps to [[usertrap]]. ([[tour:7]] covers the trampoline in detail.) The hardware does
+      not distinguish "the program asked" from "the clock interrupted": only `scause` differs.
+
+      The trap changed `pc`, the mode and a few CSRs, but **not `sp`**. Hart 1 is now in
+      supervisor mode with `sp` still pointing into pid 5's user stack, so `uservec` must not
+      push anything. It saves the user `sp` into the trapframe ([[kernel/trampoline.S:41]])
+      and only then, at [[kernel/trampoline.S:76]], loads a kernel stack
+      ([[concept:stacks]] has the whole picture).
+
+  - title: usertrap saves the interrupted pc
+    file: kernel/trap.c
+    lines: 37-53
+    focus: 42-52
+    state:
+      hart: 1
+      mode: S
+      proc: pid 5 (usertests child)
+      intr: off
+      satp: kernel
+      locks: []
+      stack: [usertrap]
+      sp:
+        "on": kernel
+        switched: "`ld sp, 8(a0)` in [[uservec]] ([[kernel/trampoline.S:76]])"
+        detail: "`KSTACK(4)`, top `0x3fffff6000`; empty until `usertrap`'s frame"
+      irq: 0
+    note: |
+      [[usertrap]] does its usual opening: checks the trap came from user mode, points
+      `stvec` at [[kernelvec]], finds pid 5 with [[myproc]] (hart 1's `cpus[1].proc`), and
+      saves `sepc` into `p->trapframe->epc`: `0x3a7a`.
+
+      It runs on pid 5's own [[g:kernel-stack]]. [[uservec]] loaded `sp` from
+      `p->trapframe->kernel_sp`, which [[prepare_return]] always sets to the *top* of the
+      stack ([[kernel/trap.c:117]]). A process in user mode has nothing on its kernel stack,
+      so `usertrap`'s frame is the first thing on it. Pid 5 lives in `proc[4]`, so its kernel
+      stack is the page `KSTACK(4)`, mapped only in the kernel page table, with an unmapped
+      guard page below it.
+
+      Saving `sepc` matters more for an interrupt than for a system call. In a moment pid 5
+      may be switched off hart 1 and resumed on another hart, much later. Hart 1's `sepc` will
+      be overwritten many times by then, and the other hart's `sepc` has nothing to do with
+      pid 5. The trapframe travels with the process; the CSR stays with the hart.
+
+      Notice also what will *not* happen: no `epc += 4`. That adjustment is for `ecall`,
+      whose trap leaves `sepc` pointing at the `ecall` itself ([[kernel/trap.c:60-61]]);
+      resuming there would make the system call again. An interrupt is taken *before* the
+      instruction at `sepc` runs, so pid 5 must resume by executing `j 3a7a` itself.
+    others: |
+      [[myproc]] reads `cpus[cpuid()].proc`. Only hart 1 ever writes `cpus[1]`, so no lock is
+      needed; interrupts are off, so pid 5 cannot be moved to another hart between reading
+      `tp` and reading the array.
+
+  - title: Not a system call, so ask devintr
+    file: kernel/trap.c
+    lines: 54-79
+    focus: 69-70
+    state:
+      hart: 1
+      mode: S
+      proc: pid 5 (usertests child)
+      intr: off
+      satp: kernel
+      locks: []
+      stack: [usertrap]
+      sp: kernel
+      irq: 0
+    note: |
+      `scause` is not 8, so the system-call branch is skipped, and with it the
+      [[intr_on]] on line 66. Pid 5's whole trip through the kernel runs with interrupts
+      **off**, from the trap until `sret` returns it to user mode (on hart 0, as it turns
+      out). The kernel work for one tick is short, so nothing is lost by keeping them off, and it means no
+      second interrupt can arrive while this one is half handled.
+
+      [[devintr]] decides whether the trap was a device interrupt it recognizes, and returns
+      a code that `usertrap` keeps in `which_dev`: 2 for the timer, 1 for another device, 0
+      for "not mine". If it returned 0, the next test would try the page-fault handler and,
+      failing that, kill the process.
+    others: |
+      Hart 0 and hart 2 are still spinning in user mode. Their timers are independent; one
+      of them may trap a few milliseconds from now and walk this same code with its own
+      process, its own trapframe and its own kernel stack.
+
+  - title: devintr recognizes the timer
+    file: kernel/trap.c
+    lines: 187-220
+    focus: 213-216
+    state:
+      hart: 1
+      mode: S
+      proc: pid 5 (usertests child)
+      intr: off
+      satp: kernel
+      locks: []
+      stack: [usertrap, devintr]
+      sp: kernel
+      irq: 0
+    note: |
+      [[devintr]] reads `scause`. The first branch, `0x8000000000000009` (supervisor external
+      interrupt), is for devices behind the [[g:plic|PLIC]], such as the UART and the disk;
+      [[tour:9]] follows that path. Ours is `0x8000000000000005`, the supervisor timer
+      interrupt, so it calls [[clockintr]] and returns 2.
+
+      The timer needs no PLIC and no claim/complete handshake. It is not an external device
+      at all: it is part of each hart, compared against that hart's own `stimecmp`. That is
+      also why a timer interrupt always lands on the hart whose timer fired. Hart 1's tick
+      will never be delivered to hart 0.
+
+  - title: clockintr on hart 1 does not count
+    file: kernel/trap.c
+    lines: 166-180
+    focus: 169-174
+    state:
+      hart: 1
+      mode: S
+      proc: pid 5 (usertests child)
+      intr: off
+      satp: kernel
+      locks: []
+      stack: [usertrap, devintr, clockintr]
+      sp: kernel
+      irq: 0
+    note: |
+      [[clockintr]] has two jobs, and hart 1 does only the second.
+
+      The first job, lines 169–174, is to advance the kernel's clock, `ticks`. Only hart 0
+      does that. `cpuid()` is 1 here, so hart 1 skips the block and never touches
+      `tickslock`.
+
+      Why only one hart? Every hart gets a tick every 0.1 s. If all three counted, `ticks`
+      would advance about 30 times a second instead of 10, and the rate would depend on how
+      many CPUs QEMU was started with. One counter, fed by one hart, keeps "a tick" meaning
+      "about a tenth of a second". [[tour:14]] follows the counting side: `ticks++`,
+      `wakeup(&ticks)` and the processes sleeping in `pause`.
+    others: |
+      At some other moment, hart 0 runs these lines for its own tick:
+
+      | Time | Hart 0 | Hart 2 |
+      |---|---|---|
+      | t1 | `acquire(&tickslock)` | in [[sys_uptime]]: `acquire(&tickslock)`, spins |
+      | t2 | `ticks++`, `wakeup(&ticks)` | spinning |
+      | t3 | `release(&tickslock)` | gets the lock, reads the new value |
+
+      `ticks++` is a load, an add and a store. The lock makes it indivisible with respect to
+      every reader and to [[sys_pause]]'s check-then-sleep sequence on other harts.
+
+  - title: Re-arm the alarm, or drown in interrupts
+    file: kernel/trap.c
+    lines: 166-180
+    focus: 176-179
+    state:
+      hart: 1
+      mode: S
+      proc: pid 5 (usertests child)
+      intr: off
+      satp: kernel
+      locks: []
+      stack: [usertrap, devintr, clockintr]
+      sp: kernel
+      irq: 0
+    note: |
+      Every hart, including hart 1, does the second job: `stimecmp = time + 1000000`, the
+      next tick 0.1 s from now.
+
+      This write is also what **acknowledges** the interrupt. With Sstc, the timer interrupt
+      is pending exactly while `time >= stimecmp`. Moving `stimecmp` into the future makes it
+      stop being pending. If `clockintr` forgot this line, the condition would still be true
+      when pid 5 returned to user mode, and hart 1 would trap again immediately, forever,
+      never executing another user instruction.
+
+      The new deadline is computed from the current `time`, not from the previous deadline.
+      So if this hart was slow to take the interrupt (because it had interrupts off for a
+      while), the next tick is simply later. Ticks are never "made up" in a burst; the
+      schedule drifts a little instead.
+    others: |
+      Each hart writes only its own `stimecmp`, a per-hart register, so there is nothing to
+      lock. Hart 0 and hart 2 re-arm their own alarms when their own ticks arrive.
+
+  - title: Back in usertrap, the decision to yield
+    file: kernel/trap.c
+    lines: 80-95
+    focus: 81-86
+    state:
+      hart: 1
+      mode: S
+      proc: pid 5 (usertests child)
+      intr: off
+      satp: kernel
+      locks: []
+      stack: [usertrap]
+      sp: kernel
+      irq: 0
+    note: |
+      `which_dev` is 2. Two more decisions:
+
+      - Was pid 5 killed? [[killed]] reads `p->killed` under `p->lock`. If someone had run
+        `kill 5`, this is where a pure spinner would die, at its next tick. ([[tour:23]]
+        follows `kill`.)
+      - It is a timer interrupt, so call [[yield]].
+
+      This line is the whole of xv6's preemption policy: **every tick, the running process
+      gives up its CPU**. There is no priority, no measurement of how long pid 5 has run, no
+      quantum longer than one tick. Pid 5 has run for at most 0.1 s, and now it goes to the
+      back of the line, which in xv6 means: back in the process table as `RUNNABLE`, for any
+      hart's scheduler to find.
+
+  - title: yield takes pid 5's lock and marks it RUNNABLE
+    file: kernel/proc.c
+    lines: 499-508
+    focus: 504-505
+    state:
+      hart: 1
+      mode: S
+      proc: pid 5 (usertests child)
+      intr: off
+      satp: kernel
+      locks: ["pid 5's p->lock"]
+      stack: [usertrap, yield]
+      sp: kernel
+      irq: {noff: 1, intena: 0}
+    note: |
+      [[yield]] takes pid 5's `p->lock` and sets `p->state = RUNNABLE`.
+
+      The lock is needed because `p->state` is read by **every** hart's scheduler. The moment
+      this write is visible, the state says "pid 5 may be run by anyone". But pid 5 is still
+      running: it is on hart 1, executing `yield`, on its own [[g:kernel-stack]]. Its
+      registers have not been saved yet.
+
+      So the lock must stay held until pid 5 has fully stopped. It will: [[sched]] switches
+      to the scheduler *with the lock held*, and hart 1's scheduler releases it only after
+      the switch is complete. [[acquire]] also turns interrupts off, but they are already off,
+      so [[push_off]] records `intena = 0` in `cpus[1]`: when the last lock is released,
+      interrupts should stay off.
+      Compare a process that sleeps from a system call, where `intena` is 1
+      ([[concept:locks#intena]]).
+    others: |
+      Hart 2's scheduler may be scanning the table right now (if pid 7 just took its own
+      tick). Here is what the lock prevents:
+
+      | Time | Hart 1 (pid 5) | Hart 2 (scheduler) |
+      |---|---|---|
+      | t1 | holds pid 5's `p->lock`, `state = RUNNABLE` | `acquire(&proc[4].lock)`: **spins** |
+      | t2 | [[swtch]] saves pid 5's registers | spinning |
+      | t3 | hart 1's scheduler: `release(&p->lock)` | gets the lock, sees `RUNNABLE`, runs pid 5 |
+
+      Without the lock, hart 2 could see `RUNNABLE` at t1 and switch to pid 5 at once: two
+      harts executing on the same kernel stack, with hart 2 loading registers that hart 1 has
+      not finished saving. Both would crash, or worse, corrupt memory quietly.
+
+  - title: sched checks the rules
+    file: kernel/proc.c
+    lines: 479-497
+    focus: 483-494
+    state:
+      hart: 1
+      mode: S
+      proc: pid 5 (usertests child)
+      intr: off
+      satp: kernel
+      locks: ["pid 5's p->lock"]
+      stack: [usertrap, yield, sched]
+      sp: kernel
+      irq: {noff: 1, intena: 0}
+    note: |
+      [[sched]] is the only way into the scheduler, and it checks that the caller has
+      followed the rules:
+
+      - pid 5's `p->lock` is held ([[holding]]): yes.
+      - exactly one spinlock is held (`noff == 1`): yes, only `p->lock`.
+      - the state is no longer `RUNNING`: it is `RUNNABLE`.
+      - interrupts are off: yes.
+
+      Then it copies `cpus[1].intena` (0) into a local variable. That value describes pid 5's
+      path through the kernel, not hart 1, and pid 5 may resume on another hart, so it must
+      travel with pid 5. [[tour:13]] explains each check and the `intena` rule in depth.
+      (In this build the local lives in `s3`, which [[swtch]] saves:
+      [[concept:locks#sched-intena]].)
+    others: |
+      Why insist on exactly one lock? If pid 5 switched away holding, say, `tickslock`, that
+      lock would stay locked while pid 5 sat in the table. Hart 0's next [[clockintr]] would
+      spin on it with interrupts off, until some scheduler happened to run pid 5 again.
+
+  - title: swtch saves pid 5
+    file: kernel/swtch.S
+    lines: 8-40
+    focus: 10-23
+    state:
+      hart: 1
+      mode: S
+      proc: pid 5 (usertests child)
+      intr: off
+      satp: kernel
+      locks: ["pid 5's p->lock"]
+      stack: [usertrap, yield, sched, swtch]
+      sp: kernel
+      irq: {noff: 1, intena: 0}
+    note: |
+      `sched` calls `swtch(&p->context, &mycpu()->context)`.
+
+      The first fourteen `sd` instructions store pid 5's `ra`, `sp` and `s0`–`s11` into
+      `proc[4].context`. The saved `ra` is `0x80001e9c` in this build: the instruction in
+      [[sched]] right after its call to `swtch`. The saved `sp` points into pid 5's kernel
+      stack, which still holds the frames of `usertrap`, `yield` and `sched`:
+
+      ```text
+      pid 5's kernel stack (KSTACK(4), one page)
+        top ─► usertrap
+               yield
+               sched     ◄─ sp, saved in proc[4].context.sp
+      ```
+
+      (`swtch` itself is a leaf in assembly and pushes no frame.)
+
+      After these stores, pid 5's kernel thread is a frozen snapshot: a stack in memory and
+      112 bytes of registers. It will "return" from this same call when some hart switches
+      back to it. ([[tour:13]] takes `swtch` apart.)
+
+  - title: swtch loads hart 1's scheduler
+    file: kernel/swtch.S
+    lines: 8-40
+    focus: 26-40
+    state:
+      hart: 1
+      mode: S
+      proc: none (hart 1's scheduler; c->proc still says pid 5)
+      intr: off
+      satp: kernel
+      locks: ["pid 5's p->lock"]
+      stack: [main, scheduler, swtch]
+      sp:
+        "on": scheduler
+        switched: "`ld sp, 8(a1)` in [[swtch]] ([[kernel/swtch.S:26]])"
+        detail: "`sp` = `0x80009810` in this build (slice top `0x80009890`)"
+      irq: {noff: 1, intena: 0, note: "cpus[1] still holds pid 5's values; line 456 will set intena 0 anyway"}
+    note: |
+      The next fourteen `ld` instructions load `cpus[1].context`, saved the last time hart
+      1's scheduler switched away. Line 25 loads its `ra`, `0x80001df0`, the instruction in
+      [[scheduler]] right after *its* call to `swtch`. Line 26 loads its `sp`, which points
+      into hart 1's **scheduler stack**.
+
+      The `ld sp` on line 26 is the moment hart 1 changes threads: before it, `sp` pointed
+      into pid 5's kernel stack; after it, into the scheduler's. `ret` jumps to `ra`, and the
+      scheduler thread "returns" from a `swtch` call it made long ago. `c->proc` still names
+      pid 5 until line 460 clears it.
+
+      The scheduler stack is not new memory. It is hart 1's 4 KiB slice of `stack0`, the very
+      stack [[kernel/entry.S:17]] gave hart 1 at power-on: `main` called `scheduler`, which
+      never returns, so the boot stack simply became the scheduler stack
+      ([[concept:stacks#scheduler]]). In this build the slice is `0x80008890`–`0x80009890`,
+      and its top 128 bytes hold three frames: `start`'s 16 (never popped, because `start`
+      leaves by `mret`), `main`'s 16 and `scheduler`'s 96:
+
+      ```text
+      hart 1 now                          pid 5, frozen
+      stack0 slice (top 0x80009890)       KSTACK(4) (top 0x3fffff6000)
+        start (left by mret)                usertrap
+        main                                yield
+        scheduler  ◄─ sp 0x80009810         sched   (sp in proc[4].context)
+      ```
+
+      `swtch` never goes from one process's kernel stack straight to another's: every
+      switch passes through a scheduler stack.
+
+  - title: Hart 1's scheduler lets go of pid 5
+    file: kernel/proc.c
+    lines: 444-464
+    focus: 455-463
+    state:
+      hart: 1
+      mode: S
+      proc: none (hart 1's scheduler)
+      intr: off
+      satp: kernel
+      locks: ["pid 5's p->lock"]
+      stack: [main, scheduler]
+      sp: scheduler
+      irq: {noff: 1, intena: 0}
+    note: |
+      The scheduler resumes just after line 453, inside the loop iteration that picked pid 5
+      in the first place, with `p` still pointing at `proc[4]`.
+
+      - Line 456 sets `cpus[1].intena = 0`, so that releasing the lock leaves interrupts off.
+      Here it was 0 already (pid 5's value), but a process that slept from a system call
+      would have left 1 behind ([[concept:locks#sched-intena]]).
+      - Line 460: `c->proc = 0`. Hart 1 runs no process now; [[myproc]] on hart 1 returns 0.
+      - Line 463 releases pid 5's `p->lock`, the one `yield` took on this hart a few hundred
+        instructions ago, in a different thread.
+
+      Only now, at line 463, may another hart run pid 5. Its registers are safely in
+      `proc[4].context`, and no CPU is using its kernel stack.
+    others: |
+      If hart 2's scheduler was spinning on `proc[4].lock`, it gets the lock the instant
+      line 463 stores 0 into `locked`. The `release` ordering guarantees that hart 2 sees
+      all of hart 1's earlier stores, including the saved context, before it sees the lock
+      free ([[g:memory-barrier]]).
+
+  - title: Hart 1 keeps scanning and finds pid 4
+    file: kernel/proc.c
+    lines: 435-464
+    focus: 447-453
+    state:
+      hart: 1
+      mode: S
+      proc: none (hart 1's scheduler)
+      intr: off
+      satp: kernel
+      locks: ["pid 4's p->lock"]
+      stack: [main, scheduler]
+      sp: scheduler
+      irq: {noff: 1, intena: 0}
+    note: |
+      The loop goes on from where it was: `proc[5]` (pid 6, `RUNNING` on hart 0: skip),
+      `proc[6]` (pid 7, `RUNNING` on hart 2: skip), then the unused slots up to `proc[63]`,
+      each locked and unlocked in turn. At the end of the table, `found` is 1, so there is no
+      `wfi`; the outer loop opens and closes the interrupt window and starts again at
+      `proc[0]`.
+
+      `proc[0]` (init), `proc[1]` (sh) and `proc[2]` (usertests) are `SLEEPING` in `wait`.
+      `proc[3]` is pid 4, `RUNNABLE` since pid 7's write. Hart 1 takes its lock, sets
+      `RUNNING`, sets `c->proc`, and switches to it.
+
+      This is what the `preempt` test checks: three spinners on three harts cannot starve a
+      fourth process, because every tick sends one of them back to the table. Pid 4 will
+      return from `read`, then `kill` its three children.
+    others: |
+      Hart 1 holds one `p->lock` at a time while scanning: never two. Every other hart's
+      scheduler does the same, so the schedulers cannot deadlock against each other.
+      [[tour:12]] follows three schedulers scanning the same table.
+
+  - title: Hart 0's tick, and pid 5 is picked up
+    file: kernel/proc.c
+    lines: 435-464
+    focus: 447-453
+    state:
+      hart: 0
+      mode: S
+      proc: none (hart 0's scheduler)
+      intr: off
+      satp: kernel
+      locks: ["pid 5's p->lock"]
+      stack: [main, scheduler]
+      sp:
+        "on": scheduler
+        switched: "hart 0's own `ld sp, 8(a1)` in [[swtch]] ([[kernel/swtch.S:26]]), leaving pid 6"
+        detail: "`sp` = `0x80008810` in this build"
+      irq: {noff: 1, intena: 0}
+    note: |
+      Some time later (anything up to 0.1 s, since the harts' timers are not synchronized),
+      and in our run before hart 2's, hart 0's own timer fires while pid 6 spins. Hart 0 goes
+      through every step you have just seen: trampoline, `usertrap`, `devintr`,
+      `clockintr` (and, being hart 0, it also does `ticks++` under `tickslock`), `yield`,
+      `sched`, `swtch`. Hart 0's scheduler releases pid 6 and continues its scan from
+      `proc[6]`.
+
+      Pid 7 is running; the rest of the table is unused or sleeping; the scan wraps to
+      `proc[0]`. At `proc[3]`, pid 4 is now `RUNNING` on hart 1: skip. At `proc[4]`, pid 5:
+      `RUNNABLE`. Hart 0 takes `proc[4].lock`, sets `RUNNING` and `cpus[0].proc`, and calls
+      `swtch(&cpus[0].context, &proc[4].context)`.
+
+      Pid 5 is moving from hart 1 to hart 0. Nothing about pid 5 belongs to hart 1: its
+      registers are in its trapframe and its context, its kernel stack is its own, and its
+      page table is its own.
+    others: |
+      Hart 2 might reach `proc[4]` at the same moment. Both call [[acquire]]; the atomic
+      swap lets exactly one in. If hart 2 loses, it spins until hart 0's scheduler has set
+      `RUNNING`, switched, and pid 5's `yield` has released the lock; then hart 2 sees
+      `RUNNING` and moves on. Checking `RUNNABLE` and writing `RUNNING` under one lock is what
+      makes "pick this process" a single indivisible decision.
+
+      Each hart has its own `sp` register and its own scheduler stack. At this instant hart 0
+      is on its slice of `stack0`; hart 1 is on pid 4's kernel stack (finishing `read`) or,
+      a little later, its user stack; hart 2 is on pid 7's user stack, unless its own tick has
+      just arrived, in which case it is on pid 7's kernel stack or, as in the paragraph
+      above, already on its own scheduler stack. Three stacks in use at once, one per hart.
+
+  - title: Pid 5 wakes up inside sched, on hart 0
+    file: kernel/proc.c
+    lines: 479-497
+    focus: 496
+    state:
+      hart: 0
+      mode: S
+      proc: pid 5 (usertests child)
+      intr: off
+      satp: kernel
+      locks: ["pid 5's p->lock"]
+      stack: [usertrap, yield, sched]
+      sp:
+        "on": kernel
+        switched: "`ld sp, 8(a1)` in [[swtch]] ([[kernel/swtch.S:26]]), called by hart 0's scheduler"
+        detail: "`KSTACK(4)` again, with the `usertrap`, `yield`, `sched` frames hart 1 left"
+      irq: {noff: 1, intena: 0, note: "line 496 restored pid 5's own intena: 0, saved on hart 1"}
+    note: |
+      `swtch` loads `proc[4].context` and returns to `0x80001e9c`: the line after the
+      `swtch` call in [[sched]]. From pid 5's point of view, the call that began on hart 1
+      has just returned. Its stack, its local variables and its callee-saved registers are
+      exactly as it left them.
+
+      The `ld sp` in that `swtch` moved hart 0 from its scheduler stack onto pid 5's kernel
+      stack: the same page, `KSTACK(4)`, at the same virtual address, with the same three
+      frames hart 1 left behind. Kernel stacks are mapped in the one kernel page table that
+      every hart uses, so the stack does not need to move for the process to move; only the
+      `sp` register changes, and that register belongs to whichever hart loads it.
+
+      Line 496 calls [[mycpu]] *again*, and this time it returns `&cpus[0]`, because the
+      [[g:reg:tp|tp]] register, which `swtch` does not touch, holds this hart's number, 0.
+      It stores pid 5's saved `intena` (0) there ([[concept:locks#sched-intena]]). A pointer to `cpus[1]` kept from before
+      the switch would now be wrong: hart 1 is busy running pid 4.
+
+  - title: yield releases the lock hart 0's scheduler took
+    file: kernel/proc.c
+    lines: 499-508
+    focus: 507
+    state:
+      hart: 0
+      mode: S
+      proc: pid 5 (usertests child)
+      intr: off
+      satp: kernel
+      locks: []
+      stack: [usertrap, yield]
+      sp: kernel
+      irq: {noff: 0, note: "release took noff 1 → 0; intena was 0, so pop_off left SIE off"}
+    note: |
+      `sched` returns into [[yield]], which releases `p->lock`. This is the lock that hart
+      0's *scheduler* acquired at `proc[4]` a moment ago; pid 5's thread releases it.
+
+      [[release]] calls [[pop_off]]: `cpus[0].noff` drops to 0, and `cpus[0].intena` is 0,
+      so interrupts stay **off**. That is correct: pid 5 entered the kernel through a trap
+      with interrupts off and never turned them on.
+      They come back on only at `sret`, from the `SPIE` bit that [[prepare_return]] sets
+      ([[concept:locks#sie]]).
+
+      Look at the symmetry. On hart 1, `yield` acquired the lock and the scheduler released
+      it. On hart 0, the scheduler acquired it and `yield` released it. Each acquire and its
+      release happen on the same hart, but in different threads.
+    others: |
+      From the moment this lock is released, other harts' schedulers can lock `proc[4]`
+      again. They will see `RUNNING` and skip it. `p->lock` is *not* held while a process
+      runs; the `RUNNING` state is what keeps others away.
+
+  - title: prepare_return records hart 0
+    file: kernel/trap.c
+    lines: 97-132
+    focus: 116-131
+    state:
+      hart: 0
+      mode: S
+      proc: pid 5 (usertests child)
+      intr: off
+      satp: kernel
+      locks: []
+      stack: [usertrap, prepare_return]
+      sp: kernel
+      irq: 0
+    note: |
+      `yield` returns to [[usertrap]], which calls [[prepare_return]] exactly as after a
+      system call. Two of its lines matter especially after a migration:
+
+      - Line 119 stores `kernel_hartid = 0`. When pid 5 next traps (on hart 0, because a
+        process in user mode stays on its hart), [[uservec]] will load `tp = 0`. The value
+        written on hart 1 is now stale and is overwritten.
+      - Line 131 writes `sepc = p->trapframe->epc`, which is still `0x3a7a`. Hart 0's `sepc`
+        had held pid 6's address when hart 0's tick arrived; now it holds pid 5's.
+
+      Line 117 rewrites `kernel_sp` with the same value it always has, the top of
+      `KSTACK(4)`. By the time pid 5 next traps, `usertrap`'s frame will have been popped and
+      its kernel stack will be empty again, so the next trap can start from the top.
+
+      Then [[userret]] executes `fence.i` (it runs on every return to user space; this time
+      it actually matters, because pid 5 has never run on hart 0 before), switches `satp` to
+      pid 5's page table between two `sfence.vma`, restores its 31 registers from the
+      trapframe, and executes `sret`. Between `csrw satp` ([[kernel/trampoline.S:111]]) and
+      `ld sp, 48(a0)` ([[kernel/trampoline.S:118]]) hart 0 has no usable stack: `sp` still
+      holds a kernel-stack address that the user page table does not map. Line 118 loads
+      pid 5's user `sp` from the trapframe, where [[uservec]] saved it on hart 1; supervisor
+      code cannot use that stack, so it becomes usable only when `sret` returns to user mode.
+
+  - title: The jump executes, on a different CPU
+    file: user/usertests.c
+    lines: 855-872
+    focus: 866-868
+    state:
+      hart: 0
+      mode: U
+      proc: pid 5 (usertests child)
+      intr: on
+      satp: user
+      locks: []
+      stack: [main, drivetests, runtests, run, preempt]
+      sp:
+        "on": user
+        switched: "`ld sp, 48(a0)` in [[kernel:userret]] ([[kernel/trampoline.S:118]]) and `sret` ([[kernel/trampoline.S:153]])"
+    note: |
+      `sret` drops to user mode at `0x3a7a`, with interrupts enabled. Pid 5 executes
+      `j 3a7a`, and goes on spinning, now on hart 0. It cannot tell anything happened, except
+      that the clock on the wall moved more than its own work explains.
+
+      What this one tick cost, counted for this run. On hart 1: one trap; 31 user registers
+      saved by `uservec`, with one `csrw satp` and two `sfence.vma`; pid 5's `p->lock` taken
+      twice (in `killed` and in `yield`); two `swtch` calls (pid 5 → scheduler, scheduler →
+      pid 4) of 28 memory operations each; and a scan that acquired 63 `p->lock`s
+      (`proc[5]`…`proc[63]`, then `proc[0]`…`proc[3]`). Pid 5's own thread ran with
+      interrupts off the whole time; hart 1's scheduler opened its interrupt window once, at
+      the wrap-around. Hart 0 paid the second half to resume pid 5: after its own tick, a
+      `swtch` into pid 5, then `fence.i`, one `csrw satp`, two `sfence.vma`, 31 registers
+      restored by `userret`, and one `sret`.
+
+      The key ideas:
+
+      - The timer is what makes xv6 **preemptive**: [[usertrap]] calls [[yield]] on every
+        tick, so no process can keep a CPU.
+      - `p->lock` is held across the switch, from `yield` until the scheduler has finished
+        switching away, so no hart can run a process that another hart has not finished
+        leaving.
+      - Everything a process needs travels with it (trapframe, context, kernel stack);
+        everything a hart owns (`tp`, `sepc`, `stimecmp`, `cpus[i]`) stays put and is
+        rewritten for whoever runs next.
+locks:
+  - lock: "pid 5's p->lock (spinlock)"
+    where: "[[kernel:killed]] (briefly, trap.c:81); [[kernel:yield]] acquires and hart 1's [[kernel:scheduler]] releases; hart 0's scheduler acquires and [[kernel:yield]] releases"
+    protects: "`p->state`, and the guarantee that no other hart runs pid 5 until it has fully left its CPU"
+  - lock: "each p->lock in turn (spinlock)"
+    where: "[[kernel:scheduler]]'s scan, one slot at a time"
+    protects: "Reading `p->state` and claiming a `RUNNABLE` process as one indivisible step"
+  - lock: "tickslock (spinlock)"
+    where: "[[kernel:clockintr]], on hart 0 only"
+    protects: "`ticks`, and the wakeup of processes sleeping on `&ticks`"
+  - lock: "stimecmp (no lock: per-hart register)"
+    where: "[[kernel:clockintr]], on every hart"
+    protects: "Nothing to protect: each hart writes only its own timer-compare register"
+  - lock: "cpus[i] (no lock: per-hart, interrupts off)"
+    where: "[[kernel:myproc]], [[kernel:sched]], [[kernel:scheduler]]"
+    protects: "Each hart writes only its own `struct cpu`, with interrupts off so the thread cannot migrate mid-access"
+quiz:
+  - q: "Pid 5 never executes `ecall`. Which hardware and kernel facts together guarantee that it loses hart 1 within about 0.1 seconds?"
+    a: "Hart 1's `stimecmp` was armed for `time + 1000000`, and in user mode a pending, locally enabled (`sie.STIE`) supervisor interrupt is taken regardless of `sstatus.SIE`, so the trap is unavoidable. [[kernel:usertrap]] then calls [[kernel:yield]] whenever `devintr` returns 2."
+  - q: "What would happen if `clockintr` stopped writing `stimecmp` on harts 1 and 2 (thinking only hart 0's ticks matter)?"
+    a: "With Sstc the timer interrupt stays pending while `time >= stimecmp`. As soon as harts 1 and 2 returned to user mode (or turned interrupts on in the scheduler), they would trap again immediately, forever, and make no progress."
+  - q: "Suppose `yield` released `p->lock` *before* calling `sched`. Describe an interleaving that breaks."
+    a: "Hart 1 sets `RUNNABLE` and releases the lock; hart 2's scheduler immediately takes it, sees `RUNNABLE`, and swtches to pid 5's saved context, which is stale, while hart 1 is still running on pid 5's kernel stack. Two harts would run the same kernel thread on one stack."
+  - q: "Why does `usertrap` add 4 to `epc` for a system call but not for a timer interrupt?"
+    a: "An `ecall` trap leaves `sepc` pointing at the `ecall` itself, so returning there would repeat the system call; the kernel adds 4 to resume at the next instruction. An interrupt is taken before the instruction at `sepc` executes, so the process must resume at that very instruction (`j 3a7a`) or it would skip it."
+  - q: "After the migration, line 496 of `sched` calls `mycpu()` again instead of reusing a pointer from before `swtch`. What would go wrong with the old pointer?"
+    a: "It would point at `cpus[1]`, but pid 5 now runs on hart 0. Writing `intena` there would corrupt the state of whatever hart 1 is doing (it is running pid 4), and hart 0's `intena` would never receive pid 5's value. Here both values happen to be 0, but for a thread that went to sleep with interrupts on they differ ([[tour:13]])."
+  - q: "Only hart 0 increments `ticks`. If hart 0 holds a spinlock with interrupts off for a long time, what happens to `ticks`?"
+    a: "The timer interrupt becomes pending and stays pending; it is taken once, when hart 0 re-enables interrupts. However long the delay, it counts as only one tick, and because `clockintr` re-arms relative to the current `time`, the missed ticks are never made up: `ticks` falls behind real time."

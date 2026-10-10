@@ -1,0 +1,859 @@
+title: Traps taken inside the kernel
+group: Traps and system calls
+prerequisites: [5, 7]
+summary: |
+  In [[tour:5]] a trap came from user mode: the program asked for help, and the
+  [[g:trampoline]] switched page tables, saved 31 registers and found a kernel stack. This
+  tour is about the other kind of trap: one that hits the **kernel itself**, in the middle of
+  kernel code, at an instruction the kernel did not choose.
+
+  The scene: the user typed `zombie & ; cat README`. `cat` (pid 3) is inside its `read`
+  system call on hart 2, copying file bytes into
+  its user buffer, when hart 2's [[g:timer-interrupt|timer]] goes off. You will watch the
+  hardware divert hart 2 into [[kernelvec]], see why it saves only some registers, follow
+  [[kerneltrap]] and [[clockintr]], and then watch `cat` give up hart 2 from *inside the
+  kernel* with [[yield]], and come back later on hart 0, in the middle of the same `memmove`.
+
+  Along the way you meet the rule that makes kernel interrupts safe at all: **a hart holding a
+  spinlock never takes an interrupt**. You will see what goes wrong without it (a hart that
+  deadlocks against itself), and the bookkeeping (`noff`, `intena`) that makes the rule work
+  even across a context switch.
+cast: |
+  The machine has three [[g:hart|harts]]. When the tour starts:
+
+  | Hart | What it is doing |
+  |---|---|
+  | 0 | Running `zombie` (pid 5), which has just forked its child (pid 6) and is about to call `pause(5)` |
+  | 1 | Idle in its [[kernel:scheduler]], waiting in `wfi` for something to happen |
+  | 2 | Running `cat README` (pid 3) **in the kernel**, inside `read`: the thread this tour follows |
+
+  Both came from one command line, the first typed after boot: `zombie & ; cat README`. The
+  shell (pid 2) forked pid 3 to run the list; pid 3 forked pid 4 for `zombie &`, which
+  forked pid 5 to exec `zombie` and exited; pid 3 reaped it and then exec'd `cat` itself.
+
+  The shell (pid 2) is asleep in [[kernel:kwait]], waiting for `cat`.
+steps:
+  - title: cat is in the kernel, reading README
+    file: kernel/file.c
+    lines: 105-130
+    focus: 122
+    state:
+      hart: 2
+      mode: S
+      proc: cat (pid 3)
+      intr: on
+      satp: kernel
+      locks: ["README's inode lock (sleep-lock)"]
+      stack: [usertrap, syscall, sys_read, fileread]
+      sp: {"on": kernel, detail: "cat's kernel stack, `KSTACK(2)`, top `0x3fffffa000`"}
+      irq: 0
+    note: |
+      `cat` called `read(3, buf, 512)` ([[user/cat.c:12]]). Everything up to here is the path
+      of [[tour:5]]: `ecall`, the trampoline, [[usertrap]], [[syscall]], [[sys_read]], and now
+      [[fileread]]. README is an `FD_INODE` file, so `fileread` locks the inode with
+      [[ilock]] and calls [[readi]].
+
+      Two facts about the machine state matter for this whole tour:
+
+      - **Interrupts are on.** [[usertrap]] turned them on with [[intr_on]] before calling
+        `syscall()` ([[kernel/trap.c:66]]). A system call can take a long time, and a hart that
+        ignored its timer and its devices for that long would make the whole machine
+        sluggish. So the kernel runs interruptible most of the time.
+      - **`cat` holds a [[g:sleeplock]]**, the inode's `ip->lock`, not a [[g:spinlock]].
+        Holding a sleep-lock leaves interrupts alone. Keep that in mind: it is the reason the
+        timer is allowed to interrupt this code at all.
+    others: |
+      Hart 0 is about to enter the kernel too, for `pause(5)`. Hart 1 is idle. Any of the
+      three harts can take an interrupt at any instruction where its interrupts are enabled,
+      and each hart has its own timer, so hart 2's tick has nothing to do with hart 0's.
+
+  - title: Deep inside copyout, in the middle of memmove
+    file: kernel/vm.c
+    lines: 345-377
+    focus: 370
+    state:
+      hart: 2
+      mode: S
+      proc: cat (pid 3)
+      intr: on
+      satp: kernel
+      locks: ["README's inode lock (sleep-lock)", "README block's buffer lock (sleep-lock)"]
+      stack: [usertrap, syscall, sys_read, fileread, readi, either_copyout, copyout, memmove]
+      sp: {"on": kernel, detail: "cat's kernel stack: eight frames, `usertrap` to `memmove`"}
+      irq: 0
+    note: |
+      [[readi]] called [[bread]], which returns the disk block with its buffer's sleep-lock
+      held, and then [[either_copyout]] → [[copyout]] to move up to 512 bytes into `cat`'s
+      `buf`. Line 370 hands the actual copy to [[memmove]] (in this build, the `jal` at
+      `0x80001584` in `kernel/kernel.asm`).
+
+      Picture hart 2 halfway through that copy. Its registers are full of live values:
+      `memmove`'s source and destination pointers in `a`-registers, a loop counter, the return
+      address `ra` pointing back into `copyout`. The kernel stack holds eight frames, from
+      `usertrap` at the top of `cat`'s [[g:kernel-stack]] down to `memmove`.
+
+      Nothing here expects to be interrupted. `memmove` does not save anything "just in
+      case". If the timer fires now, whatever handles it must leave every one of these
+      registers exactly as it found them, and must not disturb the stack frames below the
+      current `sp`.
+    others: |
+      The two sleep-locks keep other processes away from README's inode and from this
+      disk block. A process on hart 0 or 1 that wanted the same block would sleep in
+      [[acquiresleep]], giving up its hart. Neither lock disables interrupts, so hart 2's
+      timer can still fire.
+
+  - title: Where a kernel trap will land
+    file: kernel/trap.c
+    lines: 19-53
+    focus: 45-47
+    state:
+      hart: 2
+      mode: S
+      proc: cat (pid 3)
+      intr: off
+      satp: kernel
+      locks: []
+      stack: [usertrap]
+      sp: {"on": kernel, detail: "cat's kernel stack, earlier, at the start of the `read` system call"}
+      irq: 0
+    note: |
+      This step looks back a moment, to when `cat` entered the kernel for `read` on hart 2.
+      Every trap that is handled in supervisor mode (in xv6 that is all of them, because
+      [[start]] delegated them) begins at the address in [[g:csr:stvec|stvec]]. So which handler runs
+      depends entirely on what `stvec` holds *at the moment of the trap*.
+
+      While `cat` is in the kernel, it holds [[kernelvec]], because of two writes:
+
+      - [[trapinithart]] sets it once per hart at boot ([[kernel/main.c:24]] on hart 0,
+        [[kernel/main.c:40]] on the others).
+      - [[usertrap]] sets it again on **every** entry from user mode (line 47), because the
+        last return to user mode ([[prepare_return]]) pointed it at `uservec` in the
+        trampoline.
+
+      Why not let kernel traps go to `uservec` too? `uservec` stores registers through the
+      virtual address `TRAPFRAME`, which exists only in *user* page tables. The kernel page
+      table does not map it ([[kernel/proc.h:33]]). A kernel trap there would fault on its
+      very first store, and that fault would go to `uservec` again, forever. Two kinds of
+      trap, two entry points.
+
+      In this build `kernelvec` is at `0x800055b0`. The `.align 4` in
+      [[kernel/kernelvec.S:11]] makes its low bits zero, which `stvec` needs: its two low bits
+      select the vectoring mode, and 0 means "jump straight to this address".
+
+  - title: Hart 2's timer is armed
+    file: kernel/start.c
+    lines: 30-66
+    focus: 31-33
+    state:
+      hart: 2
+      mode: M
+      proc: none (boot)
+      intr: off
+      satp: bare
+      locks: []
+      stack: [start]
+      sp: {"on": boot, detail: "hart 2's slice of `stack0`, top `0x8000a890`, at boot"}
+    note: |
+      Another look back, this time to boot. The timer that is about to fire on hart 2 was set
+      up in machine mode, by [[start]] and [[timerinit]], on every hart:
+
+      - `mideleg` (line 32) delegates interrupts to supervisor mode, so they go to `stvec`,
+        not to a machine-mode handler.
+      - Line 33 sets `STIE` in [[g:csr:sie|sie]]: supervisor *timer* interrupts are wanted.
+      - [[timerinit]] turns on the [[g:sstc]] extension (`menvcfg.STCE`) and writes the
+        first deadline into [[g:csr:stimecmp|stimecmp]].
+
+      With Sstc, the rule is pure hardware: whenever the hart's [[g:csr:time|time]] counter
+      is greater than or equal to its `stimecmp`, the timer-pending bit `STIP` in `sip` is 1.
+      An interrupt is actually *taken* in supervisor mode only when three things line up:
+      `STIP` pending, `STIE` enabled, and `sstatus.SIE`, the global switch, set.
+
+      Each hart has its own `stimecmp`. The deadlines drift apart, so ticks on different
+      harts are not synchronized. Back in the present, hart 2's deadline arrives while `cat` is
+      in `memmove`, with `SIE` set to 1. All three conditions hold.
+
+  - title: The hardware diverts hart 2 into kernelvec
+    file: kernel/kernelvec.S
+    lines: 1-14
+    focus: 12-14
+    state:
+      hart: 2
+      mode: S
+      proc: cat (pid 3)
+      intr: off
+      satp: kernel
+      locks: ["README's inode lock (sleep-lock)", "README block's buffer lock (sleep-lock)"]
+      stack: [usertrap, syscall, sys_read, fileread, readi, either_copyout, copyout, memmove, kernelvec]
+      sp: {"on": kernel, detail: "cat's kernel stack, with a 256-byte `kernelvec` frame pushed on top; no switch"}
+      irq: {noff: 0, note: "cat holds only sleep-locks, so noff is 0 and SIE was on: that is why the timer could be taken"}
+    note: |
+      Between two instructions of `memmove`, hart 2 takes the trap. In one step the hardware:
+
+      | Register | Becomes |
+      |---|---|
+      | `sepc` | the address of the `memmove` instruction that did **not** run yet |
+      | `scause` | `0x8000000000000005`: top bit 1 = interrupt, code 5 = supervisor timer |
+      | `sstatus.SPP` | 1: the trap came from supervisor mode |
+      | `sstatus.SPIE` | 1: the old `SIE` |
+      | `sstatus.SIE` | 0: interrupts **off** |
+      | `pc` | `stvec`, which is `kernelvec` |
+
+      Compare with [[tour:5]]'s `ecall`: the privilege mode does not change (S stays S),
+      and `satp` was already the kernel page table, so there is no page-table switch and no
+      trampoline. The hart is still on `cat`'s kernel stack, with a perfectly good `sp`.
+
+      So [[kernelvec]] does the simplest possible thing: line 14 makes room for 256 bytes
+      *below* the current `sp`, on the very same kernel stack. The frames of `usertrap`
+      through `memmove` sit above it, untouched. ([[g:csr:sepc|sepc and scause]],
+      [[g:trap-cause]])
+
+      ```text
+      cat's kernel stack (KSTACK(2), 0x3fffff9000–0x3fffffa000)
+        top ─► usertrap
+               syscall
+               sys_read
+               fileread
+               readi
+               either_copyout
+               copyout
+               memmove          ◄─ interrupted here (sepc)
+               kernelvec frame  256 bytes, being filled
+        sp ──►
+      ```
+
+      There is no separate interrupt stack in xv6 and no stack switch here: a kernel trap
+      **pushes a frame onto whatever stack is current** ([[concept:stacks]]). That is safe
+      only because the current stack is the interrupted thread's own and has room: one page,
+      with an unmapped [[g:guard-page]] below it, so an overflow faults instead of silently
+      corrupting a neighbor.
+    others: |
+      Notice what hart 2 did **not** need: a lock, or any per-CPU scratch area. The trap is
+      saved on the stack of the thread that was running, and only this hart uses that stack
+      right now. If hart 0's timer fires at the same moment, it saves *its* registers on
+      whatever stack *its* `sp` points into: `zombie`'s kernel stack if it is in a system
+      call, or its scheduler stack if it is idle. Each hart has its own `sp`. Nothing is
+      shared.
+
+  - title: Saving only the caller-saved registers
+    file: kernel/kernelvec.S
+    lines: 13-38
+    focus: 16-35
+    state:
+      hart: 2
+      mode: S
+      proc: cat (pid 3)
+      intr: off
+      satp: kernel
+      locks: ["README's inode lock (sleep-lock)", "README block's buffer lock (sleep-lock)"]
+      stack: [usertrap, syscall, sys_read, fileread, readi, either_copyout, copyout, memmove, kernelvec]
+      sp: {"on": kernel, detail: "cat's kernel stack, `kernelvec` frame on top"}
+      irq: 0
+    note: |
+      `uservec` saved all 31 registers. `kernelvec` saves 17: `ra`, `gp`, `t0`–`t6` and
+      `a0`–`a7`. Why is that enough?
+
+      Because the next thing it does is `call kerneltrap`, an ordinary C function, and the
+      RISC-V [[g:calling-convention]] promises that a C function returns with `sp` and the
+      **callee-saved** registers `s0`–`s11` unchanged. If [[kerneltrap]] or anything it calls
+      uses an `s` register, the compiler saves and restores it in that function's own frame.
+      The only registers C code may destroy are the **caller-saved** ones, so those are the
+      ones `kernelvec` must protect. (`gp` is saved too, although kernel C code never changes
+      it; it costs one store.)
+
+      Three registers are deliberately left alone:
+
+      - `sp` (line 18, commented out): it is the stack pointer itself. Line 61 undoes line 14.
+      - `tp` (line 20, commented out): it holds the hart ID ([[g:reg:tp]]). You will see in
+        step 20 why restoring an old copy would be *wrong*.
+      - `s0`–`s11`: protected by the calling convention, as above.
+
+      The frame is 256 bytes, 32 slots of 8, laid out as if all 32 registers were saved
+      (`a0` at 72, `t3` at 216); the slots for `sp`, `tp` and the `s` registers stay
+      unused. 256 also keeps `sp` 16-byte aligned, as the calling convention requires.
+
+  - title: kerneltrap copies sepc, sstatus and scause first
+    file: kernel/trap.c
+    lines: 134-148
+    focus: 140-142
+    state:
+      hart: 2
+      mode: S
+      proc: cat (pid 3)
+      intr: off
+      satp: kernel
+      locks: ["README's inode lock (sleep-lock)", "README block's buffer lock (sleep-lock)"]
+      stack: [usertrap, syscall, sys_read, fileread, readi, either_copyout, copyout, memmove, kernelvec, kerneltrap]
+      sp: {"on": kernel, detail: "cat's kernel stack, `kerneltrap`'s frame above the `kernelvec` frame"}
+      irq: 0
+    note: |
+      The first thing [[kerneltrap]] does is copy three trap [[g:csr|CSRs]] into local
+      variables. They are the only record of *where* `memmove` stopped and *in what state*,
+      and they are **per-hart registers**, not per-thread: the next trap on hart 2,
+      whoever it belongs to, will overwrite them.
+
+      Look at what the compiler made of these lines in this build (`kernel/kernel.asm`):
+
+          800026e0: csrr s2,sepc
+          800026e4: csrr s1,sstatus
+          800026e8: csrr a5,scause
+
+      `sepc` and `sstatus` went into `s2` and `s1`, **callee-saved** registers, which
+      `kerneltrap`'s prologue had already saved in its own 48-byte frame. That detail is the
+      whole trick of this tour: from now on, the interrupted `memmove`'s PC and status live
+      in registers and stack memory that belong to `cat`'s **thread**. If `cat` is switched
+      out and later resumes, even on another hart, these values come back with it, because
+      [[swtch]] saves and restores `s` registers and the stack goes wherever the thread goes.
+
+  - title: Two sanity checks
+    file: kernel/trap.c
+    lines: 136-154
+    focus: 144-147
+    state:
+      hart: 2
+      mode: S
+      proc: cat (pid 3)
+      intr: off
+      satp: kernel
+      locks: ["README's inode lock (sleep-lock)", "README block's buffer lock (sleep-lock)"]
+      stack: [usertrap, syscall, sys_read, fileread, readi, either_copyout, copyout, memmove, kernelvec, kerneltrap]
+      sp: kernel
+      irq: 0
+    note: |
+      Before trusting anything, `kerneltrap` checks two invariants:
+
+      - **`SPP` must be 1.** `kernelvec` is only for traps from supervisor mode. If `SPP`
+        were 0, a trap from *user* mode reached `kernelvec`, which means `stvec` was wrong
+        while a process ran in user mode, and the "kernel stack" in `sp` is really a user
+        stack pointer. Nothing sensible can be done; panic.
+      - **Interrupts must be off.** The hardware cleared `SIE` on entry. If it is on now,
+        something re-enabled interrupts while trap state was still unsaved, and a second
+        trap could have overwritten `sepc` before line 140 read it.
+
+      Then line 149 calls [[devintr]] to find out what happened. If the answer is
+      "nothing I recognize", the kernel cannot continue: an *exception* in kernel code (a
+      bad pointer, an illegal instruction) means the kernel itself is broken. That path,
+      printing `scause`, `sepc` and `stval` and calling [[panic]], is the subject of
+      [[tour:10]].
+
+  - title: devintr decodes scause
+    file: kernel/trap.c
+    lines: 182-219
+    focus: 190-192
+    state:
+      hart: 2
+      mode: S
+      proc: cat (pid 3)
+      intr: off
+      satp: kernel
+      locks: ["README's inode lock (sleep-lock)", "README block's buffer lock (sleep-lock)"]
+      stack: [usertrap, syscall, sys_read, fileread, readi, either_copyout, copyout, memmove, kernelvec, kerneltrap, devintr]
+      sp: kernel
+      irq: 0
+    note: |
+      [[devintr]] is shared by both trap paths: [[usertrap]] calls it for traps from user
+      mode, `kerneltrap` for traps from the kernel. It reads `scause` again (it has not
+      changed: interrupts are off) and compares it with two values:
+
+      | `scause` | Meaning | Handled by |
+      |---|---|---|
+      | `0x8000000000000009` | supervisor external interrupt (a device, via the [[g:plic|PLIC]]) | [[plic_claim]], the driver, [[plic_complete]]: [[tour:9]] |
+      | `0x8000000000000005` | supervisor timer interrupt | [[clockintr]], line 215 |
+      | anything else | not a device interrupt | return 0 |
+
+      Ours is `...05`. `devintr` calls [[clockintr]] and returns **2**, the code that means
+      "this was the timer". That 2 is what will make `cat` give up the CPU.
+
+  - title: clockintr on hart 2 re-arms the timer, and nothing else
+    file: kernel/trap.c
+    lines: 166-180
+    focus: 169-179
+    state:
+      hart: 2
+      mode: S
+      proc: cat (pid 3)
+      intr: off
+      satp: kernel
+      locks: ["README's inode lock (sleep-lock)", "README block's buffer lock (sleep-lock)"]
+      stack: [usertrap, syscall, sys_read, fileread, readi, either_copyout, copyout, memmove, kernelvec, kerneltrap, devintr, clockintr]
+      sp: kernel
+      irq: 0
+    note: |
+      [[clockintr]] has two jobs, and hart 2 does only the second.
+
+      1. **Count time.** Only hart 0 increments the global [[ticks]] counter (line 169). Every
+         hart gets timer interrupts, so if each one counted, `ticks` would run three times too
+         fast. Hart 2 skips the block, and so takes no lock at all.
+      2. **Ask for the next tick.** Line 179 writes `stimecmp = time + 1000000`. On QEMU's
+         10 MHz `time` counter that is a tenth of a second ahead. Because `time` is now *below*
+         `stimecmp`, the Sstc hardware clears `STIP`. That write is how a timer interrupt is
+         acknowledged; forget it, and the interrupt would be pending again the instant
+         interrupts came back on, and hart 2 would trap forever.
+
+      Hart 2 returns 2 up through `devintr` to `kerneltrap`.
+    others: |
+      At about this time, hart 0's own timer fires (its deadline is independent of hart 2's).
+      Hart 0 runs the same `clockintr` and does take the first branch: [[acquire]]
+      `tickslock`, `ticks++`, [[wakeup]]`(&ticks)` to wake any `pause` sleepers, release. The
+      lock is needed because `sys_pause` and `sys_uptime` (on any hart, including hart 0
+      itself) read `ticks` under it, and `sys_pause` relies on it so that a wakeup cannot
+      slip in between checking `ticks` and going to sleep. Hold on to that: the next three steps are about what this very lock teaches.
+
+  - title: "Meanwhile on hart 0: zombie takes tickslock"
+    file: kernel/sysproc.c
+    lines: 67-90
+    focus: 77-78
+    state:
+      hart: 0
+      mode: S
+      proc: zombie (pid 5)
+      intr: off
+      satp: kernel
+      locks: [tickslock]
+      stack: [usertrap, syscall, sys_pause]
+      sp: {"on": kernel, detail: "zombie's kernel stack, on hart 0"}
+      irq: {noff: 1, intena: 1}
+    note: |
+      Let's leave hart 2 for a moment. `zombie` on hart 0 has called `pause(5)`, and
+      [[sys_pause]] takes `tickslock` to read `ticks` consistently with the timer handler.
+
+      Here is the danger. `tickslock` is a lock that **an interrupt handler also takes**
+      ([[clockintr]], on hart 0). Suppose `acquire` left interrupts on, and hart 0's timer
+      fired right now:
+
+      | Time | Hart 0 |
+      |---|---|
+      | t1 | `sys_pause`: `acquire(&tickslock)` succeeds |
+      | t2 | timer interrupt → `kernelvec` → `kerneltrap` → `clockintr` |
+      | t3 | `acquire(&tickslock)`: already locked, **spin** |
+      | t4 | spins forever: the holder is `sys_pause`, frozen *underneath* the handler on the same hart; it can only continue after the handler returns |
+
+      A hart [[g:deadlock|deadlocked]] against itself, with one lock. Soon every other hart
+      that wants `tickslock` (any `pause`, any `uptime`) spins forever too, with interrupts
+      off, and the machine is dead.
+
+      (In xv6 you would actually see a panic at t3, not a silent hang: `acquire` checks
+      [[holding]] first and calls `panic("acquire")`. The bug would still be fatal.)
+    others: |
+      Contrast the harmless case: if *hart 1* held `tickslock` when hart 0's timer fired,
+      hart 0's `clockintr` would spin only until hart 1 finished its few instructions and
+      released it. Waiting for **another hart** is ordinary contention. Waiting for
+      **yourself** is deadlock. Interrupts make "yourself" possible, because the handler
+      runs on top of whatever the hart was doing.
+
+  - title: acquire turns interrupts off first
+    file: kernel/spinlock.c
+    lines: 19-42
+    focus: 24-37
+    state:
+      hart: 0
+      mode: S
+      proc: zombie (pid 5)
+      intr: off
+      satp: kernel
+      locks: []
+      stack: [usertrap, syscall, sys_pause, acquire]
+      sp: kernel
+      irq: {noff: 1, intena: 1, note: "push_off on line 24 has run; `tickslock` is not ours until the swap on line 37 returns 0"}
+    note: |
+      xv6's fix is blunt and complete: **[[acquire]] disables interrupts on this hart before
+      it even tries for the lock** (line 24, [[push_off]]), for *every* spinlock, and they
+      stay off until the matching [[release]]. While hart 0 holds `tickslock`, its timer
+      can be pending, but it is not taken. It waits, and fires the instant `release`
+      re-enables interrupts, when the lock is free and `clockintr` can take it.
+
+      Two details of the order:
+
+      - Interrupts go off **before** the swap on line 37, not after. Otherwise an interrupt
+        could land between winning the lock and disabling interrupts: the very window the
+        rule closes.
+      - It applies to *all* spinlocks, not only those that handlers use. Tracking which locks
+        interrupt handlers might take is error-prone; turning interrupts off is cheap, and
+        critical sections are short.
+
+      So the answer to "what if the timer had interrupted `cat` while it held a spinlock?"
+      is: **it can't**. This is the [[g:interrupts-and-locks]] rule, and it is why the
+      timer could interrupt `cat` in step 2 only because `cat` held nothing but sleep-locks
+      ([[concept:locks#invariant]]).
+    others: |
+      The rule is per hart. Hart 0 turning its interrupts off does nothing to hart 1 or 2:
+      their timers and devices keep interrupting them. A device interrupt that would have
+      gone to hart 0 is simply claimed by another hart through the PLIC ([[tour:9]]).
+
+  - title: push_off and pop_off count the nesting
+    file: kernel/spinlock.c
+    lines: 88-116
+    focus: 98-102
+    state:
+      hart: 0
+      mode: S
+      proc: zombie (pid 5)
+      intr: off
+      satp: kernel
+      locks: []
+      stack: [usertrap, syscall, sys_pause, acquire, push_off]
+      sp: kernel
+      irq: {noff: 1, intena: 1, note: "after line 102: SIE was on in `sys_pause`, so intena = 1"}
+    note: |
+      Code often holds two spinlocks at once (in a minute, `cat` will hold none and then
+      one; [[clockintr]] holds `tickslock` while [[wakeup]] takes each `p->lock` in turn). Releasing the inner lock
+      must not turn interrupts back on while the outer one is still held. So [[push_off]]
+      and [[pop_off]] keep two per-hart counters in [[kernel:cpu|struct cpu]]:
+
+      - `noff`: how many `push_off`s are outstanding on this hart.
+      - `intena`: whether interrupts were on before the **first** `push_off`.
+
+      Line 97 uses [[g:insn:csrrci|csrrci]] to clear `SIE` and read its old value in one
+      instruction. Only when `noff` returns to 0 does `pop_off` restore what `intena`
+      recorded. And `pop_off` panics if it finds interrupts *on* while a lock is held, a
+      cheap check that catches code that broke the rule.
+
+      For hart 0 here: interrupts were on in `sys_pause`, so `intena = 1`, `noff = 1`. When
+      `sys_pause` releases `tickslock` (line 84, after [[sleep_prepare]] has already released
+      `p->lock`), `noff` drops to 0 and interrupts come back on; if hart 0's timer became
+      pending while it held the lock, the interrupt is taken right there
+      ([[concept:locks#noff]]).
+
+  - title: Back on hart 2, kerneltrap decides to yield
+    file: kernel/trap.c
+    lines: 149-164
+    focus: 156-158
+    state:
+      hart: 2
+      mode: S
+      proc: cat (pid 3)
+      intr: off
+      satp: kernel
+      locks: ["README's inode lock (sleep-lock)", "README block's buffer lock (sleep-lock)"]
+      stack: [usertrap, syscall, sys_read, fileread, readi, either_copyout, copyout, memmove, kernelvec, kerneltrap]
+      sp: {"on": kernel, detail: "cat's kernel stack, `kernelvec` frame in the middle"}
+      irq: 0
+    note: |
+      `which_dev` is 2, and [[myproc]] returns `cat`. So `kerneltrap` calls [[yield]]: `cat`
+      has had its slice of hart 2, and it will give someone else a turn, **from inside a
+      system call**, in the middle of `memmove`. This is preemption in the kernel, and it is
+      exactly why kernel code must be written as if it could stop at any instruction where
+      interrupts are on.
+
+      Why check `myproc() != 0`? A hart with no current process is running its
+      [[scheduler]] thread. Look at [[kernel/proc.c:441]]: each round of the scheduler loop
+      briefly turns interrupts on and off, so pending interrupts get delivered right there
+      (hart 1, idle in `wfi`, takes its ticks this way). The scheduler has no process to give
+      up, and its "yield" would be meaningless, so the tick only re-arms the timer. That
+      trap's `kernelvec` frame goes onto hart 1's **scheduler stack**, its slice of
+      [[stack0]], right below `scheduler`'s own frame (`gdb` shows `sp = 0x80009810` on
+      entry to `kernelvec` there). It is pushed and popped without ever leaving that stack.
+
+      The deeper story of `yield`, `sched` and the scheduler's choice is [[tour:11]]. Here we
+      watch only what it means for the interrupted kernel code.
+
+  - title: yield takes cat's p->lock
+    file: kernel/proc.c
+    lines: 499-508
+    focus: 505-506
+    state:
+      hart: 2
+      mode: S
+      proc: cat (pid 3)
+      intr: off
+      satp: kernel
+      locks: ["README's inode lock (sleep-lock)", "README block's buffer lock (sleep-lock)", "cat's p->lock"]
+      stack: [usertrap, syscall, sys_read, fileread, readi, either_copyout, copyout, memmove, kernelvec, kerneltrap, yield]
+      sp: kernel
+      irq: {noff: 1, intena: 0}
+    note: |
+      [[yield]] takes `cat`'s `p->lock`, marks it `RUNNABLE`, and calls [[sched]].
+
+      Follow the counters on hart 2. Interrupts were already off (the trap turned them off),
+      so [[push_off]] records `intena = 0` and `noff = 1`. That `0` is correct and important:
+      when `cat` later releases `p->lock`, interrupts must stay off, because `cat` is still
+      inside `kerneltrap` with trap state to restore ([[concept:locks#intena]]).
+
+      `cat` still holds its two sleep-locks, and it is about to stop running while holding
+      them. That is allowed: a sleep-lock is just a flag, and anyone who wants it will sleep
+      until `cat` runs again and releases it. Stopping while holding a *spinlock* (other than
+      `p->lock`, which the scheduler deals with) would be fatal: anyone waiting for it would
+      spin with interrupts off, possibly forever.
+    others: |
+      `p->lock` protects `p->state`. The schedulers on harts 0 and 1 scan the process table
+      taking each `p->lock` in turn. Because `cat` sets `RUNNABLE` while holding the lock and
+      keeps holding it through the switch, no other hart can pick `cat` up while it is still
+      running on hart 2's stack. Two harts running one kernel stack would destroy it.
+
+  - title: sched's checks catch a spinlock held across the switch
+    file: kernel/proc.c
+    lines: 472-497
+    focus: 485-495
+    state:
+      hart: 2
+      mode: S
+      proc: cat (pid 3)
+      intr: off
+      satp: kernel
+      locks: ["README's inode lock (sleep-lock)", "README block's buffer lock (sleep-lock)", "cat's p->lock"]
+      stack: [usertrap, syscall, sys_read, fileread, readi, either_copyout, copyout, memmove, kernelvec, kerneltrap, yield, sched]
+      sp: kernel
+      irq: {noff: 1, intena: 0}
+    note: |
+      [[sched]] refuses to switch unless the world is in order:
+
+      - `p->lock` held, and `mycpu()->noff == 1`: **exactly one** spinlock, `p->lock`. If the
+        interrupted code had somehow held another spinlock, `noff` would be 2 and this line
+        would panic with `"sched locks"`. It is the interrupts-and-locks rule enforced a
+        second time, at the moment it would do the most damage.
+      - `p->state != RUNNING`: the caller must already have said what it is becoming.
+      - interrupts off.
+
+      Then line 494 saves `intena` in a **local variable** (in this build the register `s3`,
+      which [[swtch]] saves in `cat`'s `p->context`). The comment
+      explains why: `intena` describes this kernel *thread* (were interrupts on before it
+      took its first lock?), but it lives in `struct cpu`, which belongs to the *hart*. The
+      thread is about to leave the hart, and another thread will overwrite hart 2's
+      `intena`. So `sched` carries it across the switch in that saved register and puts it back on line
+      496, on whatever hart that turns out to be ([[concept:locks#sched-intena]]).
+
+      Line 495, [[swtch]], saves `ra`, `sp` and `s0`–`s11` into `cat`'s `p->context` and
+      loads hart 2's scheduler context ([[tour:13]]). The saved `sp` is the address of
+      `sched`'s frame inside `cat`'s kernel stack: the only record of where that stack ends.
+
+  - title: Hart 2's scheduler lets go, hart 0's picks cat up
+    file: kernel/proc.c
+    lines: 444-464
+    focus: 455-460
+    state:
+      hart: 2
+      mode: S
+      proc: none (hart 2's scheduler)
+      intr: off
+      satp: kernel
+      locks: ["cat's p->lock"]
+      stack: [main, scheduler]
+      sp: {"on": scheduler, switched: "`ld sp, 8(a1)` in [[swtch]] ([[kernel/swtch.S:26]]), called from [[sched]]", detail: "hart 2's slice of `stack0`, `sp = 0x8000a810`"}
+      irq: {noff: 1, intena: 0, note: "line 456 has just forced intena to 0"}
+    note: |
+      Hart 2 is now running its [[scheduler]] thread, returning from the `swtch` on line 453
+      that once started `cat`. Line 456 forces `intena = 0`, so that the `release` on line
+      463 leaves interrupts **off**: the scheduler manages interrupts itself, at the top of
+      its loop. Then it releases `cat`'s `p->lock`, a lock `cat`'s own thread acquired in
+      [[yield]]; [[holding]] accepts that because it checks the hart, not the thread
+      ([[concept:locks#handoff]]). From this instant, `cat` is `RUNNABLE`
+      and any hart may take it.
+
+      `cat`'s kernel thread is frozen. Its stack holds every frame from `usertrap` to
+      `sched`, including `kernelvec`'s 256-byte save area and `kerneltrap`'s copies of
+      `sepc` and `sstatus`. Its two sleep-locks are still held. Nothing about it is tied
+      to hart 2 any more.
+
+      Hart 2 itself got here through the `ld sp, 8(a1)` in [[swtch]]
+      ([[kernel/swtch.S:26]]): its `sp` is back on its scheduler stack in [[stack0]]. `cat`'s
+      stack is left with a trap frame in the *middle*:
+
+      ```text
+      cat's kernel stack, suspended
+        top ─► usertrap … copyout, memmove
+               kernelvec frame (256 bytes: memmove's registers)
+               kerneltrap
+               yield
+               sched     ◄─ cat's p->context.sp
+      ```
+    others: |
+      | Time | Hart 0 | Hart 2 |
+      |---|---|---|
+      | t1 | `zombie` sleeps in `pause`; scheduler scanning | `cat`: `swtch` to scheduler |
+      | t2 | `acquire(&cat->lock)`: **spins** | `release(&cat->lock)` (line 463) |
+      | t3 | gets the lock, sees `RUNNABLE`, sets `RUNNING`, `swtch` to `cat` | scans on; maybe runs another process |
+      | t4 | `cat` resumes inside `sched` | scans another full round; `wfi` only if that round finds nothing runnable |
+
+      Hart 0's spin at t2 is the lock handoff working: it cannot see `cat` until hart 2 has
+      completely stopped using `cat`'s stack. ([[tour:12]], [[tour:13]])
+
+  - title: cat wakes up inside sched, on hart 0
+    file: kernel/proc.c
+    lines: 479-508
+    focus: 496
+    state:
+      hart: 0
+      mode: S
+      proc: cat (pid 3)
+      intr: off
+      satp: kernel
+      locks: ["README's inode lock (sleep-lock)", "README block's buffer lock (sleep-lock)", "cat's p->lock"]
+      stack: [usertrap, syscall, sys_read, fileread, readi, either_copyout, copyout, memmove, kernelvec, kerneltrap, yield, sched]
+      sp: {"on": kernel, switched: "`ld sp, 8(a1)` in [[swtch]] ([[kernel/swtch.S:26]]), called by hart 0's scheduler", detail: "cat's kernel stack, same frames and addresses, now on hart 0"}
+      irq: {noff: 1, intena: 0, note: "line 496 has just put back cat's own intena, 0"}
+    note: |
+      Hart 0's scheduler took `cat`'s `p->lock` (with its interrupts off, so hart 0's
+      `noff = 1`, `intena = 0`) and switched to it. [[swtch]] returns into `sched` at line
+      496, now on **hart 0**. `sched` puts back `cat`'s own `intena`, which is 0, and
+      returns to [[yield]], which releases `p->lock`. `noff` drops to 0, and since `intena`
+      is 0, interrupts **stay off**.
+
+      They must. `cat` is about to unwind into `kerneltrap` and `kernelvec`, which still have
+      trap state to restore. An interrupt now would be taken on top of a half-finished
+      trap return.
+
+      The `ld sp, 8(a1)` in hart 0's [[swtch]] put hart 0's `sp` exactly where hart 2's `sp`
+      was when `cat` left: the same frames, at the same addresses in `cat`'s kernel stack,
+      `kernelvec` frame included. Kernel stacks are mapped in the one kernel page table that
+      every hart uses, so the addresses mean the same thing on hart 0.
+
+      One register changed without anyone writing it: [[g:reg:tp|tp]]. Inside the kernel,
+      `tp` always holds the ID of the hart executing, and [[swtch]] does not save or restore
+      it, so `cat` now sees `tp = 0`. That is correct, and it is why [[cpuid]] and [[myproc]]
+      keep working after the move.
+
+  - title: Why sepc and sstatus must be put back
+    file: kernel/trap.c
+    lines: 149-164
+    focus: 160-163
+    state:
+      hart: 0
+      mode: S
+      proc: cat (pid 3)
+      intr: off
+      satp: kernel
+      locks: ["README's inode lock (sleep-lock)", "README block's buffer lock (sleep-lock)"]
+      stack: [usertrap, syscall, sys_read, fileread, readi, either_copyout, copyout, memmove, kernelvec, kerneltrap]
+      sp: kernel
+      irq: 0
+    note: |
+      Back in [[kerneltrap]], on hart 0. Lines 162–163 write the saved values back into
+      `sepc` and `sstatus`. They have to, because `kernelvec` is about to execute `sret`, and
+      `sret` takes its orders from those two CSRs. What do hart 0's CSRs hold right now?
+      Whatever the **last trap and the last return on hart 0** left there, which had nothing
+      to do with `cat`:
+
+      One possible history (illustrative; the exact traps depend on timing):
+
+      | Time | Hart 0 |
+      |---|---|
+      | t1 | `zombie` traps for `pause`: `sepc` = zombie's `ecall`, `sstatus.SPP` = 0 |
+      | t2 | `zombie` sleeps; hart 0's own timer fires in the scheduler: `sepc` = a scheduler address |
+      | t3 | the scheduler switches to `cat` |
+      | t4 | without lines 162–163: `sret` would jump to the scheduler address (`SPP` = 1); had no trap happened at t2, it would jump to zombie's `ecall` in **user mode** (`SPP` = 0 from t1) |
+
+      Even if `cat` had resumed on hart 2, the same would be true: other threads ran there in
+      the meantime. That is what the source comment means by "the yield() may have caused
+      some traps to occur".
+
+      The saved `sstatus` has `SPP = 1` (return to supervisor mode), `SPIE = 1` (interrupts
+      were on in `memmove`) and `SIE = 0` (still off now). Writing it keeps interrupts off
+      until the very last instruction. These values survived because they were in `s1` and
+      `s2` and on `cat`'s stack (step 7): thread state, not hart state.
+    others: |
+      `sepc`, `scause`, `sstatus` and `stimecmp` are per-hart CSRs, so hart 0 restoring its
+      `sepc` cannot disturb hart 2, which by now may be running another process and saving
+      its own trap state. No lock is involved anywhere in this restore.
+
+  - title: kernelvec restores registers, but not tp, and executes sret
+    file: kernel/kernelvec.S
+    lines: 37-64
+    focus: 41-64
+    state:
+      hart: 0
+      mode: S
+      proc: cat (pid 3)
+      intr: off
+      satp: kernel
+      locks: ["README's inode lock (sleep-lock)", "README block's buffer lock (sleep-lock)"]
+      stack: [usertrap, syscall, sys_read, fileread, readi, either_copyout, copyout, memmove, kernelvec]
+      sp: {"on": kernel, detail: "line 61 pops the `kernelvec` frame: `sp` is back at `memmove`'s"}
+      irq: 0
+    note: |
+      `kerneltrap` returns to [[kernelvec]], line 41. It reloads the 17 saved
+      registers from the 256-byte frame, which is still exactly where it was on `cat`'s
+      stack, pops the frame (line 61), and executes [[g:insn:sret|sret]]. The frame was
+      pushed by hart 2 and is popped by hart 0; to the stack, that makes no difference.
+      After line 61, `sp` is back where `memmove` had it.
+
+      Line 44 is the line this tour has been building up to: **"not tp (contains hartid),
+      in case we moved CPUs"**. If `kernelvec` had saved `tp = 2` on hart 2 and restored it
+      here on hart 0, `cat` would continue believing it ran on hart 2. Its next
+      [[mycpu]] would return hart 2's `struct cpu`, and its next `acquire` would update
+      another hart's `noff` and `intena`, corrupting both harts' interrupt bookkeeping.
+      Leaving `tp` alone keeps it correct, because it already holds 0.
+
+      `sret` then, in one step: sets the privilege mode from `SPP` (1, supervisor), sets
+      `SIE` from `SPIE` (1, interrupts **on**), and jumps to `sepc`, the `memmove`
+      instruction that was about to run on hart 2 moments earlier.
+
+  - title: memmove carries on, none the wiser
+    file: kernel/vm.c
+    lines: 345-377
+    focus: 370-374
+    state:
+      hart: 0
+      mode: S
+      proc: cat (pid 3)
+      intr: on
+      satp: kernel
+      locks: ["README's inode lock (sleep-lock)", "README block's buffer lock (sleep-lock)"]
+      stack: [usertrap, syscall, sys_read, fileread, readi, either_copyout, copyout, memmove]
+      sp: {"on": kernel, detail: "cat's kernel stack, back to the frames of a plain `read`"}
+      irq: 0
+    note: |
+      [[memmove]] finishes copying README's bytes into `cat`'s `buf`, [[copyout]] returns 0,
+      [[readi]] releases the buffer with [[brelse]], [[fileread]] unlocks the inode, and
+      [[sys_read]] returns the byte count. From there the return is [[tour:5]]'s: on hart 0,
+      [[prepare_return]] records `kernel_hartid = 0`, and `cat` goes back to user mode.
+
+      Count what the interruption cost: a 256-byte save area plus the frames of
+      `kerneltrap` (48 bytes), `yield` and `sched` pushed on `cat`'s kernel stack; 17 registers
+      stored and loaded; `cat`'s `p->lock` acquired and released twice (taken by `yield` and
+      dropped by hart 2's scheduler; taken by hart 0's scheduler and dropped by `yield`); two `swtch`es; and a migration from hart 2 to hart 0. And it was invisible:
+      `memmove` cannot tell that it was stopped.
+
+      The ideas that made it work:
+
+      - **Kernel traps reuse the current kernel stack**, so the trap state belongs to the
+        interrupted thread and travels with it.
+      - **The calling convention divides the work**: `kernelvec` saves the caller-saved
+        registers, C saves the rest.
+      - **Per-hart CSRs are copied into per-thread storage** before anything can switch
+        threads, and copied back just before `sret`.
+      - **A hart holding a spinlock never takes an interrupt.** `acquire` guarantees it,
+        `noff` and `intena` keep it true under nesting, and `sched` checks it before every
+        switch. That is why an interrupt handler can safely take locks at all.
+locks:
+  - lock: "README's inode lock (sleep-lock)"
+    where: "[[ilock]] in [[fileread]]"
+    protects: "The inode's contents while `readi` reads it; held across the yield, which is legal for a sleep-lock"
+  - lock: "buffer lock (sleep-lock)"
+    where: "[[bread]], released by [[brelse]]"
+    protects: "The block's data in the buffer cache while it is copied out"
+  - lock: "tickslock (spinlock)"
+    where: "[[clockintr]] (hart 0 only), [[sys_pause]], [[sys_uptime]]"
+    protects: "`ticks`. Taken by an interrupt handler, so every holder must have interrupts off"
+  - lock: "p->lock (spinlock)"
+    where: "[[yield]] and [[scheduler]] (checked by [[sched]])"
+    protects: "`p->state`: no other hart may pick `cat` until it has fully left hart 2"
+  - lock: "bcache.lock (spinlock)"
+    where: "[[bget]] (via [[bread]]), [[brelse]]"
+    protects: "The buffer cache list and each buffer's refcnt"
+  - lock: "sleep-locks' inner lk->lk (spinlock)"
+    where: "[[acquiresleep]], [[releasesleep]]"
+    protects: "The `locked` flag; held only for a few instructions, interrupts off"
+  - lock: "each p->lock taken by wakeup on hart 0"
+    where: "[[wakeup]] called from [[clockintr]]"
+    protects: "`p->chan` / `p->state`"
+  - lock: "kernelvec's save area (no lock: per-thread stack)"
+    where: "[[kernelvec]]"
+    protects: "The interrupted registers live on the interrupted thread's own kernel stack, used by one hart at a time"
+  - lock: "sepc, sstatus, scause, stimecmp (no lock: per-hart CSRs)"
+    where: "[[kerneltrap]], [[clockintr]]"
+    protects: "Each hart has its own copies; kerneltrap moves the ones it needs into thread storage before yielding"
+  - lock: "cpus[].noff / intena (no lock: interrupts off)"
+    where: "[[push_off]], [[pop_off]], [[sched]]"
+    protects: "Only this hart touches its own struct cpu, and only with interrupts off; sched carries intena across a switch in a callee-saved register saved in p->context"
+quiz:
+  - q: "`kernelvec` saves `a0`–`a7` and `t0`–`t6` but not `s0`–`s11`. Why are the interrupted function's `s` registers still intact when `sret` returns to it, even though `cat` was switched out and back in between?"
+    a: "`kerneltrap` and everything it calls are C functions, which by the calling convention restore any `s` register they use. The switch itself goes through `swtch`, which saves `s0`–`s11` in `cat`'s context and restores them when `cat` resumes, on any hart."
+  - q: "Suppose `acquire` did not turn interrupts off. Trace what happens on hart 0 if its timer fires while `sys_uptime` holds `tickslock`."
+    a: "`kerneltrap` → `devintr` → `clockintr`, which on hart 0 calls `acquire(&tickslock)`. The lock is held by `sys_uptime`, which cannot continue until the handler returns on the same hart, so the handler would spin forever (in xv6, `holding()` would make it panic instead). Every other hart wanting `tickslock` would then spin too."
+  - q: "`cat` yielded on hart 2 and resumed on hart 0. What would go wrong if `kerneltrap` did not execute `w_sepc(sepc)` and `w_sstatus(sstatus)` before returning?"
+    a: "`sret` would use hart 0's current `sepc` and `sstatus`, left by whatever last trapped or returned to user space on hart 0. It could jump to an unrelated kernel address, or, with `SPP` = 0 from a `prepare_return`, drop into user mode at a user PC while running `cat`'s kernel thread."
+  - q: "Why must `kernelvec` *not* restore `tp` from its save area?"
+    a: "In the kernel, `tp` must equal the ID of the hart executing. If the thread migrated during `yield`, the saved `tp` names the old hart; restoring it would make `mycpu()` return hart 2's `struct cpu`: `myproc()` would return whatever hart 2 is running, and `acquire`/`release` would corrupt hart 2's `noff` and `intena`. `tp` already holds the right value because swtch never changes it."
+  - q: "When `yield` acquires `p->lock` inside `kerneltrap`, `push_off` records `intena = 0`. Why is that the right value, and what would break if `release(&p->lock)` turned interrupts on when `cat` resumed?"
+    a: "Interrupts were off because the trap hardware cleared `SIE`. If the release re-enabled them, a new interrupt could arrive while `kerneltrap` and `kernelvec` were still restoring the old trap's `sepc` and `sstatus`, overwriting them before `sret`. Interrupts come back on only through `sret`, from `SPIE`."
+  - q: "Hart 1 is idle in its scheduler when its timer fires. Why doesn't `kerneltrap` call `yield`, and how does the interrupt get delivered at all if the scheduler keeps interrupts off while scanning?"
+    a: "`myproc()` returns 0 on a hart running its scheduler thread, so there is no process to yield. The scheduler briefly turns interrupts on at the top of each loop ([[kernel/proc.c:441]]), and the pending timer interrupt is taken there; `clockintr` only re-arms `stimecmp`."

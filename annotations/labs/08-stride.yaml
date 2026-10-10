@@ -1,0 +1,1873 @@
+published: true
+title: Stride scheduling with nice
+area: Scheduling
+stars: 3
+branch: ext/08-stride
+prerequisites: {tours: [11, 12, 13, 14, 16, 20, 45, 50], concepts: [locks, stacks]}
+summary: |
+  The [[scheduler]] in this tree gives every runnable process the same treatment: each of the
+  three [[g:hart|harts]] walks the process table in slot order and runs whatever is
+  RUNNABLE, one timer tick at a time. A compile job and an editor get the same share of the
+  CPU, and there is no way to ask for more or less.
+
+  In this lab you give each process a number of **tickets** and replace round robin with
+  **stride scheduling**: a process with twice the tickets should get twice the CPU, and the
+  schedule should be deterministic, not a lottery. The rule fits in one sentence. The
+  questions start when you try to apply it on three harts at once. How do you find "the
+  process with the smallest value" when three schedulers scan the same table, each holding
+  one lock at a time? What value should a process have when it wakes up after a long sleep,
+  or when it has just been created? When should a process be charged for the CPU it uses?
+  What happens when the counter wraps? And what can a proportional-share scheduler promise
+  at all when there are as many harts as processes?
+
+  The reference solution is five small commits. You will measure round robin and stride
+  scheduling side by side, on 1, 2 and 3 harts, with a CPU-time counter the kernel keeps for
+  every process, and break the design five ways on purpose: one break leaves a process
+  running on two harts at once, and in another two schedulers deadlock and the third hart
+  hangs behind them.
+learn:
+  - "Where the original scheduler makes its choice, and what share of the CPU round robin really gives each process on three harts (measured)."
+  - "How a per-process counter that advances at a rate inversely proportional to tickets turns a ratio into a deterministic schedule, and what integer division does to it."
+  - "How to choose a minimum over a table that three schedulers scan at once, when each entry has its own lock: what can change between looking and acting, and which lock orders are safe."
+  - "When a process should be charged for a time slice, and how the timer and sleeping interact with that choice."
+  - "What a process that was not competing for the CPU (asleep, or new) should start from, why that needs shared state, and which lock protects it."
+  - "How fork, exec and the scheduler share a field that one process writes and other harts read."
+  - "How fast a counter of virtual time can really grow, and how many bits it needs."
+  - "What proportional share can and cannot mean when no process can use more than one hart."
+  - "Why a user program's own count of work done is a poor measure of the CPU it received on an emulator, and what to measure instead."
+spec: |
+  **Tickets.** Every process has a number of tickets, its claim on the CPU relative to the
+  other processes that want to run. A new system call sets it:
+
+  ```c
+  int settickets(int n);   // 1 <= n <= 100; returns the old ticket count, or -1
+  ```
+
+  A process that never called `settickets` has 10 tickets. A child of `fork` has its parent's
+  tickets, and `exec` keeps them. A user command `nice` runs a command with a given number of
+  tickets (`nice 3 stridetest 1 2`). (In this lab `nice` takes a ticket count, so a larger
+  number means more CPU, the opposite of Unix niceness.)
+
+  **A measuring instrument.** The kernel keeps, for every process, the CPU time it has used:
+  the scheduler reads the `time` CSR when it switches to a process and when the process
+  switches back, and adds the difference. A second system call returns it:
+
+  ```c
+  uint64 cputime(void);    // CPU time used by the caller, in time CSR units, including
+                           // the slice it is running in (10,000,000 per second on QEMU)
+  ```
+
+  **Stride scheduling.** Each process has a *stride*, `STRIDE1 / tickets` for a large
+  constant `STRIDE1`, and a *pass*. The scheduler runs the RUNNABLE process with the smallest
+  pass and advances that process's pass by its stride for the time slice it runs. A process
+  with three times the tickets advances a third as fast, so it is chosen three times as
+  often.
+
+  **Constraints.**
+
+  - The scheduler still runs on every hart at once, as [[scheduler]] does now. Nothing may
+    deadlock, and no process may ever run on two harts at the same time.
+  - A process that slept for a long time, or was just created, while others ran must
+    neither get a burst of CPU to "make up" for lost time nor wait behind everyone else.
+  - Ctrl-P shows each process's tickets and pass.
+  - **`usertests -q` must print `ALL TESTS PASSED` on 3 harts.**
+
+  **The test program**, `stridetest`, prints one line per check, plus measurements:
+
+  ```text
+  $ stridetest
+  stridetest: tickets: OK
+  stridetest: share: 6 processes with 1 1 2 2 3 3 tickets, 50 ticks
+  stridetest: share: tickets 1: cpu 166 per mille (ideal 167); chunks 155 per mille
+  stridetest: share: tickets 2: cpu 327 per mille (ideal 333); chunks 328 per mille
+  stridetest: share: tickets 3: cpu 506 per mille (ideal 500); chunks 516 per mille
+  stridetest: share: OK
+  stridetest: sleeper: cpu 1601 ms, the others 1481 ms on average (ratio 108/100)
+  stridetest: sleeper: OK
+  stridetest: newcomer: cpu 1599 ms, the others 1480 ms on average (ratio 108/100)
+  stridetest: newcomer: OK
+  stridetest: ALL OK
+  ```
+
+  - **tickets**: `settickets` rejects 0, -3 and 101, returns the old count, and a child of
+    `fork`, and a program after `exec`, have the parent's tickets.
+  - **share**: six CPU-bound processes with 1, 1, 2, 2, 3 and 3 tickets. Each reads its
+    `cputime()` when it first sees the clock inside a window of 50 ticks (about 5 s) and
+    again when the window has ended; its share of all six processes' CPU time in the window
+    is its share of the CPU. The two processes with *t* tickets should get *t*/6 of it
+    between them, within 20%. With six processes every process wants more than its share
+    on 1, 2, 3 or 4 harts, so the ideal is the same on all of them.
+  - **sleeper** and **newcomer**: six processes with equal tickets. One of them sleeps
+    through the first 30 ticks (sleeper) or is only created after them (newcomer). During the
+    next 30 ticks its CPU time must be between 0.67 and 1.5 times the average of the other
+    five.
+
+  Each process also counts "chunks" (50,000 iterations of a busy loop) finished inside the
+  window. The chunk shares are printed beside the CPU shares for information and are not
+  checked: on QEMU a chunk takes more or less time depending on how fast the host runs each
+  hart (see Measure). `stridetest t1 t2 ...` runs one spinning process per ticket count,
+  prints the shares and checks nothing.
+think:
+  - title: What does round robin give, and where is the choice made?
+    q: |
+      Six CPU-bound processes run on the original kernel, on three harts. Before any code:
+      what share of the CPU does each get? Then find the line where the original
+      [[scheduler]] decides which process runs next. What, exactly, decides it, and what
+      would a scheduler that respects tickets need to know at that moment that this one
+      does not?
+    hints:
+      - "Read the loop in [[scheduler]] ([[kernel/proc.c:445]]-[[kernel/proc.c:463]]) and where a running process gives the CPU back: [[yield]], called from [[usertrap]] and [[kerneltrap]] on a timer interrupt ([[kernel/trap.c:86]], [[kernel/trap.c:158]])."
+      - "After `swtch` returns, the loop continues with the *next slot*. Each hart walks the table on its own, and each RUNNABLE process it meets gets one time slice, until the next timer interrupt on that hart."
+      - "The choice is \"the next RUNNABLE slot after the one I just ran\". A proportional scheduler must instead compare processes with each other: it needs a per-process number that says how much CPU each has had relative to what it is owed."
+    answer: |
+      Each RUNNABLE process gets one time slice per trip of a hart's scan, whatever it is.
+      The decision is the test `p->state == RUNNABLE` at [[kernel/proc.c:447]], applied in slot
+      order: position in `proc[]` and nothing else. A process gives the hart back at the next
+      timer interrupt on that hart ([[kernel/trap.c:86]] for a process in user space,
+      [[kernel/trap.c:158]] in the kernel), and each hart's timer is re-armed for about a
+      tenth of a second later ([[kernel/trap.c:179]]). So all CPU-bound processes get equal
+      shares. Measured with the kernel's CPU-time counter on this lab's commit 2 (tickets
+      exist but the scheduler ignores them), with `stridetest`'s six processes on three
+      harts: 333, 339 and 326 per mille for the pairs with 1, 2 and 3 tickets, where tickets
+      would ask for 167, 333 and 500. On one hart: 339, 319 and 340.
+
+      To honour tickets the scheduler has to compare processes: it needs, for each process,
+      a number that says how far ahead or behind it is relative to what its tickets entitle
+      it to, and it must pick by that number instead of by slot. That changes the shape of
+      the loop: instead of "run each RUNNABLE process as you meet it", it becomes "look at
+      all of them, then run one". The next questions are about what that number is and what
+      "look at all of them" costs on three harts.
+    checks:
+      - id: lab08-01
+        level: 1
+        type: choice
+        q: |
+          On the original kernel, three harts run six CPU-bound processes. Nothing else is
+          runnable. Which statement best describes the shares?
+        options:
+          - text: "About one sixth each: every RUNNABLE process gets one time slice per trip of a hart's scan."
+            correct: true
+            why: |
+              Right. The scan treats every RUNNABLE process alike; measured, each pair of
+              `stridetest`'s six processes got 326 to 346 per mille of the CPU time.
+          - text: "Processes in low slots get more, because every scan starts at proc[0]."
+            why: |
+              You may have thought each pass restarts at slot 0 after a switch. The `for` loop
+              continues from the slot after the process that just ran ([[kernel/proc.c:445]]);
+              only when it reaches the end of the table does it start again at 0.
+          - text: "Each hart keeps running the same process, so three get a whole hart and three get nothing."
+            why: |
+              You may have thought a hart returns to the process it was running. After a
+              [[yield]], the hart's scheduler moves on to the next RUNNABLE slot; the yielded
+              process is picked up later by whichever hart reaches its slot first.
+          - text: "Shares depend on how long ago each process last ran, like a priority that grows while waiting."
+            why: |
+              That describes an aging scheduler. The original keeps no history at all: the
+              only per-process information it reads is `p->state`.
+        explain: |
+          Round robin is fair in one sense (equal shares among CPU-bound processes) and blind in
+          every other: the only thing it reads is the state, at [[kernel/proc.c:447]]. See
+          [[tour:12]] for the three schedulers and [[tour:11]] for the tick that ends a slice.
+  - title: Stride and pass, by hand
+    q: |
+      The spec defines the rule: run the RUNNABLE process with the smallest pass, then add its
+      stride, `STRIDE1 / tickets`. Try it on paper before writing any code. Three processes on
+      one hart, A with 1 ticket, B with 2, C with 3, all starting at pass 0, ties going to the
+      earlier slot (A, then B, then C). Take `STRIDE1 = 6`. Write down the first six picks and
+      the passes after each. What pattern repeats? Then: in the kernel, how big should
+      `STRIDE1` be, and what does integer division do to the ratios?
+    hints:
+      - "With `STRIDE1 = 6` the strides are 6, 3 and 2. A pick adds the stride to the process that was picked, nobody else."
+      - "After six picks, all three passes are equal again. Count how often each process was picked in between: that count is what the ticket ratio promises."
+      - "`STRIDE1` must be divisible by every ticket count to make strides exact; it cannot be, for every count up to 100. Think about how large the error of `STRIDE1 / t` is relative to the stride itself."
+    answer: |
+      The six picks are A (0→6), B (0→3), C (0→2), C (2→4), B (3→6), C (4→6). Now all three
+      passes are 6, as at the start, and the cycle repeats: A once, B twice, C three times per
+      cycle, exactly 1:2:3. Each process's pass advances by `STRIDE1` per cycle, whatever its
+      tickets; the passes move forward *together*, and a process with more tickets simply
+      needs more picks to cover the same distance. The pass is "how much CPU you have used,
+      measured in units of your own share", which is why the smallest pass is the process
+      furthest behind.
+
+      `STRIDE1` should be large, so that `STRIDE1 / t` loses little to rounding, and a power of
+      two is convenient. The reference uses `1 << 20` (1,048,576) and allows up to 100
+      tickets, so every stride is at least 10,485 and the rounding error is below 1 part in
+      10,000. It is visible, though: `STRIDE1 / 3` is 349,525, and three of those are
+      1,048,575, one short. In a gdb trace of the reference on three harts, the two
+      3-ticket processes were picked at pass 9,317,314 in the same round in which the
+      others were picked at 9,317,318: four rounds of rounding.
+
+      The same trace shows the cycle on three harts, with 1, 1, 2, 2, 3 and 3 tickets: from
+      pass 9,317,318 to 10,365,894 (one `STRIDE1` later), twelve picks, one for each 1-ticket
+      process, two for each 2-ticket process and three for each 3-ticket process.
+
+      How big the pass grows over time is a separate question (question 7).
+    checks:
+      - id: lab08-02
+        level: 1
+        type: order
+        q: |
+          One hart, `STRIDE1 = 6`. A has 1 ticket, B 2, C 3; all passes start at 0; ties go to
+          the earlier slot (A before B before C). Put the first six picks in order.
+        items:
+          - "A runs: pass 0 → 6"
+          - "B runs: pass 0 → 3"
+          - "C runs: pass 0 → 2"
+          - "C runs: pass 2 → 4"
+          - "B runs: pass 3 → 6"
+          - "C runs: pass 4 → 6"
+        why_wrong: |
+          At each step, find the smallest pass among the three (ties to the earlier slot),
+          then add only that process's stride (6, 3 or 2).
+        explain: |
+          After six picks all passes are 6 again: one pick for A, two for B, three for C. The
+          rule turns a ratio of tickets into a fixed, repeating order, with no randomness.
+      - id: lab08-03
+        level: 2
+        type: number
+        q: |
+          In the reference, `STRIDE1` is `1 << 20`. What is the stride of a process with 3
+          tickets, as the kernel computes it?
+        answer: 349525
+        wrong:
+          349526: |
+            You may have rounded 349,525.33 to the nearest integer, or up. `STRIDE1 /
+            best->tickets` is C integer division, which drops the fraction.
+          1048576: |
+            That is `STRIDE1` itself, the stride of a process with 1 ticket.
+        why_wrong: "Divide 1,048,576 by 3 and drop the fraction."
+        explain: |
+          1,048,576 / 3 = 349,525 remainder 1. Three picks of a 3-ticket process advance its
+          pass by 1,048,575, one less than a 1-ticket process's single pick. The error is one
+          part in a million per round; gdb shows it accumulating as a pass a few units behind
+          the others.
+  - title: Finding the minimum on three harts
+    q: |
+      Every hart runs its own scheduler loop over the same `proc[]`, and each entry is
+      protected by its own `p->lock` ([[concept:locks#lock-proc]]). To find the smallest pass,
+      a scheduler has to look at every RUNNABLE process. Design the loop. Which locks are held
+      while you look, and while you decide? What can another hart do to "your" minimum between
+      the moment you saw it and the moment you start it? What would you check, and what
+      would you do if the check fails? Is the result still the true minimum?
+    hints:
+      - "The original loop holds exactly one `p->lock` at a time. Read the comment at [[kernel/proc.c:448]]: whoever starts a process must hold its lock and set it RUNNING. And remember that a process returns to the scheduler holding its own lock ([[concept:locks#handoff]])."
+      - "Between releasing a process's lock after looking at it and taking that lock again, any other hart may pick the same process, start it, and even see it yield again; the process may also exit or go to sleep. Only a value read under the lock you hold now can be trusted now."
+      - "Shape: one pass that only looks (one lock at a time, remember the best candidate), then take the candidate's lock and decide again from what you see under it. Think about what to do if the candidate is no longer what you saw, and whether you need the result to be exactly the minimum."
+    answer: |
+      The reference scans with one lock at a time, remembering the slot with the smallest pass
+      among RUNNABLE processes, then takes that process's lock again and **checks that it is
+      still RUNNABLE**. If it is, the scheduler charges it and runs it; if not, it releases the
+      lock and scans again.
+
+      The check is not optional. Between the scan and the second `acquire`, another hart can
+      pick the same process. With one process RUNNABLE and three harts scanning, that is not
+      rare but almost certain, as clinic 3 shows: without the check, the kernel died before
+      the shell prompt on every one of five boots, and gdb found one process running on two
+      harts at once.
+
+      The candidate's pass may also have changed (another hart ran it and it yielded again),
+      and other processes may have become RUNNABLE with smaller passes. The reference accepts
+      that: it runs any candidate that is RUNNABLE when locked. "The minimum" across three harts
+      is only defined at an instant, and no lock covers the whole table; a scheduler that
+      wanted it exactly would have to lock all 64 slots at once. Being one step off the exact
+      minimum costs a little accuracy for one slice, and stride scheduling corrects it on the
+      next pick, because the process that ran is charged either way.
+
+      **Why not keep the candidate's lock while scanning?** That holds two `p->lock`s at once,
+      and there is no order defined among `p->lock`s. If every scan starts at slot 0, every
+      hart takes them in increasing slot order while holding only lower slots, which is a
+      global order, and in recorded runs that variant passed `stridetest` and `usertests -q`. But
+      it makes every other scheduler, every [[wakeup]] and every [[kkill]] wait at that slot
+      for the whole scan, and the order is fragile: clinic 4 starts each hart's scan where its
+      last one stopped (a natural way to break ties fairly), and the machine froze on the
+      first `stridetest`, three boots out of three.
+    checks:
+      - id: lab08-04
+        level: 2
+        type: choice
+        q: |
+          A scheduler scans with one lock at a time, finds init (pid 1, the only RUNNABLE
+          process at boot) as its minimum, takes init's lock again and runs it **without
+          checking its state**. What happens on three harts?
+        options:
+          - text: "Two harts can switch to init, which then runs on both at once on one kernel stack."
+            correct: true
+            why: |
+              Right. A second hart that saw init RUNNABLE waits for its lock, gets it when the
+              first hart's init releases it in [[forkret]], and switches to init's saved
+              context, which still points at the top of init's kernel stack. Clinic 3 recorded
+              two harts inside `forkret → fsinit` with the same `cpus[i].proc`.
+          - text: "Nothing: the second hart waits on init's lock until init is no longer RUNNABLE, then skips it."
+            why: |
+              You may have assumed that taking the lock implies the check. [[acquire]] only
+              waits; without a test of `p->state` after it, the second hart acts on what it saw
+              before.
+          - text: "The second hart panics in acquire, because the first hart holds the lock."
+            why: |
+              You may have confused this with [[holding]]'s self-deadlock check. `panic:
+              acquire` fires only when *the same* hart acquires a lock it already holds;
+              another hart simply spins until the lock is free.
+          - text: "init runs twice in a row on the same hart, which is harmless."
+            why: |
+              The danger is not on one hart but between harts: two harts each set
+              `c->proc = init` and execute it at the same time, on one kernel stack and one
+              trapframe.
+        explain: |
+          Anything read under a lock you have since released is a hint, not a fact. The
+          re-check under the second `acquire` turns the hint back into a fact. See
+          [[concept:locks#handoff]] for why the scheduler's lock on the chosen process is what
+          makes "RUNNING on one hart" true.
+      - id: lab08-05
+        level: 3
+        type: tf
+        q: |
+          True or false: a scheduler that keeps its current best candidate's `p->lock` while it
+          acquires the locks of the later slots, always scanning from slot 0 to slot 63, can
+          deadlock with another hart running the same scheduler.
+        answer: false
+        why_tf: |
+          You may have reasoned "two `p->lock`s held at once, so a deadlock is possible". It
+          is possible only if two harts take them in opposite orders.
+        reasons:
+          - text: "Every hart acquires p->locks in increasing slot order while holding only a lower slot, and no other code holds two p->locks, so no cycle can form."
+            correct: true
+            why: |
+              Right. A global acquisition order rules out a cycle ([[concept:locks#order]]).
+              The other holders of a `p->lock` ([[wakeup]], [[kkill]], [[kwait]], [[sched]])
+              hold only one at a time. Clinic 4 breaks the order by starting each scan at a
+              different slot, and deadlocks.
+          - text: "Interrupts are off in the scheduler, so no other hart can take a p->lock at the same time."
+            why: |
+              You may have thought clearing SIE stops other harts. It affects only this hart;
+              the other two keep running and taking locks ([[concept:locks#sie]]).
+          - text: "A hart that already holds a p->lock is allowed to acquire it again."
+            why: |
+              xv6 spinlocks are not reentrant: [[acquire]] panics `acquire` if this hart holds
+              the lock already. And the question is about two different locks.
+        explain: |
+          Lock order is about instances: two harts, two locks, opposite orders. Scanning from
+          slot 0 gives a single order. That is why the reference's design (never hold two) and
+          this one (hold two, in slot order) are both deadlock-free, and why the version in
+          clinic 4, which starts each scan at a different slot, is not.
+  - title: When is a process charged?
+    q: |
+      A process's pass must advance when it uses the CPU. You could add the stride when the
+      scheduler picks it, before `swtch`, or when it gives the CPU back (in [[yield]], or on
+      every way of leaving: yield, sleep, exit). Which do you choose, and which lock protects
+      the update? Consider how long a time slice really is in this tree, and a process that
+      runs for a millisecond and then sleeps, over and over.
+    hints:
+      - "What ends a time slice? Read [[clockintr]] ([[kernel/trap.c:179]]): when is the next timer interrupt on a hart scheduled, and is it reset when a new process is switched in?"
+      - "`p->pass` is read by every hart's scan under `p->lock`. Where in the scheduler do you hold the chosen process's lock anyway? And what does [[sys_pause]] do while it waits ([[kernel/sysproc.c:83]])?"
+      - "Shape: charging at the pick is one line, under the lock you already hold, and treats every pick as one slice. Charging on the way out can be exact, but needs to know how long the process ran, in every path that leaves the CPU. Decide which inaccuracy you can live with."
+    answer: |
+      The reference charges **at the pick**: in [[scheduler]], under the chosen process's lock,
+      just before `swtch`, it adds one stride. One line, one place, under a lock it already
+      holds, and the pass of a RUNNING process already includes the slice it is using, so no
+      other hart's view of it is out of date. (RUNNING processes are not candidates anyway.)
+
+      For a CPU-bound process a pick is nearly always a whole slice. Each hart's timer is
+      re-armed for 0.1 s after every timer interrupt ([[kernel/trap.c:179]]), and a timer
+      interrupt ends the slice with [[yield]], so the next process picked gets nearly all of
+      the next 0.1 s. The kernel's own CPU-time counter shows it: on one hart, in a 50-tick
+      window, the processes of `stridetest 1 2 3` used 801, 1,601 and 2,604 ms, whole numbers
+      of slices. A slice can be shorter when a process is picked by a hart whose next tick is
+      near (first picks of 49 and 60 ms were also observed).
+
+      A process that sleeps after a millisecond is still charged a whole stride. That is the
+      price of the simple rule: it penalises processes that use little CPU per pick, which are
+      often the interactive ones. A striking case is
+      [[sys_pause]], which sleeps on `ticks` and is woken at *every* tick to look at the clock
+      ([[kernel/sysproc.c:83]], [[kernel/trap.c:172]]). Each wakeup makes the process RUNNABLE
+      and each pick charges it a stride, so its pass keeps pace with the processes that are
+      really running: up to one pick per tick when a hart is free, and about its fair share of
+      picks on a busy machine. Either way it never falls behind. A sleeper test that used
+      `pause` would find no burst at all, which is why `stridetest`'s sleeper sleeps in `read`
+      on a pipe instead.
+
+      Charging on the way out by time used (the kernel already measures it for `cputime`: add
+      `stride × used / slice`) is exact and is how many production schedulers work; it needs
+      the update after `swtch` returns in the scheduler, still under the process's lock. It is
+      a good extension (Further).
+    checks:
+      - id: lab08-06
+        level: 2
+        type: choice
+        q: |
+          In the reference (charge one stride per pick), process P with 5 tickets calls
+          `pause(30)` while five CPU-bound processes with 5 tickets each keep three harts busy.
+          What happens to P's pass during the 30 ticks?
+        options:
+          - text: "It keeps pace with the others: pause makes P RUNNABLE at every tick, and each pick charges it a stride."
+            correct: true
+            why: |
+              Right. [[sys_pause]] loops: register on `&ticks`, sleep, get woken by
+              [[clockintr]]'s `wakeup(&ticks)`, compare, sleep again. Each wakeup makes P
+              RUNNABLE; it is picked when its pass is the smallest, about as often as each of
+              the others, and every pick charges it. So when the 30 ticks are over it is not
+              behind.
+          - text: "It does not change: a sleeping process is never charged."
+            why: |
+              You may have thought `pause` is one long sleep. It is 30 short ones, each ended
+              by a wakeup and a run of a few microseconds ([[kernel/sysproc.c:83]]).
+          - text: "It advances by exactly 30 ticks' worth of the machine's virtual time, because sleep charges for time slept."
+            why: |
+              Nothing in the reference charges for sleeping. Only the scheduler's pick adds to
+              a pass.
+          - text: "It drops back to 0, because a sleeping process is reset."
+            why: |
+              No code sets a pass back. At most a waking process is moved *forward* (question
+              5).
+        explain: |
+          Charging per pick treats a run of microseconds like a full slice, so `pause`'s
+          wakeups keep P's pass moving with everyone else's. It is why a "sleeper" in this
+          lab's test sleeps in `read` on a pipe: a real sleep, with one wakeup at the end.
+  - title: What pass should a new or woken process start from?
+    q: |
+      While a process sleeps, the others' passes keep growing; its own stays put. When it
+      wakes, what should its pass be? Consider keeping it, setting it to 0, and setting it to
+      "the current minimum". Then the same question for a process created by `fork`. For each
+      choice, predict what the process and the others experience. Finally: where would the
+      information you need live, and which locks are held at the moment you need it?
+    hints:
+      - "Find every place where a state becomes RUNNABLE: [[kfork]] ([[kernel/proc.c:301]]), [[userinit]], [[wakeup]] ([[kernel/proc.c:590]]), [[kkill]] ([[kernel/proc.c:614]]), [[yield]]. Which of these is a process that was *not* competing for the CPU a moment ago?"
+      - "Kept pass: the sleeper is far behind and has the smallest pass by far. Pass 0: behind everyone, forever, if the others started long ago. \"Current minimum\": a scan of all other processes' locks, done inside [[wakeup]], which holds this process's `p->lock` (and its caller holds others, like `tickslock` or a pipe's lock)."
+      - "Shape: what single number could stand for \"how far the schedule has got\"? Where is it cheap to keep it up to date, and what would its lock's place in the lock order have to be?"
+    answer: |
+      **Keep the old pass** (commit 3 of the reference does this): the sleeper wakes with the
+      smallest pass by far and runs without a break until it has caught up, while everyone
+      else waits. `stridetest` measured it on commit 3: during the 30 ticks after waking, the
+      sleeper used 2.37 and 2.38 times the average CPU time of the other five (two runs), a
+      whole hart to itself. Commit 3 also gives a child its parent's pass, and the parent had
+      been asleep in `read`, so the newcomer got the same burst (2.37 both times).
+
+      **Pass 0 for a new process** is worse, and in a surprising way (clinic 1): new processes
+      start far behind the old ones, and any process that sleeps and wakes up is then stuck
+      behind all of them.
+
+      **The current minimum** is the right *value*, but computing it at that moment is the
+      problem: [[wakeup]] holds the sleeper's `p->lock`, and its callers hold more (`tickslock`
+      in [[clockintr]], a pipe's lock in [[pipewrite]]). Scanning every other process's
+      `p->lock` from there would hold two `p->lock`s at once, in no fixed order, on
+      every wakeup.
+
+      The reference keeps **virtual time** instead: one variable, `vtime.now`, "the largest
+      pass with which any process has been picked". Every scheduler raises it when it picks
+      (the pick is the minimum it found, so `vtime.now` follows the front of the queue), and
+      `catchup(p)`, called by [[kfork]], [[wakeup]] and [[kkill]] where a process becomes
+      RUNNABLE, raises `p->pass` to `vtime.now` if it is lower. A process that slept briefly
+      and is still ahead keeps its pass. `vtime` has its own spinlock: it is written by three
+      schedulers and read by wakeups on any hart, always while a `p->lock` is held, and nothing
+      is acquired while holding it. That makes it a leaf after `p->lock` in the lock order
+      ([[concept:locks#order]]). On commits 4 and 5 the sleeper and the newcomer used 1.08
+      times the others' average in four quiet runs, and 0.99 to 1.13 in 24 runs measured
+      while the computer was busy with other work.
+
+      "Largest pass picked" is a choice with a cost on several harts: when there are no more
+      runnable processes than harts, passes diverge (question 8), and the maximum follows the
+      fastest-moving one.
+    checks:
+      - id: lab08-07
+        level: 3
+        type: state
+        q: |
+          The `stridetest` sleeper (pid 12) sleeps in `read` on a pipe. Another process writes
+          to the pipe; [[pipewrite]] calls [[wakeup]], which finds the sleeper and is about to
+          call `catchup` on it (line 644 of the reference's `proc.c`). Fill in the state of the
+          waking hart at that moment.
+        state:
+          mode: S
+          stack: kernel
+          sie: "off"
+          noff: 2
+          intena: 1
+        why:
+          noff: |
+            Count the spinlocks held: the pipe's lock (taken in [[pipewrite]]) and the
+            sleeper's `p->lock` (taken by [[wakeup]]). `catchup`'s own acquire of the `vtime`
+            lock would make it 3, but it has not happened yet. gdb recorded noff 2.
+          intena: |
+            The outermost lock is the pipe's, taken in a system call after [[usertrap]]'s
+            `intr_on` ([[kernel/trap.c:66]]): intena 1.
+          sie: "Two spinlocks are held, so interrupts are off on this hart."
+          stack: "A system call (`write`) runs on the writer's kernel stack."
+          mode: "The kernel runs in supervisor mode."
+        why_wrong: Start at the writer's system call and count each acquire up to wakeup's.
+        explain: |
+          Recorded with gdb on the reference: hart 0, `wakeup → pipewrite → filewrite →
+          sys_write`, noff 2, intena 1, `sstatus` 0x200000020 (SIE clear). The sleeper's pass
+          was 18,964,216 and `vtime.now` 22,319,656: 16 strides behind. `catchup` moved it to
+          22,319,656, which is why it did not get 16 slices in a row.
+      - id: lab08-08
+        level: 2
+        type: choice
+        q: |
+          A variant of the reference starts every new process at pass 0 (it leaves out
+          `catchup` in [[kfork]]) but keeps `catchup` in [[wakeup]]. The machine has been up
+          for a while. What did `stridetest`'s sleeper and newcomer get?
+        options:
+          - text: "Nothing: both waited until the new spinners had caught up with virtual time, which was after the window."
+            correct: true
+            why: |
+              Right. The new spinners start at 0, far behind `vtime.now`; anything that wakes is
+              moved up to `vtime.now`, behind all of them. Clinic 1 recorded 0 ms of CPU for
+              both.
+          - text: "A burst: a process starting at pass 0 has the smallest pass and runs without a break."
+            why: |
+              That is what happens to the *new* processes relative to the old ones. But here the
+              newcomer and the sleeper are woken (or forked by a woken parent) *after* the new
+              spinners have been running, and waking means `catchup` to the far-away virtual
+              time.
+          - text: "Their fair share, because all six spinners are new and start at 0 together."
+            why: |
+              The spinners do start together, which is why the share check still passes. But
+              the sleeper, the alarm process that wakes it and the waiting parent all sleep and
+              are woken, and waking moves them up to virtual time.
+          - text: "A kernel panic, because a pass of 0 is invalid."
+            why: |
+              Nothing checks the pass; 0 is a legal value. The damage is in the schedule, not in
+              any invariant the kernel tests.
+        explain: |
+          Every process must be measured on the same clock. A new process at 0 is on a clock of
+          its own, far behind; the processes that wake up are on virtual time. Mixing the two
+          starves whoever is on the later one.
+  - title: Tickets across fork and exec, and who may read them
+    q: |
+      `settickets` writes `p->tickets`; the scheduler on any hart reads it to compute a
+      stride; [[kfork]] must give the child the parent's tickets. Which lock protects
+      `p->tickets`? In [[kfork]] the code holds the *child's* `p->lock` when it sets the child
+      up. Can it take the parent's lock to read the parent's tickets? Must it? And what
+      should `exec` do?
+    hints:
+      - "Look at the comment above the fields of `struct proc` ([[kernel/proc.h:85]]): which fields need `p->lock`, which need `wait_lock`, which are private?"
+      - "List every piece of code that will write `p->tickets`, and for each, which process it runs in and when. Then ask whether any of those writes can happen while the parent is inside [[kfork]]."
+      - "Shape: write under the process's own lock, so that schedulers on other harts read a consistent value; decide whether a process needs a lock to read its own field; avoid holding the child's and the parent's `p->lock` at once."
+    answer: |
+      `p->tickets` sits with the fields that need `p->lock`: `settickets` writes it under the
+      caller's lock, and the scheduler reads it under the lock it already holds when it
+      charges the stride. Apart from initialisation ([[allocproc]] and [[kfork]] set the new
+      process's value before anyone can run it), the only writer is `settickets`, which runs
+      in the process itself.
+
+      In [[kfork]], the reference copies `p->tickets` into the child while holding `np->lock`
+      (it sets the child RUNNABLE in the same critical section) and reads the *parent's* field
+      without the parent's lock. That is safe because after creation only the process itself
+      writes its tickets, and the process is busy in [[kfork]]: a process is single-threaded,
+      so no write can happen at the same time. Taking the parent's lock there would mean
+      holding two `p->lock`s, child and parent, with nothing that defines an order between
+      them: the very thing question 3 avoids.
+
+      `exec` keeps the tickets because [[kexec]] never touches them; it replaces the address
+      space, not the process. That is what makes `nice` work: `nice 3 cmd` sets its own
+      tickets to 3 and execs `cmd`, which runs with 3, and every process `cmd` forks inherits 3.
+      A new process that is not a fork child, `init`, gets `DEFTICKETS` (10) in [[allocproc]].
+    checks:
+      - id: lab08-09
+        level: 2
+        type: multi
+        q: |
+          In the reference, which of these can change some process's `p->tickets`?
+        options:
+          - text: "settickets called by that process"
+            correct: true
+            why: "It is the only way a running process changes its own tickets."
+          - text: "kfork, for the new child"
+            correct: true
+            why: "The child gets a copy of the parent's tickets."
+          - text: "allocproc, for a newly allocated slot"
+            correct: true
+            why: "Every new process starts with DEFTICKETS (10); kfork then overwrites it with the parent's."
+          - text: "kexec"
+            why: |
+              You may have thought exec resets the process. [[kexec]] replaces the page table,
+              size, trapframe entries and name, nothing else; tickets survive, which `nice`
+              relies on.
+          - text: "the scheduler, when it charges a stride"
+            why: |
+              The scheduler only reads `tickets` to compute the stride; it writes `pass`.
+        explain: |
+          One writer per field after creation, plus initialisation: that is what lets [[kfork]]
+          read the parent's tickets without the parent's lock, while the schedulers on other
+          harts still read them under `p->lock`.
+  - title: How fast does a pass grow?
+    q: |
+      A pass only grows, and so does virtual time. Estimate how fast. Start with a CPU-bound
+      process with 1 ticket alone on its hart, picked once per 0.1 s tick, each pick adding
+      `STRIDE1 = 1 << 20`. Then ask whether that is really the fastest: what else makes the
+      scheduler pick a process? How long until a 32-bit unsigned pass wraps, and a 64-bit one?
+      What happens to the scheduler when a pass wraps, and could you keep 32 bits and still be
+      correct?
+    hints:
+      - "One pick per tick: 10 picks per second × 2^20 per pick. But a pick happens on every return of a RUNNABLE process to the CPU, not only after a timer interrupt. What about two processes that wake each other up through a pipe, over and over?"
+      - "After the wrap, the process that wrapped has a tiny pass and every comparison `p->pass < bestpass` says it is the furthest behind. And `vtime.now` only moves forward if a pick's pass is larger than it."
+      - "The ticket lock lab ([[concept:locks#spinlock]], lab 20) has the same problem with two counters: compare differences, `(int)(a - b) < 0`, instead of values. That works only if all passes being compared are within 2^31 of each other. Is that true here, on three harts?"
+    answer: |
+      **One pick per tick** (a CPU-bound process): 10 × 2^20 ≈ 10.5 million per second. A
+      32-bit pass wraps after 2^32 / (10 × 2^20) = 409.6 seconds, under 7 minutes; a 64-bit
+      pass lasts about 56,000 years.
+
+      **But one pick per tick is not the worst case.** Every wakeup leads to a pick, and every
+      pick charges a whole stride. Two 1-ticket processes passing a byte back and forth through
+      two pipes (a scratch test program on a copy of the branch) made 20,299 round trips in 100
+      ticks, and virtual time rose from 4,299,137 to 21,349,741,335 in those 10 seconds: one
+      stride per round trip, about 2.1 billion per second (2.2 billion in a second run; a
+      third run measured 3.1 billion). At that rate a 32-bit pass wraps in **about 1.4
+      to 2 seconds**, and a 64-bit pass lasts about **190 to 270 years**, at QEMU's speed; real
+      hardware switches faster. The reference uses `uint64`. It is enough, but by a margin of
+      centuries, not millennia.
+
+      With 32 bits and plain `<`, the wrap is a disaster (clinic 5, which starts virtual time
+      20 strides before 2^32 to see it at once): the processes that wrap first get the
+      smallest passes and run in preference to everyone, `vtime.now` stops moving (no pick is
+      ever larger than it again), and every process that wakes up is moved up to that stuck
+      value and waits behind all the wrapped ones. In the recorded run, the processes with 1
+      ticket (largest stride, so they wrap first) got 666 per mille of the CPU, the 3-ticket
+      processes nothing.
+
+      Comparing differences would make 32 bits work only as long as every pair of passes ever
+      compared stays within 2^31. On three harts that fails: with no more runnable processes
+      than harts (question 8) the passes drift apart. A 1-ticket and a 3-ticket process alone
+      on their harts separate by 10 × (2^20 − 349,525), about 7 million per second, and would
+      be 2^31 apart in about 5 minutes. (Ctrl-P showed 42,991,586 against 17,476,225 after a
+      few seconds.)
+    checks:
+      - id: lab08-10
+        level: 2
+        type: number
+        q: |
+          A 1-ticket process runs alone on a hart and is picked once per timer tick (10 per
+          second). Each pick adds `1 << 20` to its 32-bit unsigned pass, starting at 0. After
+          how many seconds does the pass wrap (to the nearest second)?
+        answer: 410
+        wrong:
+          4096: |
+            You may have computed the number of picks, 2^32 / 2^20 = 4,096. At 10 picks per
+            second that is 409.6 seconds.
+          41: |
+            You may have used 100 picks per second. The timer is re-armed 1,000,000 `time`
+            units ahead ([[kernel/trap.c:179]]), a tenth of a second on QEMU's 10 MHz clock.
+          205: |
+            You may have used 2^31, the limit of a signed `int`. The pass here is unsigned.
+        why_wrong: "2^32 / (10 × 2^20) seconds."
+        explain: |
+          4,096 picks at 10 per second is 409.6 s, about 7 minutes. That is the CPU-bound case;
+          processes that wake each other through a pipe are picked thousands of times per
+          second, and wrap a 32-bit pass in about 2 seconds.
+  - title: What can stride scheduling promise on three harts?
+    q: |
+      Run `stridetest 1 2 3` in your head on three harts: three CPU-bound processes with 1, 2
+      and 3 tickets. What shares do you expect? Then predict their passes after a few seconds,
+      and what that does to virtual time.
+    hints:
+      - "How many processes can run at once? How much CPU can one process use at most?"
+      - "When a hart's process yields, which processes are RUNNABLE for that hart's scan to choose from?"
+      - "Proportional share is a statement about competition. Count the processes that compete for each hart."
+    answer: |
+      One third each. Three processes on three harts never compete: when a hart's process
+      yields, it is the only RUNNABLE candidate (the other two are RUNNING on the other harts),
+      so the hart picks it again. No process can use more than one hart, so 3 tickets cannot
+      buy more than 1 of the 3. Measured on the reference with the kernel's counter: 5,001,
+      5,003 and 5,005 ms of CPU in the 5-second window, 333 per mille each. Tickets would ask
+      for 167, 333 and 500, which is impossible here: 500 per mille of three harts is one and
+      a half harts.
+
+      The passes then drift apart, because each process is charged its own stride at its own
+      hart's tick rate. Ctrl-P during that run showed passes 42,991,586 (1 ticket),
+      23,592,930 (2) and 17,476,225 (3), and `vtime.now` at 41,943,010, following the fastest.
+      If a fourth CPU-bound process now arrived, it would start at virtual time, ahead of the
+      3-ticket process, which has "saved up" a large lead it could not use.
+
+      With six processes (two per ticket count) the shares come out right on 1, 2 and 3 harts,
+      because no process's share exceeds one hart: 3/12 × 3 harts = 0.75 of a hart for each
+      3-ticket process. That is why `stridetest`'s share check uses six. Multiprocessor
+      proportional-share schedulers have to handle this "infeasible weight" case explicitly:
+      cap a process's effective tickets at what one CPU can deliver, and keep the passes of
+      processes that cannot use their share from running away (Further).
+    checks:
+      - id: lab08-11
+        level: 2
+        type: choice
+        q: |
+          On the reference, three harts, `stridetest 1 2 3` (three CPU-bound processes with
+          1, 2 and 3 tickets, nothing else running). What shares were measured?
+        options:
+          - text: "About one third each."
+            correct: true
+            why: |
+              Right: 333 per mille each. Each process has a hart to itself; a hart whose
+              process yields finds no other RUNNABLE process and picks it again.
+          - text: "About 1/6, 2/6 and 3/6."
+            why: |
+              You may have applied the ticket ratio without the hart limit. The 3-ticket
+              process would need one and a half harts; one process runs on at most one.
+          - text: "The 3-ticket process gets a hart; the other two share the remaining two in a 1:2 ratio."
+            why: |
+              Sharing needs competition. There are two processes for two harts, so each gets a
+              whole hart.
+          - text: "The 1-ticket process starves, because its pass grows fastest."
+            why: |
+              Its pass does grow fastest, but nobody else wants its hart. A large pass only
+              loses to *runnable* processes with smaller passes.
+        explain: |
+          Tickets divide contended CPU. With no more runnable processes than harts there is
+          nothing to divide, and the passes drift apart instead (Ctrl-P showed 43.0 million
+          against 17.5 million after a few seconds).
+build: |
+  **Start.**
+
+  ```text
+  git checkout -b my-stride 06aad25
+  ```
+
+  **Milestones, in an order that keeps the system bootable after each one.**
+
+  1. **Tickets, `settickets` and a CPU-time counter.** Add `tickets` to `struct proc` (with
+     the fields protected by `p->lock`), `DEFTICKETS` and `MAXTICKETS` to `param.h`, the system
+     call (number, table entry, `usys.pl`, `user.h`), a default in [[allocproc]] and a copy in
+     [[kfork]]. Add the measuring instrument too: two fields, a reading of the `time` CSR
+     before and after the scheduler's `swtch` to a process, and `cputime()`. Do it now, before
+     you change the scheduler, so that you can measure round robin with the same instrument.
+     Test: `usertests -q`.
+  2. **The test and `nice`.** Write `user/stridetest.c` and `user/nice.c` and add both to
+     `UPROGS`. Run `stridetest` on round robin and keep the output: `tickets: OK`,
+     `share: FAIL`, and the sleeper and newcomer checks pass. This is the contrast for
+     everything that follows.
+  3. **Pick the smallest pass.** Add `pass` and `STRIDE1`, rewrite the scan in [[scheduler]]
+     (keeping the CPU-time lines around `swtch`), charge the pick. Test: `stridetest` (share
+     should pass; watch the sleeper and newcomer lines), `usertests -q`. If the kernel panics
+     or hangs before the first prompt, go to clinic 3.
+  4. **Virtual time.** Add the shared value and its lock, and move processes that become
+     RUNNABLE after not competing up to it. Test: `stridetest` (all OK), `usertests -q`,
+     `stridetest` again.
+  5. **Make it visible.** Print tickets, pass and virtual time from [[procdump]]. Type Ctrl-P
+     during `stridetest 1 2 3` and during `stridetest 1 1 2 2 3 3`, and explain the passes.
+
+  Also run on one hart (QEMU `-smp 1`) and on two: with one hart nothing runs in parallel,
+  so the share is purely the scheduler's doing, and bugs that need two harts (clinics 3 and
+  4) disappear, which is itself worth seeing.
+
+  **Debugging advice.** To use gdb, start QEMU with `make qemu-gdb` (it adds `-S` and a gdb
+  port of its own, which it writes into `.gdbinit`) and run `${TOOLPREFIX}gdb kernel/kernel`
+  in another terminal. `TOOLPREFIX` is your RISC-V toolchain's prefix, the same one xv6's
+  Makefile detects (`riscv64-unknown-elf-`, `riscv64-linux-gnu-` or `riscv64-elf-`); set it
+  with `export TOOLPREFIX=riscv64-unknown-elf-` or whichever you have. On Debian/Ubuntu/WSL,
+  `gdb-multiarch` also works as the debugger.
+
+  - A **hang** with no output: interrupt the running QEMU from gdb (Ctrl-C) and run `info threads` and
+    `thread apply all bt`. Harts spinning in [[acquire]] called from [[scheduler]] are a lock
+    order problem (clinic 4). Print the lock of each slot: `proc[i].lock.locked` and
+    `(char *)proc[i].lock.cpu - (char *)cpus` (divide by 128, the size of `struct cpu`, to get
+    the holder's hart).
+  - A **panic at boot** after `hart 2 starting`, such as `sched locks` or `acquire`, with a
+    scheduler change: suspect one process running on two harts (clinic 3). In gdb, two harts
+    with the same `cpus[i].proc` prove it.
+  - **Shares that look wrong**: trust `cputime()`, not a count of loop iterations (Measure
+    shows why). To watch the schedule itself, a gdb breakpoint at the charging line with a
+    command list that prints `best->pid`, `best->tickets`, `best->pass` and `vtime.now`, then
+    `continue`s, gives the sequence of picks without stopping the machine for long.
+  - `pause` is not a sleep for this lab's purposes: it wakes every tick (question 4). Make test
+    processes that must really sleep block in `read` on a pipe.
+clinic:
+  - bug: New processes start at pass 0
+    change: |
+      [[kfork]] leaves the child's pass at the 0 that [[allocproc]] set, instead of moving it
+      up to virtual time; woken processes are still moved up:
+
+      ```diff
+         acquire(&np->lock);
+         np->tickets = p->tickets;
+      -  catchup(np);
+         np->state = RUNNABLE;
+         release(&np->lock);
+      ```
+
+      It looks harmless: a new process "has used no CPU yet".
+    symptom: |
+      $ stridetest
+      stridetest: tickets: OK
+      stridetest: share: 6 processes with 1 1 2 2 3 3 tickets, 50 ticks
+      stridetest: share: tickets 1: cpu 167 per mille (ideal 167); chunks 164 per mille
+      stridetest: share: tickets 2: cpu 325 per mille (ideal 333); chunks 335 per mille
+      stridetest: share: tickets 3: cpu 507 per mille (ideal 500); chunks 499 per mille
+      stridetest: share: OK
+      stridetest: sleeper: cpu 0 ms, the others 1810 ms on average (ratio 0/100)
+      stridetest: sleeper: FAIL
+      stridetest: newcomer: cpu 0 ms, the others 1802 ms on average (ratio 0/100)
+      stridetest: newcomer: FAIL
+      stridetest: SOME FAILED
+      $
+      1 sleep  init tickets 10 pass 3355424
+      2 sleep  sh tickets 10 pass 15309206
+      vtime 15204349
+    why: |
+      Not a burst, but the opposite: the sleeper and the newcomer got **no CPU at all** in the
+      window. (The last three lines are Ctrl-P after the run. A second `stridetest` in the
+      same boot gave the same result.)
+
+      Follow the clocks. Virtual time is the largest pass any process has been picked with.
+      The shell, `stridetest`'s parent and the spinners of earlier phases have passes near it:
+      after the run it was 15,204,349, and the shell's pass 15,309,206. Every new spinner
+      starts at 0, millions behind. The new spinners therefore have the smallest passes on
+      the machine and run in preference to every older process, which is the "monopoly" one
+      expects from pass 0.
+
+      The sleeper phase shows who pays. The alarm process (which writes to the pipe when the
+      window starts) waits in `pause`, which wakes it at every tick, and every wakeup moves it
+      up to virtual time, behind all five spinners. It cannot run until they have caught up.
+      A spinner with 5 tickets advances 209,715 per pick; reaching 15 million takes about 70
+      picks each, about 12 seconds on three harts, longer than the whole phase. So the alarm
+      runs only after the spinners have left at the end of the window, the sleeper is woken
+      too late, and it uses no CPU in the window. The newcomer phase fails the same way: the
+      parent waits for the same alarm before it forks.
+
+      The share check still passes because all six spinners there are new and start at 0
+      together. The lesson: every process must be placed on the same clock. A pass is only
+      meaningful relative to the others', and 0 is a position on that clock, not "nothing used".
+  - bug: Woken processes keep their old pass
+    change: |
+      [[wakeup]] makes a sleeper RUNNABLE without moving it up to virtual time (new processes
+      still get `catchup`):
+
+      ```diff
+             if (p->state == SLEEPING) {
+      -        catchup(p);
+               p->state = RUNNABLE;
+             }
+      ```
+    symptom: |
+      $ stridetest
+      stridetest: tickets: OK
+      stridetest: share: 6 processes with 1 1 2 2 3 3 tickets, 50 ticks
+      stridetest: share: tickets 1: cpu 166 per mille (ideal 167); chunks 151 per mille
+      stridetest: share: tickets 2: cpu 326 per mille (ideal 333); chunks 319 per mille
+      stridetest: share: tickets 3: cpu 506 per mille (ideal 500); chunks 529 per mille
+      stridetest: share: OK
+      stridetest: sleeper: cpu 2920 ms, the others 1228 ms on average (ratio 237/100)
+      stridetest: sleeper: FAIL
+      stridetest: newcomer: cpu 1600 ms, the others 1481 ms on average (ratio 108/100)
+      stridetest: newcomer: OK
+      stridetest: SOME FAILED
+      [...]
+      stridetest: sleeper: cpu 2905 ms, the others 1222 ms on average (ratio 237/100)
+      stridetest: sleeper: FAIL
+      stridetest: newcomer: cpu 1598 ms, the others 1483 ms on average (ratio 107/100)
+      stridetest: newcomer: OK
+    why: |
+      This is the burst. The sleeper's pass froze when it went to sleep in `read`; for 30
+      ticks the five spinners advanced. When the alarm wrote to the pipe, the sleeper came back
+      with the smallest pass by far and was picked every time a hart looked, until it caught
+      up. It used 2,920 ms of CPU in a 3-second window (2,905 ms in a second run in the same
+      boot): a whole hart for nearly the whole window, while the other five shared two.
+
+      How far behind a sleeper gets can be read from the reference, where gdb caught the same
+      moment with `catchup` in place: pass 18,964,216 against virtual time 22,319,656, a
+      difference of 3,355,440, exactly 16 strides of a 5-ticket process. Without `catchup`,
+      that is 16 slices in a row, 1.6 s of one hart.
+
+      The newcomer passes because forks still start at virtual time. On real systems the same
+      bug shows up as a program that slept (waiting for input, a timer, the disk) and then
+      hogs the CPU, which is exactly backwards for an interactive program's neighbours. A
+      sleeper should be neither charged for the time it slept nor paid for it.
+  - bug: The candidate is not re-checked under its lock
+    change: |
+      After the scan, the scheduler takes the chosen process's lock and runs it, without
+      checking that it is still RUNNABLE:
+
+      ```diff
+           acquire(&best->lock);
+      -    if (best->state == RUNNABLE) {
+      +    {
+             // Advance virtual time to best's pass, then charge best
+      ```
+    symptom: |
+      # boots 1 and 3
+      xv6 kernel is booting
+
+      hart 1 starting
+      hart 2 starting
+      panic: sched locks
+
+      # boot 2
+      xv6 kernel is booting
+
+      hart 2 starting
+      hart 1 starting
+      panic: scause=0xpanic: 8r000701eelease sepc=0x
+      3fffffd
+
+      # boot 4
+      xv6 kernel is booting
+
+      hart 1 starting
+      hart 2 starting
+      usertrap(): unexpected scause 0xc pid=1
+      scause=0xc sepc=0x8000fe30 stval=0x8000fe30
+        panic:           sepc=0x50505050k5050504 stval=ernel0x50505trap0505050
+      504
+
+      # boot 5, gdb attached after the panic
+      xv6 kernel is booting
+
+      hart 1 starting
+      hart 2 starting
+      panic: sched locks
+      [...]
+        Id   Target Id                    Frame
+      * 1    Thread 1.1 (CPU#0 [running]) panic (s=s@entry=0x800071b0 "sched locks") at kernel/printk.c:144
+        2    Thread 1.2 (CPU#1 [running]) acquire (lk=0x800211f8 <disk+296>) at kernel/spinlock.c:37
+        3    Thread 1.3 (CPU#2 [running]) acquire (lk=lk@entry=0x8000fe30 <proc>) at kernel/spinlock.c:37
+
+      Thread 3 (Thread 1.3 (CPU#2 [running])):
+      #0  acquire (lk=lk@entry=0x8000fe30 <proc>) at kernel/spinlock.c:37
+      #1  0x000000008000207e in wakeup (chan=0x80015e60 <bcache+24>) at kernel/proc.c:635
+      #2  0x0000000080005d16 in virtio_disk_intr () at kernel/virtio_disk.c:327
+      #3  0x00000000800026a8 in devintr () at kernel/trap.c:201
+      #4  0x0000000080002802 in kerneltrap () at kernel/trap.c:149
+      #5  0x0000000080005768 in kernelvec () at kernel/kernelvec.S:38
+      [...]
+
+      Thread 2 (Thread 1.2 (CPU#1 [running])):
+      #0  acquire (lk=0x800211f8 <disk+296>) at kernel/spinlock.c:37
+      #1  0x0000000080005c34 in virtio_disk_rw (b=b@entry=0x80015e60 <bcache+24>, write=write@entry=0) at kernel/virtio_disk.c:290
+      #2  0x0000000080002dec in bread (dev=dev@entry=1, blockno=blockno@entry=1) at kernel/bio.c:98
+      #3  0x0000000080003704 in readsb (dev=1, sb=0x8001e508 <sb>) at kernel/fs.c:35
+      #4  fsinit (dev=dev@entry=1) at kernel/fs.c:44
+      #5  0x00000000800019a0 in forkret () at kernel/proc.c:582
+      [...]
+
+      Thread 1 (Thread 1.1 (CPU#0 [running])):
+      #0  panic (s=s@entry=0x800071b0 "sched locks") at kernel/printk.c:144
+      #1  0x0000000080001f90 in sched () at kernel/proc.c:542
+      #2  0x0000000080002030 in sleep () at kernel/proc.c:623
+      #3  0x0000000080005c34 in virtio_disk_rw (b=b@entry=0x80015e60 <bcache+24>, write=write@entry=0) at kernel/virtio_disk.c:290
+      #4  0x0000000080002dec in bread (dev=dev@entry=1, blockno=blockno@entry=1) at kernel/bio.c:98
+      #5  0x0000000080003704 in readsb (dev=1, sb=0x8001e508 <sb>) at kernel/fs.c:35
+      #6  fsinit (dev=dev@entry=1) at kernel/fs.c:44
+      #7  0x00000000800019a0 in forkret () at kernel/proc.c:582
+      [...]
+      $1 = (struct proc *) 0x8000fe30 <proc>
+      $2 = (struct proc *) 0x8000fe30 <proc>
+      $3 = (struct proc *) 0x0
+      [...]
+      $11 = {locked = 1, name = 0x80007680 "virtio_disk", cpu = 0x8000fb30 <cpus+256>}
+    why: |
+      Five boots, five deaths, all before the first prompt. The kernel never reached `init:
+      starting sh`.
+
+      gdb shows why in boot 5. `$1` and `$2` are `cpus[0].proc` and `cpus[1].proc`: both harts
+      are running the same process, `proc[0]` at `0x8000fe30`, which is pid 1. And both harts
+      are **inside `forkret → fsinit → readsb → bread → virtio_disk_rw`**, the first process's
+      very first steps. Here is how. At boot, init is the only RUNNABLE process and all three
+      schedulers scan the table continuously. Two harts' scans see init RUNNABLE. One takes
+      init's lock first, sets RUNNING and switches to it. The other waits on the lock; init
+      releases it at the top of [[forkret]] ([[kernel/proc.c:520]] in the original), and the
+      second hart gets it, sets RUNNING again and switches to init's saved context. That
+      context was never updated (init has not switched out yet), so it still says what
+      [[allocproc]] put there: `ra = forkret`, `sp` = the top of init's kernel stack. The
+      second hart starts a second copy of `forkret` on the same kernel stack; `static int
+      first` is still 1 for both, so both run [[fsinit]].
+
+      From there the two copies overwrite each other's stack frames and saved registers, and
+      what breaks first varies: [[sched]] found noff not 1 (`panic: sched locks`, boots 1, 3
+      and 5; in boot 5 hart 0 is the one that panicked, hart 1 is the other copy, and hart 2's
+      disk interrupt waits for init's lock), or init took an instruction page fault in user
+      mode while the kernel jumped to `0x8000fe30`, the address of `proc[0]`, as if it were
+      code (boot 4). In boots 2 and 4 two harts printed at once: after `panicking` is set,
+      [[printk]] no longer takes its lock, so two messages interleave character by character
+      (in boot 2 a `panic: release` and a kerneltrap report; in boot 4 the second line of the
+      `usertrap()` message and `panic: kerneltrap`).
+
+      The window looks tiny (between `release` at the end of the scan and `acquire` of the
+      candidate), but at boot it is hit almost every time, because idle harts do nothing but
+      scan. The re-check costs one comparison. The general rule: what you saw under a lock you
+      have released is a hint; act only on what you see under the lock you hold.
+  - bug: Keeping the candidate's lock, with scans that start at different slots
+    change: |
+      The scan keeps the best candidate's lock (so nobody can take the candidate away, and no
+      re-check is needed), and, to break ties fairly, each hart starts its next scan after the
+      slot it last ran:
+
+      ```c
+      best = 0;
+      for (int i = 0; i < NPROC; i++) {
+        p = &proc[(first + i) % NPROC];
+        acquire(&p->lock);
+        if (p->state == RUNNABLE && (best == 0 || p->pass < best->pass)) {
+          if (best)
+            release(&best->lock);
+          best = p; // keep its lock: nobody can take it from us
+        } else {
+          release(&p->lock);
+        }
+      }
+      ...
+      first = (best - proc + 1) % NPROC; // break ties round robin
+      ```
+    symptom: |
+      $ stridetest
+      stridetest: tickets: OK
+      [... nothing more; after 5 minutes gdb was attached:]
+        Id   Target Id                    Frame
+      * 1    Thread 1.1 (CPU#0 [running]) acquire (lk=lk@entry=0x80010730 <proc+2304>) at kernel/spinlock.c:37
+        2    Thread 1.2 (CPU#1 [running]) acquire (lk=lk@entry=0x80010a30 <proc+3072>) at kernel/spinlock.c:37
+        3    Thread 1.3 (CPU#2 [running]) acquire (lk=lk@entry=0x80010730 <proc+2304>) at kernel/spinlock.c:37
+
+      Thread 3 (Thread 1.3 (CPU#2 [running])):
+      #0  acquire (lk=lk@entry=0x80010730 <proc+2304>) at kernel/spinlock.c:37
+      #1  0x0000000080001e64 in scheduler () at kernel/proc.c:481
+      #2  0x0000000080000ea0 in main () at kernel/main.c:44
+
+      Thread 2 (Thread 1.2 (CPU#1 [running])):
+      #0  acquire (lk=lk@entry=0x80010a30 <proc+3072>) at kernel/spinlock.c:37
+      #1  0x0000000080001e64 in scheduler () at kernel/proc.c:481
+      #2  0x0000000080000ea0 in main () at kernel/main.c:44
+
+      Thread 1 (Thread 1.1 (CPU#0 [running])):
+      #0  acquire (lk=lk@entry=0x80010730 <proc+2304>) at kernel/spinlock.c:37
+      #1  0x00000000800020cc in wakeup (chan=chan@entry=0x800078c0 <ticks>) at kernel/proc.c:635
+      #2  0x0000000080002696 in clockintr () at kernel/trap.c:172
+      #3  0x0000000080002716 in devintr () at kernel/trap.c:215
+      #4  0x0000000080002758 in usertrap () at kernel/trap.c:69
+      #5  0x0000003ffffff09c in ?? ()
+      [...]
+      proc[5] pid 8 state 3 lock 0 held by cpus+2147419600 name stridetest
+      proc[6] pid 9 state 3 lock 1 held by cpus+128 name stridetest
+      proc[7] pid 10 state 4 lock 0 held by cpus+2147419600 name stridetest
+      proc[8] pid 11 state 3 lock 1 held by cpus+256 name stridetest
+    why: |
+      All three boots hung at the same place, the start of the share phase, when six spinners
+      became RUNNABLE at once. In this build `struct proc` is 384 bytes, so `proc+2304` is
+      `proc[6]` and `proc+3072` is `proc[8]`; `struct cpu` is 128 bytes, so `cpus+128` is hart
+      1 and `cpus+256` hart 2 (the large number is the subtraction for a lock held by nobody).
+      State 3 is RUNNABLE.
+
+      - Hart 1 holds `proc[6]` (pid 9) as its candidate and spins for `proc[8]`.
+      - Hart 2 holds `proc[8]` (pid 11) as its candidate and spins for `proc[6]`.
+      - Hart 0 took a timer interrupt in user mode; [[clockintr]] holds `tickslock` and its
+        [[wakeup]] of `&ticks` spins for `proc[6]` too.
+
+      Hart 2 reached slot 8 before slot 6: its scan started above 6 and wrapped around. Hart 1's
+      scan reached 6 first. Each holds what the other wants, with interrupts off: a classic
+      two-lock cycle between two schedulers ([[concept:locks#order]]), and the third hart hangs
+      behind it. The other two boots froze the same way with other pairs (`proc[3]` and
+      `proc[4]`; `proc[3]` and `proc[5]`), each time with the third hart spinning on one of
+      the two locks.
+
+      Holding two `p->lock`s is only safe if every holder takes them in one global order.
+      Scanning from slot 0 every time is such an order, and that variant (otherwise identical)
+      passed `stridetest`, `usertests -q` and `stridetest` again. Starting at different slots
+      destroys the order. The reference avoids the question altogether by never holding two.
+  - bug: A 32-bit pass
+    change: |
+      `pass`, `bestpass` and `vtime.now` are `uint` (32 bits) instead of `uint64`. To see the
+      wrap at once rather than after a while (question 7), the experiment also starts virtual
+      time 20 strides before 2^32:
+
+      ```diff
+      -  uint64 pass;          // stride scheduling: CPU used, in virtual time
+      +  uint pass;            // stride scheduling: CPU used, in virtual time
+      ...
+      -} vtime;
+      +} vtime = {.now = 0xffffffff - 20 * STRIDE1}; // EXPERIMENT: start 20 strides before the wrap
+      ```
+    symptom: |
+      $
+      1 sleep  init tickets 10 pass 4277456056
+      2 run    sh tickets 10 pass 4278294912
+      vtime 4278190055
+      stridetest
+      stridetest: tickets: OK
+      stridetest: share: 6 processes with 1 1 2 2 3 3 tickets, 50 ticks
+      stridetest: share: tickets 1: cpu 166 per mille (ideal 167); chunks 160 per mille
+      stridetest: share: tickets 2: cpu 326 per mille (ideal 333); chunks 331 per mille
+      stridetest: share: tickets 3: cpu 506 per mille (ideal 500); chunks 507 per mille
+      stridetest: share: OK
+      stridetest: sleeper: cpu 0 ms, the others 1803 ms on average (ratio 0/100)
+      stridetest: sleeper: FAIL
+      stridetest: newcomer: cpu 0 ms, the others 1800 ms on average (ratio 0/100)
+      stridetest: newcomer: FAIL
+      stridetest: SOME FAILED
+      $
+      1 sleep  init tickets 10 pass 4277456056
+      2 run    sh tickets 10 pass 89844
+      vtime 4294952283
+      stridetest
+      stridetest: tickets: OK
+      stridetest: share: 6 processes with 1 1 2 2 3 3 tickets, 50 ticks
+      stridetest: share: tickets 1: cpu 666 per mille (ideal 167); chunks 673 per mille
+      stridetest: share: tickets 2: cpu 333 per mille (ideal 333); chunks 326 per mille
+      stridetest: share: tickets 3: cpu 0 per mille (ideal 500); chunks 0 per mille
+      stridetest: share: FAIL
+      stridetest: sleeper: cpu 0 ms, the others 1802 ms on average (ratio 0/100)
+      stridetest: sleeper: FAIL
+      stridetest: newcomer: cpu 0 ms, the others 1802 ms on average (ratio 0/100)
+      stridetest: newcomer: FAIL
+      stridetest: SOME FAILED
+    why: |
+      The Ctrl-P lines (before and between the runs) show the clock. The initializer sets
+      virtual time to 4,273,995,775 (`0xffffffff − 20 × 2^20`); by the first Ctrl-P it stood at
+      4,278,190,055, 16.8 million short of 2^32 = 4,294,967,296. During the first share phase
+      the spinners' passes cross 2^32 and wrap to small numbers. From then on:
+
+      - **Virtual time stops.** It only moves when a pick's pass is larger than it
+        (`best->pass > vtime.now`), and no wrapped pass ever is. It stays at 4,294,952,283,
+        just below the wrap.
+      - **Wakers starve.** Every process that wakes is moved up to that stuck value, behind
+        every wrapped process: the sleeper, the alarm and the waiting parent get no CPU in
+        the window, in both runs. The shell wrapped too: woken after the run, it was moved up
+        to the stuck 4,294,952,283, charged one stride (104,857 for 10 tickets) when picked,
+        and wrapped to 4,294,952,283 + 104,857 − 2^32 = 89,844.
+      - **The schedule inverts.** In the second run, all six spinners start near the top
+        (virtual time). Those with the largest stride, the 1-ticket processes, cross 2^32
+        first; with tiny passes they win every comparison against processes that have not
+        wrapped. The 1-ticket pair got 666 per mille of the CPU, the 2-ticket pair 333 and
+        the 3-ticket pair nothing at all.
+
+      The first share check passed only because the spinners started together and crossed
+      the wrap close together. A comparison that survives the wrap (`(int)(a - b) < 0`, the
+      trick of the ticket lock lab) would help only while compared passes stay within 2^31 of
+      each other, which on three harts they need not (question 7); `uint64` makes the question
+      moot for centuries even at the fastest rate measured.
+reveal:
+  - title: Tickets live with the fields p->lock protects
+    commit: 1
+    file: kernel/proc.h
+    lines: 80-107
+    focus: 85-93
+    diff: true
+    state:
+      hart: any
+      mode: S
+      proc: any
+      intr: "off"
+      satp: kernel
+      locks: ["the process's p->lock"]
+      irq: {noff: 1, intena: 1, note: "in a system call; inside the scheduler the same lock is held with intena 0"}
+      stack: [sys_settickets]
+      sp: {"on": kernel}
+    note: |
+      The first commit adds the knob and the measuring instrument, and changes no behaviour:
+      the scheduler still ignores tickets.
+
+      Where the fields go is a locking decision. `struct proc` is divided by the comments above
+      the fields: those that need `p->lock`, the one that needs `wait_lock`, and those private
+      to the process. `tickets` goes in the first group (line 91). It is written by the process
+      itself (`settickets`) and read by schedulers on *other* harts, which choose among
+      processes they do not own; any field read across harts needs a lock, and the scheduler
+      already holds `p->lock` when it looks at a process ([[concept:locks#lock-proc]]). The
+      comment records the one exception the design uses later: after creation only the process
+      itself writes its tickets, so the process may *read* its own field without the lock
+      (question 6).
+
+      `cputime` and `runstart` (lines 92-93) are the instrument: the scheduler writes them
+      around `swtch`, under the process's lock, and the process reads them through a system
+      call. Defaults are in `param.h`: `DEFTICKETS` (10) for a process that never set any,
+      `MAXTICKETS` (100) as the upper bound `settickets` accepts.
+  - title: settickets, under the caller's own lock
+    commit: 1
+    file: kernel/sysproc.c
+    lines: 102-130
+    focus: 125-128
+    diff: true
+    state:
+      hart: 2
+      mode: S
+      proc: stridetest (pid 3)
+      intr: "off"
+      satp: kernel
+      locks: ["stridetest's p->lock (pid 3)"]
+      irq: {noff: 1, intena: 1}
+      stack: [usertrap, syscall, sys_settickets]
+      sp: {"on": kernel, detail: "pid 3's kernel stack (`sp` = `0x3fffff9f90`)"}
+    note: |
+      The system call checks the range first (lines 123-124), with no lock: `n` is a local
+      copy of the argument. Then it swaps old for new under the caller's `p->lock` and returns
+      the old count, which is how a program (or the test) can read its tickets without a
+      second system call.
+
+      Recorded with gdb on the finished branch, where this function is unchanged: `stridetest`
+      (pid 3) on hart 2 calling `settickets(7)`, stopped at line 127. noff 1 (the `p->lock`),
+      intena 1: [[usertrap]] turned interrupts on before the system call
+      ([[kernel/trap.c:66]]), so the [[release]] on line 128 will turn them back on. `sstatus`
+      read `0x200000020`: SIE (bit 1) clear while the lock is held.
+    others: |
+      While hart 2 holds pid 3's lock, a scheduler on hart 0 or 1 scanning the table spins
+      briefly at pid 3's slot before it can look at pid 3's state. The critical section is two
+      instructions long. pid 3 is RUNNING on hart 2, so no other scheduler would pick it
+      anyway; the lock is for the *value*, which from commit 3 on every scheduler reads when
+      it charges a stride.
+  - title: The instrument, CPU time per process
+    commit: 1
+    file: kernel/proc.c
+    lines: 436-476
+    focus: 456-460
+    diff: true
+    state:
+      hart: any
+      mode: S
+      proc: none (scheduler)
+      intr: "off"
+      satp: kernel
+      locks: ["the chosen process's p->lock"]
+      irq: {noff: 1, intena: 0}
+      stack: [main, scheduler]
+      sp: {"on": scheduler, detail: "this hart's slice of `stack0`"}
+    note: |
+      Before changing the scheduler, the lab gives it a meter. Line 458 reads the `time` CSR
+      just before `swtch` to the process; line 460 runs when the process has switched back
+      (by yielding, sleeping or exiting) and adds the time it spent away from the scheduler to
+      `p->cputime`. Both happen under the process's lock, which the scheduler holds on both
+      sides of `swtch` ([[concept:locks#handoff]]). [[allocproc]] sets `cputime` to 0
+      (line 128).
+
+      `sys_cputime` (in `sysproc.c`, after `settickets`) returns `p->cputime` plus the part of
+      the current slice already used, `r_time() - p->runstart`: the caller is running, so its
+      `runstart` is the moment its current slice began. It reads both under its own lock.
+
+      Why a kernel counter? A user program can count its own work (iterations of a loop), but
+      that measures CPU received only if every hart runs at the same speed. On QEMU each hart
+      is a host thread, and its speed varies with what else the computer is doing; Measure shows the counts
+      straying by several percent while the kernel's numbers stay put. The `time` CSR is the
+      same clock on every hart (QEMU's 10 MHz timebase), so CPU time measured with it does not
+      depend on which hart ran the process.
+
+      The cost is two CSR reads per switch. Everything later in the lab is measured with it,
+      round robin included.
+  - title: fork passes the tickets on
+    commit: 1
+    file: kernel/proc.c
+    lines: 285-310
+    focus: 302-307
+    diff: true
+    state:
+      hart: 2
+      mode: S
+      proc: stridetest (pid 3), forking pid 4
+      intr: "off"
+      satp: kernel
+      locks: ["child's p->lock (pid 4)"]
+      irq: {noff: 1, intena: 1}
+      stack: [usertrap, syscall, sys_fork, kfork]
+      sp: {"on": kernel, detail: "pid 3's kernel stack (`sp` = `0x3fffff9f70`)"}
+    note: |
+      [[kfork]] already re-takes the child's lock at the very end to make it RUNNABLE
+      ([[kernel/proc.c:300]]-[[kernel/proc.c:302]] in the original). The child's tickets are
+      set in the same critical section, before any scheduler can see the child as RUNNABLE:
+      the moment another hart can pick it, its tickets are right.
+
+      The value comes from the *parent*, read without the parent's lock. That is the exception
+      recorded in `proc.h`: after creation only a process writes its own tickets, and the
+      parent is busy here, in [[kfork]]. Taking the parent's lock would mean holding two
+      `p->lock`s (child and parent), and nothing in the kernel defines an order between two
+      `p->lock`s.
+
+      [[allocproc]] gives every new process `DEFTICKETS` first (line 127); for a fork child
+      line 305 overwrites it. The only process that keeps the default is `init`, created by
+      [[userinit]] without a parent. `exec` does not touch tickets at all, so `nice 3 cmd`
+      works: `nice` sets its own tickets and becomes `cmd`.
+
+      Recorded on the finished branch at the equivalent line (gdb, `stridetest`'s first fork:
+      hart 2, pid 3 creating pid 4, noff 1, intena 1).
+    others: |
+      The child's lock is held, so no scheduler can look at the child until line 307. A
+      scheduler on another hart that reaches the child's slot spins for a few instructions.
+      The parent's own lock is *not* held: another hart's scheduler can read the parent's
+      tickets at this very moment, which is fine, because nobody is writing them.
+  - title: "The test: CPU time in a window"
+    commit: 2
+    file: user/stridetest.c
+    lines: 1-60
+    focus: 30-59
+    diff: true
+    state:
+      hart: any
+      mode: U
+      proc: stridetest (a spinner)
+      intr: "on"
+      satp: user
+      locks: []
+      stack: [main, sharetest, measure, spin]
+      sp: {"on": user}
+    note: |
+      Each spinner runs a busy loop in chunks of 50,000 iterations; after each chunk it asks
+      the kernel for the time (`uptime`, in ticks). The first time it sees the clock inside the
+      window `[wstart, wend)` it reads its CPU time (line 50); when the window has ended it
+      reads it again (line 56). The difference is the CPU this process received during the
+      window, measured by the kernel; its share of all spinners' CPU time is what the checks
+      use. Both readings are taken within one chunk (well under a millisecond of CPU) of the
+      window's edges.
+
+      The chunks finished inside the window are counted too (line 52) and printed beside the
+      CPU shares, as information. They are what a user program would naturally measure, and
+      Measure shows how much they stray on QEMU.
+
+      `x` is `volatile` so that the compiler cannot delete the loop. A process that is not
+      running reads nothing, and when it next runs after `wend` it leaves at its first look at
+      the clock. Every spinner reports one 16-byte `struct result` on a pipe; the parent reads
+      six of them. Six results fit in the pipe's 512-byte buffer, so no writer waits for space
+      in the middle of its write, and [[pipewrite]] holds the pipe's lock for the whole of it:
+      the results cannot interleave.
+  - title: "Sleepers that really sleep"
+    commit: 2
+    file: user/stridetest.c
+    lines: 61-131
+    focus: 94-117
+    state:
+      hart: any
+      mode: U
+      proc: stridetest (the parent)
+      intr: "on"
+      satp: user
+      locks: []
+      stack: [main, latetest, measure]
+      sp: {"on": user}
+    note: |
+      `measure` forks the spinners and, for the sleeper and newcomer checks, an *alarm*
+      process. The sleeper (line 100) and the parent (line 112, before it forks the newcomer)
+      block in `read` on the `go` pipe; the alarm waits until the window starts and writes one
+      byte.
+
+      The comment on lines 77-79 explains why the sleeper does not simply call `pause` until
+      the window. A sleeper that did would show no burst at all on the stride kernel: [[sys_pause]] waits on `&ticks` and is woken at every tick
+      ([[kernel/sysproc.c:83]]), so a "sleeping" process was picked, and charged, again and
+      again (question 4). A process blocked in `read` is woken exactly once. The alarm itself
+      may use `pause`: its own share does not matter.
+
+      In the newcomer check the parent is the one asleep, so the newcomer is forked by a
+      process that slept for 30 ticks. That is the case commit 3 gets wrong: its fork copies
+      the parent's pass.
+  - title: "The checks, and round robin's result"
+    commit: 2
+    file: user/stridetest.c
+    lines: 171-232
+    focus: 189-207
+    state:
+      hart: any
+      mode: U
+      proc: stridetest (the parent)
+      intr: "on"
+      satp: user
+      locks: []
+      stack: [main, sharetest]
+      sp: {"on": user}
+    note: |
+      The share check runs six spinners with 1, 1, 2, 2, 3 and 3 tickets. With six, no process
+      ever deserves more than one hart (a 3-ticket process deserves 3/12 of the CPU, 0.75 of a
+      hart on three harts), so the ideal shares, 167, 333 and 500 per mille for the three pairs,
+      hold on 1 to 4 harts. Each pair's share of CPU time must be within 20% (line 203). The
+      sleeper and newcomer checks (lines 214-232) use equal tickets and compare the late
+      process's CPU time with the average of the other five, between 0.67 and 1.5.
+
+      On this commit the scheduler still ignores tickets, and the test says so (3 harts):
+
+      ```text
+      stridetest: share: tickets 1: cpu 333 per mille (ideal 167); chunks 332 per mille
+      stridetest: share: tickets 2: cpu 339 per mille (ideal 333); chunks 344 per mille
+      stridetest: share: tickets 3: cpu 326 per mille (ideal 500); chunks 323 per mille
+      stridetest: share: FAIL
+      stridetest: sleeper: cpu 1603 ms, the others 1482 ms on average (ratio 108/100)
+      stridetest: sleeper: OK
+      stridetest: newcomer: cpu 1403 ms, the others 1522 ms on average (ratio 92/100)
+      stridetest: newcomer: OK
+      ```
+
+      Round robin keeps no history, so it cannot be unfair to a sleeper: the late checks pass.
+      They are there for what comes next. Every check is computed from the CPU times; the chunk
+      shares are not checked, and the final line, `ALL OK` or `SOME FAILED`, covers the checks
+      only.
+  - title: "The scan: look at everyone, one lock at a time"
+    commit: 3
+    file: kernel/proc.c
+    lines: 427-469
+    focus: 452-469
+    diff: true
+    state:
+      hart: any
+      mode: S
+      proc: none (scheduler)
+      intr: "off"
+      satp: kernel
+      locks: ["p->lock of the slot being looked at"]
+      irq: {noff: 1, intena: 0}
+      stack: [main, scheduler]
+      sp: {"on": scheduler, detail: "this hart's slice of `stack0`"}
+    note: |
+      The loop body changes shape. The original ran each RUNNABLE process as soon as it met it
+      ([[kernel/proc.c:447]]). Now the scan only *looks*: for each slot it takes the lock, reads
+      the state and the pass, remembers the slot if it is RUNNABLE with a smaller pass than
+      the best so far, and releases the lock before moving on (lines 457-464). Ties go to the
+      earlier slot, because only a strictly smaller pass replaces the best.
+
+      One lock at a time, never two (the comment on lines 452-454): no lock-order question can
+      arise among `p->lock`s, whatever the other harts do (question 3). The price is that
+      `bestpass` and `best` are only a record of what was true while each lock was held.
+
+      If nothing is RUNNABLE, the hart waits for an interrupt (`wfi`) and then starts over, as
+      the original did. The `intr_on(); intr_off();` at the top is unchanged: interrupts are
+      off during the whole scan, so intena is 0 for every acquire here
+      ([[concept:locks#sched-intena]]).
+    others: |
+      The other two harts may be scanning the same table at this moment, each in its own loop.
+      They meet only at individual locks: if two harts want the lock of the same slot, one
+      spins for the few instructions the other needs to read two fields. A process running on
+      another hart may also take its own `p->lock` to [[yield]] or [[sleep]]; the scan simply
+      waits for that slot.
+  - title: "Re-check under the lock, charge, run"
+    commit: 3
+    file: kernel/proc.c
+    lines: 465-496
+    focus: 471-477
+    diff: true
+    state:
+      hart: 1
+      mode: S
+      proc: none (scheduler; about to run pid 6)
+      intr: "off"
+      satp: kernel
+      locks: ["pid 6's p->lock"]
+      irq: {noff: 1, intena: 0}
+      stack: [main, scheduler]
+      sp: {"on": scheduler, detail: "`sp` = `0x80009850`, in hart 1's slice of `stack0` (head build)"}
+    note: |
+      Now the scheduler acts on what it saw. It takes the candidate's lock again and **checks
+      the state again** (line 474): another hart may have picked the same process in between,
+      or it may have exited or gone to sleep. If it is no longer RUNNABLE, the lock is released
+      (line 494) and the outer loop scans again. Without this test, two harts run one process
+      at once (clinic 3, where it killed every boot).
+
+      If it is still RUNNABLE, the pass may no longer be the smallest (another process may have
+      woken up), and the code does not care: it runs it anyway. That is the "approximate
+      minimum" of question 3, corrected by the next pick.
+
+      Line 476 is the whole of stride scheduling's accounting: add `STRIDE1 / tickets` to the
+      pass, under the lock, before `swtch`. Lines 481-492 are commit 1's: the switch, with the
+      CPU-time readings around it. The candidate's lock is held across `swtch` and released by
+      the process, exactly as before ([[concept:locks#handoff]]).
+
+      Recorded with gdb on the finished branch at the charging line: hart 1 picked pid 6 (1
+      ticket) at pass 9,317,318, holding pid 6's lock, noff 1, intena 0, on hart 1's
+      scheduler stack.
+    others: |
+      The recorded schedule, at the charging line on all three harts (gdb, the share phase of
+      `stridetest`, pids 6 and 7 with 1 ticket, 8 and 9 with 2, 10 and 11 with 3):
+
+      | pick | hart | pid (tickets) | pass picked at |
+      |---|---|---|---|
+      | 1 | 1 | 6 (1) | 9,317,318 |
+      | 2 | 0 | 10 (3) | 9,317,314 |
+      | 3 | 1 | 11 (3) | 9,317,314 |
+      | 4 | 2 | 7 (1) | 9,317,318 |
+      | 5 | 0 | 8 (2) | 9,317,318 |
+      | 6 | 1 | 9 (2) | 9,317,318 |
+      | 7 | 2 | 10 (3) | 9,666,839 |
+      | 8 | 0 | 11 (3) | 9,666,839 |
+      | 9 | 1 | 8 (2) | 9,841,606 |
+      | 10 | 2 | 9 (2) | 9,841,606 |
+      | 11 | 0 | 10 (3) | 10,016,364 |
+      | 12 | 1 | 11 (3) | 10,016,364 |
+
+      The thirteenth pick was pid 6 again, at 10,365,894: one `STRIDE1` later, after exactly
+      one pick per ticket. The three harts interleave freely; the passes, not the harts, keep
+      the ratio.
+  - title: "Commit 3's fork copies the parent's pass"
+    commit: 3
+    file: kernel/proc.c
+    lines: 293-311
+    focus: 302-308
+    diff: true
+    state:
+      hart: any
+      mode: S
+      proc: the parent, in fork
+      intr: "off"
+      satp: kernel
+      locks: ["child's p->lock"]
+      irq: {noff: 1, intena: 1}
+      stack: [usertrap, syscall, sys_fork, kfork]
+      sp: {"on": kernel}
+    note: |
+      Commit 3 gives a child its parent's pass (line 306), the natural first idea: the child
+      continues where its parent is. (`proc.h` gets `uint64 pass` next to `tickets`, and
+      `param.h` gets `STRIDE1`, `1 << 20`.)
+
+      The test shows what is wrong with it, and with leaving a sleeper's pass alone (3 harts):
+
+      ```text
+      stridetest: share: OK
+      stridetest: sleeper: cpu 2901 ms, the others 1220 ms on average (ratio 237/100)
+      stridetest: sleeper: FAIL
+      stridetest: newcomer: cpu 2903 ms, the others 1221 ms on average (ratio 237/100)
+      stridetest: newcomer: FAIL
+      ```
+
+      Shares are right now. But the sleeper's pass stood still for 30 ticks while the others
+      advanced, so when it woke it had the smallest pass by far and ran without a break: 2.9
+      seconds of CPU in a 3-second window, where the others got about 1.2 each. The newcomer is
+      the child of a parent that slept in `read`, so it inherited the same stale pass and the
+      same burst. Both are "not competing for a while, then competing", and the next commit
+      treats them alike.
+  - title: Virtual time, and a lock of its own
+    commit: 4
+    file: kernel/proc.c
+    lines: 21-49
+    focus: 29-48
+    diff: true
+    state:
+      hart: 0
+      mode: S
+      proc: stridetest (the alarm process, writing to the pipe)
+      intr: "off"
+      satp: kernel
+      locks: ["the pipe's lock", "pid 12's p->lock", vtime.lock]
+      irq: {noff: 3, intena: 1, note: "inside catchup, called from wakeup; reasoned from the recorded noff 2 just before the call"}
+      stack: [usertrap, syscall, sys_write, filewrite, pipewrite, wakeup, catchup]
+      sp: {"on": kernel}
+    note: |
+      `vtime.now` is the largest pass with which any process has been picked. Because each
+      pick is the smallest pass a scheduler found, `vtime.now` follows the front of the queue:
+      where a process that has been competing all along would be now.
+
+      `catchup` (lines 41-48) is called whenever a process becomes RUNNABLE after *not*
+      competing, and raises its pass to virtual time if it is behind. It never lowers a pass:
+      a process that used a whole stride and slept for a moment is ahead, and stays ahead.
+
+      The lock is the interesting part. `vtime.now` is written by every hart's scheduler and
+      read by [[wakeup]] on any hart, so it needs one. Every caller already holds a `p->lock`,
+      and `catchup` takes nothing else while holding `vtime.lock`: the comment on line 32
+      records its place in the lock order, *after* `p->lock`, as a leaf. A leaf lock cannot be
+      part of a cycle. The alternative, computing the current minimum at wakeup time, would
+      need every other process's lock while holding this one's (question 5).
+
+      The state shown is the recorded wakeup of the next steps, one level deeper: inside
+      `catchup` the waking hart holds the pipe's lock, the sleeper's `p->lock` and
+      `vtime.lock`, noff 3.
+  - title: The scheduler moves virtual time
+    commit: 4
+    file: kernel/proc.c
+    lines: 474-524
+    focus: 496-504
+    diff: true
+    state:
+      hart: 1
+      mode: S
+      proc: none (scheduler; about to run pid 6)
+      intr: "off"
+      satp: kernel
+      locks: ["pid 6's p->lock", vtime.lock]
+      irq: {noff: 2, intena: 0, note: "reasoned: gdb recorded noff 1 at line 504, after the release of vtime.lock"}
+      stack: [main, scheduler]
+      sp: {"on": scheduler, detail: "hart 1's slice of `stack0`"}
+    note: |
+      Just before charging, the scheduler raises virtual time to the pass the chosen process
+      had (lines 500-503), under `vtime.lock`, nested inside the chosen process's `p->lock`.
+      The order matters: virtual time is the pass *before* the charge, the position of the
+      front of the queue. Raising it after adding the stride would put virtual time one slice
+      ahead of the front, and every waking process would start one slice behind the processes
+      already competing.
+
+      "Never let it go back" (the `>` on line 501) keeps virtual time monotonic even though the
+      three harts pick at slightly different passes: in the recorded trace, a hart picked a
+      3-ticket process at 9,317,314 while virtual time was already 9,317,318, and virtual time
+      stayed where it was.
+
+      The nesting is the one recorded in the lock-order comment: `p->lock` then `vtime.lock`.
+      The scheduler holds no other lock here, and [[wakeup]] nests them the same way, so the
+      two can never wait for each other in opposite orders.
+    others: |
+      While hart 1 holds `vtime.lock` (three instructions), a wakeup on another hart calling
+      `catchup` spins for it while holding the sleeper's `p->lock`. Hart 1 never wants the
+      sleeper's lock while holding `vtime.lock`, so the wait is bounded.
+  - title: A sleeper wakes at virtual time
+    commit: 4
+    file: kernel/proc.c
+    lines: 625-651
+    focus: 643-646
+    diff: true
+    state:
+      hart: 0
+      mode: S
+      proc: stridetest (the alarm process, writing to the pipe)
+      intr: "off"
+      satp: kernel
+      locks: ["the pipe's lock", "pid 12's p->lock"]
+      irq: {noff: 2, intena: 1}
+      stack: [usertrap, syscall, sys_write, filewrite, pipewrite, wakeup]
+      sp: {"on": kernel, detail: "the alarm process's kernel stack (`sp` = `0x3ffffebe80`)"}
+    note: |
+      [[wakeup]] calls `catchup` only for a process that actually went to sleep (line 643). A
+      process that registered with `sleep_prepare` but had not yet called `sleep` is still
+      RUNNING or RUNNABLE, competing all along; it is left alone.
+
+      Recorded with gdb on the finished branch: the alarm process writes "g" to the `go` pipe;
+      [[pipewrite]] calls [[wakeup]] on hart 0, which finds the sleeper, pid 12, SLEEPING with
+      pass **18,964,216** while virtual time is **22,319,656**. One line later its pass is
+      22,319,656. The difference, 3,355,440, is exactly 16 strides of a 5-ticket process
+      (209,715 each): without `catchup`, 16 slices in a row (clinic 2).
+
+      noff 2, intena 1: the pipe's lock (taken in a system call, after interrupts were turned
+      on) and the sleeper's `p->lock`. `catchup` adds `vtime.lock` for three instructions.
+    others: |
+      The sleeper is RUNNABLE as soon as this hart releases its lock (line 648); any hart's
+      next scan can pick it, perhaps before this write returns. It enters the queue level with
+      the front, not ahead of it: on commits 4 and 5 it used about 1.08 times the others'
+      average CPU time (0.99 to 1.09 in 24 runs on a busy computer) instead of 2.37.
+  - title: New processes start at virtual time, and so do killed sleepers
+    commit: 4
+    file: kernel/proc.c
+    lines: 316-334
+    focus: 325-331
+    diff: true
+    state:
+      hart: 2
+      mode: S
+      proc: stridetest (pid 3), forking pid 4
+      intr: "off"
+      satp: kernel
+      locks: ["child's p->lock (pid 4)"]
+      irq: {noff: 1, intena: 1}
+      stack: [usertrap, syscall, sys_fork, kfork]
+      sp: {"on": kernel, detail: "pid 3's kernel stack"}
+    note: |
+      [[allocproc]] now sets `p->pass = 0` (line 151; a reused slot would otherwise keep the
+      pass of the process that used it last), and [[kfork]] calls `catchup` in the critical
+      section that makes the child RUNNABLE. The child starts exactly at virtual time: level
+      with the front of the queue, neither behind it (a burst, commit 3) nor at 0 (clinic 1).
+
+      Recorded with gdb at line 329: `stridetest` (pid 3) on hart 2 creating pid 4; the child's
+      pass is 0 and virtual time 4,613,708. noff 1 (the child's lock), intena 1 (a system
+      call).
+
+      [[kkill]] gets the same call (line 669): it wakes a SLEEPING victim so that it can
+      notice `killed` and exit, and that victim is a sleeper like any other. `init`, made
+      RUNNABLE by [[userinit]], needs none: at boot virtual time is 0.
+  - title: Ctrl-P shows the passes
+    commit: 5
+    file: kernel/proc.c
+    lines: 729-761
+    focus: 756-760
+    diff: true
+    state:
+      hart: 0
+      mode: S
+      proc: "stridetest (pid 6, 3 tickets, interrupted in user mode)"
+      intr: "off"
+      satp: kernel
+      locks: [cons.lock]
+      irq: {noff: 1, intena: 0}
+      stack: [usertrap, devintr, uartintr, consoleintr, procdump]
+      sp: {"on": kernel, detail: "pid 6's kernel stack (`sp` = `0x3fffff3f80`)"}
+    note: |
+      The last commit prints each process's tickets and pass, and virtual time, on Ctrl-P. Like
+      the rest of [[procdump]] it takes no lock (the comment above it: a stuck machine must
+      still be able to print), so a number may be a moment old; each is a single aligned load,
+      never torn.
+
+      Recorded during `stridetest 1 2 3` on three harts: the UART interrupt landed on hart 0,
+      which was running a spinner (pid 6) in user mode; [[consoleintr]] holds `cons.lock`
+      (noff 1, intena 0: an interrupt handler) and calls [[procdump]]. The output:
+
+      ```text
+      1 sleep  init tickets 10 pass 3565138
+      2 sleep  sh tickets 10 pass 4508851
+      3 sleep  stridetest tickets 10 pass 5242850
+      4 run    stridetest tickets 1 pass 42991586
+      5 run    stridetest tickets 2 pass 23592930
+      6 run    stridetest tickets 3 pass 17476225
+      vtime 41943010
+      ```
+
+      Three processes, three harts, all RUNNING: none competes, each is re-picked by its own
+      hart at every tick, and each pass grows at its own rate (question 8). Virtual time
+      follows the largest. In that run each process used about 5,000 ms of CPU in the 5-second
+      window: 333 per mille each.
+  - title: The whole scheduler, and what it cost
+    commit: 5
+    file: kernel/proc.c
+    lines: 474-524
+    focus: 478-504
+    state:
+      hart: any
+      mode: S
+      proc: none (scheduler)
+      intr: "off"
+      satp: kernel
+      locks: ["best's p->lock"]
+      irq: {noff: 1, intena: 0}
+      stack: [main, scheduler]
+      sp: {"on": scheduler}
+    note: |
+      The change is about 80 added lines in `proc.c`, `proc.h` and `param.h`, plus two system
+      calls. Nothing outside the process code noticed: `usertests -q` passes at every commit.
+
+      What it bought: on 1, 2 and 3 harts, six processes with 1:2:3 tickets got 1:2:3 shares
+      of the CPU, within a slice or two of a 50-tick window, where round robin gave every one
+      the same (Measure).
+
+      What it cost: a scan of all 64 slots before every pick (the original also scans, but runs
+      the first RUNNABLE process it meets), a second `acquire` of the chosen process, a leaf
+      lock taken on every pick and every wakeup, and an approximation (the minimum is only
+      approximately the minimum, on three harts).
+
+      And what the clinics taught: the dangerous decisions are not in the arithmetic but in
+      the concurrency. Acting on a value seen under a released lock ran one process on two
+      harts. Holding two locks in an order that depends on the hart deadlocked two schedulers
+      and hung the third hart. Placing a process on the wrong clock (pass 0, or a stale pass,
+      or a wrapped one) starved someone; which one depended on where the clocks pointed.
+verify: |
+  On the branch (`ext/08-stride`, 5 commits), built with the project toolchain and run on
+  3 harts (`-smp 3 -m 128M`):
+
+  ```text
+  $ stridetest
+  stridetest: tickets: OK
+  stridetest: share: 6 processes with 1 1 2 2 3 3 tickets, 50 ticks
+  stridetest: share: tickets 1: cpu 166 per mille (ideal 167); chunks 155 per mille
+  stridetest: share: tickets 2: cpu 327 per mille (ideal 333); chunks 328 per mille
+  stridetest: share: tickets 3: cpu 506 per mille (ideal 500); chunks 516 per mille
+  stridetest: share: OK
+  stridetest: sleeper: cpu 1601 ms, the others 1481 ms on average (ratio 108/100)
+  stridetest: sleeper: OK
+  stridetest: newcomer: cpu 1599 ms, the others 1480 ms on average (ratio 108/100)
+  stridetest: newcomer: OK
+  stridetest: ALL OK
+  $ usertests -q
+  usertests starting
+  [...]
+  ALL TESTS PASSED
+  $ stridetest
+  stridetest: tickets: OK
+  stridetest: share: 6 processes with 1 1 2 2 3 3 tickets, 50 ticks
+  stridetest: share: tickets 1: cpu 166 per mille (ideal 167); chunks 171 per mille
+  stridetest: share: tickets 2: cpu 326 per mille (ideal 333); chunks 325 per mille
+  stridetest: share: tickets 3: cpu 506 per mille (ideal 500); chunks 503 per mille
+  stridetest: share: OK
+  stridetest: sleeper: cpu 1602 ms, the others 1481 ms on average (ratio 108/100)
+  stridetest: sleeper: OK
+  stridetest: newcomer: cpu 1600 ms, the others 1479 ms on average (ratio 108/100)
+  stridetest: newcomer: OK
+  stridetest: ALL OK
+  ```
+
+  And on one hart (`-smp 1`):
+
+  ```text
+  $ stridetest
+  stridetest: tickets: OK
+  stridetest: share: 6 processes with 1 1 2 2 3 3 tickets, 50 ticks
+  stridetest: share: tickets 1: cpu 159 per mille (ideal 167); chunks 161 per mille
+  stridetest: share: tickets 2: cpu 320 per mille (ideal 333); chunks 315 per mille
+  stridetest: share: tickets 3: cpu 519 per mille (ideal 500); chunks 523 per mille
+  stridetest: share: OK
+  stridetest: sleeper: cpu 600 ms, the others 480 ms on average (ratio 124/100)
+  stridetest: sleeper: OK
+  stridetest: newcomer: cpu 599 ms, the others 480 ms on average (ratio 124/100)
+  stridetest: newcomer: OK
+  stridetest: ALL OK
+  ```
+
+  `usertests -q` passing shows that the new scheduler runs everything the old one did,
+  including the tests that fork many processes, kill sleepers and exhaust the process table.
+  `stridetest` before and after it shows the scheduler still divides the CPU by tickets after
+  thousands of processes have come and gone. Every commit was built, and `usertests -q`
+  printed `ALL TESTS PASSED` on 3 harts at commits 2, 3, 4 and 5 (commit 1's kernel is
+  byte-identical to commit 2's).
+
+  **The margin.** The share check uses the kernel's CPU-time counter, so what else the
+  computer is doing barely matters. In 24 runs of `stridetest` at the head, measured while
+  the computer was heavily busy with other work, all 24 printed `ALL OK`; the 1-ticket pair's share
+  was 163 to 166 per mille (the check allows 134 to 200), the 2-ticket pair's 325 to 329 and
+  the 3-ticket pair's 506 to 507. The chunk shares of the 1-ticket pair in the same runs
+  ranged from 153 to 173.
+measure: |
+  **Shares, round robin against stride** (per mille of the CPU time of all spinners in the
+  50-tick window, per ticket count, from the kernel's counter; ideal 167 / 333 / 500). Round
+  robin is commit 2 of the branch: tickets exist, the scheduler ignores them.
+
+  | kernel | harts | 1 ticket | 2 tickets | 3 tickets |
+  |---|---|---|---|---|
+  | round robin | 3 | 333, 346 | 339, 326 | 326, 326 |
+  | round robin | 1 | 339 | 319 | 340 |
+  | stride | 3 | 159-166 | 326-333 | 506 |
+  | stride, 24 runs on a busy computer | 3 | 163-166 | 325-329 | 506-507 |
+  | stride | 2 | 159 | 330 | 509 |
+  | stride | 1 | 159 | 320 | 519 |
+
+  (Stride on 3 harts: six quiet runs on commits 3, 4 and 5, which schedule CPU-bound
+  processes identically.) CPU time is handed out in whole slices of about 100 ms, so a
+  50-tick window cannot split exactly 1:2:3: on one hart, the six processes of
+  `stridetest 1 1 2 2 3 3` used 400, 400, 800, 800, 1,301 and 1,301 ms, that is 8, 16 and
+  26 slices per pair where 8.3, 16.7 and 25 would be exact.
+
+  **Three processes with 1, 2 and 3 tickets** (`stridetest 1 2 3`, CPU time in the window):
+
+  | kernel | harts | 1 ticket | 2 tickets | 3 tickets |
+  |---|---|---|---|---|
+  | round robin | 1 | 1,701 ms (339) | 1,602 ms (320) | 1,702 ms (340) |
+  | stride | 1 | 801 ms (160) | 1,601 ms (319) | 2,604 ms (520) |
+  | stride | 2 | 1,601 ms (160) | 3,402 ms (340) | 5,003 ms (499) |
+  | stride | 3 | 5,001 ms (333) | 5,003 ms (333) | 5,005 ms (333) |
+
+  On 3 harts there is nothing to share: each process has a hart (question 8). On 2 harts the
+  3-ticket process deserves exactly one hart, the most it can use, and gets all of it.
+
+  **Late processes** (CPU time of the sleeper or newcomer divided by the others' average,
+  3 harts):
+
+  | kernel | sleeper | newcomer |
+  |---|---|---|
+  | round robin (commit 2) | 1.08, 0.99 | 0.92, 1.00 |
+  | stride, pass kept or copied (commit 3) | 2.37, 2.38 | 2.37, 2.37 |
+  | stride with virtual time (commits 4, 5), quiet | 1.08 (4 runs) | 1.08 (4 runs) |
+  | the same, 24 runs on a busy computer | 0.99-1.09 | 1.07-1.13 |
+  | woken pass kept (clinic 2) | 2.37, 2.37 | 1.08, 1.07 |
+  | new pass 0 (clinic 1) | 0 | 0 |
+
+  The reference's 1.08 is a small advantage of about one slice: a woken or new process
+  starts exactly at virtual time, level with the front of the queue, and ties go to the
+  earlier slot. On one hart, where the window holds only about five slices per process, the
+  same one slice makes 1.24.
+
+  **Why count CPU time and not work.** Counting chunks of a busy loop is what a user program
+  would naturally do. In the 24 busy runs above, the chunk share of the 1-ticket pair
+  ranged from 153 to 173 per mille while its CPU share stayed at 163 to 166, and in 83 runs
+  of a version of the test that checked chunk shares, they went as low as 132. The
+  scheduler was exact; the chunks were not. Two things make chunks stray. Each QEMU hart is
+  a host thread whose speed depends on what else the computer runs; on a busy computer,
+  `stridetest 1 2 3` once gave chunk shares of 277,
+  357 and 365 per mille although each process had a hart to itself. And the twelve picks of
+  a stride round fall on the three harts in a repeating pattern, so the 1-ticket processes run
+  on only some harts: in one recorded trace both ran on hart 0 for 20 of 21 picks, in another
+  only on harts 1 and 2. Their chunk count then measures the speed of fewer harts than the
+  other pairs' does. The `time` CSR is the same 10 MHz clock on every hart, so CPU time
+  measured with it does not care which hart ran the process.
+
+  **How fast virtual time can grow.** With a scratch program on a copy of the branch, two
+  1-ticket processes passing a byte back and forth through pipes made 20,299 and 20,961
+  round trips in 100 ticks; virtual time rose from 4,299,137 to 21,349,741,335 and then to
+  43,379,484,233, about 2.1 to 2.2 billion per second, one stride per round trip
+  (question 7).
+
+  **The schedule, recorded.** A gdb breakpoint at the charging line printed every pick
+  without stopping the machine for long (reveal, "Re-check under the lock"): one `STRIDE1` of
+  virtual time, 9,317,318 to 10,365,894, contained twelve picks on three harts, one per
+  ticket.
+further: |
+  - **Charge for time used.** The kernel already measures each slice for `cputime`. Add
+    `stride × used / slice` instead of a whole stride, and measure an interactive process
+    (one that sleeps after a millisecond) against CPU-bound neighbours before and after.
+    Look at the `pause` case of question 4 again.
+  - **Infeasible weights.** On three harts, `stridetest 1 2 3` cannot give 3/6 to one process.
+    Cap each process's effective tickets at what one hart can deliver, and keep the passes of
+    processes that run alone from drifting (Ctrl-P showed 43.0 million against 17.5
+    million). Compare with how Linux's CFS handles a task whose weight exceeds a CPU.
+  - **Per-hart run queues.** The scan of all 64 slots under 64 locks, on every pick, on every
+    hart, is the cost of one shared table. Give each hart its own queue of RUNNABLE processes
+    sorted by pass, and work out what moving a process between queues needs (lab 18 did the
+    same for free pages).
+  - **A 32-bit pass that survives the wrap.** Keep `uint`, compare with `(int)(a - b) < 0`, and
+    find out what must hold for every two passes ever compared to stay within 2^31 of each
+    other: question 7 shows that drifting passes on three harts break it within minutes, so
+    the infeasible-weight fix above is a prerequisite. Then run clinic 5's experiment against
+    it.
+  - **Lottery scheduling.** Replace the minimum with a random draw weighted by tickets and
+    compare the variance of the shares over short windows with stride's.

@@ -1,0 +1,620 @@
+title: One scheduler per hart
+group: Time and scheduling
+prerequisites: [11]
+summary: |
+  xv6 has no central scheduler that hands out work. Instead every hart runs its own copy of
+  the same loop, [[kernel:scheduler]], forever, and all three loops walk the same table of
+  64 processes, `proc[]`, looking for one marked `RUNNABLE`. Nobody coordinates them. Two
+  harts may reach the same process at the same instant.
+
+  This tour watches three schedulers at work while a test program creates processes, and
+  answers the questions that design raises: how two harts decide which of them gets a
+  process (one [[kernel:acquire]], one atomic instruction), why a process can never run on
+  two harts at once, why the scheduler briefly turns interrupts on and immediately off
+  again, what an idle hart does, and how fair the result is.
+
+  [[tour:11]] showed a process leaving its CPU on a timer tick. This tour stays with the
+  schedulers on the other side of that switch. [[tour:13]] looks inside the switch itself.
+cast: |
+  The machine has three [[g:hart|harts]]. You typed `usertests preempt`. The test process,
+  pid 4 (in slot `proc[3]`), is about to fork its children; on a fresh boot they land in
+  `proc[4]`, `proc[5]` and `proc[6]` as pids 5, 6 and 7. When the tour starts:
+
+  | Hart | What it is doing |
+  |---|---|
+  | 0 | Running pid 4, inside the `fork` system call |
+  | 1 | In its [[kernel:scheduler]], stopped at `wfi`: nothing was runnable on its last scan |
+  | 2 | Also in its scheduler at `wfi` |
+
+  `init` (pid 1), the shell (pid 2) and `usertests` (pid 3) are `SLEEPING` in `wait`.
+steps:
+  - title: Every hart ends its boot in the same loop
+    file: kernel/main.c
+    lines: 9-45
+    focus: 44
+    state:
+      hart: [0, 1, 2]
+      mode: S
+      proc: none
+      intr: off
+      satp: kernel
+      locks: []
+      stack: [main]
+      sp: {"on": boot, detail: "hart *i*'s slice ends at `stack0 + 4096 × (i + 1)`; `stack0` = `0x80007890`"}
+      irq: 0
+    note: |
+      At boot, hart 0 built the kernel and the other harts waited for it ([[tour:3]]). Then
+      all three reached line 44 and called [[scheduler]], which never returns. From that
+      moment the machine has three scheduler threads, one per hart, each running on its own
+      boot stack: `add sp, sp, a0` at [[kernel/entry.S:17]] gave hart *i* the 4096 bytes
+      ending at `stack0 + 4096 × (i + 1)`.
+
+      Calling `scheduler` does not change stacks. Its frame goes on the same slice of
+      `stack0`, just below `main`'s, and since neither function ever returns, that slice is
+      the hart's **scheduler stack** for as long as the machine runs
+      ([[concept:stacks#scheduler]]). In this build the slices are `0x80007890`–`0x80008890`
+      (hart 0), `0x80008890`–`0x80009890` (hart 1) and `0x80009890`–`0x8000a890` (hart 2).
+      Unlike a process's kernel stack, a slice has no guard page below it: if hart 2's stack
+      overflowed, it would silently overwrite hart 1's slice.
+
+      There is no "master" scheduler and no run queue. The only shared structure is the
+      process table `proc[]`, and each scheduler decides for itself what its hart runs next.
+      This is the simplest design that can work on several CPUs, and it puts all the weight
+      on one question: what stops two harts from picking the same process?
+
+      The answer is a lock in each process, `p->lock`, and it is the subject of this tour.
+    others: |
+      Hart 0 is the one that created the first process, [[userinit]], before reaching line
+      44, but any hart's scheduler may be the one that first runs it. From here on no hart is
+      special for scheduling. (Hart 0 is special for one other job: counting `ticks`
+      ([[tour:14]]).)
+
+  - title: A scheduler belongs to one hart forever
+    file: kernel/proc.c
+    lines: 428-435
+    focus: 431-434
+    state:
+      hart: 1
+      mode: S
+      proc: none (hart 1's scheduler)
+      intr: off
+      satp: kernel
+      locks: []
+      stack: [main, scheduler]
+      sp: {"on": scheduler, detail: "the boot stack under a new name: same memory, same `sp`; nothing switched"}
+      irq: 0
+    note: |
+      [[scheduler]] computes `c = mycpu()` once and keeps it for its whole infinite life.
+      Unlike a process, which may resume on any hart, the scheduler thread never moves: it
+      is switched away from and switched back to only on its own hart, through `c->context`.
+      So caching `c` is safe here, though it would be a bug in process code.
+
+      `c->proc = 0` records that no process is running on this hart. [[myproc]] reads this
+      field; anything that asks "which process am I?" while the scheduler runs gets 0.
+    others: |
+      `struct cpu` ([[kernel/proc.h:22]]) is 128 bytes in this build, one per hart, in the
+      array `cpus[NCPU]` (8 entries; QEMU starts 3 harts, so 5 are never used). Each hart
+      writes only its own entry, which is why `c->proc`, `c->noff` and `c->intena` need no
+      lock. Interrupts are off whenever they are used, so the thread reading them cannot be
+      moved to another hart halfway.
+
+  - title: The struct each hart fights over
+    file: kernel/proc.h
+    lines: 79-104
+    focus: 83-90
+    state:
+      hart: [0, 1, 2]
+      mode: S
+      proc: none
+      intr: off
+      satp: kernel
+      locks: []
+      stack: [main, scheduler]
+      sp: scheduler
+      irq: 0
+    note: |
+      `proc[]` holds 64 of these ([[kernel:NPROC]]), 360 bytes each in this build, starting
+      at `0x8000fdd0`. Every scheduler reads every slot on every pass.
+
+      The comment on line 85 is the contract: `state`, `chan`, `killed`, `xstate` and `pid`
+      may only be used while holding that process's own `lock`. For the scheduler, `state`
+      is the one that matters:
+
+      | State | Meaning for a scheduler |
+      |---|---|
+      | `UNUSED`, `USED` | free slot, or a process still being built: ignore |
+      | `SLEEPING` | waiting for an event: ignore |
+      | `RUNNABLE` | ready: **take it** |
+      | `RUNNING` | some hart is running it right now: ignore |
+      | `ZOMBIE` | exited, waiting for its parent: ignore |
+
+      One lock per process, rather than one lock for the whole table, means hart 1 working
+      on `proc[4]` never delays hart 2 working on `proc[9]`.
+
+  - title: A new process becomes visible only when complete
+    file: kernel/proc.c
+    lines: 292-305
+    focus: 300-301
+    state:
+      hart: 0
+      mode: S
+      proc: pid 4 (usertests preempt)
+      intr: off
+      satp: kernel
+      locks: ["pid 5's p->lock"]
+      stack: [usertrap, syscall, sys_fork, kfork]
+      sp: {"on": kernel, detail: "`KSTACK(3)`, holding `usertrap` → `syscall` → `sys_fork` → `kfork`"}
+      irq: {noff: 1, intena: 1}
+    note: |
+      On hart 0, pid 4 is finishing its first `fork`. [[allocproc]] claimed `proc[4]` for the
+      child, pid 5, and marked it `USED`, not `RUNNABLE`. While [[kfork]] copied memory and
+      open files into it, every scheduler that looked at `proc[4]` saw `USED` and walked past.
+
+      Only now, with the child complete, does `kfork` take the child's lock and set
+      `RUNNABLE`. This is the moment pid 5 joins the competition. The lock makes the write
+      visible to the other harts together with everything written before it: a scheduler
+      that sees `RUNNABLE` (under the same lock) also sees the finished trapframe, page table
+      and context ([[g:memory-barrier]]).
+    others: |
+      Who will run pid 5? Not hart 0, which is busy with pid 4. Harts 1 and 2 are idle in
+      `wfi`, but nothing tells them a process just became runnable: xv6 sends no
+      inter-processor interrupts. They will find out at their next interrupt, at the latest
+      their next timer tick, up to 0.1 s away. A simple design pays for its simplicity with a
+      little latency.
+
+  - title: The idle hart sleeps with interrupts off
+    file: kernel/proc.c
+    lines: 435-470
+    focus: 465-468
+    state:
+      hart: 1
+      mode: S
+      proc: none (hart 1's scheduler)
+      intr: off
+      satp: kernel
+      locks: []
+      stack: [main, scheduler]
+      sp: scheduler
+      irq: 0
+    note: |
+      Hart 1 got here on its previous pass: it scanned all 64 slots, found nothing
+      `RUNNABLE`, and `found` stayed 0. Rather than rescan millions of times a second, it
+      executes [[g:insn:wfi|wfi]]: "wait for interrupt". On QEMU the hart stops
+      executing until an interrupt is pending; the spec lets `wfi` return early, and the
+      loop would still be correct if it did, just wasteful.
+
+      Interrupts are **off** at this point (line 442 turned them off). That seems backwards:
+      how can an interrupt wake a hart that has interrupts disabled? The RISC-V rule is that
+      `wfi` resumes when an interrupt is pending *and locally enabled* in `sie`, regardless of
+      the global `sstatus.SIE` bit. So the timer still wakes hart 1. The interrupt is not
+      taken yet; it stays pending, and `wfi` simply finishes.
+
+      Now hart 1's timer fires. `wfi` completes, the `for (;;)` loop goes around, and
+      execution reaches the top of the loop again.
+
+  - title: Open the window, let the interrupt in
+    file: kernel/proc.c
+    lines: 435-443
+    focus: 441
+    state:
+      hart: 1
+      mode: S
+      proc: none (hart 1's scheduler)
+      intr: on
+      satp: kernel
+      locks: []
+      stack: [main, scheduler]
+      sp: scheduler
+      irq: 0
+    note: |
+      [[intr_on]] sets `sstatus.SIE`. The timer interrupt has been pending since the `wfi`, so
+      the hart traps at once, before the next instruction (in the build, `csrsi sstatus,2` is
+      immediately followed by `csrci sstatus,2`, and the trap is taken between them).
+
+      Why have this window at all? The scheduler holds no locks here, and this is the only
+      place in its own loop where it lets interrupts be handled. If every process were sleeping, waiting for a
+      disk read or a key press, those devices' interrupts must be able to run, call
+      [[wakeup]] and make something `RUNNABLE`. A scheduler that never enabled interrupts
+      would wait forever for a wakeup that could never be delivered to it.
+      Line 441 is safe because `noff` is 0 there; an interrupt can only ever be *taken*
+      at such a moment, since whenever `noff` > 0, `SIE` is off
+      ([[concept:locks#invariant]]).
+    others: |
+      The external interrupts (UART, disk) come through the [[g:plic|PLIC]], which offers each
+      one to all three harts ([[plicinithart]]). An idle hart, opening this window, is often
+      the one that claims it. [[tour:9]] follows that path.
+
+  - title: A tick inside the scheduler does not yield
+    file: kernel/trap.c
+    lines: 136-164
+    focus: 149-158
+    state:
+      hart: 1
+      mode: S
+      proc: none (hart 1's scheduler)
+      intr: off
+      satp: kernel
+      locks: []
+      stack: [main, scheduler, kernelvec, kerneltrap]
+      sp: {"on": scheduler, detail: "with a 256-byte `kernelvec` frame on top (`0x80009810` → `0x80009710`)"}
+      irq: 0
+    note: |
+      The trap came from supervisor mode, so `stvec` sent it to [[kernelvec]], which saved the
+      scheduler's registers on the scheduler's own stack and called [[kerneltrap]]. There is
+      no separate interrupt stack in xv6: `addi sp, sp, -256` ([[kernel/kernelvec.S:14]])
+      simply pushes a frame onto whatever stack `sp` points into, and here that is hart 1's
+      slice of `stack0`. Measured in this build with gdb:
+
+      ```text
+      hart 1's scheduler stack (stack0 slice, top 0x80009890)
+        start         16 bytes, never popped (start left by mret)
+        main
+        scheduler     sp was 0x80009810
+        kernelvec     256-byte register frame, sp = 0x80009710
+        kerneltrap    ◄─ sp
+      ```
+      [[devintr]] sees a timer interrupt; [[clockintr]] re-arms hart 1's `stimecmp` (hart 1
+      does not count `ticks`) and returns 2.
+
+      In [[usertrap]], a tick means [[yield]]. Here line 157 adds a condition:
+      `myproc() != 0`. The scheduler is not a process. It has no `p->lock` to take and no
+      `p->state` to set; there is nothing to yield *to*, since the scheduler is where
+      yielding leads. So the tick is just acknowledged, and [[kernelvec]] returns into the
+      scheduler at the instruction after `csrsi`.
+
+      Said in terms of stacks: `myproc() == 0` is exactly the case "this trap landed on a
+      scheduler stack". A tick that lands on a process's kernel stack (a system call in
+      progress, [[tour:8]]) does yield, and leaves its `kernelvec` frame buried in that
+      process's kernel stack until it is resumed. A tick on the scheduler stack is handled,
+      its frame popped, and the scan goes on.
+
+      ([[tour:8]] covers traps taken in the kernel.)
+
+  - title: Close the window before scanning
+    file: kernel/proc.c
+    lines: 435-443
+    focus: 442
+    state:
+      hart: 1
+      mode: S
+      proc: none (hart 1's scheduler)
+      intr: off
+      satp: kernel
+      locks: []
+      stack: [main, scheduler]
+      sp: scheduler
+      irq: 0
+    note: |
+      [[intr_off]] clears `sstatus.SIE`, and the scan runs with interrupts off. The reason is
+      the `wfi` at the end of the loop. If interrupts were on during the scan:
+
+      | Time | Hart 1 (scheduler) | |
+      |---|---|---|
+      | t1 | scans all 64 slots: nothing `RUNNABLE` | |
+      | t2 | disk interrupt **taken** on hart 1; handler wakes a process waiting for that block: `RUNNABLE` | |
+      | t3 | `found == 0`, so `wfi` | |
+      | t4 | stalls until the *next* interrupt, up to 0.1 s, with that process ready | |
+
+      With interrupts off, the interrupt at t2 stays pending instead of being handled, `wfi`
+      at t3 returns immediately because something is pending, and the next pass handles it
+      in the window and then finds that process.
+
+      This version of the loop dates from November 2024 (commit `f7b14e5`, "maybe fix a race
+      between interrupt and wfi"). Before it, the scheduler turned interrupts on at the top
+      of the loop and left them on during the scan (except while holding each `p->lock`),
+      then turned them on again just before `wfi`, leaving exactly the window in the table.
+
+  - title: The scan, one lock at a time
+    file: kernel/proc.c
+    lines: 444-464
+    focus: 447
+    state:
+      hart: 1
+      mode: S
+      proc: none (hart 1's scheduler)
+      intr: off
+      satp: kernel
+      locks: ["the scanned slot's p->lock"]
+      stack: [main, scheduler]
+      sp: scheduler
+      irq: {noff: 1, intena: 0}
+    note: |
+      The scan visits `proc[0]` to `proc[63]` in order. For each slot it takes `p->lock`,
+      looks at `state`, and (if it is not `RUNNABLE`) releases the lock at line 463. That is
+      64 acquire/release pairs per pass, even for unused slots, because the rule
+      ([[kernel/proc.h:85]]) is that `state` is only touched under `p->lock`: if the
+      scheduler finds `RUNNABLE`, it must still hold the lock when it writes `RUNNING`, and
+      the lock's barriers guarantee it also sees everything written before `RUNNABLE`.
+      Taking the lock for every slot, even unused ones, keeps the rule simple.
+
+      Hart 1 finds `proc[0]`, `proc[1]` and `proc[2]` `SLEEPING`, and `proc[3]` (pid 4)
+      `RUNNING` on hart 0. Then it reaches `proc[4]`.
+      Each of these `acquire`s finds interrupts already off (line 442), so `push_off`
+      records `intena = 0` and the `release` at line 463 leaves them off
+      ([[concept:locks#intena]]).
+
+      The scheduler never holds two process locks at once. That matters: the schedulers on
+      three harts are constantly taking the same 64 locks, and a thread that held one lock
+      while waiting for another could form a cycle with another hart doing the opposite.
+      Holding one at a time makes [[g:deadlock]] among schedulers impossible.
+    others: |
+      Hart 2's timer fired at about the same time, so its scheduler is scanning too, a few
+      slots behind or ahead. The two scans proceed in parallel without blocking each other,
+      except at a slot both want at once. The next step is such a slot.
+
+  - title: Two harts reach proc[4] at once
+    file: kernel/spinlock.c
+    lines: 21-42
+    focus: 37-38
+    state:
+      hart: 1
+      mode: S
+      proc: none (hart 1's scheduler)
+      intr: off
+      satp: kernel
+      locks: ["pid 5's p->lock"]
+      stack: [main, scheduler, acquire]
+      sp: scheduler
+      irq: {noff: 1, intena: 0}
+    note: |
+      Harts 1 and 2 both call `acquire(&proc[4].lock)`. Inside, each executes one
+      [[g:insn:amoswap|amoswap.w.aq]]: atomically write 1 to `locked` and get the old value
+      back. The memory system performs the two swaps one after the other, in some order.
+      Hart 1's swap happens to come first, gets 0, and leaves the loop: it owns the lock.
+      Hart 2's swap gets 1 and repeats, spinning.
+
+      This single instruction is the whole arbitration. No scheduler asks another; whoever
+      swaps first owns `proc[4]` for the next few instructions, and the other waits.
+      [[tour:15]] builds spinlocks up from this instruction.
+
+      Line 41 records `lk->cpu = &cpus[1]`, which [[holding]] will later use to check
+      ownership.
+    others: |
+      Hart 2 spins with interrupts off. Is that dangerous? Only if the holder could keep
+      the lock for long. Hart 1 will hold it only until pid 5, which it is about to run,
+      releases it in [[forkret]]: a few dozen instructions.
+
+  - title: Hart 1 claims pid 5 and switches to it
+    file: kernel/proc.c
+    lines: 444-464
+    focus: 447-453
+    state:
+      hart: 1
+      mode: S
+      proc: none (hart 1's scheduler)
+      intr: off
+      satp: kernel
+      locks: ["pid 5's p->lock"]
+      stack: [main, scheduler]
+      sp: scheduler
+      irq: {noff: 1, intena: 0}
+    note: |
+      `state` is `RUNNABLE`. Still holding the lock, hart 1:
+
+      1. sets `state = RUNNING` (line 451), so that every later reader sees "taken";
+      2. sets `c->proc = p` (line 452), so that [[myproc]] on hart 1 returns pid 5;
+      3. calls [[swtch]] (line 453), which saves the scheduler's registers in
+         `cpus[1].context` and loads pid 5's.
+
+      Pid 5 has never run, so its context, prepared by [[allocproc]], sends it to
+      [[forkret]] with an empty kernel stack: `context.sp` is the top of `KSTACK(4)`
+      ([[kernel/proc.c:147]]). Inside `swtch`, `ld sp, 8(a1)` ([[kernel/swtch.S:26]]) is
+      where hart 1 leaves its scheduler stack for that page. The first thing `forkret` does is release
+      `proc[4].lock`, the lock hart 1's scheduler is holding right now. A lock taken by
+      one thread and released by another: [[tour:13]] explains why that is the right design.
+
+      The check (`RUNNABLE`?) and the claim (`RUNNING`) happen inside one critical section.
+      That is what makes them a single decision.
+
+  - title: Hart 2 gets the lock, and sees RUNNING
+    file: kernel/proc.c
+    lines: 444-464
+    focus: 446-447
+    state:
+      hart: 2
+      mode: S
+      proc: none (hart 2's scheduler)
+      intr: off
+      satp: kernel
+      locks: ["pid 5's p->lock"]
+      stack: [main, scheduler]
+      sp: scheduler
+      irq: {noff: 1, intena: 0}
+    note: |
+      On hart 1, pid 5's `forkret` releases `proc[4].lock`. Hart 2's spinning `amoswap`
+      finally returns 0. Hart 2 reads `state`: `RUNNING`. Not for it. It releases the lock
+      and moves on to `proc[5]`: pid 6, made `RUNNABLE` by pid 4's second `fork` on hart 0 a
+      moment ago. Hart 2 claims and runs pid 6.
+
+      Here is the race the lock prevents, if `state` were read and written without it:
+
+      | Time | Hart 1 | Hart 2 |
+      |---|---|---|
+      | t1 | reads `proc[4].state`: `RUNNABLE` | reads `proc[4].state`: `RUNNABLE` |
+      | t2 | writes `RUNNING`, `swtch` to pid 5 | writes `RUNNING`, `swtch` to pid 5 |
+      | t3 | runs pid 5 on its kernel stack | runs pid 5 on the **same** kernel stack |
+
+      With the lock, t1 and t2 for hart 2 cannot fall between hart 1's t1 and t2. And
+      because the lock stays held until pid 5 is actually running (and is taken again before
+      pid 5 stops), hart 2 can never see `RUNNABLE` for a process that is still on a CPU.
+    others: |
+      Each hart has its own `sp`. Right now hart 1 is on pid 5's kernel stack (soon its user
+      stack), hart 2 on its own slice of `stack0`, and hart 0 on one of pid 4's stacks (pid 4 has
+      just finished a second `fork`).
+
+      While pid 5 runs, nobody holds `proc[4].lock`. Any scheduler may lock the slot, read
+      `RUNNING`, and leave. The lock is not "held while running"; it is held *while the
+      state changes*, and the state itself keeps others away the rest of the time.
+
+  - title: A scheduler comes back and keeps its place
+    file: kernel/proc.c
+    lines: 444-464
+    focus: 455-463
+    state:
+      hart: 1
+      mode: S
+      proc: none (hart 1's scheduler)
+      intr: off
+      satp: kernel
+      locks: ["pid 5's p->lock"]
+      stack: [main, scheduler]
+      sp:
+        "on": scheduler
+        switched: "`ld sp, 8(a1)` in [[swtch]] ([[kernel/swtch.S:26]]), called from pid 5's [[sched]]"
+      irq: {noff: 1, intena: 0, note: "after line 456: whatever intena the returning process left, the scheduler's is 0"}
+    note: |
+      0.1 s later, pid 5 (spinning in user mode) takes a tick on hart 1 and yields, as in
+      [[tour:11]]. Hart 1's scheduler returns from the `swtch` on line 453, still inside the
+      loop iteration for `proc[4]`. The `swtch` that pid 5's [[sched]] called put hart 1 back
+      on its scheduler stack, at exactly the `sp` saved in `cpus[1].context` when the
+      scheduler switched away; pid 5's kernel stack keeps its `usertrap` → `yield` → `sched`
+      frames until some hart resumes it. It clears `intena` (line 456: pid 5 left its own value in `cpus[1]`, and the scheduler wants 0 so that its release leaves interrupts off, [[concept:locks#sched-intena]]) and `c->proc`, and releases the lock
+      that pid 5's [[yield]] acquired. `found = 1`.
+
+      Then the loop continues with `proc[5]`, not with `proc[0]`. The scan position is the
+      fairness mechanism. The process that just ran is now *behind* the scan position, so
+      every other `RUNNABLE` process further along gets considered before it is considered
+      again. When the scan reaches the end, the outer loop restarts at `proc[0]` (after the
+      interrupt window; there is no `wfi`, because `found` is 1).
+
+      This is round-robin, but per hart: each of the three schedulers has its own scan
+      position, and they move independently.
+
+  - title: How fair is it?
+    file: kernel/proc.c
+    lines: 435-470
+    focus: 444-464
+    state:
+      hart: [0, 1, 2]
+      mode: S
+      proc: none (the three schedulers)
+      intr: off
+      satp: kernel
+      locks: ["the scanned slot's p->lock"]
+      stack: [main, scheduler]
+      sp: scheduler
+      irq: {noff: 1, intena: 0}
+    note: |
+      Here is one plausible run of the `preempt` test after all three children exist. Ticks
+      on different harts are not synchronized, so the order is illustrative:
+
+      | Tick on | Hart 0 | Hart 1 | Hart 2 |
+      |---|---|---|---|
+      | start | pid 7 | pid 5 | pid 6 |
+      | hart 1 | pid 7 | yields pid 5, finds pid 4 (woken by pid 7's write) | pid 6 |
+      | hart 0 | yields pid 7, finds pid 5 | pid 4 | pid 6 |
+      | hart 2 | pid 5 | pid 4 | yields pid 6, finds pid 7 |
+
+      No `RUNNABLE` process can starve: a hart cannot pass a `RUNNABLE` slot without taking
+      it, and every busy hart returns to its scheduler about once a tick. But each returning
+      hart takes the *next* `RUNNABLE` process after its scan position, not the one that has
+      waited longest, so with many processes waiting, one may wait several ticks: roughly
+      (number waiting ÷ number of harts). In this test at most one process is waiting at a
+      time, so the next tick on any hart picks it up.
+
+      But xv6 makes no stronger promise. There are no priorities, and no record of how long
+      a process has run: a process that sleeps 1 ms before its tick and one that ran the
+      full 100 ms are treated alike. When a process yields, the next scheduler to reach its
+      slot may be another hart's, so it can be running again almost immediately; a process
+      that yields is not guaranteed to wait. A real operating system's scheduler adds all of
+      that. xv6's job is to show the mechanism, and the mechanism is this loop.
+    others: |
+      With three harts and three spinners, the parent pid 4 can still run because each tick
+      sends one spinner back to the table. That is exactly what the test checks. (Its
+      comment says it is "meant to be run w/ at most two CPUs": with more CPUs than spinners,
+      the parent would get an idle hart without needing preemption, and the test would prove
+      less.)
+
+  - title: When the table is empty, the hart rests
+    file: kernel/proc.c
+    lines: 435-470
+    focus: 465-468
+    state:
+      hart: 2
+      mode: S
+      proc: none (hart 2's scheduler)
+      intr: off
+      satp: kernel
+      locks: []
+      stack: [main, scheduler]
+      sp: scheduler
+      irq: 0
+    note: |
+      Later, pid 4 kills its children and reaps them, `usertests` prints `OK` and `ALL TESTS PASSED` and exits, and
+      the shell goes back to reading the console. Every process is `SLEEPING`. Each hart's
+      scan finds nothing, and each executes `wfi`.
+
+      Now the three harts stall, waking ten times a second for their own ticks, scanning 64
+      slots, and stalling again. When you type a line and press Enter, each key's UART
+      interrupt goes through the PLIC to whichever hart claims it; on the newline
+      [[consoleintr]] calls [[wakeup]], the shell becomes `RUNNABLE`, and the hart that handled the interrupt
+      usually finds it on its very next scan, since its interrupt window was where the
+      interrupt was handled.
+
+      Without `wfi`, xv6 would still work. An idle hart would spin through the table
+      continuously, taking and releasing 64 locks in a loop, and an emulator such as QEMU
+      would burn host CPU time for every idle hart (with its default one-thread-per-hart
+      emulation, about a whole host core each). The `wfi` was added for exactly that
+      reason: the commit that introduced it is titled "wfi to save CPU time on Athena",
+      MIT's shared machines.
+    others: |
+      An idle hart and a hart running a process look the same to the rest of the system:
+      neither holds any lock between scans. That is why one hart's idleness never delays
+      another hart's work.
+
+  - title: What three independent loops add up to
+    file: kernel/proc.c
+    lines: 428-470
+    focus: 444-464
+    state:
+      hart: [0, 1, 2]
+      mode: S
+      proc: none (the three schedulers)
+      intr: off
+      satp: kernel
+      locks: []
+      stack: [main, scheduler]
+      sp: scheduler
+      irq: 0
+    note: |
+      The [[user:preempt]] test exercises everything in this tour: three schedulers, a shared
+      table, processes that never yield on their own, and a parent that needs a CPU.
+
+      The key ideas:
+
+      - **No central scheduler.** Each hart runs [[scheduler]] over the same `proc[]`. The
+        only coordination between harts is per-process locks.
+      - **Ownership is decided by `acquire`.** Testing `RUNNABLE` and setting `RUNNING` under
+        `p->lock` makes "this hart runs this process" a single indivisible decision; the
+        lock's hand-off across [[swtch]] ([[tour:13]]) keeps it true until the process has
+        fully left its CPU.
+      - **One lock at a time.** Schedulers never hold two process locks, so they cannot
+        deadlock with each other.
+      - **Interrupts only in the window.** The scheduler scans with interrupts off and opens
+        a two-instruction window per pass, so wakeups from interrupts are not lost to a
+        badly timed `wfi`.
+      - **Fair enough.** Round-robin per hart, with a quantum of at most one tick (the rest
+        of the hart's current 0.1 s timer interval): no starvation, no priorities.
+locks:
+  - lock: "p->lock (spinlock), each slot"
+    where: "[[kernel:scheduler]] (scan), [[kernel:kfork]] (set `RUNNABLE`), [[kernel:allocproc]], [[kernel:yield]], [[kernel:forkret]] (releases the scheduler's acquisition)"
+    protects: "`p->state`: deciding which hart runs a process, as one indivisible test-and-claim"
+  - lock: "cpus[i] (no lock: per-hart)"
+    where: "[[kernel:scheduler]] (`c->proc`), [[kernel:myproc]]"
+    protects: "Each hart writes only its own `struct cpu`, with interrupts off"
+  - lock: "The interrupt window (not a lock)"
+    where: "[[kernel:scheduler]], lines 441–442"
+    protects: "Keeps an interrupt from being handled between an empty scan and `wfi`, where its wakeup would be missed until the next interrupt"
+quiz:
+  - q: "Why does the scheduler take `p->lock` even for slots whose state is `UNUSED`?"
+    a: "Because the rule is that `state` is read and written only under `p->lock`: checking `RUNNABLE` and claiming it with `RUNNING` must happen in one critical section, and the lock's barriers ensure a hart that sees `RUNNABLE` also sees the finished process. For an `UNUSED` slot an unlocked peek would be harmless in practice, but xv6 keeps one simple rule rather than special cases."
+  - q: "Hart 1 and hart 2 both reach `proc[4]` while it is `RUNNABLE`. Trace what each one does, and explain why exactly one of them runs pid 5."
+    a: "Both call `acquire`; their `amoswap`s are serialized and only the first gets 0. That hart sets `RUNNING` and switches to pid 5 while still holding the lock. The other spins until pid 5's own kernel thread releases the lock (here in `forkret`), then reads `RUNNING` and moves on."
+  - q: "What would go wrong if the scheduler left interrupts enabled during its scan, as an older version did?"
+    a: "An interrupt could be handled after a scan that found nothing but before `wfi`. If its handler made a process `RUNNABLE`, the hart would then stall in `wfi` until the next interrupt (up to a tick) with a runnable process waiting."
+  - q: "`kfork` on hart 0 makes pid 5 `RUNNABLE` while harts 1 and 2 are stalled in `wfi`. How long can it take before pid 5 runs, and why?"
+    a: "Up to about one tick (0.1 s). xv6 sends no inter-processor interrupt, so the idle harts discover new work only when their own next interrupt (usually the timer) wakes them and they rescan."
+  - q: "Why is it safe for `scheduler` to compute `c = mycpu()` once, when the comment above `cpuid` warns that a process can be moved to a different CPU?"
+    a: "The scheduler thread is only ever switched to and from on its own hart, through `c->context`, so it never migrates. A process's kernel thread can resume on any hart, so its code must call `mycpu()` again after a switch."
+  - q: "Could two schedulers deadlock each other? Why not?"
+    a: "No. Each holds at most one `p->lock` at a time and releases it before taking the next, so no hart ever waits for a lock while holding another, and no cycle of waiting can form."

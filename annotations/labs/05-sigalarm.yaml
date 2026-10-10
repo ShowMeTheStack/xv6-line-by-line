@@ -1,0 +1,1685 @@
+published: true
+title: "sigalarm and sigreturn: calling a user handler from a timer"
+area: Traps and control flow
+stars: 3
+branch: ext/05-sigalarm
+prerequisites: {tours: [5, 7, 11, 22, 43, 44], concepts: [stacks, locks, mode-stack-page-table]}
+summary: |
+  You add two system calls. `sigalarm(n, handler)` asks the kernel to call `handler` in user
+  space after every `n` timer ticks of CPU time the process uses; `sigreturn()`, called at
+  the end of the handler, puts the process back exactly where the timer interrupted it, with
+  every register as it was. `sigalarm(0, 0)` turns the alarm off. It is a small version of
+  what Unix calls a signal: the kernel makes a running program jump to a function it never
+  called, then makes it carry on as if nothing had happened.
+
+  About sixty lines of kernel code (not counting comments), and almost every one of them
+  touches something central. You will decide what "a tick of this process" means when three
+  [[g:hart|harts]] each take their own [[g:timer-interrupt]] but only hart 0 advances
+  `ticks`. You will find out where the hart decides which user instruction comes next, and
+  whether you can change it from [[usertrap]]. You will decide what to save so that the
+  interrupted code notices nothing, and where to keep it. Along the way: is user address 0 a
+  valid handler? What happens to `a0` when `sigreturn`, itself a system call, returns a
+  value? And what if the handler runs longer than its interval?
+learn:
+  - "How a timer interrupt reaches [[usertrap]] on every hart, why the global `ticks` counts only hart 0's interrupts ([[kernel/trap.c:169]]), and how to charge a tick to the process that was running on the hart that took it."
+  - "How the return to user space chooses where to land, and which piece of state you must change (a register, or something in memory?) to send the process somewhere else."
+  - "What the trapframe holds (31 registers and the program counter), what an ordinary C function called from nowhere changes (`sp`, `ra`, `s0` and its scratch registers), and why the copy has to live somewhere the kernel controls."
+  - "How the ordinary system-call path ([[usertrap]] and [[syscall]]) treats the trapframe before and after a handler runs, and what that means for a system call whose job is to restore registers."
+  - "What happens when a timer tick lands inside a handler that is still running, and what one per-process fact prevents it; the clinic shows the real failure."
+  - "Why all of this needs no lock on three harts: every field is used only by the process that owns it, and a process runs on one hart at a time even when it moves between harts mid-handler."
+spec: |
+  **The system calls.**
+
+  ```c
+  int sigalarm(int ticks, void (*handler)());
+  int sigreturn(void);
+  ```
+
+  - `sigalarm(n, handler)` with `n > 0`: from now on, after every `n` ticks of **user** CPU
+    time this process uses, the kernel makes the process call `handler`. A tick of this
+    process is a timer interrupt, on whichever hart runs it, that arrives while it is running
+    in user mode. Ticks spent in the kernel (inside a system call) do not count. Returns 0.
+  - `sigalarm(0, 0)` turns the alarm off. A negative `n` fails with -1.
+  - The handler is an ordinary C function with no arguments. It must end by calling
+    `sigreturn()`, which resumes the code the timer interrupted, at the interrupted
+    instruction, with every register (including `a0`, `sp` and `ra`) exactly as it was. Called
+    when no handler is running, `sigreturn` fails with -1.
+  - While a handler runs, the kernel does not call it again and does not count ticks; the
+    next interval starts when the handler returns.
+  - `handler` may be any user address, including 0.
+  - A child made by `fork` starts with the alarm off. `exec` turns the alarm off.
+
+  **Constraints.** Processes that never call `sigalarm` behave exactly as before; `usertests
+  -q` must still print `ALL TESTS PASSED` on three harts. Existing system call numbers do not
+  change (`sigalarm` is 23, `sigreturn` 24).
+
+  **The test.** `alarmtest` runs six checks and prints `OK` or `FAIL` for each. Everything it
+  reports, it checks itself; nothing needs to be compared by eye.
+
+  ```text
+  $ alarmtest
+  alarmtest: periodic is at address 0x0000000000000000
+  alarmtest: 5 calls; 0 more in 10 ticks after sigalarm(0, 0)
+  alarmtest: handler called, then stopped: OK
+  alarmtest: sigreturn outside a handler fails: OK
+  alarmtest: the handler ran during 10 fillspin runs (10 calls)
+  alarmtest: registers preserved: OK
+  alarmtest: slow ran 3 times, nested at most 1 deep
+  alarmtest: no re-entry: OK
+  alarmtest: the handler ran during 10 a0spin runs (10 calls)
+  alarmtest: sigreturn restores a0: OK
+  alarmtest: handler calls in the forked child: 0, after exec: 0
+  alarmtest: fork and exec start with the alarm off: OK
+  alarmtest: 6 of 6 checks OK
+  ```
+
+  - **handler called, then stopped**: with `sigalarm(2, periodic)` the handler runs at least
+    5 times within 300 ticks; after `sigalarm(0, 0)` it does not run again for 10 ticks. The
+    handler `periodic` is the first function in the program, so it sits at address 0.
+  - **registers preserved**: an assembly loop fills 26 registers with known values and spins;
+    the handler (every tick) interrupts it; afterwards every register must still hold its
+    value. The test repeats until 10 runs of the loop were interrupted.
+  - **no re-entry**: a handler that runs for 3 ticks with an interval of 1 must never find
+    itself already running.
+  - **sigreturn restores a0**: like the register check, for `a0` alone.
+  - **fork and exec**: a forked child, and a process that turns its alarm on and then calls
+    `exec`, see no handler calls.
+
+  A second program, `alarmrate INTERVAL SECONDS NPROC`, measures how often handlers run; it
+  checks nothing and prints numbers (see Measure).
+think:
+  - title: What does the kernel need to remember, and what means "off"?
+    q: |
+      `sigalarm(n, handler)` must record something in the kernel for later. List the
+      per-process state you need. Then decide: how does the rest of the kernel tell whether
+      the alarm is on? Commit to one test, for example "the handler is not null" or "the
+      interval is not 0", and justify it.
+    hints:
+      - |
+        Look at how a user program is laid out: [[user/user.ld]] (where does `.text` start?)
+        and the first lines of any `user/*.asm` file after a build. Then look at where
+        per-process state lives in [[kernel/proc.h]].
+      - |
+        In this kernel, user virtual address 0 is the first byte of the program's code, and
+        it is mapped readable and executable for the user. A C function pointer equal to 0 is
+        "null" to C, but to the hardware it is an ordinary address.
+      - |
+        You need an interval, a handler address and a running count. Which of these has a
+        natural "none" value that can never be a real setting?
+    answer: |
+      Three per-process fields, in the section of `struct proc` that is private to the
+      process ([[kernel/proc.h:95]]): `alarminterval` (an `int`), `alarmhandler` (a `uint64`,
+      the user address) and `alarmticks` (the count so far). Later questions add two more.
+
+      The interval is the on/off switch: `alarminterval == 0` means off. The handler's address
+      cannot be the switch, because 0 is a valid handler. [[user/user.ld]] starts `.text` at
+      address `0x0`, so the first function in a program's first object file lands there. In
+      this lab's build `periodic`, the first function in `alarmtest.c`, is at address 0
+      (`alarmtest.asm` shows `0000000000000000 <periodic>:`, and the test prints it). A kernel
+      that treated a handler of 0 as "none" would silently never call it (clinic 3).
+
+      The handler's address is stored, never dereferenced or checked by the kernel. It is
+      only ever placed in the saved program counter, so the hardware uses it in user mode,
+      under the user page table, where a bad address simply faults like any other bad jump.
+      That is why `sys_sigalarm` fetches it with [[argaddr]] (no check) rather than copying
+      anything through [[copyin]].
+    checks:
+      - id: lab05-01
+        level: 1
+        type: choice
+        q: |
+          A learner writes `if (p->alarmhandler == 0) return;` as the "alarm is off" test.
+          `alarmtest` calls `sigalarm(2, periodic)`, and `periodic` is at user address 0.
+          What happens?
+        options:
+          - text: The handler is never called; the first check fails after waiting 300 ticks.
+            correct: true
+            why: |
+              The kernel sees handler 0 and concludes the alarm is off. That is what the
+              recorded run of this mistake printed: `0 calls`, then `FAIL`.
+          - text: The kernel panics when it jumps to address 0.
+            why: |
+              You may have thought address 0 is never mapped. In xv6 the program's code starts
+              at 0 ([[user/user.ld]]); and in any case the kernel never jumps to the handler
+              itself, the user program does, in user mode.
+          - text: The handler is called, because the compiler never places a function at 0.
+            why: |
+              You may have carried over a rule from other systems, where page 0 is left
+              unmapped on purpose. xv6's linker script starts `.text` at 0, and `periodic`
+              landed there in this build.
+          - text: The process is killed with a page fault at address 0.
+            why: |
+              You may have thought a jump to 0 must fault. Address 0 is mapped `R|X|U` here;
+              and with this check the jump never happens at all.
+        explain: |
+          The C idea of a null function pointer and the hardware's idea of address 0 are
+          different things. In xv6 user space, 0 is real code. Use the interval to mean on/off
+          and treat the handler as an opaque user address. See [[tour:25]] for the user
+          address space.
+  - title: What counts as one tick of this process?
+    q: |
+      The alarm should fire after the process has used `n` ticks of CPU time. The kernel
+      already counts `ticks`. On three harts, decide exactly which event is "one tick of this
+      process", and find the place in the kernel where that event happens *and* you know which
+      process it belongs to. Is reading `ticks` enough?
+    hints:
+      - |
+        Read [[clockintr]] and [[devintr]] in [[kernel/trap.c]], then the two places that call
+        `devintr`: [[usertrap]] and [[kerneltrap]]. Where is `ticks` incremented, and on which
+        harts?
+      - |
+        Every hart programs its own `stimecmp` and takes its own timer interrupt, about ten
+        times a second, whether or not anyone is watching `ticks`. `ticks` advances only when
+        hart 0 takes one. A tick of CPU time belongs to whatever was running on the hart that
+        took the interrupt.
+      - |
+        Count in the trap handler that runs when a timer interrupt arrives while the process
+        is in user mode, on any hart: the branch where `devintr()` returned 2 and the current
+        process is the one that was interrupted.
+    answer: |
+      `ticks` is the wrong clock for this, in two ways. It counts **wall-clock time**: one
+      increment per tenth of a second whether this process ran or slept. And it is
+      advanced **only by hart 0**: [[clockintr]] does `ticks++` inside `if (cpuid() == 0)`
+      ([[kernel/trap.c:169]]), while every hart re-arms its own timer
+      ([[kernel/trap.c:179]], `stimecmp = time + 1000000`, a tenth of a second at QEMU's
+      10 MHz timebase).
+
+      The event that means "this process used a tick" is a timer interrupt taken *while the
+      process is running*, on whatever hart that is. When it arrives in user mode, the hart
+      goes through [[uservec]] into [[usertrap]], `devintr()` returns 2, and `myproc()` is
+      the interrupted process. So the count goes there, in the `which_dev == 2` branch, next
+      to the `yield()` ([[kernel/trap.c:85]]). The reference solution puts it in a small
+      function, `alarmtick(p)`, called just before `yield()`.
+
+      Timer interrupts taken *in the kernel* (in [[kerneltrap]], during a system call) are
+      not counted. That makes this a user-time alarm, like Unix's `ITIMER_VIRTUAL`. It is
+      also the simpler choice: `usertrap` is the one place that can redirect the return to
+      user space (next question), and a count kept in `kerneltrap` would still have to wait
+      for `usertrap` to act on it.
+
+      Measured on three harts: one process spinning alone for 100 ticks of `ticks` saw 97
+      handler calls with `sigalarm(1, ...)`; six processes sharing three harts saw 45 to 49
+      each, about half, because each had a hart only half of the time. A version that
+      counted next to `ticks++` (clinic 5) gave 28 calls to a lone process, and 89, 7 and 0
+      to three processes, depending on who sat on hart 0.
+    checks:
+      - id: lab05-02
+        level: 2
+        type: choice
+        q: |
+          A process spins in user mode on hart 2 for one second. Nothing else is runnable.
+          About how many timer interrupts does hart 2 take, and by how much does `ticks`
+          advance?
+        options:
+          - text: About 10 interrupts on hart 2, and `ticks` advances by about 10, through hart 0's own interrupts.
+            correct: true
+            why: |
+              Every hart re-arms its own timer for a tenth of a second ahead
+              ([[kernel/trap.c:179]]); only hart 0's interrupts increment `ticks`. Hart 0 is
+              idle in its scheduler but takes its timer interrupts all the same.
+          - text: About 10 interrupts on hart 2, and `ticks` advances by about 10 because of them.
+            why: |
+              You may have thought every hart's interrupt bumps `ticks`. [[clockintr]] skips
+              the increment unless `cpuid() == 0`. Hart 2's interrupts never touch `ticks`.
+          - text: No interrupts on hart 2; only hart 0 has a timer.
+            why: |
+              You may have thought the timer is a single device. With Sstc, each hart has its
+              own `stimecmp` and takes its own interrupts; `devintr` returns 2 on every hart.
+          - text: About 30 interrupts on hart 2, because three harts share the timer.
+            why: |
+              You may have thought the harts' interrupts add up somewhere. Each hart's timer
+              is independent; each fires about ten times a second.
+        explain: |
+          `ticks` is hart 0's wall clock. The CPU time a process uses is measured by the timer
+          interrupts it receives, on whichever hart it runs. See [[tour:11]] and [[tour:44]],
+          and [[g:sstc]].
+      - id: lab05-03
+        level: 2
+        type: state
+        q: |
+          A timer interrupt has arrived while `alarmtest` (pid 3) was spinning in user mode on
+          hart 2. [[usertrap]] has called `devintr()`, which returned 2, and is about to count
+          the tick. Fill in the machine state of hart 2.
+        state: {mode: S, stack: kernel, satp: kernel, sie: "off", noff: "0", intena: "-"}
+        why:
+          mode: "You may have thought the tick is counted in user mode or by the timer hardware. The trap moved the hart to supervisor mode; usertrap is kernel code."
+          stack: "You may have thought interrupts have their own stack. uservec switched to the process's kernel stack ([[kernel/trampoline.S:76]]); usertrap's frame is the only one on it."
+          satp: "You may have thought the user page table is still installed. uservec switched to the kernel page table before calling usertrap ([[kernel/trampoline.S:92]])."
+          sie: "You may have thought usertrap always turns interrupts on. It does so only for a system call ([[kernel/trap.c:66]]); for a device or timer interrupt they stay off until the return to user space."
+          noff: "You may have thought some lock is held. Nothing on this path has called acquire or push_off."
+          intena: "With noff 0 there is no saved interrupt state to show."
+        why_wrong: |
+          Ask the three questions of [[concept:mode-stack-page-table]] (mode, stack, page
+          table), then ask whether interrupts were turned back on on this path.
+        explain: |
+          A gdb run on this lab's kernel stopped there on hart 2 and read `sstatus.SIE` = 0,
+          `noff` = 0, `sp` = `0x3fffff9fe0` (32 bytes below the top of pid 3's kernel stack
+          page `0x3fffff9000`) and `satp` = the kernel page table. Interrupts stay off for the
+          whole timer path in `usertrap`, which is one reason the counting code needs no lock.
+  - title: How do you make the process land in the handler?
+    q: |
+      The count has reached the interval. The next user instruction this process executes
+      must be the first instruction of the handler, not the one the timer interrupted. The
+      hart will leave the kernel through `sret`. Where does `sret` get its target, and what is
+      the last place where you can change it?
+    hints:
+      - |
+        Read the end of [[usertrap]], then [[prepare_return]], then [[userret]] in
+        [[kernel/trampoline.S]]. Which register does `sret` jump to, and who writes it?
+      - |
+        The register is written from a value saved in memory, very late, after anything else
+        on this hart (including a `yield()` that runs other processes) has had its chance to
+        overwrite the register. Whatever you write to the register earlier is lost.
+      - |
+        Find the memory word that line 131 of [[kernel/trap.c]] copies from. What if it held a
+        different address?
+    answer: |
+      `sret` jumps to the address in `sepc`. [[prepare_return]] writes `sepc` from the
+      process's saved program counter, `p->trapframe->epc`, as its very last action
+      ([[kernel/trap.c:131]]). So the redirect is one line:
+
+      ```c
+      p->trapframe->epc = p->alarmhandler;
+      ```
+
+      and [[prepare_return]], [[userret]] and `sret` do the rest. Writing `sepc` directly in
+      `usertrap` cannot work: `yield()` runs next, and while this process is switched out the
+      hart takes other traps that overwrite `sepc`; and in any case line 131 overwrites it with
+      `epc` before `sret`. The saved `epc` is the single source of truth for "where this
+      process continues", which is also why [[usertrap]] saves `sepc` into it on entry
+      ([[kernel/trap.c:52]]) and adds 4 to it for a system call ([[kernel/trap.c:62]]).
+
+      Nothing else needs to change for the jump: `sret` drops to user mode (`SPP` = 0,
+      [[kernel/trap.c:126]]) with interrupts enabled, under the process's page table, and the
+      handler starts running with the interrupted code's registers, including its `sp`.
+      The handler's frame goes on the same user stack, below the interrupted code's `sp`.
+      That is safe because the RISC-V calling convention defines no red zone; it says
+      "procedures must not rely upon the persistence of stack-allocated data whose addresses
+      lie below the stack pointer". A function may be interrupted at any instruction and
+      nothing it owns lies there. The same document says the operating system must realign
+      the stack pointer before invoking a signal handler; xv6 code built for the standard ABI
+      keeps `sp` 16-byte aligned throughout, so the interrupted `sp` is already aligned and
+      the lab does not realign it.
+    checks:
+      - id: lab05-04
+        level: 2
+        type: line
+        q: |
+          Click the line that decides where `sret` sends the process.
+        code: kernel/trap.c:101-132
+        answer: 131
+        lines:
+          108: |
+            You may have thought turning interrupts off is part of choosing the target. It
+            protects the switch of `stvec` on the next lines; it does not touch `sepc`.
+          112: |
+            You may have confused the two vectors. `stvec` says where the *next trap* goes
+            (uservec); `sepc` says where `sret` returns to.
+          117: |
+            That prepares the kernel stack pointer for the *next* trap. It has nothing to do
+            with where the process resumes.
+          128: |
+            `sstatus` decides the *mode* and interrupt state after `sret` (user, interrupts
+            on), not the address.
+        why_wrong: |
+          `sret` jumps to the address in `sepc`. Find the line that writes `sepc`.
+        explain: |
+          `w_sepc(p->trapframe->epc)` copies the saved program counter into `sepc` as the
+          last step before the trampoline. Change `p->trapframe->epc` and the process lands
+          wherever you put it. See [[tour:43]] for every CSR on this path.
+      - id: lab05-05
+        level: 2
+        type: choice
+        q: |
+          A learner skips the trapframe and writes `w_sepc(p->alarmhandler);` in [[usertrap]]
+          just before `yield()`. What happens?
+        options:
+          - text: The handler never runs; the process resumes where it was interrupted.
+            correct: true
+            why: |
+              [[prepare_return]] writes `sepc` from `p->trapframe->epc` after the `yield()`
+              returns ([[kernel/trap.c:131]]), overwriting the handler's address.
+          - text: The handler runs, because `sepc` is the register `sret` uses.
+            why: |
+              You may have stopped reading at `sret`. The register is right, but the value is
+              replaced before `sret` runs.
+          - text: The handler runs on the next hart that picks the process up.
+            why: |
+              You may have thought `sepc` travels with the process. It is a per-hart register;
+              what travels is the trapframe.
+          - text: The kernel panics in `kerneltrap`, because `sepc` now holds a user address.
+            why: |
+              You may have thought `sepc` is checked. Nothing checks it; any trap on this hart
+              while switched out would simply overwrite it.
+        explain: |
+          Registers belong to harts; the trapframe belongs to the process. Anything that must
+          survive a `yield()` (and a move to another hart) has to be in the trapframe or in
+          `struct proc`. See [[tour:7]].
+  - title: What must you save, and where?
+    q: |
+      The handler is an ordinary C function. It was never called, so it has no caller to
+      return to, and it will run with the interrupted code's registers and then change some
+      of them. Which registers can it change? What exactly must you keep so that the
+      interrupted code can continue as if nothing happened, and where will you keep it?
+    hints:
+      - |
+        Read `struct trapframe` in [[kernel/proc.h]] and the save sequence in [[uservec]]. Then
+        read the code the compiler made for a tiny handler, in `user/alarmtest.asm`.
+      - |
+        The handler's prologue moves `sp` and changes `s0` (the frame pointer) and `ra` (a
+        call changes it); its body may use any caller-saved register. The interrupted code
+        could be at *any* instruction, with any register live. And the copy must survive the
+        handler, which can make system calls of its own.
+      - |
+        Keep a copy of the entire trapframe, taken before you change `epc`, in a place only the
+        kernel writes and that belongs to the process.
+    answer: |
+      All of them. The interrupted code may be in the middle of anything (an assembly loop,
+      a function prologue), so every register is potentially live: the 31 general registers
+      and the program counter, exactly what [[uservec]] saved in the trapframe. Even a
+      two-line handler changes several. `periodic` (`count++; sigreturn();`) moves `sp` down
+      16 bytes, sets `s0` to its frame, uses `a4` and `a5` for the counter, and its call to
+      the `sigreturn` stub sets `ra`, whose `li a7, 24` sets `a7`. A gdb run caught it at that
+      `ecall`: `sp` = `0x4f20` instead of `0x4f30`, `ra` = `0x1e`, `a7` = `0x18`.
+
+      The reference keeps the copy in `struct proc` as a second `struct trapframe`,
+      `p->alarmframe`, copied with one structure assignment just before `epc` is changed (in
+      this build the compiler turns it into an inline loop of 9 rounds of 32 bytes; 288 bytes
+      in all). The alternatives:
+
+      - **Only `epc`.** The handler's register changes leak into the interrupted code. In
+        clinic 1 this broke the stack pointer and ended in an endless loop.
+      - **On the user stack**, as Unix kernels do. It works, but the kernel must
+        [[copyout]] 288 bytes to a stack that might be nearly full, handle the failure, and
+        later read back a frame the program could have changed. In this lab nothing is gained
+        by it.
+      - **In the trapframe page.** That page is 4096 bytes and the trapframe uses 288; a second
+        copy would fit. It works too, but hides a second structure inside a page whose layout
+        `trampoline.S` depends on.
+
+      Keeping it in `struct proc` needs no allocation, cannot fail, and is freed with the
+      slot.
+    checks:
+      - id: lab05-06
+        level: 2
+        type: multi
+        q: |
+          `periodic` is `count++; sigreturn();`, compiled as `addi sp,sp,-16; sd ra,8(sp);
+          sd s0,0(sp); addi s0,sp,16;` then `auipc a5` / `lw a5` / `addiw a5` / `auipc a4` /
+          `sw a5`, then `jal sigreturn`, whose stub is `li a7,24; ecall`. When the `ecall`
+          executes, which registers may differ from their values at the moment of the timer
+          interrupt?
+        options:
+          - text: sp
+            correct: true
+            why: The prologue subtracted 16. gdb read `sp` = `0x4f20` at the ecall, `0x4f30` at the interrupt.
+          - text: ra
+            correct: true
+            why: "`jal sigreturn` wrote the return address `0x1e` into `ra`."
+          - text: a7
+            correct: true
+            why: The stub loaded the system call number 24 (`0x18`).
+          - text: s0
+            correct: true
+            why: The prologue set the frame pointer to the handler's own frame.
+          - text: s1
+            why: |
+              You may have thought every register is clobbered. `periodic` never uses `s1`;
+              but a bigger handler could, which is why you save all of them anyway.
+          - text: a0
+            why: |
+              You may have expected the argument register to change. Nothing in `periodic`
+              writes `a0` before the `ecall`. (The system call's *return value* will, later:
+              that is the next question.)
+        explain: |
+          Even a two-line handler changes six registers (`a4` and `a5` too). You cannot predict
+          which ones a real handler uses, so the only safe rule is to save everything the
+          trapframe holds. See [[g:calling-convention]] and [[g:trapframe]].
+  - title: How does sigreturn get back, and what happens to a0?
+    q: |
+      `sigreturn()` is itself a system call. Trace what happens to the trapframe's `epc` and
+      `a0` from the handler's `ecall` to the moment the interrupted code runs again. Then write
+      the body of `sys_sigreturn`: what does it copy, and what does it return?
+    hints:
+      - |
+        Read the system call branch of [[usertrap]] ([[kernel/trap.c:54]] to
+        [[kernel/trap.c:68]]) and [[syscall]] ([[kernel/syscall.c:136]]). What does each one
+        do to the trapframe before and after the handler function runs?
+      - |
+        `usertrap` adds 4 to `epc` *before* the handler function runs. `syscall()` stores the
+        handler function's return value into `trapframe->a0` *after* it returns, on top of
+        whatever was there.
+      - |
+        After your copy, which line writes `trapframe->a0` again, and with what value? What
+        would you have to return for that write to do no harm?
+    answer: |
+      The order of events, all in the process's own trapframe:
+
+      1. The handler's `ecall` enters [[uservec]], which saves the *handler's* registers in
+         the trapframe.
+      2. [[usertrap]] sees `scause` 8 and adds 4 to `epc`: it now points after the `ecall`
+         in the `sigreturn` stub (`0xd7a` in this build).
+      3. [[syscall]] calls `sys_sigreturn`, which copies `p->alarmframe` over the whole
+         trapframe. `epc` is back to the interrupted instruction (the earlier `+= 4` is simply
+         overwritten), and so are `sp`, `ra`, `a7` and every other register.
+      4. `sys_sigreturn` returns a value, and [[syscall]] stores it in `trapframe->a0`
+         ([[kernel/syscall.c:146]]). That is the trap. If `sys_sigreturn` returns 0, the
+         interrupted code's `a0` becomes 0.
+      5. [[prepare_return]] puts `epc` in `sepc`; [[userret]] reloads all registers, `a0` last;
+         `sret` resumes the interrupted code.
+
+      So the body is: copy the frame back, then `return p->trapframe->a0;`, so that step 4
+      writes the restored value onto itself. Clinic 4 shows the bug: every interrupted run of
+      the `a0` loop came back with `a0` = 0. It is easy to miss, because `a0` is often dead at
+      the interrupted instruction (any instruction that overwrites `a0` before reading it
+      hides the bug), which is why `alarmtest` has a check just for `a0`.
+    checks:
+      - id: lab05-07
+        level: 2
+        type: number
+        q: |
+          `sys_sigreturn` restores the trapframe correctly but ends with `return 0;`. The
+          interrupted code had `a0` = `0x0a0a0a0a0a0a0a0a`. What value is in `a0` when the
+          interrupted code runs again?
+        answer: 0
+        wrong:
+          "0x0a0a0a0a0a0a0a0a": |
+            You may have thought the restore is the last thing that touches the trapframe.
+            [[syscall]] stores the return value in `trapframe->a0` after `sys_sigreturn`
+            returns ([[kernel/syscall.c:146]]).
+          24: |
+            You may have confused `a0` with `a7`. 24 is the system call number, which the
+            restore also undid.
+          -1: |
+            You may have thought a "successful" sigreturn returns -1. It returns whatever the
+            function returns; here 0.
+        why_wrong: |
+          Follow the trapframe's `a0` slot: restored by the copy, then overwritten by the
+          system call's return value.
+        explain: |
+          `trapframe->a0` does double duty: on the way back from every system call it carries
+          the return value. A call that restores registers must make its return value equal to
+          the restored `a0`. The recorded run of this mistake printed `a0 is 0x0 after
+          sigreturn` ten times.
+      - id: lab05-08
+        level: 3
+        type: order
+        q: |
+          Put these events in order, from the handler's call to `sigreturn` to the
+          interrupted code running again.
+        items:
+          - "uservec saves the handler's registers in the trapframe"
+          - "usertrap adds 4 to trapframe->epc"
+          - "sys_sigreturn copies alarmframe over the trapframe"
+          - "syscall() stores the return value in trapframe->a0"
+          - "prepare_return copies trapframe->epc into sepc"
+          - "userret reloads a0 from the trapframe and executes sret"
+        why_wrong: |
+          You may have placed the `+= 4` after the restore. `usertrap` adjusts `epc` before it
+          calls `syscall()`, so the restore wins; and the return value is stored after the
+          handler function returns, so it wins over the restore.
+        explain: |
+          Two writes race for each of the two interesting slots, and the order decides who
+          wins: for `epc`, the restore overwrites the `+= 4`; for `a0`, the return value
+          overwrites the restore. See [[tour:5]] for the system call path.
+  - title: What if the handler is still running at the next tick?
+    q: |
+      Take `sigalarm(1, slow)` where `slow` runs for three ticks before calling `sigreturn`.
+      With the design so far, what happens at the first tick that lands while `slow` is
+      running? Follow it through the saved frame. Then decide what the kernel should do with
+      ticks that arrive while a handler runs.
+    hints:
+      - |
+        A tick that lands inside `slow` arrives in user mode, like any other. Look at what your
+        timer path does unconditionally once the count reaches the interval.
+      - |
+        The saved frame is a single slot. A second delivery overwrites it with the registers
+        of the running handler, and the original interrupted state is gone. Each nested call
+        also pushes another frame on the user stack.
+      - |
+        What single per-process fact would let the timer path tell "a handler is running"
+        from "normal code is running"? Who would set it, and who would clear it?
+    answer: |
+      Without a guard, the tick redirects `slow` into a fresh call of `slow`: a nested call on
+      the same user stack, and `alarmframe` overwritten with the outer `slow`'s registers. The
+      original interrupted state in `main` is lost for good. With an interval of 1 and a
+      handler that needs 3 ticks, every nested call is itself interrupted before it finishes,
+      so the nesting never unwinds. In the recorded run (clinic 2) `slow` reported 56 nested
+      entries, 64 bytes of stack per level, until a store in the deepest level's `printf`
+      landed in the stack's [[g:guard-page]] and the kernel killed the process.
+
+      The reference adds `alarmactive` to `struct proc`: set when the handler is entered,
+      cleared by `sigreturn`. While it is set, the timer path returns early and does not even
+      count, so the next interval starts when the handler returns. (Counting during the
+      handler and calling it again right after `sigreturn` would be a reasonable choice too;
+      the important part is never to deliver while the flag is set.) The flag also lets
+      `sigreturn` refuse to run outside a handler: without it, a stray `sigreturn()` would
+      restore a stale frame and jump into the past.
+
+      The gdb run shows the guard at work: during the re-entry test, timer interrupts that
+      landed inside `slow` (at user address `0x9e`) found `alarmactive` = 1 and left the count
+      at 0.
+    checks:
+      - id: lab05-09
+        level: 3
+        type: choice
+        q: |
+          With no "handler running" flag, `alarmtest`'s re-entry test (`sigalarm(1, slow)`,
+          `slow` spins for 3 ticks) was run on three harts. What did the run show?
+        options:
+          - text: "56 lines saying slow was entered while already running, then a store page fault at 0x3fe8, and the process was killed."
+            correct: true
+            why: |
+              Each tick nested another `slow` on the user stack. `0x3fe8` is in the guard page
+              below the one-page stack (`0x4000`-`0x4fff`), so the stack overflowed.
+          - text: "One such line, then the test continued normally."
+            why: |
+              You may have thought the nesting stops after one level. The inner `slow` also
+              runs for 3 ticks, so it is interrupted too, and so on.
+          - text: A kernel panic, because alarmframe was overwritten.
+            why: |
+              You may have thought the kernel depends on `alarmframe`. Only the user program's
+              state is lost; the kernel keeps running and kills the process when it faults.
+          - text: Nothing visible; the outer handler's sigreturn restored main correctly.
+            why: |
+              You may have thought the first saved frame survives. The second delivery
+              overwrote it with the outer `slow`'s registers.
+        explain: |
+          One save slot means at most one handler at a time. A real signal system that allows
+          nesting needs a stack of saved frames, which is what Unix kernels keep on the user
+          stack. See [[g:guard-page]].
+  - title: Does any of this need a lock on three harts?
+    q: |
+      List every place that reads or writes the alarm fields: `sys_sigalarm`, the timer path
+      in `usertrap`, `sys_sigreturn`, and (coming next) `exec` and `freeproc`. Can two of them
+      ever run at the same time for the same process? Can an interrupt land in the middle of
+      one of them and run another? Decide whether you need a lock.
+    hints:
+      - |
+        Read the comment groups in `struct proc` ([[kernel/proc.h:85]] and
+        [[kernel/proc.h:95]]). Then check, for each place in the list, which process it runs
+        as and whether interrupts are on.
+      - |
+        A process runs on at most one hart at a time, even if it moves between harts. A timer
+        interrupt that lands while the process is *in the kernel* goes to [[kerneltrap]], not
+        `usertrap`.
+      - |
+        Write down who can touch the fields of process P: only P itself (in its own system
+        calls and its own user-mode traps), plus code that runs when P cannot run at all.
+    answer: |
+      No lock. The fields join `kstack`, `sz` and `ofile` in the section of `struct proc` that
+      is private to the process ([[kernel/proc.h:95]]):
+
+      - `sys_sigalarm` and `sys_sigreturn` run *as* the process, in its own system call.
+      - The timer path in `usertrap` runs as the process too, on its kernel stack, with
+        interrupts off the whole time (they are turned on only for system calls,
+        [[kernel/trap.c:66]]).
+      - Could the timer interrupt `sys_sigalarm` halfway, between setting the interval and
+        clearing the count? Yes, interrupts are on during a system call, but that interrupt
+        is taken in the kernel and goes to [[kerneltrap]], which only yields; it never touches
+        the alarm fields.
+      - A process runs on one hart at a time, so no second hart can run its timer path at the
+        same moment. It may move between harts (the gdb run saw `alarmtest` move from hart 2
+        to hart 1 in the middle of the register test), but each piece of code still runs as
+        the only thread of that process.
+      - [[kexec]] runs as the process; [[freeproc]] runs when the process is a ZOMBIE that will
+        never run again, under its `p->lock`.
+
+      Compare `ticks`: hart 0's interrupt handler writes it while any hart may read it in
+      `sys_uptime`, so it needs `tickslock`.
+    checks:
+      - id: lab05-10
+        level: 2
+        type: tf
+        q: |
+          True or false: `sys_sigalarm` must hold `p->lock` while it sets the three fields,
+          because a timer interrupt could run the counting code in the middle.
+        answer: false
+        why_tf: |
+          You may have thought any interrupt can run any interrupt-time code. Which handler
+          runs depends on where the interrupt lands.
+        reasons:
+          - text: "False: an interrupt during sys_sigalarm is taken in the kernel and goes to kerneltrap, which never touches the alarm fields; the counting code runs only in usertrap."
+            correct: true
+            why: This is the reason. The counting code runs only for interrupts that arrive in user mode, and the process is not in user mode while it runs `sys_sigalarm`.
+          - text: "False: interrupts are off during every system call."
+            why: You may have overlooked [[kernel/trap.c:66]]. `usertrap` turns interrupts on before calling `syscall()`.
+          - text: "True: another hart could be counting ticks for this process at the same time."
+            why: You may have thought a process can be on two harts at once. An xv6 process has one thread and runs on at most one hart.
+          - text: "True: p->lock protects every field of struct proc."
+            why: You may have read the struct as one block. Only the first section (`state`, `chan`, `killed`, `xstate`, `pid`) needs `p->lock`.
+        explain: |
+          Data needs a lock when two threads, or a thread and an interrupt handler, can touch
+          it at the same time. Here every piece of code that touches the alarm fields runs as
+          the owning process, and the one interrupt handler that does (the user-mode timer
+          path) cannot interrupt the others. See [[concept:locks#lock-proc]].
+  - title: What should fork and exec do with an alarm?
+    q: |
+      A process with an alarm calls `fork`, or calls `exec`. For each, decide whether the
+      alarm should survive, and which function must change (if any). Think about what the
+      handler's address means in each case.
+    hints:
+      - |
+        Read [[kfork]], [[kexec]] and [[freeproc]]. Which one builds a fresh `struct proc`,
+        which one keeps the `struct proc` but replaces the program, and which one clears a
+        slot?
+      - |
+        After `exec`, the old program's code is gone; the same number now names some
+        instruction of a different program (or nothing). After `fork`, the address still
+        means the same function in the child's copy of memory.
+      - |
+        Turn the alarm off in `kexec` once it has committed to the new image; clear the fields
+        in `freeproc`; and decide whether `kfork` copies them.
+    answer: |
+      - **exec**: turn it off. [[kexec]] keeps the `struct proc`, so without a change the
+        alarm survives, and the next tick would jump to the old handler's address in the
+        *new* program: some arbitrary instruction. The reference clears `alarminterval` and
+        `alarmactive` right after the new image is committed, next to the new `epc` and `sp`
+        ([[kernel/exec.c:136]]). Not before: if `exec` fails, the old program continues, alarm
+        and all.
+      - **fork**: the reference starts the child with the alarm off, as a Unix child starts
+        with no pending timer. [[kfork]] simply does not copy the fields; the child's slot
+        came from [[allocproc]] with them cleared by [[freeproc]] (or zero from boot). Copying
+        them would also be defensible: the address means the same function in the child.
+        Neither choice handles a `fork` called *from inside* a handler for free. With the
+        reference, such a child is left in the handler: its `sigreturn` fails with -1
+        (observed with a small probe program on the reference kernel), so it can never
+        return to the interrupted code. Copying `alarmactive` and `alarmframe` together is
+        what would let it return.
+      - **freeproc** clears all four fields with the others, so a reused slot never inherits
+        a stranger's alarm.
+
+      `alarmtest`'s last check tests both: a forked child counts handler calls (0), and a
+      child that calls `sigalarm(1, periodic)` and then execs `alarmtest exec` counts them in
+      the new image (0). Because the new image is the same program, `periodic` is at the
+      same address there, so a surviving alarm would have been caught.
+    checks:
+      - id: lab05-11
+        level: 2
+        type: choice
+        q: |
+          `kexec` is left unchanged. A process sets `sigalarm(1, handler)` and execs `ls`.
+          What is the most accurate prediction?
+        options:
+          - text: "At the next user-mode tick, `ls` jumps to whatever code of `ls` is at the old handler's address."
+            correct: true
+            why: |
+              `exec` keeps the `struct proc`, so the interval and the address survive; the
+              address now names some instruction of `ls`.
+          - text: The alarm stops by itself, because exec frees the old memory.
+            why: |
+              You may have thought the alarm is part of the memory image. It lives in
+              `struct proc`, which `exec` keeps.
+          - text: The kernel panics when it delivers the alarm.
+            why: |
+              You may have thought the kernel dereferences the handler. It only puts the
+              address in `epc`; whatever happens next happens in user mode.
+          - text: "`exec` fails, because the process has an alarm."
+            why: |
+              Nothing in `exec` looks at the alarm unless you make it.
+        explain: |
+          Anything in `struct proc` that refers to user memory must be revisited in `exec`.
+          See [[tour:22]] for what `exec` keeps and what it replaces.
+build: |
+  **Start from the frozen commit**, in your own clone of xv6 (not this site's `xv6/`):
+
+  ```sh
+  git checkout -b my-sigalarm 06aad25
+  ```
+
+  Work in this order; each milestone can be tested before the next. **Run `make clean`
+  whenever you change `kernel/proc.h`** (or after switching between commits): the Makefile's
+  dependency files usually catch it, but a kernel with two layouts of `struct proc` in
+  different object files fails in baffling ways. (A stale object file can make even a
+  correct solution fail its own test.)
+
+  1. **The plumbing.** Numbers 23 and 24 in `kernel/syscall.h`, two `entry(...)` lines in
+     `user/usys.pl`, two prototypes in `user/user.h`, two `extern`s and two table entries in
+     `kernel/syscall.c`. Three fields in `struct proc`. `sys_sigalarm` stores them;
+     `sys_sigreturn` returns -1 for now. Check with a tiny program that `sigalarm(2, f)`
+     returns 0.
+  2. **Count.** In [[usertrap]]'s `which_dev == 2` branch, before `yield()`, count a tick if
+     the interval is not 0. To see it work, temporarily `printk` the count every 10 ticks.
+  3. **Deliver.** When the count reaches the interval, save the trapframe and set `epc` to
+     the handler. A handler that only increments a counter and loops forever should now run.
+     (Without `sigreturn` it cannot get back yet.)
+  4. **Return.** `sys_sigreturn` restores the frame and returns the restored `a0`. Now a
+     handler that ends with `sigreturn()` works: try `test_called` from `alarmtest`.
+  5. **No re-entry.** The `alarmactive` flag, set in delivery, cleared in `sigreturn`.
+  6. **exec and freeproc.** Turn the alarm off in `kexec`, clear the fields in `freeproc`.
+  7. **The test.** `alarmtest`, then `usertests -q`, then `alarmtest` again.
+
+  **Debugging.** Most bugs here show up in user space, as wrong registers or a process lost in
+  a loop, so the kernel never panics. `TOOLPREFIX` is your RISC-V toolchain's prefix, the
+  same one xv6's Makefile detects (`riscv64-unknown-elf-`, `riscv64-linux-gnu-` or
+  `riscv64-elf-`); set it with `export TOOLPREFIX=riscv64-unknown-elf-` or whichever you
+  have. On Debian/Ubuntu/WSL, `gdb-multiarch` also works as the debugger. In gdb
+  (`make qemu-gdb`, then `${TOOLPREFIX}gdb kernel/kernel` and `target remote`), break on
+  the line that changes `epc` and on `sys_sigreturn`, and print `*p->trapframe` and `p->alarmframe` side by side: `epc`, `sp`,
+  `ra` and `a0` tell the story. For a hang, interrupt and look at each hart (`info threads`,
+  `thread 2`, `bt`); for a process stuck in user space, print its trapframe from
+  `proc[i].trapframe`. gdb reads memory through the page table that is installed at the
+  moment it stops, so to read user memory, stop while that process's page table is in
+  `satp`, or walk the page table yourself.
+clinic:
+  - bug: Saved and restored only the program counter
+    change: |
+      The learner reasons that the handler only needs to "come back to where it was":
+
+      ```diff
+      -  struct trapframe alarmframe; // user registers when the handler was called
+      +  uint64 alarmepc;     // user pc when the handler was called
+      ...
+      -  p->alarmframe = *p->trapframe;
+      +  p->alarmepc = p->trapframe->epc;
+      ...
+      -  *p->trapframe = p->alarmframe;
+      +  p->trapframe->epc = p->alarmepc;
+      ```
+    symptom: |
+      $ alarmtest
+      alarmtest: periodic is at address 0x0000000000000000
+      alarmtest: 5 calls; 0 more in 10 ticks after sigalarm(0, 0)
+      alarmtest: handler called, then stopped: OK
+      alarmtest: sigreturn outside a handler fails: OK
+
+      (no more output: no prompt after 90 seconds. gdb then attached six times, about two
+      seconds apart, reading memory physically; first sample:)
+      --- attach 1 16:31:56.814508084
+      s_sstatus (x=2) at kernel/riscv.h:67
+      warning: 67	kernel/riscv.h: No such file or directory
+      hart 0 pc=0x80001e10 sepc=0x80001e14 scause=0x8000000000000005 satp=0x8000000000087fff(kernel)
+      hart 1 pc=0x80001e10 sepc=0x80001e14 scause=0x8000000000000005 satp=0x8000000000087fff(kernel)
+      hart 2 pc=0x80000bbc sepc=0xd76 scause=0x8 satp=0x8000000000087fff(kernel) cpus[2].proc=alarmtest/3
+      proc init/1 SLEEPING satp=0x8000000000087f52 interval=0 aticks=0 active=0 tf.epc=0x380 tf.sp=0x3fb0 tf.ra=0x4a tf.a0=0x0 tf.a7=0x3
+      proc sh/2 SLEEPING satp=0x8000000000087f41 interval=0 aticks=0 active=0 tf.epc=0xc94 tf.sp=0x4f90 tf.ra=0x938 tf.a0=0x0 tf.a7=0x3
+      proc alarmtest/3 RUNNING satp=0x8000000000087f25 interval=1 aticks=0 active=0 tf.epc=0xd7a tf.sp=0x4f20 tf.ra=0x1e tf.a0=0xffffffffffffffff tf.a7=0x18
+        user 0x4f20: 0x0101010101010101
+        user 0x4f28: 0x0000000000000000
+        user 0x4f30: 0x0000000000004fb0
+        user 0x4f38: 0x000000000000068e
+        user 0x4f40: 0x0000000000000012
+        user 0x4f48: 0x0505050505050505
+      [...]
+      --- attach 2 16:31:58.922623975
+      [...]
+      hart 1 pc=0x800025de sepc=0xd76 scause=0x8 satp=0x8000000000087fff(kernel) cpus[1].proc=alarmtest/3
+      [...]
+      proc alarmtest/3 RUNNING satp=0x8000000000087f25 interval=1 aticks=0 active=0 tf.epc=0xd7a tf.sp=0x4f20 tf.ra=0x1e tf.a0=0xffffffffffffffff tf.a7=0x18
+    why: |
+      After each delivery the "restored" process continues with the *handler's* registers:
+      `sp` 16 bytes too low, `s0` pointing at the handler's frame, `ra` = `0x1e`, `a7` = 24.
+      The first test happens to survive that (why the damage stayed invisible there
+      was not traced). The register test does not: the handler is delivered into `fillspin`,
+      and somewhere after that, with `sp` and `ra` wrong, a function return lands at address
+      0, which is `periodic`. (This start of the loop is reasoned from the code; nothing
+      recorded it.)
+
+      From then on it is a loop. All six samples found pid 3 in the kernel or the
+      trampoline for a system call (`scause` 8) made by the `ecall` at `0xd76` in the
+      `sigreturn` stub, with `a7` = 24, the same `sp` = `0x4f20` and `ra` = `0x1e`, and
+      `a0` = -1. Most iterations get there by themselves: `periodic` calls `sigreturn`,
+      which fails with -1 because `alarmactive` is 0 (no handler was delivered; the
+      program jumped to `periodic` on its own). `periodic` then returns normally:
+      `ld ra, 8(sp)` loads the word at `0x4f28`, which the samples show is 0, so `ret`
+      jumps to 0, which is `periodic` again, whose prologue saves that `ra` = 0 at
+      `0x4f28` again.
+
+      But the alarm is still on (interval 1), so user-mode ticks keep delivering. A second
+      run with gdb breakpoints on the delivery and on a successful `sigreturn` saw 18 of
+      each between `ticks` 600 and 662: every delivery at `epc` = `0xd7a` (the stub's
+      `ret`, the first user instruction after a `sigreturn`) with `sp` = `0x4f20`, `ra` =
+      `0x1e`, `s0` = `0x4f30`. Those `sigreturn`s succeed, and since only `epc` is restored,
+      the extra handler frame unwinds through `periodic`'s epilogue back into the same loop.
+      (The -1 in `a0` does not tell the two kinds apart: this variant returns the handler's
+      own `a0`, which is the -1 left by the previous failed call.) The registers, stack
+      words and counts are what gdb read; the order of instructions is reasoned from
+      `alarmtest.asm`.
+
+      The process is not dead or blocked; it is RUNNING forever, making a system call per
+      iteration and moving between harts 1 and 2 (`cpus[2]` in sample 1, `cpus[1]` in sample
+      2). Nothing crashes, which is exactly why "save only the pc" is a dangerous mistake.
+  - bug: No check for a handler that is already running
+    change: |
+      The flag exists and `sigreturn` clears it, but the timer path does not look at it:
+
+      ```diff
+       alarmtick(struct proc *p)
+       {
+      -  if (p->alarminterval == 0 || p->alarmactive)
+      +  if (p->alarminterval == 0)
+           return;
+      ```
+    symptom: |
+      $ alarmtest
+      alarmtest: periodic is at address 0x0000000000000000
+      alarmtest: 5 calls; 0 more in 10 ticks after sigalarm(0, 0)
+      alarmtest: handler called, then stopped: OK
+      alarmtest: sigreturn outside a handler fails: OK
+      alarmtest: the handler ran during 10 fillspin runs (10 calls)
+      alarmtest: registers preserved: OK
+      alarmtest: slow entered while already running
+      alarmtest: slow entered while already running
+      [...]
+      alarmtest: slow entered while already running
+      usertrap(): unexpected scause 0xf pid=3
+                  sepc=0xd7e stval=0x3fe8
+      $
+
+      (56 "slow entered while already running" lines in all.)
+    why: |
+      The first two tests pass: `periodic` is so short that a tick almost never lands inside it.
+      `slow` runs for 3 ticks with an interval of 1, so the very next tick redirects `slow` into
+      a new call of `slow`, on the same user stack, overwriting `alarmframe` with the outer
+      call's registers. The inner call is interrupted the same way, and so on: the nesting
+      never unwinds, and each level costs `slow`'s 64-byte frame. The arithmetic matches the
+      run: level 1's frame is at `0x4ef0` (gdb), so level 58's is at `0x4ef0` - 57 x 64 =
+      `0x40b0`; its `printf` (96 bytes), `vprintf` (96) and `putc` (32) put `putc`'s `sp` at
+      `0x3fd0`, and `sd ra,24(sp)` stores to `0x3fe8`. Levels 2 to 57 printed their 56 lines;
+      level 58's never came out.
+
+      `stval` = `0x3fe8` is the address of the store that failed. The test's user memory is
+      text from `0x0`, data at `0x2000`, then the [[g:guard-page]] at `0x3000` and the
+      one-page stack at `0x4000` to `0x4fff`. So the stack overflowed into the guard page, at
+      `sepc` = `0xd7e`, the `sd ra, 24(sp)` in `putc`'s prologue (called by `vprintf`). For
+      the store page fault (`scause` 15), [[vmfault]] refuses to help because the guard page
+      is already mapped (without `PTE_U`), so [[usertrap]] prints the message and kills the
+      process ([[kernel/trap.c:76]]). The test never gets to print its own verdict: the
+      kernel's message is the symptom.
+  - bug: Used handler == 0 to mean "off"
+    change: |
+      ```diff
+       alarmtick(struct proc *p)
+       {
+      -  if (p->alarminterval == 0 || p->alarmactive)
+      +  if (p->alarmhandler == 0 || p->alarmactive)
+           return;
+      ```
+    symptom: |
+      $ alarmtest
+      alarmtest: periodic is at address 0x0000000000000000
+      alarmtest: 0 calls; 0 more in 10 ticks after sigalarm(0, 0)
+      alarmtest: handler called, then stopped: FAIL
+      alarmtest: sigreturn outside a handler fails: OK
+      alarmtest: the handler ran during 0 fillspin runs (0 calls)
+      alarmtest: registers preserved: FAIL
+      alarmtest: slow ran 3 times, nested at most 1 deep
+      alarmtest: no re-entry: OK
+      alarmtest: the handler ran during 0 a0spin runs (0 calls)
+      alarmtest: sigreturn restores a0: FAIL
+      alarmtest: handler calls in the forked child: 0, after exec: 0
+      alarmtest: fork and exec start with the alarm off: OK
+      alarmtest: 3 of 6 checks FAILED
+      $
+    why: |
+      `periodic` is the first function of `alarmtest.c`, and [[user/user.ld]] starts `.text` at
+      address 0, so `sigalarm(1, periodic)` passes 0. The kernel reads that as "no handler"
+      and never delivers: the three tests that wait for `periodic` to run each wait their full 300 ticks (30
+      seconds) and fail. The re-entry test passes because `slow` is at `0x26`.
+
+      The fork-and-exec check passes for the wrong reason: no alarm ever fires, so nothing
+      can survive `fork` or `exec`. Passing checks do not always mean the code they are about
+      is right; here they cannot tell.
+  - bug: sigreturn returned 0
+    change: |
+      ```diff
+         *p->trapframe = p->alarmframe;
+      -  // syscall() stores the return value in trapframe->a0:
+      -  // return the interrupted code's a0, not 0.
+      -  return p->trapframe->a0;
+      +  return 0;
+       }
+      ```
+    symptom: |
+      $ alarmtest
+      alarmtest: periodic is at address 0x0000000000000000
+      alarmtest: 5 calls; 0 more in 10 ticks after sigalarm(0, 0)
+      alarmtest: handler called, then stopped: OK
+      alarmtest: sigreturn outside a handler fails: OK
+      alarmtest: the handler ran during 10 fillspin runs (10 calls)
+      alarmtest: registers preserved: OK
+      alarmtest: slow ran 3 times, nested at most 1 deep
+      alarmtest: no re-entry: OK
+      alarmtest: a0 is 0x0 after sigreturn
+      [...]
+      alarmtest: a0 is 0x0 after sigreturn
+      alarmtest: the handler ran during 10 a0spin runs (10 calls)
+      alarmtest: sigreturn restores a0: FAIL
+      alarmtest: handler calls in the forked child: 0, after exec: 0
+      alarmtest: fork and exec start with the alarm off: OK
+      alarmtest: 1 of 6 checks FAILED
+      $
+
+      (ten "a0 is 0x0" lines in all, one per interrupted run.)
+    why: |
+      `sys_sigreturn` restores `a0` correctly, then returns 0, and [[syscall]] stores that 0 in
+      `trapframe->a0` ([[kernel/syscall.c:146]]) after the restore. [[userret]] loads it, and
+      the interrupted code resumes with `a0` = 0.
+
+      Only the `a0` check notices. In `waitfor`, `a0` is dead at the interrupted instruction:
+      the loop writes it (`uptime`'s result) before it reads it, so a zero there does no
+      harm. In `fillspin`, `a0` is the loop counter: the bug sets
+      it to 0, `addi a0, a0, -1` makes it -1, `bgtz` falls through, and that run of the loop
+      simply ends early; `a0` is not among the registers that check compares. A bug that
+      shows only when the clobbered register is live at the interrupted instruction is the
+      worst kind, and the reason for a test that keeps `a0` live on purpose.
+  - bug: Counted ticks next to ticks++ in clockintr
+    change: |
+      The learner looks for "where the tick happens" and finds `ticks++`:
+
+      ```diff
+         if (cpuid() == 0) {
+           acquire(&tickslock);
+           ticks++;
+           wakeup(&ticks);
+           release(&tickslock);
+      +    // one more tick for the running process's alarm.
+      +    struct proc *p = myproc();
+      +    if (p != 0 && p->alarminterval != 0 && !p->alarmactive)
+      +      p->alarmticks++;
+         }
+      ```
+
+      and `alarmtick` no longer increments the count; it only checks it and delivers.
+    symptom: |
+      $ alarmtest
+      alarmtest: periodic is at address 0x0000000000000000
+      alarmtest: 5 calls; 0 more in 10 ticks after sigalarm(0, 0)
+      alarmtest: handler called, then stopped: OK
+      [...]
+      alarmtest: 6 of 6 checks OK
+      $ alarmrate 1 10 1
+      alarmrate: pid 7: 28 handler calls
+      alarmrate: a process with a hart to itself for 100 ticks would make about 100
+      $ alarmrate 1 10 3
+      alarmrate: pid 9: 7 handler calls
+      alarmrate: pid 10: 0 handler calls
+      alarmrate: pid 11: 89 handler calls
+      alarmrate: a process with a hart to itself for 100 ticks would make about 100
+      $ alarmrate 1 10 1
+      alarmrate: pid 13: 83 handler calls
+      alarmrate: a process with a hart to itself for 100 ticks would make about 100
+
+      (a second boot of the same kernel, gdb attaching 8 times about two seconds apart
+      while this ran:)
+      $ alarmrate 1 30 3
+      alarmrate: pid 4: 6 handler calls
+      alarmrate: pid 6: 251 handler calls
+      alarmrate: pid 5: 23 handler calls
+      alarmrate: a process with a hart to itself for 300 ticks would make about 300
+
+      (gdb, first sample:)
+      --- attach 1 16:31:00.452078225
+      hart 0 pc=0x11c sepc=0x49a scause=0x8 satp=0x8000000000087f33(alarmrate/6) cpus[0].proc=alarmrate/6
+      hart 1 pc=0x11c sepc=0x49a scause=0x8 satp=0x8000000000087f29(alarmrate/5) cpus[1].proc=alarmrate/5
+      hart 2 pc=0x11c sepc=0x49a scause=0x8 satp=0x8000000000087f24(alarmrate/4) cpus[2].proc=alarmrate/4
+      [...]
+    why: |
+      Every check of `alarmtest` passes: each one only needs *some* handler calls within a
+      generous time limit. The rate is wrong, and wildly so. [[clockintr]] runs on every hart,
+      but the new lines are inside `if (cpuid() == 0)`, so a process gets a tick only when a
+      timer interrupt lands **on hart 0** while it is the current process there. (They also
+      count ticks that land while the process is in the kernel on hart 0, because `clockintr`
+      is called from [[kerneltrap]] too.)
+
+      A lone process gets 28 calls in one run and 83 in another: it depends on how much of the
+      time the scheduler happened to run it on hart 0. With three processes on three harts,
+      whichever one settles on hart 0 takes nearly all the calls: in the gdb run, pid 6 was on hart 0 in all 8 samples and got 251 calls in 300 ticks,
+      while pids 4 and 5 moved between harts 1 and 2 and got 6 and 23. With the reference
+      solution the same three processes get 91, 96 and 94 calls in 100 ticks (see Measure).
+
+      `alarmtest` cannot catch this; `alarmrate` exists because a correctness test with
+      generous timeouts says nothing about a rate.
+reveal:
+  - title: Two new numbers
+    commit: 1
+    file: kernel/syscall.h
+    lines: 1-25
+    focus: 24-25
+    diff: true
+    state:
+      hart: 2
+      mode: U
+      proc: alarmtest (pid 3)
+      intr: "on"
+      satp: user
+      locks: []
+      stack: [main, test_called]
+      sp: {"on": user, detail: "alarmtest's user stack, one page at 0x4000-0x4fff"}
+    note: |
+      The story for this tour is a recorded run of `alarmtest` on three harts with gdb
+      attached to the reference kernel (the branch head). The machine state in every step
+      comes from that run; at this commit there is no test program yet. `alarmtest` is pid 3; for its first test it runs on
+      hart 2. `sh` (pid 2) and `init` (pid 1) are asleep in `wait`.
+
+      The first commit adds the plumbing, the same five places as any new system call (lab 1
+      walks through each one): numbers 23 and 24 here, two `entry(...)` lines in
+      [[user/usys.pl]], two prototypes in [[user/user.h]], and two `extern`s and table entries
+      in [[kernel/syscall.c]]. In this build the stubs are at `0xd6c` (`sigalarm`: `li a7,23;
+      ecall; ret`) and `0xd74` (`sigreturn`) in `alarmtest`.
+
+      The prototype in `user.h` is `int sigalarm(int ticks, void (*handler)());`: a
+      [[g:function-pointer]]. When `test_called` calls `sigalarm(2, periodic)`, `a0` holds 2
+      and `a1` holds the address of `periodic`, which in this build is 0.
+  - title: sys_sigalarm records three numbers
+    commit: 1
+    file: kernel/sysproc.c
+    lines: 114-139
+    focus: 116-131
+    diff: true
+    state:
+      hart: 2
+      mode: S
+      proc: alarmtest (pid 3)
+      intr: "on"
+      satp: kernel
+      locks: []
+      stack: [usertrap, syscall, sys_sigalarm]
+      sp: {"on": kernel, detail: "sp = 0x3fffff9f90 in pid 3's kernel stack page 0x3fffff9000 (gdb)"}
+      irq: 0
+    note: |
+      gdb stopped here (at the line that stores the interval) on hart 2: `sstatus.SIE` = 1,
+      `noff` = 0, and pid 3's trapframe held `a7` = `0x17` (23) and `epc` = `0xd72`, the
+      stub's `ecall` at `0xd6e` plus the 4 that [[usertrap]] added.
+
+      [[argint]] reads the interval from the saved `a0`; [[argaddr]] reads the handler from
+      the saved `a1`, as a plain 64-bit number. Neither checks anything, and nothing needs
+      checking: the kernel never dereferences the handler. It will only ever copy it into the
+      saved program counter, so if it is garbage, the process jumps to garbage in user mode,
+      and the hardware handles that like any other bad jump.
+
+      `sigalarm(0, 0)` stores interval 0, which is what "off" means; a negative interval is
+      refused. Resetting `alarmticks` makes every `sigalarm` start a fresh interval.
+
+      `sys_sigreturn` is a placeholder at this commit. It returns -1, and [[syscall]] will
+      put that in `a0`.
+    others: |
+      Hart 0 and hart 1 have nothing to run: their schedulers scan the process table, taking
+      and releasing each `p->lock`, and wait for interrupts. They never look at pid 3's alarm
+      fields; only pid 3 does, on whichever hart it runs.
+  - title: The state is private to the process
+    commit: 1
+    file: kernel/proc.h
+    lines: 81-109
+    focus: 105-108
+    diff: true
+    state:
+      hart: 2
+      mode: S
+      proc: alarmtest (pid 3)
+      intr: "on"
+      satp: kernel
+      locks: []
+      stack: [usertrap, syscall, sys_sigalarm]
+      sp: kernel
+      irq: 0
+    note: |
+      The three fields go after `name`, in the section that is "private to the process, so
+      p->lock need not be held" ([[kernel/proc.h:95]]). The comment on `alarmhandler` says what
+      the first think question was about: 0 is a valid handler. The interval is the switch.
+
+      Who touches these fields? `sys_sigalarm` (this step), the timer path in `usertrap`
+      (next), and later `sys_sigreturn`, `kexec` and `freeproc`. All but `freeproc` run as
+      process 3 itself; `freeproc` runs when it is dead. That is the whole argument for no
+      lock.
+  - title: Counting ticks where the process is known
+    commit: 2
+    file: kernel/trap.c
+    lines: 82-109
+    focus: 85-89
+    diff: true
+    state:
+      hart: 2
+      mode: S
+      proc: alarmtest (pid 3)
+      intr: "off"
+      satp: kernel
+      locks: []
+      stack: [usertrap, alarmtick]
+      sp: {"on": kernel, switched: "`ld sp, 8(a0)` in [[uservec]] ([[kernel/trampoline.S:76]])", detail: "sp = 0x3fffff9fe0: only usertrap's frame on an empty kernel stack (gdb)"}
+      irq: 0
+    note: |
+      A timer interrupt arrived on hart 2 while pid 3 was spinning in `waitfor`: gdb saw `sepc`
+      = `0x14c`, the `lw a5,-68(s0)` of the `volatile` loop. The hart went through
+      [[uservec]] into [[usertrap]], `devintr()` returned 2, and now, before `yield()`,
+      `alarmtick(p)` counts the tick.
+
+      This is the one place where all three facts are known at once: a timer interrupt
+      happened, it interrupted user code, and `p` is the process that was running. It works
+      the same on every hart. The compiler inlined `alarmtick` into `usertrap` (there is no
+      separate symbol in `kernel.asm`); gdb still shows it as a frame.
+
+      Interrupts are off: `usertrap` turns them on only for system calls
+      ([[kernel/trap.c:66]]), so nothing can interrupt the counting on this hart. gdb read
+      `SIE` = 0 and `noff` = 0 here. The saved `a7` was `0xe` (14), left over from `waitfor`'s
+      last `uptime()` call: the trapframe holds whatever the registers held.
+
+      Ticks taken in the kernel (in [[kerneltrap]]) do not reach this code. The alarm counts
+      user time only.
+    others: |
+      Harts 0 and 1 take their own timer interrupts, about ten a second each, landing in their
+      idle schedulers through [[kerneltrap]], where `myproc()` is 0, so they do not yield and
+      count nothing. Hart 0's also increments `ticks`, the next step.
+  - title: Why not next to ticks++?
+    commit: 2
+    file: kernel/trap.c
+    lines: 180-194
+    focus: 183-188
+    state:
+      hart: 2
+      mode: S
+      proc: alarmtest (pid 3)
+      intr: "off"
+      satp: kernel
+      locks: []
+      stack: [usertrap, devintr, clockintr]
+      sp: kernel
+      irq: 0
+    note: |
+      A moment earlier on the same path, `devintr` called [[clockintr]]. On hart 2,
+      `cpuid() == 0` is false, so the whole block is skipped: `ticks` is not touched. The
+      only thing every hart does is re-arm its own timer, `stimecmp = time + 1000000`, a tenth
+      of a second ahead at QEMU's 10 MHz timebase ([[g:sstc]]).
+
+      So `ticks` is hart 0's wall clock, protected by `tickslock` because `sys_uptime` and
+      `sys_pause` read it from any hart. It cannot tell you how much CPU time pid 3 used: it
+      advances while pid 3 sleeps, and it never advances because of anything pid 3's hart
+      does. Clinic 5 put the count inside this `if`: a lone process got 28 handler calls in 100
+      ticks instead of about 100, and with three processes the one that sat on hart 0 got
+      nearly all of them.
+    others: |
+      This is the step to picture three timers. Each hart's `stimecmp` fires on its own
+      schedule. Hart 0's interrupt increments `ticks` and wakes sleepers in `pause`; hart 1's
+      and hart 2's only re-arm. A process gets a tick from whichever hart it is running on.
+  - title: Redirecting the return to the handler
+    commit: 3
+    file: kernel/trap.c
+    lines: 98-118
+    focus: 109-117
+    diff: true
+    state:
+      hart: 2
+      mode: S
+      proc: alarmtest (pid 3)
+      intr: "off"
+      satp: kernel
+      locks: []
+      stack: [usertrap, alarmtick]
+      sp: kernel
+      irq: 0
+    note: |
+      With `sigalarm(2, periodic)`, the second tick reaches the interval. gdb stopped on line
+      116 at `ticks` = 2: the count had just been reset to 0, the trapframe said `epc` =
+      `0x14c`, `sp` = `0x4f30`, `ra` = `0x136`, `a0` = 1.
+
+      Line 116 copies all 288 bytes of the trapframe into `p->alarmframe`: the 31 registers
+      [[uservec]] saved, the user program counter, and the four `kernel_*` fields. (In
+      `kernel.asm` the structure assignment is an inline loop, 9 rounds of 32 bytes.) Only
+      then does line 117 change `epc`. The order matters: copy first, or the copy would
+      remember the handler instead of the interrupted instruction.
+
+      Line 117 is the redirect. Nothing is jumped to here. `usertrap` will `yield()`, then
+      [[prepare_return]] will copy `epc` into `sepc`, and the `sret` at the end of
+      [[userret]] will land on the handler.
+    others: |
+      The `yield()` that follows may give hart 2 to another process, and pid 3 may continue on
+      hart 0 or hart 1. That is fine: everything this step changed is in pid 3's trapframe
+      and `struct proc`, which travel with the process. Writing `sepc` here instead would
+      not survive the switch (think question 3).
+  - title: A second trapframe in struct proc
+    commit: 3
+    file: kernel/proc.h
+    lines: 81-110
+    focus: 109
+    diff: true
+    state:
+      hart: 2
+      mode: S
+      proc: alarmtest (pid 3)
+      intr: "off"
+      satp: kernel
+      locks: []
+      stack: [usertrap, alarmtick]
+      sp: kernel
+      irq: 0
+    note: |
+      `alarmframe` is a whole `struct trapframe` embedded in `struct proc`, at offset 376 at
+      this commit (`addi a4,s1,376` in the inlined copy; 384 at the branch head, after
+      `alarmactive` is added). The real trapframe is a separate
+      page, because the trampoline must reach it at the fixed address `TRAPFRAME` in every
+      user page table. The copy is never touched by the trampoline, so ordinary kernel
+      memory will do. Embedding it means no allocation and no failure path; each of the 64
+      slots grows by 304 bytes at this commit (360 to 664), and by 312 at the head (360 to
+      672).
+
+      Why not keep it on the user stack, as Unix does? That needs a [[copyout]] that can
+      fail on a full stack, and `sigreturn` would read back a frame the program could have
+      changed. Why not only `epc`? Clinic 1 answers that: the handler's `sp`, `s0` and `ra`
+      leak into the interrupted code.
+  - title: prepare_return puts the handler in sepc
+    commit: 3
+    file: kernel/trap.c
+    lines: 123-155
+    focus: 153-154
+    state:
+      hart: 2
+      mode: S
+      proc: alarmtest (pid 3)
+      intr: "off"
+      satp: kernel
+      locks: []
+      stack: [usertrap, prepare_return]
+      sp: kernel
+      irq: 0
+    note: |
+      [[prepare_return]] is unchanged by this lab, and it does exactly what we need. It turns
+      interrupts off, points `stvec` at the trampoline, refreshes the four `kernel_*` fields
+      for the next trap, sets `sstatus` for a return to user mode with interrupts enabled, and
+      last, copies the saved program counter into `sepc`.
+
+      gdb, stopped just after `prepare_return` returned to `usertrap`, read `sepc` = `0x0`:
+      the handler's address, from the trapframe's `epc`. The trapframe still holds all of the
+      interrupted code's registers, `sp` = `0x4f30` included, so the handler will start with
+      them.
+
+      Notice line 142, `kernel_hartid = r_tp()`. Those four fields are rewritten before every
+      return to user space. That is why a saved copy can be restored wholesale later, even on
+      a different hart, without breaking the next trap.
+  - title: sret lands at address 0
+    commit: 3
+    file: kernel/trampoline.S
+    lines: 100-153
+    focus: 148-153
+    state:
+      hart: 2
+      mode: S
+      proc: alarmtest (pid 3)
+      intr: "off"
+      satp: user
+      locks: []
+      stack: [userret]
+      sp: {"on": none, detail: "`sp` holds the user's 0x4f30 again (line 118), which S-mode cannot use until `sret`"}
+      irq: 0
+    note: |
+      [[usertrap]] returned the user `satp` to [[uservec]]'s `jalr`, which falls into
+      [[userret]]. It installed pid 3's page table (line 111), reloaded every register from
+      the trapframe, `a0` last (line 149), and executes `sret`: user mode, interrupts on, and
+      the program counter from `sepc`, which is 0.
+
+      So the first user instruction is `addi sp,sp,-16` at address 0, the start of `periodic`.
+      Every register holds what the interrupted `waitfor` had. `periodic` was never called,
+      so its `ra` is `waitfor`'s `ra` (`0x136`), and if it ever executed `ret` it would
+      "return" into the middle of `waitfor`. That is why a handler must end with
+      `sigreturn()`.
+
+      The handler's frame goes on the same user stack, just below `waitfor`'s `sp`: at
+      `0x4f20`. The RISC-V calling convention says procedures "must not rely upon the
+      persistence of stack-allocated data whose addresses lie below the stack pointer" (it
+      defines no red zone), so `periodic` can be dropped onto the stack at any instruction
+      without harming `waitfor`.
+  - title: sigreturn copies the frame back
+    commit: 4
+    file: kernel/sysproc.c
+    lines: 132-145
+    focus: 140-144
+    diff: true
+    state:
+      hart: 2
+      mode: S
+      proc: alarmtest (pid 3)
+      intr: "on"
+      satp: kernel
+      locks: []
+      stack: [usertrap, syscall, sys_sigreturn]
+      sp: {"on": kernel, detail: "sp = 0x3fffff9fb0 (gdb)"}
+      irq: 0
+    note: |
+      `periodic` did `count++` and called `sigreturn()`. Before line 141, gdb read the
+      trapframe as the handler left it: `epc` = `0xd7a` (the stub's `ecall` at `0xd76`, plus
+      4), `sp` = `0x4f20`, `s0` = `0x4f30`, `ra` = `0x1e`, `a7` = `0x18`. After line 141 it was
+      `epc` = `0x14c`, `sp` = `0x4f30`, `s0` = `0x4f80`, `ra` = `0x136`, `a7` = `0xe`, `a0` =
+      1: exactly the values saved at the interrupt.
+
+      One structure assignment undoes everything: the handler's registers, and also the 4
+      that [[usertrap]] added to `epc` for this `ecall`. The process will not continue after
+      the `ecall`; it will continue at `0x14c`, the instruction the timer interrupted, which
+      has not run yet.
+
+      Interrupts are on (this is a system call), and that is fine: a timer interrupt here goes
+      to [[kerneltrap]], which never touches the alarm fields.
+  - title: The return value lands in a0
+    commit: 4
+    file: kernel/syscall.c
+    lines: 140-155
+    focus: 146-150
+    state:
+      hart: 2
+      mode: S
+      proc: alarmtest (pid 3)
+      intr: "on"
+      satp: kernel
+      locks: []
+      stack: [usertrap, syscall]
+      sp: kernel
+      irq: 0
+    note: |
+      Back in [[syscall]], line 150 stores `sys_sigreturn`'s return value in
+      `p->trapframe->a0`, after the restore. That is the line that makes every system call's
+      result appear in `a0`, and here it would destroy the restored `a0` unless the two are
+      the same value. `sys_sigreturn` returns `p->trapframe->a0`, so line 150 writes the
+      restored value onto itself (in `kernel.asm`: `ld a0,112(a5)`, offset 112 being `a0` in
+      the trapframe).
+
+      Clinic 4 returned 0 instead: the `a0` check failed on every one of its ten interrupted
+      runs, while every other check passed.
+  - title: No delivery while the handler runs
+    commit: 5
+    file: kernel/trap.c
+    lines: 100-119
+    focus: 106-107
+    diff: true
+    state:
+      hart: 1
+      mode: S
+      proc: alarmtest (pid 3)
+      intr: "off"
+      satp: kernel
+      locks: []
+      stack: [usertrap, alarmtick]
+      sp: kernel
+      irq: 0
+    note: |
+      The re-entry test: `sigalarm(1, slow)`, and `slow` spins for 3 ticks. By now
+      `alarmtest` runs on hart 1 (it moved during the register test; more in a later step).
+      gdb caught several timer interrupts that landed *inside* `slow`, at `sepc` = `0x9e`
+      with `sp` = `0x4ef0`: `alarmactive` was 1 and the count stayed 0. Line 106 returned at
+      once.
+
+      `alarmactive` is set on line 116 at delivery and cleared by `sigreturn`. While it is
+      set, nothing is counted, so the next interval starts after the handler returns. Without
+      the check (clinic 2), `slow` nested 56 times and the process died in its stack's guard
+      page.
+  - title: sigreturn only inside a handler
+    commit: 5
+    file: kernel/sysproc.c
+    lines: 133-149
+    focus: 140-142
+    diff: true
+    state:
+      hart: 1
+      mode: S
+      proc: alarmtest (pid 3)
+      intr: "on"
+      satp: kernel
+      locks: []
+      stack: [usertrap, syscall, sys_sigreturn]
+      sp: kernel
+      irq: 0
+    note: |
+      `sigreturn` now refuses to run unless a handler is running, and clears the flag when it
+      does. Without this, a stray `sigreturn()` would copy whatever `alarmframe` held, which is
+      the frame of some earlier interrupt, or all zeros, and the process would jump back
+      in time with an old stack pointer. `alarmtest`'s first test calls `sigreturn()` from
+      `main` and expects -1.
+
+      Clearing the flag before the copy or after makes no difference here: interrupts are on,
+      but an interrupt in this system call goes to [[kerneltrap]], never to the timer path
+      that reads the flag.
+  - title: exec turns the alarm off
+    commit: 6
+    file: kernel/exec.c
+    lines: 126-152
+    focus: 132-142
+    diff: true
+    state:
+      mode: S
+      proc: "alarmtest (the exec'd child of test_forkexec)"
+      intr: "on"
+      satp: kernel
+      locks: []
+      stack: [usertrap, syscall, sys_exec, kexec]
+      sp: kernel
+      irq: 0
+    note: |
+      In `test_forkexec`, a child turns its alarm on with `sigalarm(1, periodic)` and execs
+      `alarmtest exec`. [[kexec]] has built the new image, and from line 133 on it is
+      committed: the new page table, size, `epc` and `sp` are in place and the old memory is
+      freed. Only then are the alarm fields cleared. If `exec` fails earlier (at `bad:`), the
+      old program goes on running with its alarm intact.
+
+      The new program is the same `alarmtest`, so `periodic` is at the same address 0 in the
+      new image. That makes the check sharp: a surviving alarm would really call `periodic`
+      in the new program and count. The recorded run printed `after exec: 0`.
+
+      `alarmhandler` and `alarmticks` are left as they are: with the interval at 0 nothing
+      reads them, and the next `sigalarm` overwrites all three.
+  - title: freeproc clears the alarm
+    commit: 6
+    file: kernel/proc.c
+    lines: 152-175
+    focus: 170-173
+    diff: true
+    state:
+      mode: S
+      proc: alarmtest (pid 3)
+      intr: "off"
+      satp: kernel
+      locks: [wait_lock, "the child's p->lock"]
+      stack: [usertrap, syscall, sys_wait, kwait, freeproc]
+      sp: kernel
+      irq: {noff: 2, intena: 1}
+    note: |
+      `alarmtest` reaps a child in [[kwait]], which holds `wait_lock` and the child's
+      `p->lock` while it calls [[freeproc]]: two spinlocks, `noff` 2, interrupts off, and
+      `intena` 1 because the first `acquire` happened during a system call with interrupts
+      on.
+
+      The four alarm fields are cleared with the rest. [[allocproc]] does not clear them, so
+      this is what makes a forked child start with the alarm off: [[kfork]] does not copy the
+      fields, and the slot it gets was last cleared here (or is zero from boot). The first
+      `test_forkexec` child spins for 10 ticks after `fork` and saw 0 handler calls.
+    others: |
+      While `kwait` holds the child's `p->lock`, a scheduler on another hart that reaches this
+      slot spins in `acquire` until `freeproc` is done, then sees UNUSED and moves on. The
+      alarm fields themselves need no lock; they are cleared here because this is where the
+      slot is reset.
+  - title: A handler at address 0
+    commit: 7
+    file: user/alarmtest.c
+    lines: 1-39
+    focus: 9-17
+    diff: true
+    state:
+      hart: 2
+      mode: U
+      proc: alarmtest (pid 3)
+      intr: "on"
+      satp: user
+      locks: []
+      stack: [main, test_called, waitfor, periodic]
+      sp: {"on": user, switched: "`sret` in [[userret]] ([[kernel/trampoline.S:153]])", detail: "periodic's frame at 0x4f20, just below waitfor's sp 0x4f30"}
+    note: |
+      This is the code that ran after the `sret` three steps back. `periodic` is the first
+      function in the file, and `alarmtest.asm` shows `0000000000000000 <periodic>:`; the
+      test prints the address, so a reader can see that 0 is real code.
+
+      The stack list above is an honest oddity: `waitfor` never called `periodic`. The
+      kernel dropped it on top of `waitfor`'s frame, so its saved `ra` is `waitfor`'s `ra`
+      (`0x136`), and only `sigreturn()` gets the process back. `count` is `volatile` because
+      `main`'s loop reads it while the handler changes it behind the compiler's back.
+
+      `slow` (from line 21) is the long handler for the re-entry test: it records its nesting
+      depth and prints a line if it is ever entered twice. In clinic 2 that line appeared 56
+      times.
+  - title: Checking 26 registers at once
+    commit: 7
+    file: user/alarmtest.c
+    lines: 83-150
+    focus: 94-104
+    state:
+      hart: 2
+      mode: U
+      proc: alarmtest (pid 3)
+      intr: "on"
+      satp: user
+      locks: []
+      stack: [main, test_registers, fillspin]
+      sp: user
+    note: |
+      `fillspin` is [[g:inline-asm]]: it loads 26 registers with recognizable patterns
+      (`x11` gets `0x1111111111111111`), spins 20 million times with the counter in `a0`, then
+      stores all 26 into `regs[]`. The clobber list tells the compiler that every one of them
+      changes, so it saves `s1`-`s11` and `ra` in the prologue. `sp`, `s0`, `gp`, `tp` and `a0`
+      are not compared; `a0` gets its own test.
+
+      gdb caught the deliveries: every one interrupted the loop at `0x52e` (`addi a0,a0,-1`),
+      with `ra` = `0x0101010101010101`, `a7` = `0x1717171717171717`, `sp` = `0x4ed0`, and `a0`
+      a counter such as `0xd049b3`. At the matching `sigreturn`, the trapframe held the
+      handler's `ra` = `0x1e` and `sp` = `0x4ec0`; after the copy, the patterns were back.
+
+      During this test the process moved: timer interrupts 18 and 19 of the gdb run landed on
+      hart 2 and then on hart 1, and the trapframe's `kernel_hartid` changed from 2 to 1.
+      `alarmframe` and the trapframe moved with the process, and the test passed.
+    others: |
+      A move between harts happens at a `yield()`: pid 3 becomes RUNNABLE, and the scheduler
+      that next finds it, on hart 1 here, runs it. Nothing about the alarm cares which hart:
+      [[prepare_return]] writes `kernel_hartid` fresh before every return, and everything else
+      is per process.
+  - title: Keeping a0 live on purpose
+    commit: 7
+    file: user/alarmtest.c
+    lines: 167-208
+    focus: 173-180
+    state:
+      hart: 1
+      mode: U
+      proc: alarmtest (pid 3)
+      intr: "on"
+      satp: user
+      locks: []
+      stack: [main, test_a0, a0spin]
+      sp: user
+    note: |
+      `a0spin` puts a pattern in `a0` and spins with the counter in `t0`, so `a0` is live at
+      every instruction of the loop. gdb saw the timer interrupts land at `0x7b8`
+      (`addi t0,t0,-1`) on hart 1, with the trapframe's `a0` = `0x0a0a0a0a0a0a0a0a`, the value
+      `alarmframe` then preserved.
+
+      This is the check that catches the `sigreturn`-returns-0 bug. Elsewhere `a0` is often
+      dead at the interrupted instruction, so a clobbered `a0` changes nothing. A good test
+      makes the value you are worried about matter.
+  - title: Measuring the rate
+    commit: 8
+    file: user/alarmrate.c
+    lines: 1-56
+    focus: 35-55
+    diff: true
+    state:
+      mode: U
+      proc: alarmrate
+      intr: "on"
+      satp: user
+      locks: []
+      stack: [main]
+      sp: user
+    note: |
+      `alarmtest` checks behaviour with generous time limits; it cannot tell a correct rate
+      from a wrong one (clinic 5 passed all six checks). `alarmrate INTERVAL SECONDS NPROC`
+      forks `NPROC` spinners, each with `sigalarm(INTERVAL, tick)`, and lets them burn user
+      time for `SECONDS` of wall-clock time measured with `uptime()`. Each child reports its
+      handler count through its [[g:exit-status]], so the parent prints whole lines that
+      cannot interleave.
+
+      With the reference kernel on three harts: one spinner, interval 1, 10 seconds: 97
+      calls; three spinners: 91, 96, 94; six spinners: 45 to 49 each. The alarm follows the
+      CPU time each process actually gets, not the clock on the wall. The full numbers are
+      under Measure.
+verify: |
+  On the branch head, on three harts (QEMU `-smp 3`), `alarmtest` passes, `usertests -q`
+  passes, and `alarmtest` passes again afterwards:
+
+  ```text
+  $ alarmtest
+  alarmtest: periodic is at address 0x0000000000000000
+  alarmtest: 5 calls; 0 more in 10 ticks after sigalarm(0, 0)
+  alarmtest: handler called, then stopped: OK
+  alarmtest: sigreturn outside a handler fails: OK
+  alarmtest: the handler ran during 10 fillspin runs (10 calls)
+  alarmtest: registers preserved: OK
+  alarmtest: slow ran 3 times, nested at most 1 deep
+  alarmtest: no re-entry: OK
+  alarmtest: the handler ran during 10 a0spin runs (10 calls)
+  alarmtest: sigreturn restores a0: OK
+  alarmtest: handler calls in the forked child: 0, after exec: 0
+  alarmtest: fork and exec start with the alarm off: OK
+  alarmtest: 6 of 6 checks OK
+  $ usertests -q
+  usertests starting
+  [...]
+  test lazy_sbrk: OK
+  test partial_write: OK
+  test unlinkcwd: OK
+  ALL TESTS PASSED
+  $ alarmtest
+  alarmtest: periodic is at address 0x0000000000000000
+  [...]
+  alarmtest: 6 of 6 checks OK
+  ```
+
+  What this shows: the handler is called and stopped; all 26 compared registers and `a0`
+  survive ten interrupted runs each; a long handler is never nested; a forked child and an
+  exec'd program start with the alarm off. No program in `usertests` calls `sigalarm`, so
+  for every other process the only cost is one load and compare per user-mode timer
+  interrupt (`alarminterval == 0`), and 312 more bytes in each of the 64 `struct proc`
+  slots (`struct proc` grows from 360 to 672 bytes in this build).
+
+  Every commit on the branch was built from clean (`make clean; make kernel/kernel fs.img`).
+measure: |
+  **Handler calls versus the requested interval, on three harts.** `alarmrate INTERVAL 10
+  NPROC` (each process spins for 100 ticks of `ticks`, ten seconds), reference kernel, one
+  boot:
+
+  | interval | processes | handler calls per process | with a hart to itself |
+  |---|---|---|---|
+  | 1 | 1 | 97 | about 100 |
+  | 1 | 3 | 91, 96, 94 | about 100 |
+  | 1 | 6 | 45, 46, 49, 45, 49, 47 | about 100 |
+  | 5 | 1 | 18 | about 20 |
+  | 5 | 6 | 10, 9, 9, 9, 9, 9 | about 20 |
+  | 1 | 1 (again, at the end) | 89 | about 100 |
+
+  - Up to three processes, each gets a hart of its own and close to the full rate. The few
+    missing calls are ticks that landed while the process was in the kernel: its `uptime()`
+    calls, the `yield()` after every tick and the trip through the scheduler. Those go to
+    [[kerneltrap]] and are not user time.
+  - Six processes on three harts get about half each (45 to 49 instead of about 95): the alarm
+    measures CPU time, and each had a hart about half the time.
+  - Interval 5 gives a fifth of the calls, as it should (18 instead of 97; 9 or 10 instead of
+    about 47).
+
+  **The same measurement with ticks counted next to `ticks++`** (clinic 5), same machine:
+  one process, interval 1, 10 seconds: **28** calls on one run and **83** on another; three
+  processes: **89, 7 and 0**. In a 30-second run with gdb sampling the harts, pid 6 was on
+  hart 0 in all 8 samples and got 251 calls; pids 4 and 5, on harts 1 and 2, got 6 and 23.
+  The reference kernel gave the three processes 91, 96 and 94. The difference is the whole
+  point of the second think question: a process's ticks must be counted on the hart it runs
+  on, and only hart 0 advances `ticks`.
+
+  **Cost of a delivery.** One extra trip through the kernel (the `sigreturn` system call; the
+  timer interrupt that redirects would have happened anyway), plus two 288-byte copies.
+further: |
+  - **Count kernel time too.** Count timer interrupts in [[kerneltrap]] when `myproc()` is
+    not 0, and deliver at the next return to user space. Teaches the difference between
+    `ITIMER_VIRTUAL` and `ITIMER_PROF`, and why the delivery must still happen in
+    [[usertrap]].
+  - **Pass an argument.** Call the handler as `handler(ticks)` by setting `a0` in the
+    trapframe before the return. Teaches the calling convention from the callee's side, and
+    why `alarmframe` must be taken before `a0` is changed.
+  - **Let the handler return normally.** Set the handler's `ra` to a small piece of code
+    (a "trampoline" in the user's memory) that calls `sigreturn`, as Unix kernels do. Teaches
+    where that code can live and who maps it.
+  - **Nested signals.** Allow a second, different signal while a handler runs, by keeping a
+    stack of saved frames on the user stack. Teaches why real kernels save the frame in user
+    memory, and what they must check when they read it back.
+  - **Ctrl-C as a signal.** Lab 6 delivers an interrupt from the console to the foreground
+    job; with this lab's delivery path you could let a program catch it instead of dying.

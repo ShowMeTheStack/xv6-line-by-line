@@ -1,0 +1,770 @@
+title: Breaking the lock rules
+group: Locks and interrupt state
+prerequisites: [15, 16, 18, 48, 50]
+summary: |
+  xv6's locking rests on a short list of rules: never acquire a lock you already hold; never
+  sleep holding a spinlock; keep interrupts off while you hold one; let `intena` travel with the
+  thread; register for a wakeup before you let go of the condition lock; take locks in one
+  global order; release with a fence. Tours [[tour:15]] to [[tour:18]] explained why each rule
+  exists. This tour **breaks them, one at a time**, and reports what happened.
+
+  Each experiment is one small change to a scratch copy of the kernel (never to the tree the
+  site annotates), built with the same compiler, booted in QEMU on three harts, with gdb
+  attached (in most runs from the first instruction, with a breakpoint on [[panic]]). Where a rule needs
+  pressure to fail, the copy also contains a 30-line test program, `lockstress`, that we added
+  to its `user/` directory: three worker processes that each call `uptime()`, or
+  `fork()` + `exit()` + `wait()`, in a tight loop. When a run panicked, gdb stopped every hart
+  at the `panic` call; when it hung, gdb interrupted the machine and printed where each hart
+  was.
+
+  Some breaks panic with a message that names the rule. Some freeze the whole machine without a
+  word. One freezes one or two processes while everything else keeps running. Four changes, to two
+  rules, produced nothing we could observe, and we say why, because "it passed" is not the same
+  as "it is safe".
+cast: |
+  Every experiment starts from the same place: a fresh copy of the source tree, a fresh disk
+  image, one change, three harts.
+
+  | Hart | What it is doing |
+  |---|---|
+  | 0 | Booting, then running whatever its scheduler picks; also the only hart that counts `ticks` |
+  | 1 | Booting, then the same |
+  | 2 | Booting, then the same |
+
+  The control: the unmodified kernel (with `lockstress` added) passed `usertests -q` on three
+  harts (`ALL TESTS PASSED`) and finished `lockstress fork 3000` and `lockstress up 100000`.
+steps:
+  - title: "Rule 1: never acquire a lock you already hold"
+    file: kernel/spinlock.c
+    lines: 19-42
+    focus: 24-26
+    state:
+      hart: 0
+      mode: S
+      proc: lockstress (pid 4)
+      intr: off
+      satp: kernel
+      locks: [tickslock]
+      stack: [usertrap, syscall, sys_uptime, acquire]
+      sp: {"on": kernel}
+      irq: {noff: 2, intena: 1, note: "the broken kernel's second `acquire`: one level for `tickslock`, one for this `push_off`. gdb read `cpus[0].noff = 2` at the panic"}
+    note: |
+      A spinlock has no idea who wants it. If the hart that holds it calls [[acquire]] again,
+      the spin on line 37 waits for a release that only this same hart could perform, and this
+      hart is busy spinning. [[holding]] on line 25 looks for exactly that case and panics
+      instead ([[concept:locks#holding]]).
+
+      **Break 1.** In [[sys_uptime]], a copy of the kernel with `acquire(&tickslock)` written
+      twice (line 108 doubled). Two boots, then `lockstress up 1` at the shell. Both runs ended
+      the same way (run 2's console; run 1 also shows the echoed command before the panic):
+
+      ```text
+      init: starting sh
+      $ panic: acquire
+      ```
+
+      gdb, stopped at the `panic` call (line numbers are the modified file's; its line 109 is
+      the added second `acquire`):
+
+      ```text
+      #0  panic (s="acquire") at kernel/printk.c:139
+      #1  acquire (lk=0x800157d0 <tickslock>) at kernel/spinlock.c:26
+      #2  sys_uptime () at kernel/sysproc.c:109
+      #3  syscall () at kernel/syscall.c:146
+      #4  usertrap () at kernel/trap.c:68
+      cpus[0].noff = 2, cpus[0].intena = 1
+      ```
+
+      In the first run gdb also read `tickslock = {locked = 1, cpu = 0x8000f9d0 <cpus>}`: the
+      owner recorded on line 41 is `&cpus[0]`, and this is hart 0 asking. That comparison is all
+      `holding` does. It records a **hart**, not a process, which is why the check works only
+      because interrupts are off: the thread cannot move to another hart between the two
+      `acquire` calls.
+    others: |
+      In the first run, gdb attached some seconds after the panic and found harts 1 and 2 inside
+      `sys_uptime` too, spinning on line 37 for `tickslock`: the other two `lockstress` workers.
+      A panicked hart never releases what it holds, so every hart that wants one of its locks
+      joins it. Hart 0's own timer interrupts can no longer count `ticks`; the panic is the
+      last thing this machine does.
+
+  - title: Break 1b, with the check deleted
+    file: kernel/sysproc.c
+    lines: 101-112
+    focus: 108-110
+    state:
+      hart: 1
+      mode: S
+      proc: lockstress (pid 4)
+      intr: off
+      satp: kernel
+      locks: [tickslock]
+      stack: [usertrap, syscall, sys_uptime]
+      sp: {"on": kernel}
+      irq: {noff: 1, intena: 1, note: "the original code at line 109: one level for `tickslock`, taken with SIE on. In the broken kernel gdb read noff 2 on hart 1: the second `acquire`'s `push_off` never comes back"}
+    note: |
+      Now delete lines 25–26 of `spinlock.c` as well, keep the doubled `acquire`, and run the
+      same command. Two runs, two freezes: the shell prints `$ `, takes the command, and
+      **nothing more appears, ever**. No panic.
+
+      gdb, after interrupting the frozen machine (run 1; the modified `spinlock.c` is two lines
+      shorter, so its line 35 is the spin on line 37 of the original):
+
+      ```text
+      hart 0: acquire (lk=<tickslock>) at spinlock.c:35
+              clockintr () at trap.c:170
+              devintr () at trap.c:215
+              kerneltrap () at trap.c:149
+              kernelvec ()
+              [interrupted: scheduler () at proc.c:442]
+      hart 1: acquire (lk=<tickslock>) at spinlock.c:35
+              sys_uptime () at sysproc.c:109        <- its own second acquire
+      hart 2: acquire (lk=<tickslock>) at spinlock.c:35
+              sys_uptime () at sysproc.c:108
+      tickslock = {locked = 1, cpu = <cpus+128>}     (hart 1)
+      ticks = 4
+      ```
+
+      Hart 1 holds `tickslock` and waits for itself. Hart 2's worker waits behind it. Hart 0
+      was idle in its [[scheduler]]; its timer interrupt arrived in the `intr_on(); intr_off();`
+      window, and [[clockintr]] wants `tickslock` to count the tick. `ticks` stopped at 4. All
+      three harts spin with interrupts off, so nothing can ever preempt them. The third worker
+      sat `RUNNABLE` with no hart left to run it. In run 2 the holder happened to be hart 0
+      itself, so its own `clockintr` could never even be taken; the other two harts spun on
+      line 108 just the same.
+
+      One deleted `if` turned an instant, one-line diagnosis into a machine that looks merely
+      idle. That is what `holding()` is for.
+
+  - title: "Rule 2: never sleep holding a spinlock"
+    file: kernel/console.c
+    lines: 87-110
+    focus: 104-105
+    state:
+      hart: 2
+      mode: S
+      proc: sh (pid 2)
+      intr: off
+      satp: kernel
+      locks: [cons.lock]
+      stack: [usertrap, syscall, sys_read, fileread, consoleread]
+      sp: {"on": kernel}
+      irq: {noff: 1, intena: 1, note: "`cons.lock`, taken in a system call with SIE on"}
+    note: |
+      The shell reads its command line through [[consoleread]], which waits for keystrokes
+      under `cons.lock`. The pattern is the one [[tour:16]] walked through: register on the
+      channel ([[sleep_prepare]], line 104), **release the condition lock** (105), [[sleep]]
+      (106), take the lock again (107). The keyboard's interrupt handler, [[consoleintr]], needs
+      `cons.lock` to put the character in the buffer and wake the reader.
+
+      [[tour:48]] already broke this rule with `tickslock` in `pause`. Here is a second
+      instance, on a lock that an *interrupt handler* needs. **Break 2:** a copy of the kernel
+      with lines 105 and 107 deleted, so the shell sleeps holding `cons.lock`. Two boots; both
+      died the moment the shell first waited for input:
+
+      ```text
+      init: starting sh
+      $ panic: sched locks
+      ```
+
+      gdb on hart 2:
+
+      ```text
+      #0  panic (s="sched locks")
+      #1  sched () at kernel/proc.c:488
+      #2  sleep () at kernel/proc.c:569
+      #3  consoleread (user_dst=1, dst=20255, n=1) at kernel/console.c:106
+      #4  fileread ...
+      #5  sys_read ...
+      cpus[2].noff = 2, cpus[2].intena = 1
+      cons.lock = {locked = 1, cpu = <cpus+256>}      (hart 2)
+      sh: SLEEPING, chan = <cons+152> (&cons.r)
+      ```
+
+      `sh` had already set its state to `SLEEPING`; [[sched]] refused the switch.
+
+  - title: What sched counted, and what it prevented
+    file: kernel/proc.c
+    lines: 479-497
+    focus: 485-488
+    state:
+      hart: 2
+      mode: S
+      proc: sh (pid 2)
+      intr: off
+      satp: kernel
+      locks: ["p->lock"]
+      stack: [usertrap, syscall, sys_read, fileread, consoleread, sleep, sched]
+      sp: {"on": kernel}
+      irq: {noff: 1, intena: 1, note: "the original code: only `p->lock`. In the broken kernel gdb read noff 2 here (`cons.lock` + `p->lock`), and line 487 panicked"}
+    note: |
+      [[sched]] cannot see which locks a hart holds, only how many: `noff`, the
+      [[push_off]] depth ([[concept:locks#noff]]). Exactly one level is allowed, for `p->lock`,
+      the lock the [[scheduler]] will release on this hart after [[swtch]]
+      ([[concept:locks#handoff]]). Two levels means some other spinlock would stay locked while
+      its holder is off the hart.
+
+      What the check prevented here is a deadlock with the keyboard. With `cons.lock` stuck,
+      the next key press would reach [[consoleintr]] on some hart, which would spin on
+      `cons.lock` with interrupts off forever. The only code that could release the lock is
+      `sh`, which sleeps until that same handler wakes it. Then the next hart to touch the
+      console would spin too. (One way out remains: a `kill` of `sh` from another hart would
+      make it runnable, and `consoleread`'s `killed` path, lines 100–102, releases the lock.)
+
+      Sleep-locks are invisible to this count, which is exactly right: [[tour:17]] shows
+      processes sleeping while holding two or three of them.
+    others: |
+      In the first run, gdb attached some seconds after the panic and found the other two harts
+      blocked behind the panicked one. Hart 0 was in [[uartintr]] → [[wakeup]], spinning on
+      `sh`'s `p->lock` (still held by hart 2, which panicked inside `sched`); hart 1's scheduler
+      was spinning on the same lock in its scan. A panic freezes its own hart, and every lock
+      it held freezes whoever comes next.
+
+  - title: "Rule 3: interrupts off while any spinlock is held"
+    file: kernel/spinlock.c
+    lines: 88-103
+    focus: 97-102
+    state:
+      hart: 2
+      mode: S
+      proc: init (pid 1)
+      intr: off
+      satp: kernel
+      locks: []
+      stack: [usertrap, syscall, myproc, push_off]
+      sp: {"on": kernel}
+      irq: {noff: 1, intena: 1, note: "after line 102: `myproc()`'s level, recorded with intena 1 because [[usertrap]] had turned interrupts on"}
+    note: |
+      Line 97 is one instruction, `csrrci a5,sstatus,2`: read `sstatus` and clear SIE in the
+      same step ([[concept:locks#sie]]). From then until the matching [[pop_off]] brings `noff`
+      back to 0, no interrupt can be taken on this hart. That is the invariant
+      ([[concept:locks#invariant]]): **noff > 0 ⇒ SIE = 0**. It is why an interrupt handler on
+      this hart can never find a lock this hart holds.
+
+      **Break 3:** a copy of the kernel whose line 97 reads `sstatus` without clearing SIE
+      (`r_sstatus()` instead of `rc_sstatus(SSTATUS_SIE)`). Everything else is untouched: the
+      counter still counts and `intena` is still recorded. Four boots, the same panic message every time,
+      before the shell ever started:
+
+      ```text
+      hart 2 starting
+      panic: pop_off - interruptible
+      ```
+
+      gdb, the three runs where it was attached from reset:
+
+      ```text
+      #0  panic (s="pop_off - interruptible")
+      #1  pop_off () at kernel/spinlock.c:110
+      #2  myproc () at kernel/proc.c:88
+      #3  syscall () at kernel/syscall.c:140
+      #4  usertrap () at kernel/trap.c:68
+      ```
+
+      The process was `init`, making its first system call. The first lock-like section that
+      ran with interrupts on was not even a lock: it was [[myproc]]'s `push_off`/`pop_off` pair.
+
+  - title: pop_off is the alarm
+    file: kernel/spinlock.c
+    lines: 105-116
+    focus: 109-110
+    state:
+      hart: 2
+      mode: S
+      proc: init (pid 1)
+      intr: off
+      satp: kernel
+      locks: []
+      stack: [usertrap, syscall, myproc, pop_off]
+      sp: {"on": kernel}
+      irq: {noff: 1, intena: 1, note: "the original code: `myproc()`'s level, SIE 0. In the broken kernel SIE was still 1 here (gdb: `sstatus = 0x200000022`, bit 1 set), and line 109 panicked"}
+    note: |
+      [[pop_off]] begins by checking the invariant from the other end: if SIE is on while
+      `noff` is still at least 1, something enabled interrupts inside a critical section, and it
+      panics. In a correct kernel this never fires; only `pop_off` itself (at `noff` 0), the
+      scheduler's `intr_on`, `usertrap`'s `intr_on` and `sret` ever set SIE.
+
+      In break 3 the check fired on the first `pop_off` executed after `usertrap` turned
+      interrupts on at [[kernel/trap.c:66]]. That was line 140 of `syscall.c`, `myproc()`, on
+      `init`'s very first system call. The broken kernel never got a chance to deadlock; the
+      check caught the rule being broken, not a consequence of it.
+
+      So we broke the alarm too.
+
+  - title: "Break 3b: the alarm removed"
+    file: kernel/trap.c
+    lines: 134-164
+    focus: 156-158
+    state:
+      hart: 2
+      mode: S
+      proc: init (pid 1)
+      intr: off
+      satp: kernel
+      locks: []
+      stack: [usertrap, syscall, sys_mknod, kernelvec, kerneltrap]
+      sp: {"on": kernel, detail: "init's kernel stack, with a kernelvec frame on top of the interrupted frames"}
+      irq: {noff: 0, note: "in a correct kernel an interrupt is only taken at noff 0. In the broken kernel gdb found the interrupted code at noff 1, holding a buffer sleep-lock's inner spinlock"}
+    note: |
+      Break 3 plus lines 109–110 of `spinlock.c` deleted. Now nothing complains when a lock is
+      held with interrupts on. Six boots with gdb from reset; every one panicked before the
+      shell started, while `init` was the only process (in the three runs where the backtrace
+      reached the system call, it was `init`'s first `mknod`, creating `/console`):
+
+      | Runs | First panic (gdb) | Path |
+      |---|---|---|
+      | 4 | `sched locks` | timer interrupt inside a critical section → [[kerneltrap]] → [[yield]] → [[sched]] with `noff` 2 |
+      | 2 | `sched interruptible` | [[sleep]] in `end_op` → `bread` → `virtio_disk_rw`: `acquire(&p->lock)` no longer turned SIE off |
+
+      In one `sched locks` run we unwound through the [[kernelvec]] frame by hand (pc ← the
+      saved `sepc`, sp ← the frame's top) to see what the timer had interrupted:
+
+      ```text
+      kvbt: interrupted code at sepc=0x80000bbc
+      #0  push_off () at kernel/spinlock.c:97
+      #1  acquire (lk=<proc+6120>)              proc[17].lock
+      #2  wakeup (chan=<bcache+16720>)
+      #3  releasesleep (lk=<bcache+16720>)       holding the buffer's lk->lk
+      #4  brelse ...
+      #5  readi ...
+      #6  dirlookup (name="console")
+      #7  dirlink ...
+      #8  create (path="console", type=3)
+      #9  sys_mknod ()
+      ```
+
+      `init` held `lk->lk`, the spinlock inside a buffer's sleep-lock, and was walking the
+      process table in [[wakeup]]. The timer fired. A correct kernel would have kept it
+      pending until [[release]]. Here `kerneltrap` ran at once and tried to [[yield]]; `sched`
+      counted two levels and refused. Without that check the process would have left the hart
+      still holding `lk->lk`. Any hart that touched that buffer would spin until `init` ran
+      again, and if `init` resumed on another hart, its `release` would panic, because the lock
+      records the hart, not the process.
+    others: |
+      A seventh run, an earlier one where gdb was attached only after the fact, printed
+      `ppanic: acquire`. gdb found hart 1 in `panic("acquire")` called from
+      [[wakeup]] ← [[uartintr]] ← [[kerneltrap]], with `init`'s `p->lock` recorded as held by
+      `cpus[1]`: a UART interrupt on hart 1, whose handler wanted a `p->lock` that hart 1
+      itself held. That is the textbook same-hart deadlock ([[tour:15]]), stopped by
+      [[holding]]. The doubled `p` suggests that a first panic had started printing and was
+      itself interrupted (with SIE never cleared, even `panic` runs interruptibly), so we
+      cannot say which rule broke first in that run.
+
+  - title: Why every interrupt handler forces the rule on every lock
+    file: kernel/proc.c
+    lines: 574-595
+    focus: 580-581
+    state:
+      hart: 1
+      mode: S
+      proc: init (pid 1)
+      intr: off
+      satp: kernel
+      locks: []
+      stack: [usertrap, syscall, kernelvec, kerneltrap, devintr, uartintr, wakeup, acquire]
+      sp: {"on": kernel, detail: "init's kernel stack, a kernelvec frame on top"}
+      irq: {noff: 1, intena: 0, note: "the original code: the handler runs at noff 0 with SIE off, so this `acquire`'s `push_off` records intena 0. The p->lock is not held yet"}
+    note: |
+      It might seem enough to turn interrupts off only around locks that a handler uses:
+      `tickslock`, `cons.lock`, `disk.vdisk_lock`. Break 3b shows why xv6 does not try. Every
+      device handler can call [[wakeup]] ([[uartintr]] line 145, [[consoleintr]],
+      [[virtio_disk_intr]] once per finished request, and [[clockintr]] on hart 0), and `wakeup` takes **every** process's `p->lock` in turn, line
+      581. The measured inventory agrees: `p->lock` was taken in interrupt context 1.37 million
+      times in the measurement run (boot, `usertests` and several stress programs;
+      [[concept:locks#handlers]]).
+
+      And many other locks are held *while* a `p->lock` is taken. The `sched locks` run above
+      was holding a buffer's `lk->lk` and taking `proc[17].lock` inside `wakeup`. Any lock held
+      at a moment when a handler could run is one the hart can deadlock on. Rather than track
+      which, `acquire` turns interrupts off for all of them, and [[pop_off]] and [[sched]] check
+      that nobody turned them back on ([[concept:locks#rules]]).
+
+  - title: "Rule 4: intena belongs to the thread, not the hart"
+    file: kernel/proc.c
+    lines: 472-497
+    focus: 494-496
+    state:
+      hart: any
+      mode: S
+      proc: a process sleeping in a system call
+      intr: off
+      satp: kernel
+      locks: ["p->lock"]
+      stack: [usertrap, syscall, sys_read, fileread, consoleread, sleep, sched]
+      sp: {"on": kernel}
+      irq: {noff: 1, intena: 1, note: "a sleep from a system call: `p->lock` was taken with SIE on, so intena is 1. A `yield` from a trap would show intena 0"}
+    note: |
+      `mycpu()->intena` answers one question for the outermost [[pop_off]]: should interrupts
+      come back on? The answer depends on the thread. A process that sleeps in a system call
+      had interrupts on before it took `p->lock` (intena 1). A process that yields from a timer
+      trap had them off (intena 0). Both go through [[sched]] on the same hart, so `sched` keeps
+      the thread's value in a local (register `s3` in this build) across [[swtch]] and puts it
+      back on line 496. The [[scheduler]] sets its own value to 0 on line 456
+      ([[concept:locks#sched-intena]]).
+
+      We measured how much work these two lines do. A copy of the kernel with counters (and no
+      other change) ran `usertests -q` to `ALL TESTS PASSED`:
+
+      | Event | Count |
+      |---|---|
+      | `sched` entered with intena 1 (a sleep or `exit` in a system call) | 30,831 |
+      | `sched` entered with intena 0 (a yield from a trap, and the like) | 3,724 |
+      | returns from `swtch` in `sched` | 27,911 |
+      | ... where `mycpu()->intena` was already 1 before line 496 | **0** |
+      | ... where line 496 changed the value (0 → 1) | 24,368 |
+      | line 456 found intena 1 and cleared it | 30,831 |
+
+      (The returns are fewer than the entries because an exiting process never comes back, and a
+      few processes were still asleep when we stopped.)
+      So with line 456 in place, a resumed process always finds intena 0; line 496 only ever
+      *restores 1* to processes that slept in system calls.
+
+  - title: "Break 4: three ways to lose track of intena"
+    file: kernel/proc.c
+    lines: 428-470
+    focus: 455-456
+    state:
+      hart: any
+      mode: S
+      proc: "none (this hart's scheduler)"
+      intr: off
+      satp: kernel
+      locks: ["p->lock"]
+      stack: [main, scheduler]
+      sp: {"on": scheduler, switched: "`ld sp, 8(a1)` in [[swtch]], back from the process"}
+      irq: {noff: 1, intena: 0, note: "line 456 has just replaced the intena the process left behind (1 after 30,831 of the 34,555 switches we counted)"}
+    note: |
+      Three copies of the kernel, each run through `usertests -q`:
+
+      | Change | Prediction from the code | Result |
+      |---|---|---|
+      | **a.** delete lines 494 and 496 (and the unused declaration on 482) | a process that slept in a system call resumes with intena 0; the rest of that call runs with interrupts off | `ALL TESTS PASSED`, 2 of 2 runs |
+      | **b.** delete line 456 | after a system-call sleeper switches out, the scheduler's `release(&p->lock)` turns interrupts on in the scheduler loop; a new process's [[forkret]] release can turn them on too | `ALL TESTS PASSED`, 2 of 2 |
+      | **c.** delete 494, 496 and 456 | a process that yielded from [[kerneltrap]] can inherit intena 1, so its `release(&p->lock)` in [[yield]] turns interrupts on *inside* `kerneltrap`, before it restores `sepc` and `sstatus` | `ALL TESTS PASSED`, 3 of 3 |
+
+      A counting copy of variant c (the same changes in effect: it reads `intena` on line 494 for
+      the counter but never restores it, and line 456 is gone) also passed, and
+      recorded what each thread found in `mycpu()->intena` when its `swtch` returned:
+
+      | Switched out with | Came back to 0 | Came back to 1 |
+      |---|---|---|
+      | intena 0 | 18,605 | **652** |
+      | intena 1 | 6,132 | 854 |
+
+      The 652 are the case the comment above `sched` warns about: a thread that had interrupts
+      off (a yield from a trap, among others) came back believing they had been on, so its
+      `release(&p->lock)` turned them on. For a yield from [[usertrap]] that is harmless,
+      because [[prepare_return]] turns them off again. For a yield from [[kerneltrap]] it is
+      not, as the next paragraph says. Our counters could not tell the two apart.
+
+      None of these crashed, and that is an honest result, not a proof. In (a) the cost is
+      latency: interrupts stay off for the rest of every system call that slept (about 24,000
+      per run, the number of times line 496 restored a 1 in our counting run). Nothing in that
+      stretch busy-waits for an interrupt: whenever it waits, it sleeps, and the hart runs
+      something else. In (b) the scheduler holds no lock
+      while interrupts are on, so a handler finds nothing held on its own hart. In (c) the
+      danger is a window of a few instructions in `kerneltrap` between `w_sepc` and
+      `w_sstatus`: a nested trap there would overwrite `sepc`. [[kerneltrap]]'s own check
+      (`kerneltrap: interrupts enabled`) cannot see it, because the hardware clears SIE on
+      every trap. We did not hit the window. The rule stays: `intena` is a property of the
+      thread, and the comment above `sched` says so.
+
+  - title: "Rule 5: register before releasing the condition lock"
+    file: kernel/proc.c
+    lines: 367-419
+    focus: 413-414
+    state:
+      hart: any
+      mode: S
+      proc: a lockstress worker waiting for its child
+      intr: off
+      satp: kernel
+      locks: [wait_lock]
+      stack: [usertrap, syscall, sys_wait, kwait]
+      sp: {"on": kernel}
+      irq: {noff: 1, intena: 1, note: "`wait_lock`, taken in a system call"}
+    note: |
+      [[kwait]] scans for a `ZOMBIE` child under `wait_lock`. Finding none, it must sleep until
+      a child exits. The child's [[kexit]] takes `wait_lock` and calls `wakeup(p->parent)`.
+      The order on lines 414–416 is the lost-wakeup defence of this tree ([[tour:16]],
+      [[concept:locks#sleep-wakeup]]): [[sleep_prepare]] sets `p->chan` **while `wait_lock` is
+      still held**, so no child can be between "checked" and "registered". If the child's
+      `wakeup` runs after the release but before [[sleep]], it clears `p->chan`, and `sleep`
+      returns at once.
+
+      **Break 5:** a copy of the kernel with lines 414 and 415 swapped: release `wait_lock`
+      first, then `sleep_prepare(p)`. Run `lockstress fork 3000`: three workers, each forking
+      and waiting for a child 3,000 times.
+
+      Four runs, four hangs. In each, one or two workers stopped printing progress while the
+      others finished; the shell never printed its next prompt. The machine was not frozen:
+      `ticks` kept counting (1,096, 1,105, 1,378 and 1,372 when we looked), and all three harts
+      sat idle in their schedulers.
+
+  - title: "Break 5: a parent asleep for a wakeup that already happened"
+    file: kernel/proc.c
+    lines: 545-572
+    focus: 566-569
+    state:
+      hart: any
+      mode: S
+      proc: a lockstress worker (pid 5)
+      intr: off
+      satp: kernel
+      locks: ["p->lock"]
+      stack: [usertrap, syscall, sys_wait, kwait, sleep]
+      sp: {"on": kernel}
+      irq: {noff: 1, intena: 1, note: "`sleep`'s own `p->lock`, taken in a system call"}
+    note: |
+      gdb's view of the process table in run 1:
+
+      ```text
+      slot pid  state     name        chan                 parent
+      4    5    SLEEPING  lockstress  0x80010370 <proc+1440>  proc[2]
+      6    422  ZOMBIE    lockstress  0                    0x80010370 <proc+1440>
+      ```
+
+      Worker pid 5 sleeps on channel `&proc[4]`, its own `struct proc`, the channel [[kwait]]
+      uses. Its child, pid 422, is a `ZOMBIE` waiting to be collected. Nothing will ever call
+      `wakeup(&proc[4])` again: pid 5 has no other children, and only an exiting child wakes
+      that channel.
+
+      | Time | Worker pid 5, hart A | Child pid 422, hart B |
+      |---|---|---|
+      | t1 | scans: child not `ZOMBIE` yet | `kexit`: spins on `wait_lock` |
+      | t2 | `release(&wait_lock)` (moved up) | gets `wait_lock` |
+      | t3 | (interrupt, or simply slower) | `wakeup(&proc[4])`: `p->chan` is 0, nothing to clear |
+      | t4 | | `ZOMBIE`, [[sched]] |
+      | t5 | `sleep_prepare`: `p->chan = &proc[4]` | |
+      | t6 | `sleep`: chan still set → `SLEEPING`, forever | |
+
+      With the original order, step t5 happens before t2, so at t3 `wakeup` finds the channel
+      set and clears it; `sleep` at t6 sees `p->chan == 0` and returns. Line 567 is where the
+      two orders differ.
+
+      From the code (we did not test it): `kill 5` would unstick this worker. [[kkill]] makes
+      it `RUNNABLE`, `kwait`'s loop rescans and collects pid 422, and the worker then exits on
+      its way back to user space because `killed` is set ([[kernel/trap.c:81]]). The loop
+      around every `sleep` is what makes such a wakeup safe.
+
+  - title: "Rule 6: one global order, wait_lock before p->lock"
+    file: kernel/proc.c
+    lines: 286-305
+    focus: 292-294
+    state:
+      hart: 1
+      mode: S
+      proc: a lockstress worker in fork()
+      intr: off
+      satp: kernel
+      locks: ["np->lock (the child's)"]
+      stack: [usertrap, syscall, sys_fork, kfork]
+      sp: {"on": kernel}
+      irq: {noff: 1, intena: 1, note: "the child's lock, held since [[allocproc]]; released on line 294 in the original"}
+    note: |
+      [[kfork]] has held the new child's `p->lock` since [[allocproc]]. It must now set
+      `np->parent`, which `wait_lock` protects. The code does a small dance: release `np->lock`
+      (294), take `wait_lock` (296), set the parent, release, then take `np->lock` again (300)
+      to mark the child `RUNNABLE`. The comment-free reason is the global order
+      ([[tour:18]], [[concept:locks#order]]): **`wait_lock` is always taken before any
+      `p->lock`**. [[kexit]] and [[kwait]] hold `wait_lock` and then take process locks; the
+      order graph we measured has the edge `wait_lock → p->lock` and never the reverse.
+
+      **Break 6:** a copy of the kernel with lines 294 and 300 deleted, so `kfork` takes
+      `wait_lock` while still holding `np->lock`: a `p->lock → wait_lock` edge, the reverse of
+      everyone else's. `lockstress fork 3000`, four runs.
+
+      Four runs, four freezes, every one within the first dozen forks: the shell printed `$ `,
+      `lockstress` never printed anything, and `ticks` stopped at 5.
+
+  - title: "Break 6: three harts, one cycle"
+    file: kernel/proc.c
+    lines: 322-365
+    focus: 353
+    state:
+      hart: 2
+      mode: S
+      proc: an exiting lockstress child (pid 10)
+      intr: off
+      satp: kernel
+      locks: [wait_lock]
+      stack: [usertrap, syscall, sys_exit, kexit, wakeup, acquire]
+      sp: {"on": kernel}
+      irq: {noff: 2, intena: 1, note: "`wait_lock` plus the `push_off` of the `acquire` inside `wakeup`; gdb read noff 2 on all three harts"}
+    note: |
+      gdb in run 1 (the modified file is two lines shorter above `kexit`, so its lines 295,
+      342 and 351 are lines 296, 344 and 353 here):
+
+      ```text
+      hart 2: acquire (lk=<proc+2880>)       wants proc[8].lock
+              wakeup (chan=<proc+1080>)       kexit's wakeup(p->parent)
+              kexit () at proc.c:351          holds wait_lock
+      hart 1: acquire (lk=<wait_lock>)       wants wait_lock
+              kfork () at proc.c:295          holds proc[8].lock (pid 12, state USED)
+      hart 0: acquire (lk=<proc+2880>)       wants proc[8].lock
+              wakeup (chan=<log>)
+              end_op () at log.c:181          holds log.lock
+              kexit () at proc.c:342
+      wait_lock    = {locked = 1, cpu = <cpus+256>}    (hart 2)
+      proc[8].lock = {locked = 1, cpu = <cpus+128>}    (hart 1)
+      ```
+
+      The cycle is two harts long. Hart 1 holds the half-built child's lock and wants
+      `wait_lock`. Hart 2 holds `wait_lock` and, inside [[wakeup]], scans **every** process's
+      lock, including the half-built child's, which hart 1 holds. Hart 0 is not part of the
+      cycle; it is another exiting process whose own `wakeup` walked into the same lock, while
+      holding `log.lock`. Within moments anything that touches the log, `wait_lock` or slot 8
+      joins them. All three harts spin with interrupts off, so not even the clock advances.
+
+      The other three runs had the same shape, with the roles shuffled across harts (in run 3,
+      hart 0 held the child's lock and hart 1 waited for `wait_lock` from [[kwait]]). A rule
+      that two pieces of code obey independently is invisible until one of them breaks it;
+      then [[wakeup]]'s habit of touching every `p->lock` makes the collision almost certain.
+    others: |
+      Why so fast? In the broken kernel every `fork` waits for `wait_lock` while holding the
+      child's lock, and every `exit` holds `wait_lock` while its `wakeup` walks all 64 process
+      locks. With three workers forking and exiting continuously, the two overlapped on the
+      12th process (pid 12, slot 8) in all four runs.
+
+  - title: "Rule 7: release publishes the critical section"
+    file: kernel/spinlock.c
+    lines: 44-76
+    focus: 51-73
+    state:
+      hart: any
+      mode: S
+      proc: a lockstress worker
+      intr: off
+      satp: kernel
+      locks: [tickslock]
+      stack: [usertrap, syscall, sys_uptime, release]
+      sp: {"on": kernel}
+      irq: {noff: 1, intena: 1, note: "still `tickslock`'s level until `pop_off` on line 75"}
+    note: |
+      `__atomic_store_n(..., __ATOMIC_RELEASE)` compiles to `fence rw,w` (`0x80000c86`) and
+      `sw zero,0(s1)` (`0x80000c8a`). The fence makes every load and store of the critical
+      section visible to other harts before the store that frees the lock. Under RISC-V's weak
+      memory model (RVWMO) a plain store may become visible before earlier stores, and the next
+      holder could then read data from before the critical section finished
+      ([[concept:locks#fence]], [[tour:19]]).
+
+      **Break 7:** a copy of the kernel with `__ATOMIC_RELAXED` on line 73. The compiled
+      `release` now has no fence at all:
+
+      ```text
+      80000c82:  sd  zero,16(s1)     # lk->cpu = 0
+      80000c86:  sw  zero,0(s1)      # lk->locked = 0, no fence
+      80000c8a:  jal pop_off
+      ```
+
+      The compiler did not move anything here (inside `release`, a relaxed store would have let
+      it swap the two stores; it happened not to). `release` is a separate, non-inlined
+      function, so it has to issue every caller's stores before the call. Whether other harts
+      *see* them in that order is up to the hardware.
+
+  - title: "Break 7: no failure, and why that proves nothing"
+    file: kernel/spinlock.c
+    lines: 19-42
+    focus: 37-38
+    state:
+      hart: any
+      mode: S
+      proc: a lockstress worker
+      intr: off
+      satp: kernel
+      locks: []
+      stack: [usertrap, syscall, sys_uptime, acquire]
+      sp: {"on": kernel}
+      irq: {noff: 1, intena: 1, note: "acquire's `push_off` level; the lock is not held yet"}
+    note: |
+      Three runs of `usertests -q`: `ALL TESTS PASSED` each time. Two runs of
+      `lockstress fork 5000` followed by `lockstress up 100000`: both finished, 15,000 forks and
+      300,000 `uptime` calls per run, every one through `acquire` and the fence-less
+      `release` of `tickslock`, `wait_lock` and dozens of `p->lock`s.
+
+      The rule was broken; the experiment could not see it. QEMU's TCG translates each RISC-V
+      instruction into host code, and our desktop host is an x86-64 machine. x86 is "total store
+      order": its stores become visible in program order, and it never lets a store overtake an
+      earlier load. The reordering RVWMO permits, and the fence forbids, does not happen on this
+      host. In fact QEMU translates `fence rw,w` into no instruction at all on an x86 host, so
+      with or without the fence the host ran essentially the same code. The other half of the
+      pair is still there: `amoswap.w.aq` on line 37 keeps the next holder's reads after its
+      acquire.
+
+      On a real RISC-V core, or on a host with a weaker memory model, the same kernel could
+      hand a lock to another hart before the protected data had arrived. [[tour:48]] found the
+      same thing for the fences on `started`: "it worked every time" is a fact about one
+      machine, and the memory model is the contract.
+
+  - title: What broke, and how loudly
+    file: kernel/proc.c
+    lines: 479-497
+    focus: 485-492
+    state:
+      hart: any
+      mode: S
+      proc: the process giving up the hart
+      intr: off
+      satp: kernel
+      locks: ["p->lock"]
+      stack: [yield, sched]
+      sp: {"on": kernel}
+      irq: {noff: 1, intena: 0, note: "a `yield` from a trap: intena 0"}
+    note: |
+      | Rule | Our change | What happened (our runs) |
+      |---|---|---|
+      | don't re-acquire | `acquire(&tickslock)` twice in `sys_uptime` | `panic: acquire`, 2 of 2 |
+      | ... without `holding()` | also delete the check | silent freeze of all three harts, `ticks` stopped, 2 of 2 |
+      | no sleeping with a spinlock | `consoleread` sleeps holding `cons.lock` | `panic: sched locks` at the first prompt, 2 of 2 |
+      | interrupts off under a lock | `push_off` leaves SIE on | `panic: pop_off - interruptible` on `init`'s first system call, 4 of 4 |
+      | ... without `pop_off`'s check | also delete it | `sched locks` 4, `sched interruptible` 2, of 6; plus one run with a same-hart `panic: acquire` from a UART handler |
+      | intena per thread | delete `sched`'s save/restore, or line 456, or all three lines | no failure in `usertests -q` (a 2 of 2, b 2 of 2, c 3 of 3, plus one counting run) |
+      | register before release | swap two lines in `kwait` | one or two processes asleep forever, machine alive, 4 of 4 |
+      | lock order | `kfork` takes `wait_lock` holding `np->lock` | two-hart cycle, third hart caught, whole machine frozen, 4 of 4 |
+      | release fence | `__ATOMIC_RELAXED` in `release` | no failure (3 `usertests -q`, 2 stress runs); the x86 host hides it |
+
+      Three lessons. The **checks** ([[holding]] in `acquire`, `pop_off`'s SIE test, the four
+      tests on lines 485–492) turned four of these changes into panics, every run. Three of
+      them fired on the first offence; with `pop_off`'s check gone, the next checks (`sched`, or
+      `holding`) caught it a little later. Without them, the same mistakes became the worst kind of bug: a
+      machine that looks idle. The **unchecked** rules (wakeup registration, lock order) failed
+      silently, one freezing one or two processes while the rest ran on, one freezing everything.
+      And **not failing is not a pass**. Of the `intena` variants, (a) and (b) cost only
+      interrupt latency as far as we can tell from the code, but (c) has a real window in
+      `kerneltrap` that we simply did not hit; the missing fence is wrong under a memory model
+      that our runs on QEMU never exercised.
+      [[concept:locks#panics]] lists every panic, and [[concept:locks#rules]] the rules.
+locks:
+  - lock: tickslock
+    where: "[[sys_uptime]], [[sys_pause]], [[clockintr]] (hart 0 only)"
+    protects: "`ticks`. Break 1 re-acquired it (panic); 1b re-acquired it without the check and froze all three harts behind it"
+  - lock: cons.lock
+    where: "[[consoleread]], [[consoleintr]]"
+    protects: "The console input buffer. Break 2 slept holding it; `sched` refused"
+  - lock: "p->lock"
+    where: "[[sleep]], [[yield]], [[sched]], and [[wakeup]] for every process, from any handler"
+    protects: "A process's `state` and `chan`. Taken in interrupt context, which is why every spinlock needs interrupts off (break 3b)"
+  - lock: "lk->lk (a sleep-lock's spinlock)"
+    where: "[[acquiresleep]], [[releasesleep]]"
+    protects: "The sleep-lock's `locked` and `pid`. Held when break 3b's timer fired"
+  - lock: wait_lock
+    where: "[[kfork]], [[kexit]], [[kwait]], [[reparent]]"
+    protects: "Every `p->parent`, and the condition `kwait` sleeps on. Break 5 released it too early; break 6 took it after a `p->lock`"
+  - lock: log.lock
+    where: "[[begin_op]], [[end_op]]"
+    protects: "The log's counters; in break 6 its holder was caught behind the cycle"
+  - lock: "(no lock) mycpu()->noff, mycpu()->intena"
+    where: "[[push_off]], [[pop_off]], [[sched]], [[scheduler]]"
+    protects: "Per-hart counters, safe because only this hart touches them and only with interrupts off. Break 4 moved `intena` from the thread to the hart"
+quiz:
+  - q: "Break 1 panicked but break 1b froze. Both executed the same two `acquire` calls. What exactly did the deleted lines detect, and why could nothing else detect it later?"
+    a: "[[holding]] noticed that the lock was held and that its recorded owner was this hart. Without it the hart spins on line 37 with interrupts off. Nothing on that hart can run again, and other harts only see a lock that stays held, which looks the same as a long critical section."
+  - q: "In break 2, `sh` slept holding `cons.lock`. Which piece of code would have deadlocked first if `sched` had let it go to sleep, and why would the deadlock not resolve on its own?"
+    a: "[[consoleintr]], on the next key press: it spins on `cons.lock` with interrupts off. Only `sh` can release the lock, and `sh` is waiting for the wakeup that `consoleintr` would send after getting the lock. (Only a `kill` of `sh` from another hart could break it: `consoleread` releases the lock on its `killed` path.)"
+  - q: "Break 3 changed one instruction, yet the panic came from `myproc()`, not from any lock. Why there, and why so early?"
+    a: "`myproc()` uses `push_off`/`pop_off` too, and [[syscall]] calls it on every system call, right after [[usertrap]] turned interrupts on. The first `pop_off` that found SIE on was the first `myproc()` in `init`'s first system call."
+  - q: "With `pop_off`'s check removed too, most runs died with `sched locks` from inside `kerneltrap`. Why does a timer interrupt in a critical section end in that particular panic?"
+    a: "The timer path calls [[yield]], which takes `p->lock`; `noff` is then 2 (the interrupted section's lock plus `p->lock`). [[sched]] allows exactly one level. In a correct kernel the timer stays pending until the release, so it is only ever taken at `noff` 0."
+  - q: "In break 5 the machine kept running and `ticks` kept counting, but one process never woke. Why didn't the next timer tick, or the next `wakeup` from any device, rescue it?"
+    a: "[[wakeup]] only touches processes whose `chan` equals the channel being woken. The worker sleeps on its own `struct proc`, and only an exiting child wakes that channel. Its only child had already exited (a `ZOMBIE`), and its wakeup came before the worker registered."
+  - q: "Break 6's cycle was between `kfork` and `kexit`. `kexit` never asks for the new child's lock by name. Where did it come from?"
+    a: "From [[wakeup]], called by `kexit` under `wait_lock`: it acquires every process's `p->lock` in turn, including slots in state `USED` that are still being built by `kfork`. Any code that holds a `p->lock` and then wants `wait_lock` closes a cycle with every `wakeup` run under `wait_lock`."

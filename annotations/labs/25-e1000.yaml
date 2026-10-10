@@ -1,0 +1,1823 @@
+published: true
+title: An e1000 network driver and UDP sockets
+area: Devices
+stars: 5
+branch: ext/25-e1000
+prerequisites: {tours: [9, 15, 16, 19, 24, 29, 44, 50], concepts: [locks, stacks]}
+summary: |
+  xv6 already has one device driver that works by DMA: the virtio disk, where the kernel
+  writes descriptors into memory, pokes a register, and an interrupt says the device is done
+  ([[tour:29]]). In this lab you write a second one, for QEMU's emulation of the Intel e1000
+  network card, and put a small network stack and a socket interface on top of it, so that a
+  user program can exchange UDP packets with a program on the host.
+
+  The disk is a polite device: it only speaks when spoken to, and exactly one request waits
+  for each answer. A network card is not. Packets arrive whenever the outside world sends
+  them, on whichever hart the interrupt controller picks, while processes on the other two
+  harts are sending. That raises the questions this lab is about. Where is the card, and
+  how does the kernel even reach its registers? How do the driver and the card hand
+  descriptors back and forth without a lock they could share? What may code do that runs
+  inside an interrupt handler, and what must it never do? How does a process sleep until a
+  packet arrives without missing the wakeup that an interrupt on another hart delivers? And
+  what does "the device sees memory in the right order" mean on RISC-V?
+
+  The reference solution is seven commits: find the card on the PCI bus, give it descriptor
+  rings, transmit, receive from the interrupt, answer ARP and parse IPv4/UDP, add sockets,
+  and add the test with its host-side partner. On three harts a UDP round trip through
+  QEMU's user-mode network took a median of 149 to 243 microseconds, measured from the host
+  on three boots (measured while the computer was busy with other work; your times will
+  differ). Some driver bugs are invisible on QEMU: Clinic 2 is one that no test here can
+  show, and Clinic 6 one that shows only when the card is made to fall behind.
+learn:
+  - "How a kernel finds a PCI device on a machine with no firmware help: memory-mapped configuration space, sizing and placing a BAR, and mapping both into the kernel page table."
+  - "How a driver and a DMA device share a ring of descriptors: who owns which slot, what the head and tail registers mean, and why one slot of each ring must stay empty."
+  - "Why the order in which the CPU writes memory and device registers matters, what `fence` does about it, and why QEMU cannot show you the bug."
+  - "How a PCI interrupt pin becomes a PLIC interrupt number on QEMU's virt machine, and what the handler may and may not do on whatever hart and stack it lands on."
+  - "How to deliver data from an interrupt handler to a sleeping process with this tree's sleep_prepare/sleep/wakeup protocol, and which lock makes the hand-off safe."
+  - "How to measure the result: round-trip latency from the host, interrupts and packets per hart, and where three harts wait for each other's locks."
+spec: |
+  **Behaviour.** QEMU gets an e1000 card on its PCIe bus, connected to QEMU's user-mode
+  network ("slirp"). On that network xv6 is `10.0.2.15`, the host is `10.0.2.2` and slirp's
+  DNS server is `10.0.2.3`; UDP packets sent to the host's port `FWDPORT` arrive at xv6's
+  port 2000. The QEMU flags (the Makefile chooses `FWDPORT` from your user id, as it
+  chooses `GDBPORT`: `echo $(( $(id -u) % 5000 + 30000 ))` prints it, on Linux, macOS and
+  WSL alike):
+
+  ```text
+  -netdev user,id=net0,hostfwd=udp::FWDPORT-:2000
+  -device e1000,netdev=net0,bus=pcie.0
+  ```
+
+  Four new system calls:
+
+  ```c
+  int bind(int port);       // start queuing packets that arrive for port
+  int unbind(int port);     // stop; drop what is queued; wake a waiting recv
+  int send(uint32 dst, uint16 dport, uint16 sport, char *buf, int len);
+  int recv(uint16 port, uint32 *src, uint16 *sport, char *buf, int len);
+  ```
+
+  - `send` sends one UDP packet of `len` bytes (at most 1472, so that the IP packet fits in
+    1500 bytes) from local port `sport` to `dst:dport`. Addresses and ports are passed in
+    the host's byte order. It returns 0, or -1 on an error.
+  - `recv` waits until a packet has arrived for the bound `port`, copies its data (at most
+    `len` bytes), its source address and its source port out, and returns the number of
+    bytes copied. It sleeps while nothing has arrived; `kill` or `unbind` ends the wait
+    with -1. (As in the base kernel's [[piperead]], a `kill` that lands between recv's
+    check of `killed` and its `sleep()` does not end that sleep; on a port nobody sends
+    to, the process then waits until a packet or an `unbind` comes.)
+  - Sockets are global, not per process: any process may `recv` on or `unbind` any bound
+    port, and a port stays bound, with up to 16 queued pages, after the process that bound
+    it exits. (See "Further" for making sockets file descriptors.)
+  - A bound port queues at most 16 packets; more are dropped, as UDP allows. Packets for
+    port 0 are dropped.
+  - xv6 answers ARP requests for `10.0.2.15`, so that slirp can deliver packets to it.
+
+  **What must not change.** Everything else. **`usertests -q` must print `ALL TESTS
+  PASSED` on 3 harts**, and the kernel must stay usable while packets arrive.
+
+  **The test.** `nettest ECHOPORT` talks to `python3 nettest.py echo ECHOPORT` on the host,
+  which sends every packet back to its sender. `ECHOPORT` is any free UDP port on the host
+  other than `FWDPORT` (QEMU already holds that one), e.g. 25501; port numbers in the
+  recorded runs are shown as `ECHOPORT` and `FWDPORT`. Each check runs in a child process with a
+  watchdog that kills it after a time limit, so a lost packet becomes a `FAIL` line rather
+  than a hang:
+
+  ```text
+  $ nettest ECHOPORT
+  nettest: one round trip: OK
+  nettest: 100 round trips: OK
+  nettest: 3 processes x 300 round trips: OK
+  nettest: kill wakes recv: OK
+  nettest: dns: pdos.csail.mit.edu is 128.52.129.126
+  nettest: dns query to 10.0.2.3: OK
+  nettest: 1000 round trips of 64 bytes took 3 ticks
+  nettest: ALL OK
+  ```
+
+  - **100 round trips** pass more packets through the card than its receive ring has slots.
+  - **3 processes** each bind their own port and do 300 round trips at the same time, with
+    lengths from 1 to 1472 bytes; every byte of every echo is compared, so a packet
+    delivered to the wrong socket or corrupted fails the check.
+  - **kill wakes recv**: a child waits in `recv` on a port nobody sends to; `kill` must end
+    the wait.
+  - **dns** asks slirp's DNS server for `pdos.csail.mit.edu`. That needs the host to reach a
+    real DNS server; the test's last line says `ALL OK except dns` when only this check
+    failed.
+  - The last line before the verdict is a measurement, not a check (ticks are about 0.1 s).
+
+  `nettest server N` echoes `N` packets that arrive at port 2000; `python3 nettest.py ping
+  FWDPORT N` on the host then times each round trip.
+think:
+  - title: Where is the card, and how does the kernel reach its registers?
+    q: |
+      The UART and the virtio disk sit at fixed physical addresses that [[kernel/memlayout.h]]
+      simply lists, and [[kvmmake]] maps them. The e1000 is different: QEMU puts it on a PCIe
+      bus, and nothing tells xv6 where its registers are, because there is no firmware
+      (`-bios none`) to set the bus up. Before writing any driver code, decide: how does the
+      kernel find the card, how does it choose where the card's registers appear, and what
+      must change in the kernel page table so that the kernel can touch either? Which of
+      these happen before paging is turned on, and does that matter?
+    hints:
+      - "Look at how [[kvmmake]] maps the UART and the disk ([[kernel/vm.c:30]]-[[kernel/vm.c:36]]) and at what [[kvminithart]] does afterwards. Then look up the virt machine's memory map in QEMU's `hw/riscv/virt.c`: it lists a region called `VIRT_PCIE_ECAM` and one called `VIRT_PCIE_MMIO`."
+      - "PCI configuration space is a small block of registers per device (vendor/device ID, command, BARs, interrupt pin). On this machine it is memory-mapped (\"ECAM\"), 4096 bytes per device and function. A BAR (base address register) is where the *kernel* tells the device which physical addresses to answer; the device only tells you how many bytes it needs."
+      - "Map the configuration window for bus 0 and a window for the registers in [[kvmmake]]. At boot, after paging is on, look at each device number's ID word; for the e1000, learn the size its BAR 0 needs, write the address you chose, and turn on the bits in the command register that let it answer memory accesses and do DMA."
+    answer: |
+      The reference maps two new regions in [[kvmmake]], both with `PTE_R | PTE_W` and the
+      same physical and virtual address, like every device in xv6:
+
+      | region | address | size | what is there |
+      |---|---|---|---|
+      | PCIe configuration space (ECAM), bus 0 | `0x30000000` | 1 MiB (32 devices × 8 functions × 4 KiB) | one header per device |
+      | the e1000's registers (its BAR 0) | `0x40000000` | 128 KiB | chosen by xv6, inside QEMU's PCIe memory window |
+
+      `pci_init()` runs on hart 0 during boot, after [[kvminithart]] has turned paging on,
+      so both mappings must exist by then: an unmapped access would be a kernel page
+      fault. It reads the 32-bit ID word of device 0, 1, 2, … at `0x30000000 + (dev << 15)`
+      until it finds `0x100e8086` (device `0x100e`, an 82540EM, from vendor `0x8086`,
+      Intel). In our runs that is device 1 (device 0 is the host bridge). To size BAR 0 it
+      writes all ones and reads back `0xfffe0000`: the device keeps the 17 low address bits
+      at zero, so it needs 2¹⁷ = 131,072 bytes. Then it writes `0x40000000` to the BAR and
+      sets two bits in the command register: *memory space* (answer accesses inside the BAR)
+      and *bus master* (allowed to read and write RAM by DMA). Without bus master the card
+      would accept descriptors and never send a packet.
+
+      The address of the registers is xv6's choice, not the card's. That is the main
+      difference from the UART and the disk, whose addresses QEMU fixes.
+    checks:
+      - id: lab25-01
+        level: 1
+        type: choice
+        q: |
+          Configuration space on this machine starts at `0x30000000`, and a device's header
+          is at `0x30000000 + (bus << 20) + (device << 15) + (function << 12)`. At which
+          address does xv6 read the e1000's ID word (bus 0, device 1, function 0)?
+        options:
+          - text: "0x30008000"
+            correct: true
+            why: "1 << 15 = 0x8000. gdb showed `h` = `0x30008000` when `pci_init` found the card."
+          - text: "0x30001000"
+            why: |
+              You may have used the function field (`<< 12`) for the device number. Each
+              device has room for 8 functions of 4 KiB each, so devices are 32 KiB apart.
+          - text: "0x30100000"
+            why: |
+              That is `1 << 20`: bus 1, device 0. The e1000 is on bus 0.
+          - text: "0x40000000"
+            why: |
+              That is where xv6 *puts the card's registers* (BAR 0), not its configuration
+              header. The two are different windows.
+        explain: |
+          ECAM gives every bus/device/function its own 4 KiB of configuration registers at a
+          computable address, so finding a device is a loop over device numbers that reads
+          one word each. Device 0 on this bus is QEMU's host bridge; the e1000, added with
+          `bus=pcie.0`, got the next free slot, 1.
+      - id: lab25-02
+        level: 2
+        type: number
+        q: |
+          `pci_init` writes `0xffffffff` to the e1000's BAR 0 and reads back `0xfffe0000`.
+          The low 4 bits of a memory BAR are flags (zero here). How many bytes of registers
+          does the card need?
+        answer: 131072
+        wrong:
+          65536: |
+            You may have counted 16 zero bits. `0xfffe0000` has 17 zero bits at the bottom
+            (`0x0000` plus the zero bit in `e`, which is `1110`), so the size is 2¹⁷.
+          4294836224: |
+            That is `0xfffe0000` itself, read as an address. The size is the lowest bit the
+            device lets you set: `~0xfffe0000 + 1`.
+        why_wrong: "Invert the value (with the 4 flag bits cleared) and add 1: ~0xfffe0000 + 1 = 0x20000."
+        explain: |
+          A device ignores writes to the address bits below its size, so after writing all
+          ones the zeros mark the size: `~(0xfffe0000 & ~0xf) + 1 = 0x20000` = 128 KiB, which
+          is what the boot line `pci: e1000 at 0:1.0, 131072 bytes of registers at
+          0x40000000, INTA` prints. The kernel maps exactly that much at `0x40000000`.
+  - title: How do the driver and the card share a ring without sharing a lock?
+    q: |
+      The card reads packets to send from memory and writes packets it receives into memory,
+      by DMA, at any moment. It cannot take a spinlock. The virtio disk solved this with its
+      descriptor table and two rings ([[tour:29]]); the e1000 has a simpler scheme: for each
+      direction, one ring of 16 descriptors in RAM and two registers, *head* and *tail*.
+      Design the rules. Which slots may the driver write, and which belong to the card? How
+      does the driver learn that the card has finished with a slot? When may the page a
+      transmitted packet lives in be freed? And with the receive tail starting at 15 and the
+      head at 0, how many packets can arrive before the driver has given anything back?
+    hints:
+      - "Read the descriptor layouts in Intel's manual for the 8254x (section 3.2.3 for receive, 3.3.3 for legacy transmit) and the meaning of the head and tail registers (RDH/RDT, TDH/TDT). Compare with `used->idx` and `avail->idx` in [[kernel/virtio_disk.c]]."
+      - "Ownership changes hands in exactly two ways: the driver moves a tail register forward (\"these slots are yours now\"), and the device sets the DD (descriptor done) bit in a slot's status (\"I am finished with this one\"). The device advances the head itself. Neither side ever writes a slot the other one owns."
+      - "Write down, for each ring, which range of slots the card owns in terms of head and tail, and what \"head equals tail\" must mean. Then ask how many slots the driver may hand over at most, on each ring, without making a full ring look empty."
+    answer: |
+      The rules the reference follows (`kernel/e1000.c`):
+
+      - **Transmit.** The card sends the slots from TDH up to, but not including, TDT, and
+        sets DD in each. TDT is the next slot the driver may fill. Every slot starts with DD
+        set and no packet (`e1000_init`). `e1000_transmit` refuses (-1) when the slot after
+        TDT is TDH, or when the slot at TDT is not yet done (DD clear). Otherwise it frees the
+        page of the packet the slot carried last time (the card is done with it: that is
+        what DD means), fills in address, length and command (end of packet, report status),
+        clears DD and moves TDT one slot on.
+      - **Receive.** The card owns the slots from RDH up to, but not including, RDT. It
+        fills them in order, setting DD, and stops when RDH reaches RDT. The driver looks at
+        the slot after RDT: if its DD is set, it takes the buffer, puts a fresh page in the
+        slot, clears DD and sets RDT to that slot, which gives the slot back.
+
+      Head equal to tail means *empty* on both rings, so the driver may never hand the card
+      all 16 slots: one slot stays empty on transmit too. On the receive side the card never
+      fills the slot at RDT: with RDH = 0 and RDT = 15 it can fill slots 0 to 14, **15
+      packets**, and then waits (Clinic 1 shows exactly that number). On the transmit side
+      the driver must not move TDT onto TDH: if it filled the 16th slot, TDT would equal TDH
+      and the card would see an empty ring, send nothing, set no DD, and every later call
+      would fail. Checking DD at TDT alone does not prevent this, because every slot starts
+      with DD set. Clinic 6 shows that lock-up on a card made to fall behind.
+
+      Nobody shares a lock with the card, because nobody needs to: each slot has exactly one
+      owner at a time, and ownership moves only by a tail write (to the card) or a DD bit
+      (to the driver). The driver's own spinlock, `e1000.lock`, is for the *harts*: the
+      transmit ring is used by every hart that sends.
+    checks:
+      - id: lab25-03
+        level: 2
+        type: number
+        q: |
+          At initialization RDH = 0 and RDT = 15 in a 16-slot receive ring. If the driver
+          never gives a slot back, how many packets can the card receive?
+        answer: 15
+        wrong:
+          16: |
+            You may have thought the card fills every slot. It fills from RDH up to, but not
+            including, RDT: slot 15 is never filled, so that a full ring (head equal to tail
+            would otherwise also mean empty) can be told apart.
+          1: |
+            That is what the driver *uses* if it looks only at the slot after RDT and never
+            moves RDT (Clinic 1, first variant): the card would fill up to 15 slots if more
+            arrived, but the driver only ever reads the first.
+        why_wrong: "Count the slots from RDH (0) up to but not including RDT (15)."
+        explain: |
+          Fifteen. Clinic 1 forgot to move RDT: the host's 15th ping was the first to get
+          no reply (one slot went to slirp's ARP request), and gdb showed RDH = RDT = 15.
+      - id: lab25-04
+        level: 2
+        type: order
+        q: |
+          Put the steps of `e1000_transmit` for one packet in order.
+        items:
+          - text: "acquire e1000.lock"
+          - text: "read TDT, and check that the slot after it is not TDH and that the slot's DD bit is set"
+            why: "One slot must stay empty, and the slot may still belong to the card; DD says it is done with it."
+          - text: "free the page of the packet this slot sent last time"
+            why: "Only after DD: until then the card may still be reading it by DMA."
+          - text: "write the new packet's address, length and command into the slot, and clear DD"
+          - text: "fence"
+            why: "The descriptor must reach memory before the card can learn it may read it."
+          - text: "write TDT = the next slot"
+            why: "This store is what hands the slot to the card."
+          - text: "release e1000.lock"
+        why_wrong: "Follow ownership: check the slot is yours, use it, publish it, and only then let other harts in."
+        explain: |
+          The lock is held from the read of TDT to the write of TDT, so two harts can never
+          fill the same slot. The fence comes between the last descriptor store and the
+          register write that publishes the slot (next question).
+  - title: In what order does the card see your stores?
+    q: |
+      `e1000_transmit` writes four fields of a descriptor in RAM and then the TDT register.
+      The card reacts to the TDT write by reading the descriptor by DMA. What guarantees that
+      it reads the *new* descriptor, not the old one? Consider both the compiler and the
+      processor. [[kernel/virtio_disk.c]] has an answer for its own rings; is the same
+      needed here, and in which other places of the driver? Then predict: on QEMU, what
+      happens if you leave it out?
+    hints:
+      - "Look at what [[virtio_disk_rw]] does between filling the avail ring and notifying the device ([[kernel/virtio_disk.c:274]]-[[kernel/virtio_disk.c:284]]), and at the definition it uses in [[kernel/riscv.h]]. Read [[tour:19]] for what RISC-V's memory model allows two harts to see."
+      - "`volatile` on the register pointer orders the *register* accesses among themselves; it says nothing about the plain stores to the descriptor. RISC-V's memory model (RVWMO) lets a hart make stores visible in a different order than the program wrote them, and it treats device registers (I/O) and RAM separately. Any hand-off \"write data, then tell the other side\" needs an ordering point between the two."
+      - "Find every place where the driver writes memory the card will read and then writes a register that tells the card to read it, and every place where it reads a DD bit and then reads the memory that DD vouches for. Each needs an ordering instruction between the two steps."
+    answer: |
+      `io_fence()` is `fence iorw, iorw`: every memory and I/O access before it is ordered
+      before every memory and I/O access after it, for all observers, devices included.
+      The `"memory"` clobber in its inline assembly also stops the compiler from moving
+      memory accesses across it. The reference uses it in four places on the rings (plus
+      one after the reset in `e1000_init`):
+
+      | where | before the fence | after the fence |
+      |---|---|---|
+      | `e1000_transmit`, before TDT | descriptor stores | the TDT write that hands the slot over |
+      | `e1000_intr`, before RDT | fresh buffer address, DD cleared | the RDT write that gives the slot back |
+      | `e1000_transmit`, after the DD check | reading DD = 1 | freeing and reusing the old page |
+      | `e1000_intr`, after the DD check | reading DD = 1 | reading the length and the packet bytes |
+
+      The first two are the classic "publish" order; the last two are the "consume" order
+      (a load of a flag must not be overtaken by loads of the data it guards).
+
+      On QEMU, leaving the first two out changes nothing you can see (Clinic 2, 3 runs of
+      `nettest`). The compiler happened to keep the stores in program order (Clinic 2 shows
+      the code), and QEMU's processor model makes them visible in order anyway: in this
+      setup (QEMU's TCG on an x86-64 host, for example) a store reaches host memory in
+      program order, and the card's model runs inside the TDT write itself. Real hardware is under no such obligation. A bug
+      that a test cannot show is still a bug; the fence is there because the RISC-V
+      specification allows the reordering, not because we saw it.
+    checks:
+      - id: lab25-05
+        level: 2
+        type: multi
+        q: |
+          Which statements about `io_fence()` before `*R(E1000_TDT) = ...` are true?
+        options:
+          - text: "It orders the plain stores to the descriptor before the store to the TDT register, as seen by the device."
+            correct: true
+            why: "That is `fence iorw, iorw`: memory and I/O accesses before it are ordered before those after it."
+          - text: "It also keeps the compiler from moving the descriptor stores below it."
+            correct: true
+            why: "The inline assembly has a `\"memory\"` clobber, so the compiler may not move memory accesses across it."
+          - text: "Without it the program fails on QEMU in every run."
+            why: |
+              You may have expected a bug to show. Clinic 2 ran without both publish
+              fences: 3 of 3 runs of `nettest` passed. QEMU cannot show this reordering here.
+          - text: "It is unnecessary because R() declares the register pointer volatile."
+            why: |
+              `volatile` keeps the compiler from removing or reordering the *volatile*
+              accesses; the descriptor stores are plain, and the hardware may reorder
+              regardless of what the compiler does.
+          - text: "It makes the store to TDT happen atomically."
+            why: |
+              An aligned 32-bit store is already a single access. A fence is about order
+              between accesses, not about atomicity.
+        explain: |
+          Two different parties may reorder: the compiler (stopped by the clobber, or by
+          the fence being an opaque `asm volatile`) and the hart (stopped by the `fence`
+          instruction). `volatile` addresses neither for the plain stores. See
+          [[concept:locks#fence]] for the same idea between harts.
+  - title: Which interrupt, and who runs the handler?
+    q: |
+      The card raises an interrupt when packets have arrived. It is wired to the PCI
+      interrupt pin INTA, not to a PLIC source number. Which PLIC interrupt number does
+      xv6 have to enable and dispatch, and how would you check your answer on the running
+      machine? Then think about where the handler runs: on which hart, with what interrupt
+      state, on which stack, and what it must do to the card so that the interrupt does not
+      fire again at once.
+    hints:
+      - "[[plicinithart]] enables sources 1 and 10 with one 32-bit write ([[kernel/plic.c:26]]). QEMU's `hw/riscv/virt.c` builds an interrupt map for the PCIe bus: look for `PCIE_IRQ` and for how the device number enters the computation. [[tour:9]] and [[tour:44]] show how a claimed interrupt reaches [[devintr]]."
+      - "Four PCI pins (INTA-INTD) are shared by all devices; QEMU rotates them by device number (\"swizzling\") onto four PLIC sources starting at 32. The PLIC presents an interrupt to every hart that enabled it; the first hart to claim it handles it, with SIE off, on whatever stack that hart was using ([[concept:locks#handlers]])."
+      - "Compute 32 + (pin + device) mod 4, with pin INTA = 0; set the bit for that source in the right 32-bit enable word on every hart. In the handler, read the card's interrupt cause register, which clears it, before you look at the ring."
+    answer: |
+      Device 1, pin INTA (the configuration header's interrupt pin byte reads 1), gives PLIC
+      source 32 + (0 + 1) mod 4 = **33**. Its enable bit is bit 1 of the *second* enable
+      word of each hart's S-mode context (`PLIC_SENABLE(hart) + 4`), and its priority must be
+      non-zero ([[plicinit]]). We checked the number on the running system: gdb stopped in
+      `devintr` with `irq = 33` before it called `e1000_intr`.
+
+      The handler runs on whichever hart claims the interrupt first. In our recorded runs it
+      landed on all three harts. On an idle hart it ran on the **scheduler stack**, below a
+      [[kernelvec]] frame (in one boot `sp` = `0x80009670`, hart 0's slice of `stack0`), with
+      no process: `myproc()` is 0. On a hart that was running a process in the kernel, it
+      ran on that process's kernel stack (the reveal shows one), whether or not the packet
+      had anything to do with that process. SIE is off for the whole handler, and any spinlock it takes
+      records intena 0 ([[tour:29]] showed the same for the disk).
+
+      The card keeps its interrupt line asserted until the driver reads the interrupt cause
+      register (ICR), which clears it. Reading it first, *before* walking the ring, means a
+      packet that arrives during the walk sets the cause again and raises a new
+      interrupt after [[plic_complete]], instead of waiting unseen in the ring.
+    checks:
+      - id: lab25-06
+        level: 2
+        type: number
+        q: |
+          On QEMU's virt machine a PCI device's pin becomes PLIC source 32 + (pin + device)
+          mod 4, with INTA = 0. A second card on bus 0 as device 2, also using INTA: which
+          PLIC source does it raise?
+        answer: 34
+        wrong:
+          33: |
+            That is the e1000's source, device 1. The device number enters the formula:
+            (0 + 2) mod 4 = 2.
+          2: |
+            You may have forgotten the base. PCI sources start at 32 on this machine; 1
+            and 10 are the disk and the UART.
+        why_wrong: "Add the device number to the pin, take the remainder mod 4, and add 32."
+        explain: |
+          32 + (0 + 2) mod 4 = 34. The rotation spreads devices that all use INTA over four
+          sources. Its enable bit would be bit 2 of the second enable word.
+      - id: lab25-07
+        level: 2
+        type: choice
+        q: |
+          gdb stopped in `e1000_intr` on hart 0 while no process was running there. Where is
+          `sp`?
+        options:
+          - text: "On hart 0's scheduler stack (its slice of stack0), below a kernelvec frame"
+            correct: true
+            why: |
+              The interrupt was taken in the scheduler's interrupt window, and [[kernelvec]]
+              pushed its frame onto the stack in use. gdb: `sp` = `0x80009670`, inside
+              `stack0`.
+          - text: "On the kernel stack of the process that will receive the packet"
+            why: |
+              You may have thought the handler works for the receiving process. It runs on
+              whatever hart claimed the interrupt, on the stack that hart was using; the
+              receiver may be asleep on another hart.
+          - text: "On a separate interrupt stack"
+            why: |
+              xv6 has none. [[kernelvec]] subtracts 256 from whatever `sp` holds
+              ([[concept:stacks]]).
+          - text: "On a user stack"
+            why: |
+              An interrupt from user mode goes through [[uservec]], which switches to the
+              process's kernel stack before calling C code. The kernel never runs on a user
+              stack.
+        explain: |
+          Device interrupts serve the device, not a process ([[tour:44]]). In our trace the
+          e1000 interrupts landed on idle harts (process 0) on all three harts; had a hart
+          been running a process's system call, the frames would sit on that process's kernel
+          stack.
+  - title: What may the receive path do inside the interrupt handler?
+    q: |
+      Everything from "a slot has DD set" to "the packet is queued for a process" runs inside
+      `e1000_intr`, with SIE off, on an arbitrary hart, possibly with no process at all.
+      Some packets need an answer (ARP), so the receive path sometimes transmits. List what
+      the receive path must never do there, and decide how `e1000_intr` should use
+      `e1000.lock` given that an ARP reply calls `e1000_transmit`, which takes the same
+      lock.
+    hints:
+      - "Read [[acquire]] ([[kernel/spinlock.c:25]]-[[kernel/spinlock.c:26]]), [[acquiresleep]] ([[kernel/sleeplock.c:32]]) and [[sleep]]: what does each assume about the current hart and process?"
+      - "Holding a spinlock while calling code that acquires the same spinlock is not a deadlock in xv6: [[acquire]] notices and panics. Sleeping needs a process to put to sleep; in the handler there may be none, or the one that is there has nothing to do with the packet."
+      - "What must be finished, and released, before any code that might transmit runs? Decide what the handler needs from the ring, and where it can keep that once the lock is gone."
+    answer: |
+      Inside the handler the receive path must not:
+
+      - **sleep** or take a sleep-lock: on an idle hart there is no process (`myproc()` is
+        0), and on a busy hart the process there is an innocent bystander. Clinic 4 shows
+        what a sleep-lock does: `scause=0xd ... stval=0x30`, a load from address 0x30 =
+        `myproc()->pid` with `myproc()` = 0.
+      - **acquire a spinlock it already holds**: an ARP reply transmits, and
+        `e1000_transmit` takes `e1000.lock`. If `e1000_intr` still held it, [[acquire]]
+        would panic. We ran that change (the delivery loop moved above the release):
+        `panic: acquire` right after `$ nettest ECHOPORT`, at the first ARP request.
+      - **spend unbounded time**: a flood of packets must not keep one hart in the handler
+        forever, so the harvest loop goes around the ring at most once; packets that arrive
+        later raise a new interrupt (they set ICR again after it was read).
+
+      So `e1000_intr` holds `e1000.lock` only while it touches the ring, collects up to 16
+      buffers in a local array, releases the lock, and only then calls `net_rx` for each.
+      `kalloc` and `kfree` are allowed: they take `kmem.lock`, a spinlock, and never sleep.
+    checks:
+      - id: lab25-08
+        level: 2
+        type: choice
+        q: |
+          A learner calls `net_rx` for each packet *before* `release(&e1000.lock)` in
+          `e1000_intr`. The first packet to arrive is slirp's ARP request. What happens?
+        options:
+          - text: "panic: acquire, because arp_rx calls e1000_transmit, which acquires e1000.lock on the same hart"
+            correct: true
+            why: |
+              [[acquire]] checks `holding(lk)` first and panics. We ran this change and got
+              exactly `panic: acquire` right after `$ nettest ECHOPORT`.
+          - text: "A silent deadlock: the hart spins forever"
+            why: |
+              That would be true of a spinlock that does not know its owner. xv6's
+              `holding()` compares `lk->cpu` with this hart and panics instead.
+          - text: "Nothing: interrupts are off, so the nested acquire is safe"
+            why: |
+              Interrupts being off protects against *another* handler on this hart, not
+              against the same code acquiring a lock it already holds.
+          - text: "The ARP reply is queued and sent after the release"
+            why: |
+              There is no such queue in this design: `e1000_transmit` writes the ring
+              directly, under the lock.
+        explain: |
+          Release locks before calling code that may need them again, or restructure so that
+          it cannot. The reference harvests under the lock and delivers outside it.
+  - title: How does recv sleep until a packet arrives without missing it?
+    q: |
+      `recv` runs in a process on one hart; the packet it waits for is queued by the
+      interrupt handler on another hart, at any moment. Design the socket's queue and its
+      locking: which lock protects the queue, who takes it, and in what order relative to
+      the process locks that [[wakeup]] takes? Then write the wait loop with this tree's
+      [[sleep_prepare]]/[[sleep]]/[[wakeup]] (not the book's `sleep(chan, lock)`), and
+      explain why no packet can arrive "between the check and the sleep" unnoticed. What
+      should a full queue do, given that the handler may not wait?
+    hints:
+      - "Read [[uartwrite]] ([[kernel/uart.c:80]]-[[kernel/uart.c:96]]) and [[virtio_disk_rw]]'s wait loop, and [[concept:locks#sleep-wakeup]]. The protocol registers interest (`sleep_prepare`) before letting go of the condition's lock."
+      - "Whatever the waiter checks (\"is the queue empty?\") and whatever the interrupt changes (\"queue a packet, wake the waiter\") must be done under one lock, and the waiter must be registered on the channel before it releases that lock. [[wakeup]] takes every process's `p->lock`, so whatever lock the handler holds when it calls `wakeup` comes before `p->lock` in the lock order."
+      - "Give each socket one spinlock that both the handler's append-and-wake and recv's check-and-register take. Write recv as a loop that re-checks everything it depends on each time around, and decide what it may still hold when it copies to user space."
+    answer: |
+      Each socket has a spinlock `s->lock` covering its queue (at most 16 packets) and
+      its port. A table lock, `socktab.lock`, covers the choice of which socket has which
+      port, so that `bind` cannot hand out a port twice. Lock order: `socktab.lock`, then
+      a socket's lock, then `p->lock` (taken inside [[wakeup]], [[sleep_prepare]] and
+      [[killed]]).
+
+      `sock_rx`, in the interrupt handler, appends under `s->lock` and calls `wakeup(s)`
+      before releasing it. `recv` checks the queue under `s->lock` and, if it is empty,
+      calls `sleep_prepare(s)` *while still holding it*. Two cases, and both are safe:
+
+      - the packet is queued before recv takes the lock: recv sees it and never sleeps;
+      - the packet arrives while recv holds the lock: the handler spins on `s->lock` until
+        recv has registered on the channel and let go; its `wakeup` then clears `p->chan`,
+        so recv's [[sleep]] returns at once or wakes from `SLEEPING`.
+
+      A full queue drops the packet: the handler cannot wait for a reader, and UDP
+      promises nothing. `kill` and `unbind` must also end the wait: [[kkill]] makes the
+      sleeper runnable without clearing its channel, and `unbind` calls `wakeup(s)`; the
+      loop re-checks `killed(p)` and the port every time around, also when packets are
+      queued, so a socket that was unbound and bound to another port meanwhile is never
+      read. One window is inherited from the base pattern: a `kill` between the
+      `killed(p)` check and `sleep()` is noticed only at the next wakeup ([[piperead]] has
+      the same window). `copyout` happens after the lock is released (it may need to
+      allocate a lazily allocated heap page, and it is slow), and the page is freed
+      afterwards.
+    checks:
+      - id: lab25-09
+        level: 2
+        type: tf
+        q: |
+          True or false: `sock_rx` runs with interrupts off, so it may update the socket's
+          queue without the socket's lock.
+        answer: false
+        why_tf: |
+          You may have thought "interrupts off" means "nothing else runs". It only stops
+          interrupts on *this* hart; `recv` runs on another hart at the same time.
+        reasons:
+          - text: "recv on another hart reads the queue and registers for the wakeup; without the shared lock the handler's append and wakeup can fall between recv's check and its sleep_prepare, and the wakeup is lost."
+            correct: true
+            why: |
+              Right. Clinic 3 did this: with a delay that widens the window, gdb found a
+              process sleeping on a socket whose queue held one packet.
+          - text: "Interrupts are never off in sock_rx."
+            why: |
+              They are: it runs inside the e1000 interrupt, with SIE off for the whole
+              handler.
+          - text: "The lock is needed only because kfree takes kmem.lock."
+            why: |
+              `kmem.lock` protects the free list, not the socket queue. The socket lock is
+              about the queue and the wakeup.
+        explain: |
+          SIE is a per-hart switch ([[concept:locks#sie]]). The lock that makes the check
+          and the wakeup atomic is the one both sides take: `s->lock`.
+      - id: lab25-10
+        level: 3
+        type: order
+        q: |
+          Put the steps of `recv` on an empty queue in order (reference code).
+        items:
+          - text: "acquire socktab.lock and find the socket, which acquires s->lock"
+          - text: "release socktab.lock"
+          - text: "see that the port is still bound, the process is not killed, and the queue is empty"
+          - text: "sleep_prepare(s)"
+            why: "Registering on the channel while still holding `s->lock` is what makes the later wakeup impossible to miss."
+          - text: "release s->lock and sleep()"
+          - text: "acquire s->lock and check the queue again"
+          - text: "take the oldest packet and release s->lock"
+          - text: "copyout the data, then kfree the page"
+            why: "No spinlock is held during the copy."
+        why_wrong: "The condition is checked and the channel registered under s->lock; the copy happens after every lock is released."
+        explain: |
+          Compare with [[virtio_disk_rw]]'s loop: same shape, `s` as the channel and
+          `s->lock` as the condition's lock.
+  - title: Which bytes are big-endian?
+    q: |
+      RISC-V stores multi-byte integers little-endian. Ethernet, ARP, IP and UDP headers are
+      big-endian on the wire. The system calls take ports and addresses as ordinary numbers.
+      Decide where conversions happen, which fields need them, and predict what goes wrong,
+      and where you would see it, if `net_tx_udp` stores the destination port without
+      converting it.
+    hints:
+      - "Look at a captured frame byte by byte (gdb's `x/42xb` on a transmit buffer, or a pcap file from QEMU's `-object filter-dump`). A field that reads `0xd107` in gdb's `print` may be `0x07d1` on the wire."
+      - "Every 16- and 32-bit header field is converted exactly once, at the boundary between the kernel's numbers and the packet's bytes: on the way in when parsing, on the way out when building. Single bytes (version, TTL, protocol) need nothing."
+      - "Write the destination port 25501 (`0x639d`) into memory little-endian and read the two bytes back as a big-endian number."
+    answer: |
+      The reference converts at the packet boundary only: `net_tx_udp` and `arp_rx` call
+      `htons`/`htonl` when they store header fields, `ip_rx` and `arp_rx` call
+      `ntohs`/`ntohl` when they read them; everything above (sockets, system calls) uses
+      host order. The checksum routine sums big-endian 16-bit words and returns its
+      result in network order.
+
+      Forgetting `htons` on the destination port (Clinic 5) sends a port such as 25501 =
+      `0x639d` as the bytes `9d 63`, which the host reads as port 40291. Nobody listens
+      there, so the host answers with an ICMP "port unreachable", which xv6 drops; the echo
+      server on `ECHOPORT` never sees a packet and every `recv` waits until the watchdog
+      kills it. The capture shows it directly: in the recorded run the echo port went out
+      as `UDP 10.0.2.15:2001 -> 10.0.2.2:43880`. A DNS query to port 53
+      goes to port 13568 instead, and slirp answers "unreachable".
+    checks:
+      - id: lab25-11
+        level: 2
+        type: number
+        q: |
+          `net_tx_udp` stores `udp->dport = dport;` with `dport` = 25501 (`0x639d`) and no
+          `htons`. Which destination port does the host see?
+        answer: 40291
+        wrong:
+          25501: |
+            You may have thought the store keeps the number. It keeps the *bytes in
+            little-endian order*, `9d 63`, and the network reads them big-endian.
+          55606: |
+            You may have reversed all four hex digits (`0xd936`). Swap the two bytes:
+            `0x639d` becomes `0x9d63` = 40291.
+        why_wrong: "Swap the two bytes of 0x639d and convert 0x9d63 to decimal."
+        explain: |
+          `0x9d63` = 40,291. The capture in Clinic 5 shows the same swap for the recorded
+          run's echo port (bytes `ab 68`, port 43880), and ICMP "port unreachable" coming
+          back from 127.0.0.1.
+build: |
+  **Start.**
+
+  ```text
+  git checkout -b my-e1000 06aad25
+  ```
+
+  Add the two QEMU flags from the spec to `QEMUOPTS` first and boot: nothing changes yet,
+  but `info pci` in QEMU's monitor (Ctrl-A C) lists the card, which tells you its bus,
+  device number and IDs before you write a line of code.
+
+  **Milestones, in an order where each one can be checked on its own.**
+
+  1. **Find the card.** Map the configuration window and the register window in
+     [[kvmmake]], scan bus 0, size and place BAR 0, enable memory and bus mastering, and
+     print what you found. Check: one boot line, with 131,072 bytes at `0x40000000`, and
+     `usertests -q` still passes (the two new mappings must not overlap anything).
+  2. **Rings.** Reset the card, allocate the two rings and the receive buffers with
+     [[kalloc]], program the ring registers, the MAC address filter, and transmit and
+     receive control. Check with gdb: `x/4wx 0x40002810` shows RDH, a reserved word, RDT
+     (`0x40002818`) as 0 … 15.
+  3. **Transmit.** Write `e1000_transmit`. You cannot see a packet leave yet without a
+     protocol, so check with gdb that TDH follows TDT after each call (on QEMU the card
+     sends during the TDT write itself). Because of that, QEMU never fills your ring: test
+     the "full" case on purpose (Clinic 6 shows one way).
+  4. **Receive.** Enable IRQ 33 in the PLIC, dispatch it in [[devintr]], write the
+     handler, and for now free every packet. Check: send one UDP packet to `FWDPORT` from
+     the host (a three-line Python script) and break on your handler; the first frame is
+     60 bytes, a broadcast ARP request from slirp (`52:55:0a:00:02:02`) asking for
+     `10.0.2.15`.
+  5. **ARP, IPv4, UDP.** Answer the ARP request; parse IPv4/UDP; build headers for
+     sending. Check with gdb: after the ARP reply, slirp delivers the UDP packet, and its
+     data `hello` sits at offset 42 of the buffer.
+  6. **Sockets and the system calls.** Then the test program and its host partner.
+     Run `nettest`, `usertests -q` and `nettest` again on 3 harts.
+
+  **Debugging advice.** Run QEMU with `-smp 3` and attach gdb (`make qemu-gdb` picks its
+  own gdb port).
+
+  - **Capture the wire.** `-object filter-dump,id=f0,netdev=net0,file=net.pcap` makes QEMU
+    record every frame xv6 sends and receives; open it with Wireshark or a 20-line Python
+    script. Clinic 5's mistake is obvious there and invisible anywhere else.
+  - **When packets stop arriving,** attach gdb and print RDH (`*(unsigned
+    int*)0x40002810`), RDT (`0x40002818`) and the status byte of every receive slot. RDH
+    equal to RDT means the card has no slot to fill (Clinic 1).
+  - **Reading a device register can change it.** Reading ICR from gdb clears the card's
+    interrupt cause, so don't print it while you debug.
+  - **A malformed DNS query gets an answer anyway.** A query with a wrong label length
+    (`\6csail` for a five-letter label) got a reply from slirp's DNS server, and Google's,
+    with 12 bytes and flags `0x8181`: response, recursion desired, rcode 1 "format error".
+    Compare your bytes with a capture of a real query (for example, `dig` sent to a small
+    Python UDP listener).
+  - **A test that hangs instead of failing tells you nothing.** Keep the watchdog in your
+    test: it turns a lost packet into a `FAIL (timed out)` line and lets the next check
+    run.
+clinic:
+  - bug: The receive slot is never given back
+    change: |
+      The last statement of the harvest loop, which moves RDT onto the slot just emptied,
+      is forgotten:
+
+      ```diff
+           // give the slot back to the device.
+      -    *R(E1000_RDT) = i;
+         }
+      ```
+
+      Many drivers keep their own index of the next slot to look at instead of computing
+      it from RDT. We built that variant too (a field `rx_next`, advanced at the end of the
+      loop), with the same mistake, and as a control the same variant *with* the RDT write.
+    symptom: |
+      # nettest server 30 in xv6; nettest.py ping FWDPORT 30 on the host.
+      # as written above (the next slot is computed from RDT):
+      nettest.py: ping 0: no reply in 5 s: FAIL
+      # gdb, attached afterwards:
+      RDH 2 RDT 15
+      slot  0 status 0 length 60
+      slot  1 status 7 length 60
+      slot  2 status 0 length 0
+      [...]
+
+      # the variant with its own index rx_next (two boots, the same result):
+      nettest.py: ping 14: no reply in 5 s: FAIL
+      # gdb, attached afterwards:
+      RDH 15 RDT 15
+      $1 = 15
+      slot  0 status 0 length 60
+      slot  1 status 0 length 60
+      [...]
+      slot 14 status 0 length 60
+      slot 15 status 0 length 0
+
+      # the control (rx_next, with the RDT write):
+      nettest.py: 30 round trips: OK
+    why: |
+      Two variants of the same omission, two different numbers, and both follow from the
+      ownership rule of think question 2: the card may fill the slots from RDH up to, but
+      not including, RDT.
+
+      **Index computed from RDT.** RDT stays 15, so the driver always looks at slot 0. The
+      first frame (slirp's ARP request) lands there and is answered. The first ping lands in
+      slot 1 (`status 7`: DD, end of packet, and a checksum flag, length 60), which the
+      driver never examines: `ping 0` gets no reply. RDH 2 says the card filled exactly two
+      slots.
+
+      **Own index.** The driver walks through the slots correctly, but never tells the card.
+      The card fills slots 0 to 14 and stops when RDH reaches RDT = 15: **15 frames**, one
+      ARP request and pings 0 to 13, all of them answered. Ping 14 has nowhere to go. gdb
+      shows the end state: the driver has consumed everything (`rx_next` = 15, every status
+      0), RDH = RDT = 15, and the card holds the next frame, waiting for a slot that will
+      never be given back. Slot 15 was never used: the slot that keeps "full" and "empty"
+      apart.
+
+      In `nettest` the same variant passed "one round trip" (two frames: the ARP request
+      and one echo) and then failed every later check with `FAIL (timed out)`. Nothing
+      panics, and the transmit side keeps working; only receiving stops, for good.
+  - bug: "No fence before the tail writes (not visible on QEMU)"
+    change: |
+      Both "publish" fences are removed: the one before the TDT write in `e1000_transmit`
+      and the one before the RDT write in `e1000_intr`.
+
+      ```diff
+         e1000.tx[i].status = 0;
+      -
+      -  // the descriptor must be in memory before the device can see
+      -  // the new tail and read it.
+      -  io_fence();
+
+         // give the slot to the device.
+         *R(E1000_TDT) = (i + 1) % TX_RING_SIZE;
+      ```
+
+      (and the same three lines before `*R(E1000_RDT) = i;`).
+    symptom: |
+      $ nettest ECHOPORT
+      nettest: one round trip: OK
+      nettest: 100 round trips: OK
+      nettest: 3 processes x 300 round trips: OK
+      nettest: kill wakes recv: OK
+      nettest: dns: pdos.csail.mit.edu is 128.52.129.126
+      nettest: dns query to 10.0.2.3: OK
+      nettest: 1000 round trips of 64 bytes took 7 ticks
+      nettest: ALL OK
+      [... two more runs on the same boot: ALL OK, ALL OK ...]
+
+      # e1000_transmit in this build (objdump -d), the end of the descriptor stores
+      # and the TDT store, with nothing in between but the index arithmetic:
+          80005ef2:	01373023          	sd	s3,0(a4)
+          80005ef6:	639c                	ld	a5,0(a5)
+          80005ef8:	97ca                	add	a5,a5,s2
+          80005efa:	01479423          	sh	s4,8(a5)
+          80005efe:	4725                	li	a4,9
+          80005f00:	00e785a3          	sb	a4,11(a5)
+          80005f04:	00078623          	sb	zero,12(a5)
+          80005f08:	2485                	addiw	s1,s1,1
+      [...]
+          80005f18:	400047b7          	lui	a5,0x40004
+          80005f1c:	8097ac23          	sw	s1,-2024(a5) # 40003818 <_entry-0x3fffc7e8>
+    why: |
+      Nothing went wrong, in 3 runs of about 2,000 packets each, and nothing was expected to.
+      This entry is here because the bug is real and the test cannot show it.
+
+      What the build shows: the compiler kept the stores in program order. The address
+      (`sd`), the length (`sh`), the command (`sb` 9) and the status (`sb zero`) are all
+      written before the `sw` to `0x40003818`, TDT. It was allowed to move them below
+      (the TDT store is `volatile`, the descriptor stores are not), and a different compiler
+      version or optimization level may.
+
+      What the hardware may do: RVWMO, RISC-V's memory model, does not order a store to
+      RAM before a later store to a device register unless a fence says so. A real core
+      with a store buffer could let the card see the new TDT, read the descriptor by DMA,
+      and find the old address or length.
+
+      Why QEMU cannot show it (reasoned, not traced): when QEMU's TCG runs on an x86-64
+      host, the guest's stores become visible in program order, and the
+      card's model runs inside the emulated TDT store, after the earlier
+      stores are complete. The receive side is the same: the card fills slots from QEMU's
+      I/O thread, which takes the same global lock as the RDT write.
+
+      So the fences cost one instruction each and protect against a failure no test here
+      can produce. That is the normal situation for memory-ordering bugs: you reason them
+      out from the specification, you do not wait to see them.
+  - bug: The handler updates the socket queue without the socket's lock
+    change: |
+      "Interrupts are off in the handler, so nothing can interfere": `sock_rx` lets go of
+      the socket's lock as soon as it has found the socket.
+
+      ```diff
+         if (s == 0) {
+           kfree(buf);
+           return;
+         }
+      +  // interrupts are off here, so nothing can interfere.
+      +  release(&s->lock);
+
+         if (s->n == NQ) {
+           // nobody is reading fast enough: drop the packet.
+      -    release(&s->lock);
+           kfree(buf);
+           return;
+         }
+         [...]
+         s->n++;
+         wakeup(s);
+      -  release(&s->lock);
+       }
+      ```
+
+      We ran it as written, and a second copy with a delay loop (200,000 iterations of a
+      `volatile` counter) in `recv` between the "queue is empty" check and
+      `sleep_prepare(s)`, to widen the window. As a control, the reference with the same
+      delay.
+    symptom: |
+      # as written: 3 boots, 3 runs of nettest each: 9 of 9 ALL OK.
+
+      # with the delay (one of six boots; five of the six failed at least one check):
+      $ nettest ECHOPORT
+      nettest: one round trip: OK
+      nettest: 100 round trips: FAIL (timed out)
+      nettest: 3 processes x 300 round trips: OK
+      nettest: kill wakes recv: OK
+      nettest: dns: pdos.csail.mit.edu is 128.52.129.126
+      nettest: dns query to 10.0.2.3: OK
+      nettest: 1000 round trips of 64 bytes: FAIL (timed out)
+      nettest: SOME TESTS FAILED
+
+      # gdb snapshot of the same boot, 20 s after the first FAIL, during the last check:
+      pid 1 init SLEEPING chan 0x80010e90 <proc>
+      pid 2 sh SLEEPING chan 0x80010ff8 <proc+360>
+      pid 3 nettest SLEEPING chan 0x80011160 <proc+720>
+      pid 18 nettest SLEEPING chan 0x80021f58 <socktab+448>
+      pid 19 nettest SLEEPING chan 0x80008940 <ticks>
+      sock 0 at 0x80021db0 <socktab+24>: port 2002 n 0 head 10
+      sock 1 at 0x80021f58 <socktab+448>: port 2003 n 1 head 5
+
+      # the control (reference with the same delay): 1 boot, 3 runs: ALL OK.
+    why: |
+      The snapshot is a lost wakeup caught in the act: pid 18, the 1000-round-trip check's
+      process, sleeps on the channel of socket 1, and socket 1 (port 2003) **holds one
+      packet** (`n 1`). Nobody will wake pid 18; the watchdog kills it later and the check
+      fails. (Socket 0, port 2002, is left over from the "100 round trips" check, whose
+      process the watchdog had killed.)
+
+      An interleaving the broken code allows (reasoned from the code; the snapshot shows
+      its result):
+
+      | time | hart 1: pid 18 in recv | hart 0: the e1000 interrupt |
+      |---|---|---|
+      | 1 | | `sockfind` takes `s->lock` |
+      | 2 | spins on `s->lock` | releases it at once ("interrupts are off") |
+      | 3 | gets `s->lock`; `n` is still 0 | |
+      | 4 | delay … | `n++`; `wakeup(s)`: pid 18's `chan` is 0, nothing to do |
+      | 5 | `sleep_prepare(s)`, release, `sleep()` | |
+      | 6 | asleep, with a packet in the queue | |
+
+      In the reference, hart 0 holds `s->lock` from the lookup through `n++` and
+      `wakeup`, so step 3 cannot happen before step 4 is done; and recv holds it from its
+      check through `sleep_prepare`, so step 4 cannot fall inside step 3-5. That is the
+      whole content of the rule "check the condition and register for the wakeup under
+      the lock the waker holds" ([[concept:locks#sleep-wakeup]]). "Interrupts are off"
+      only protects against this hart; the other two harts run on.
+
+      The honest part: without the delay, 9 runs on 3 boots passed. The window is a few
+      instructions wide, and in ping-pong traffic the reply usually arrives long after
+      recv is asleep. A rare lost wakeup is still a hung process. Widening the window is how
+      you find out whether a race exists; the control shows the delay alone breaks nothing.
+  - bug: The socket is protected by a sleep-lock
+    change: |
+      "recv sleeps anyway, so why not a sleep-lock?" Every `struct spinlock lock` of a
+      socket becomes a `struct sleeplock`, every `acquire(&s->lock)` an
+      `acquiresleep(&s->lock)`, every `release(&s->lock)` a `releasesleep(&s->lock)`:
+
+      ```diff
+       struct sock {
+      -  struct spinlock lock;
+      +  struct sleeplock lock;
+      [...]
+           if (s->port == port) {
+      -      acquire(&s->lock);
+      +      acquiresleep(&s->lock);
+             return s;
+      ```
+    symptom: |
+      $ nettest ECHOPORT
+      scause=0xd sepc=0x80004028 stval=0x30
+      panic: kerneltrap
+
+      # another boot, gdb attached:
+      $ nettest ECHOPORT
+      nettest: one round trip: OK
+      scause=0xd sepc=0x80004028 stval=0x30
+      panic: kerneltrap
+      # at the breakpoint on panic: hart 0, no process (cpus[0].proc = 0), noff 2,
+      # sp = 0x80009490 <stack0+2880>
+    why: |
+      `sepc = 0x80004028` is in [[acquiresleep]]: `lw a5,48(a0)`, the load of
+      `myproc()->pid` ([[kernel/sleeplock.c:32]]), and `stval = 0x30` = 48 is the address
+      it tried to read. `myproc()` returned 0: the e1000 interrupt had landed on an idle hart,
+      in the scheduler, where no process runs. `scause 0xd` is a load page fault; page 0
+      is not mapped in the kernel page table, and a fault in the kernel is fatal
+      ([[kerneltrap]]). `noff` 2 at the panic is `socktab.lock` plus the sleep-lock's inner
+      spinlock `lk->lk`, both taken by `sock_rx`. The stack pointer is in `stack0`: the
+      scheduler stack.
+
+      The second boot shows the other half of the story: one round trip passed first. That
+      interrupt most likely landed on a hart that was running a process (gdb did not record
+      it), so `myproc()` returned that process, and `acquiresleep` recorded an unrelated
+      process as the holder of the socket. Had the lock been taken, it would have put that
+      bystander to sleep in the middle of an interrupt it had nothing to do with, with the
+      PLIC's claim not yet completed.
+
+      Interrupt handlers have no process of their own. Only spinlocks work there.
+  - bug: Forgot htons on the destination port
+    change: |
+      ```diff
+         udp->sport = htons(sport);
+      -  udp->dport = htons(dport);
+      +  udp->dport = dport;
+      ```
+
+      QEMU recorded every frame (`-object filter-dump,...,file=r.pcap`); a short Python
+      script decoded it.
+    symptom: |
+      $ nettest ECHOPORT
+      nettest: one round trip: FAIL (timed out)
+      nettest: 100 round trips: FAIL (timed out)
+      nettest: 3 processes x 300 round trips: FAIL (timed out)
+      nettest: kill wakes recv: OK
+      nettest: dns query to 10.0.2.3: FAIL (timed out)
+      [...]
+      # the host's echo server, the whole run:
+      nettest.py: echoing on port ECHOPORT
+      # the capture:
+        1 UDP 10.0.2.15:2001 -> 10.0.2.2:43880 udp-length 9 (dst port bytes ab 68)
+        2 ARP request 10.0.2.2 -> 10.0.2.15
+        3 ARP reply 10.0.2.15 -> 10.0.2.2
+        4 ICMP 127.0.0.1 -> 10.0.2.15 type 3 code 3
+      [...]
+       13 UDP 10.0.2.15:2030 -> 10.0.2.3:13568 udp-length 44 (dst port bytes 35 00)
+       14 ICMP 10.0.2.2 -> 10.0.2.15 type 3 code 0
+    why: |
+      Stored without `htons` on a little-endian hart, the echo port's two bytes go out
+      swapped (`ab 68` in this run), which every receiver reads as port 43880. slirp forwards the packet to
+      the host's port 43880, where nobody listens, and the host's kernel answers with ICMP
+      type 3 code 3, "port unreachable" (frame 4). xv6's stack drops everything that is not
+      ARP or UDP, so `recv` never learns why nothing comes back; each check waits until its
+      watchdog kills it. The echo server on `ECHOPORT` never received a single packet.
+
+      The DNS query is sent to port 53 = `0x0035`, as bytes `35 00`: port 13568 on
+      `10.0.2.3`, which slirp does not serve; it answers "network unreachable" (type 3 code
+      0, frame 14).
+
+      The source port is converted, so the frames are well formed in every other way, and
+      the ARP exchange (frames 2-3) works: nothing in the kernel can notice. The capture is
+      the only place where the mistake is visible, which is why the build advice starts
+      with it.
+  - bug: The transmit ring is allowed to fill all 16 slots
+    change: |
+      The natural first version of the "ring full" test checks only the DD bit of the slot
+      at TDT:
+
+      ```diff
+         int i = *R(E1000_TDT);
+      -  if ((i + 1) % TX_RING_SIZE == *R(E1000_TDH) ||
+      -      (e1000.tx[i].status & E1000_TXD_STAT_DD) == 0) {
+      +  if ((e1000.tx[i].status & E1000_TXD_STAT_DD) == 0) {
+           release(&e1000.lock);
+           return -1;
+         }
+      ```
+
+      QEMU's card sends during the TDT write, so on QEMU the ring never holds more than one
+      packet and this can never matter. To make the card fall behind, a scratch copy (not
+      on the branch) adds a test switch: a `send` from source port 65535 sets a flag, and
+      while it is set `e1000_transmit` clears the transmit-enable bit in TCTL, so the card
+      stops sending. A small test program then sends 20 packets with the card stopped,
+      releases it, and sends 3 more (printing each `send`'s result), and then 3 more in a
+      second command. The host's echo server counts what arrives. We ran the same test on
+      the broken check and on the reference.
+    symptom: |
+      # broken check (DD at TDT only):
+      $ nabuse txwedge ECHOPORT
+      held: 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 -1 -1 -1 -1
+      released: -1 -1 -1
+      $ nabuse tx ECHOPORT 3
+      -1 -1 -1
+      tx: done
+      # on the host:
+      nettest.py: echoed 0 packets, then 8 s without one
+      # gdb, another boot of the same kernel, after "released":
+      TDH 0 TDT 0
+      slot  0 status 0 length 52
+      slot  1 status 0 length 52
+      [...]
+      slot 15 status 0 length 52
+
+      # the reference (one slot always empty):
+      $ nabuse txwedge ECHOPORT
+      held: 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 -1 -1 -1 -1 -1
+      released: 0 0 0
+      $ nabuse tx ECHOPORT 3
+      0 0 0
+      tx: done
+      # on the host:
+      nettest.py: echoed 21 packets, then 8 s without one
+    why: |
+      With the card stopped, the broken check accepts all 16 packets: every slot starts
+      with DD set. The 16th fill moves TDT from 15 to 0, onto TDH, which is still 0 because
+      the card has sent nothing. gdb shows the result: TDH 0, TDT 0, and 16 filled slots
+      with DD clear. To the card, TDT equal to TDH means "nothing to send". When it is
+      enabled again it sends nothing, so no slot ever gets its DD bit back, and every later
+      `send` finds DD clear at TDT and returns -1. The host never saw a packet, and nothing
+      but a reboot repairs it.
+
+      The reference refuses when the slot after TDT is TDH, so it accepts 15 packets and
+      refuses the 16th to 20th; after the release the card sends the 15, and everything
+      afterwards works: 15 + 3 + 3 = 21 echoes. One slot is always empty, for the same
+      reason as on the receive ring (think question 2).
+
+      On real hardware this needs no test switch: a card that runs in parallel with the
+      CPU falls 16 packets behind whenever three harts send a burst faster than the wire,
+      and the network would die silently on the first busy moment. QEMU hides it
+      completely, because its card finishes each packet inside the TDT write. That makes it
+      invisible to `nettest` and to `usertests`. A bug that a test cannot show is still a
+      bug; here it takes reading the ownership rules against the code to find it.
+reveal:
+  - title: A network card on QEMU's command line
+    commit: 1
+    file: Makefile
+    lines: 178-188
+    focus: 183-188
+    diff: true
+    state:
+      hart: any
+      proc: "(the build)"
+      locks: []
+    note: |
+      The story of this tour: one boot of the finished branch on 3 harts, with gdb attached
+      from the first instruction, running `nettest` against the host's echo server. Its
+      first check, a child process of `nettest` (pid 4), sends one byte to the host and
+      waits for the echo. The states below come from that run unless a step says they are
+      reasoned.
+
+      Commit 1 starts outside the kernel. `-netdev user` is QEMU's user-mode network,
+      slirp: a small TCP/IP stack inside QEMU that plays router, DHCP and DNS server for
+      a private network `10.0.2.0/24` and turns the guest's packets into ordinary socket
+      calls on the host. `hostfwd=udp::FWDPORT-:2000` makes slirp forward UDP packets that
+      arrive at the host's port `FWDPORT` to the guest's port 2000. `-device e1000` adds an
+      Intel 82540EM network card, and `bus=pcie.0` puts it on the virt machine's PCIe bus,
+      the first bus QEMU creates.
+
+      `FWDPORT` is derived from your user id, as `GDBPORT` already is, so that two people on
+      one machine do not collide.
+  - title: Two new windows in the kernel page table
+    commit: 1
+    file: kernel/vm.c
+    lines: 20-59
+    focus: 35-39
+    diff: true
+    state:
+      hart: 0
+      mode: S
+      proc: none (boot)
+      intr: "off"
+      satp: bare
+      locks: []
+      irq: 0
+      stack: [main, kvminit, kvmmake]
+      sp: {"on": boot, detail: "hart 0's slice of `stack0`, `sp` = `0x80009900`"}
+    note: |
+      gdb stopped here in the recorded boot: hart 0, building the kernel page table
+      (`kpgtbl` = `0x87fff000`, the first page [[kalloc]] handed out, from the top of RAM).
+      Paging is still off: [[kvminithart]] turns it on only after [[kvmmake]] returns.
+
+      Two mappings join the UART, the disk and the PLIC, all identity-mapped and
+      readable and writable, never executable:
+
+      - **`0x30000000`, 1 MiB**: the PCIe configuration space of bus 0 (ECAM), one 4 KiB
+        header for each of 32 devices × 8 functions. QEMU's virt machine reserves 256 MiB
+        there for 256 buses; xv6 only needs bus 0.
+      - **`0x40000000`, 128 KiB**: where the next step will tell the e1000 to put its
+        registers. It is inside the window QEMU reserves for PCIe memory (`0x40000000` up to
+        the start of RAM at `0x80000000`), so it collides with nothing.
+
+      Both lie below `KERNBASE`, like every device in xv6, and both are mapped once at boot
+      and never changed: [[kvmmap]] panics if a mapping fails.
+  - title: Find the card and choose its address
+    commit: 1
+    file: kernel/pci.c
+    lines: 29-55
+    focus: 32-52
+    diff: true
+    state:
+      hart: 0
+      mode: S
+      proc: none (boot)
+      intr: "off"
+      satp: kernel
+      locks: []
+      irq: 0
+      stack: [main, pci_init]
+      sp: {"on": boot, detail: "`sp` = `0x80009920`"}
+    note: |
+      Recorded at line 39 (at commit 7; the lines are the same here): `dev` = 1, `h` =
+      `0x30008000`, `h[0]` = 269385862 = `0x100e8086`, the e1000's device and vendor IDs.
+      Device 0, the host bridge, was skipped. Then at line 46: `size` = 131072.
+
+      Three steps make the card usable:
+
+      1. **Size BAR 0.** Writing all ones and reading back tells the kernel how many
+         address bits the card ignores: `~(0xfffe0000 & ~0xf) + 1` = `0x20000`.
+      2. **Place it.** Writing `0x40000000` to BAR 0 is a request: "answer the 128 KiB from
+         here". The card does not choose; the kernel does.
+      3. **Enable it.** Memory space (bit 1) lets the card answer accesses to its BAR; bus
+         master (bit 2) lets it read and write RAM by DMA, which the descriptor rings need.
+
+      Word 15 of the header holds the interrupt pin: gdb read `h[15]` = 256 = `0x100`, so
+      the pin byte (bits 8-15) is 1, INTA, and the line byte is 0 (nobody routed it; there
+      is no firmware). The boot line follows:
+
+      ```text
+      pci: e1000 at 0:1.0, 131072 bytes of registers at 0x40000000, INTA
+      ```
+
+      `pci_init` runs only on hart 0, from [[main]], before the other harts are released,
+      so it needs no lock. Paging is on by now (`satp: kernel`): the two mappings from the
+      last step are what make these accesses legal.
+  - title: Two rings, each in a page of RAM
+    commit: 2
+    file: kernel/e1000.c
+    lines: 15-36
+    focus: 18-33
+    diff: true
+    state:
+      hart: any
+      proc: "(the definitions)"
+      locks: []
+    note: |
+      The driver's state. Each ring is an array of 16-byte descriptors (layouts in
+      `kernel/e1000_dev.h`: an address, a length, a command byte for transmit, a status
+      byte with the DD bit for both). 16 slots × 16 bytes = 256 bytes, so one [[kalloc]]
+      page holds a ring with room to spare. The card requires the ring length to be a
+      multiple of 128 bytes and the base address to be 16-byte aligned; a page satisfies
+      both.
+
+      The comment at lines 22-24 is the reason DMA is easy in xv6: the kernel maps RAM
+      one-to-one ([[g:direct-map]]), so the kernel address of a descriptor *is* the physical
+      address the card needs. Real kernels with a different layout must translate.
+
+      `tx_bufs` and `rx_bufs` remember which page each slot holds, so that the driver can
+      free a transmitted page later and hand a received one up. `lock` is for harts, not for
+      the card: think question 2.
+  - title: Reset, then give the card its rings
+    commit: 2
+    file: kernel/e1000.c
+    lines: 38-98
+    focus: 52-84
+    diff: true
+    state:
+      hart: 0
+      mode: S
+      proc: none (boot)
+      intr: "off"
+      satp: kernel
+      locks: []
+      irq: 0
+      stack: [main, pci_init, e1000_init]
+      sp: {"on": boot, detail: "`sp` = `0x800098f0`"}
+    note: |
+      Recorded: `e1000.tx` = `0x87f53000` with `tx[0].status` = 1 (DD), and `e1000.rx` =
+      `0x87f52000`, whose slot 0 points at the buffer `0x87f51000` (still full of the
+      junk byte 5 that [[kalloc]] writes into every page).
+
+      - **Transmit** (52-65): every slot starts *done* (DD set, no packet), so the first
+        transmit finds slot 0 free. TDH = TDT = 0: nothing to send.
+      - **Receive** (67-84): every slot gets an empty page. RDH = 0 and RDT = 15 hand the
+        card slots 0 to 14. Slot 15 is the one the card may never fill (think question
+        2): if it could, "head equals tail" would mean both full and empty.
+
+      The register writes are `volatile` stores to the mapped BAR (the `R()` macro, line
+      16), the same idiom as [[kernel/virtio_disk.c]]. Lines 86-97 (in view) program the
+      MAC address `52:54:00:12:34:56` into the receive filter (QEMU's default for a card)
+      and enable transmit and receive.
+  - title: "Transmit: is the slot at the tail free?"
+    commit: 3
+    file: kernel/e1000.c
+    lines: 100-143
+    focus: 108-127
+    diff: true
+    state:
+      hart: 2
+      mode: S
+      proc: nettest (pid 4)
+      intr: "off"
+      satp: kernel
+      locks: [e1000.lock]
+      irq: {noff: 1, intena: 1}
+      stack: [usertrap, syscall, sys_send, net_tx_udp, e1000_transmit]
+      sp: {"on": kernel, detail: "pid 4's kernel stack, `sp` = `0x3fffff7ef0`"}
+    note: |
+      The callers `sys_send` and `net_tx_udp` arrive in commits 6 and 5; this state was
+      recorded at commit 7, where the function is the same, 4 lines further down. pid 4
+      sends its one byte: at the "full?" test (line 116 here), `i` = TDT = 0, TDH = 0,
+      `tx[0].status` = 1.
+
+      The test has two halves, and both matter:
+
+      - **The slot after TDT must not be TDH.** The card sends the slots from TDH up to,
+        but not including, TDT, so TDT equal to TDH means "nothing to send". If the driver
+        filled the 16th slot, TDT would move onto TDH and the card would see an empty ring
+        holding 16 packets: it would send none of them, and no DD bit would ever come back.
+        So one slot always stays empty, as on the receive ring. Clinic 6 shows the lock-up
+        when this half is missing.
+      - **The slot must be done (DD).** The card may have fetched the descriptor but not
+        yet finished reading the packet; DD is its promise that it has.
+
+      `e1000.lock` is the only lock here, taken in a system call after [[usertrap]] turned
+      interrupts on: noff 1, intena 1, SIE 0 (gdb read `sstatus` = `0x200000020`). It
+      serializes the harts that transmit; the card itself never sees it.
+
+      In six measured runs of `nettest` (2,003 packets each) the test never refused: QEMU's
+      card sends during the TDT write itself, so by the next call TDH has caught up (next
+      step). The -1 path is for real hardware, where the card runs in parallel.
+
+      Line 122, `io_fence()` after the test, keeps the reads and writes of the old slot
+      from moving above the read of DD; the old page is freed only now (125-126).
+    others: |
+      Another hart may want the same lock at this moment: an ARP reply is sent from inside
+      the e1000 interrupt ([[tour:44]]). It spins with interrupts off until pid 4 releases.
+      In the measurement copy `e1000.lock` was contended 176 to 196 times per run of
+      `nettest`, 26 to 44 of them by the interrupt handler.
+  - title: "Transmit: fill the slot, fence, move the tail"
+    commit: 3
+    file: kernel/e1000.c
+    lines: 100-143
+    focus: 127-141
+    state:
+      hart: 1
+      mode: S
+      proc: nettest (pid 4)
+      intr: "off"
+      satp: kernel
+      locks: [e1000.lock]
+      irq: {noff: 1, intena: 1}
+      stack: [usertrap, syscall, sys_send, net_tx_udp, e1000_transmit]
+      sp: {"on": kernel, detail: "`sp` = `0x3fffff7ef0`"}
+    note: |
+      Recorded at the publish fence (line 136 here, 140 in the final file), in a second
+      boot where pid 4 happened to run on hart 1: `tx[0]` = {addr = `0x87f33000`, length
+      = 43, cmd = 9, status = 0}, while TDT and TDH were still 0. 43 bytes is 14
+      (Ethernet) + 20 (IP) + 8 (UDP) + 1 byte of data; the card pads it to the 60-byte
+      minimum (`TCTL.PSP`). `cmd` 9 is EOP (this descriptor ends the packet) plus RS (set
+      DD when done).
+
+      The fence at line 136 is the "publish" fence of think question 3. The store at 139 is
+      the moment of hand-over: from then on slot 0 belongs to the card.
+
+      The next transmit in that boot (from inside an interrupt, the ARP reply) found TDT = 1
+      **and TDH = 1**, and slot 0's status back at 1: QEMU's model had already sent the
+      packet. A real card works in parallel with the CPU, and TDH would lag behind.
+  - title: IRQ 33, enabled on every hart
+    commit: 4
+    file: kernel/plic.c
+    lines: 11-33
+    focus: 14-29
+    diff: true
+    state:
+      hart: 0
+      mode: S
+      proc: none (boot)
+      intr: "off"
+      satp: kernel
+      locks: []
+      irq: 0
+      stack: [main, plicinithart]
+      sp: {"on": boot, detail: "`sp` = `0x80009920`"}
+    note: |
+      `E1000_IRQ` is 33 (`kernel/memlayout.h`, with the computation in its comment): QEMU
+      maps PCI pin INTA of device 1 to PLIC source 32 + (0 + 1) mod 4. Two things change
+      in the PLIC:
+
+      - [[plicinit]] (line 17) gives source 33 priority 1. Priority 0 means "never".
+      - `plicinithart` (line 29) sets bit 1 of the *second* 32-bit enable word: each word
+        enables 32 sources, and 33 is the second bit of sources 32-63.
+
+      gdb recorded line 29 on hart 0, 1 and 2 in turn, each enabling the source for its own
+      S-mode context. So the PLIC may offer IRQ 33 to any of the three harts, and whoever
+      claims first handles it; the next steps show that this is what happened.
+  - title: devintr claims 33
+    commit: 4
+    file: kernel/trap.c
+    lines: 187-214
+    focus: 196-212
+    diff: true
+    state:
+      hart: 2
+      mode: S
+      proc: nettest (pid 4), on its way to sleep in recv
+      intr: "off"
+      satp: kernel
+      locks: []
+      irq: 0
+      stack: [usertrap, syscall, sys_recv, kernelvec, kerneltrap, devintr]
+      sp:
+        "on": kernel
+        switched: "no switch: [[kernelvec]] pushed its 256-byte frame onto the stack hart 2 was already on, pid 4's kernel stack ([[kernel/kernelvec.S:14]])"
+        detail: "`sp` = `0x3fffff7dd0`"
+    note: |
+      pid 4 sent its byte on hart 2, entered `recv`, found the queue empty and registered
+      on the socket's channel. Before it got to sleep, slirp's ARP request arrived and gdb
+      stopped at line 203 on **hart 2**: `irq` = 33. That is the check of the IRQ number:
+      the card's interrupt arrives as 33.
+
+      The interrupt landed on pid 4's own hart, on pid 4's kernel stack, in the short stretch
+      after `recv` released its socket lock (noff 0, interrupts on) and before [[sleep]]
+      took `p->lock`. (gdb cannot unwind past [[kernelvec]]; the `sys_recv` frames are
+      reasoned from `sp`, which is inside pid 4's kernel stack, and from the order of the
+      breakpoints.) The irony is instructive: the frame is not even for pid 4. It is an ARP
+      request, and pid 4 is merely the process that happened to be running. Interrupt
+      handlers serve the device.
+
+      [[devintr]] calls `e1000_intr` and, afterwards, [[plic_complete]]. Between claim and
+      complete the PLIC will not offer IRQ 33 to any hart, so `e1000_intr` never runs on
+      two harts at once. The driver still takes `e1000.lock`, because the transmit path,
+      which any hart may run, shares the same structure.
+
+      The next interrupt of this run, the echo itself, landed on hart 1, idle in its
+      [[scheduler]], on hart 1's slice of `stack0`. In the measurement runs each hart
+      handled 424 to 869 of the roughly 1,800 interrupts per run.
+  - title: Harvest the filled slots under the lock
+    commit: 4
+    file: kernel/e1000.c
+    lines: 149-203
+    focus: 159-195
+    diff: true
+    state:
+      hart: 2
+      mode: S
+      proc: nettest (pid 4), interrupted
+      intr: "off"
+      satp: kernel
+      locks: [e1000.lock]
+      irq: {noff: 1, intena: 0, note: "an interrupt handler: SIE was already off when this `acquire` pushed the first level, so intena is 0 ([[concept:locks#intena]])"}
+      stack: [usertrap, syscall, sys_recv, kernelvec, kerneltrap, devintr, e1000_intr]
+      sp: {"on": kernel, detail: "`sp` = `0x3fffff7cc0`, below the `kernelvec` frame"}
+    note: |
+      Recorded at line 163: RDH = 1, RDT = 15. The card has filled slot 0 (the slot after
+      RDT) and moved its head to 1. Recorded at line 194, just before the RDT store of the
+      first iteration: `i` = 0, `n` = 1, the slot's length 60 (slirp's ARP request,
+      padded), status 0 again, and the buffer in the slot is a fresh page. The next
+      interrupt of the run found RDT = 0: slot 0 was the card's again.
+
+      Read in order:
+
+      - **ICR first** (163). The read clears the card's interrupt cause and lowers its line.
+        A packet that arrives later sets it again and raises a new interrupt.
+      - **The slot after the tail** (169), recomputed each time from RDT, which the loop
+        itself advances.
+      - **The consume fence** (175): nothing about the packet is read before DD.
+      - **A fresh page or a dropped packet** (179-187). [[kalloc]] never sleeps, so it is
+        allowed here. If memory runs out, the old buffer stays and the packet is lost.
+      - **The publish fence, then RDT** (191-194), as in transmit.
+      - **At most once around the ring** (168). A flood cannot keep this hart here
+        forever.
+
+      In the measurement runs, 87% of interrupts found exactly one packet, 9% two, 1% three,
+      and about 2% none: a packet that arrived after ICR was read was taken by the running
+      loop, and its own interrupt then found nothing.
+    others: |
+      Another hart may be in `e1000_transmit` for another process; it spins on
+      `e1000.lock` until line 197. The lock is held only for the ring work: a few hundred
+      instructions.
+  - title: Deliver outside the lock
+    commit: 4
+    file: kernel/e1000.c
+    lines: 149-203
+    focus: 197-202
+    state:
+      hart: 2
+      mode: S
+      proc: nettest (pid 4), interrupted
+      intr: "off"
+      satp: kernel
+      locks: []
+      irq: 0
+      stack: [usertrap, syscall, sys_recv, kernelvec, kerneltrap, devintr, e1000_intr]
+      sp: {"on": kernel}
+    note: |
+      Recorded at line 202: noff 0, SIE still 0 (this is still the interrupt handler), and
+      `lens[0]` = 60. The packets in `bufs` no longer belong to the ring, so they need
+      no lock, and `net_rx` is free to transmit. We ran a copy that calls it before the
+      release: `panic: acquire` on the first ARP request (think question 5).
+
+      At this commit `net_rx` (in `kernel/net.c`) frees the page: the driver works, but
+      nothing listens yet.
+  - title: Headers and byte order
+    commit: 5
+    file: kernel/net.h
+    lines: 1-46
+    focus: 5-21
+    diff: true
+    state:
+      hart: any
+      proc: "(the definitions)"
+      locks: []
+    note: |
+      Every multi-byte field on the wire is big-endian; RISC-V is little-endian.
+      `htons`/`htonl` reverse the bytes; `ntohs` and `ntohl` are the same operations under
+      the names that say which way the value travels.
+
+      The structs are `packed`: an IP header starts 14 bytes into the frame, so its
+      32-bit addresses sit at offsets 26 and 30, not multiples of 4. Packed tells the
+      compiler to assume nothing about alignment and to access them a byte at a time.
+
+      gdb shows what byte order means in practice. In the recorded `net_tx_udp`, `print
+      *udp` gave `sport = 53511, dport = 44904`: 53511 is `0xd107`, the bytes `07 d1` of
+      port 2001 read back as a little-endian number; 44904 is the echo port (`ECHOPORT`) the
+      same way.
+      `ip_len = 7424` is `0x1d00`, 29 bytes. The fields are right; it is the debugger that
+      reads them in the host's order.
+  - title: Answering ARP inside the interrupt
+    commit: 5
+    file: kernel/net.c
+    lines: 76-102
+    focus: 81-101
+    diff: true
+    state:
+      hart: 2
+      mode: S
+      proc: nettest (pid 4), interrupted
+      intr: "off"
+      satp: kernel
+      locks: []
+      irq: 0
+      stack: [usertrap, syscall, sys_recv, kernelvec, kerneltrap, devintr, e1000_intr, net_rx, arp_rx]
+      sp: {"on": kernel, detail: "`sp` = `0x3fffff7c90`"}
+    note: |
+      Slirp knows that the guest is `10.0.2.15`, but not its MAC address, so before it can
+      deliver the echo it broadcasts "who has 10.0.2.15? tell 10.0.2.2". In the recorded run
+      this was the very first frame xv6 received, *after* its first transmit: slirp asks
+      only when it has something to deliver.
+
+      `arp_rx` first checks that this really is an Ethernet/IPv4 request for us, with 6-
+      and 4-byte addresses (lines 84-86), then turns the request into the reply in the same
+      page: op 2, target = the old sender, sender = us. Recorded at line 100: `sha` =
+      `52:54:00:12:34:56`, `op` = 512 (2 in network order), `tip` = 33685514 =
+      `0x0202000a`, the bytes `0a 00 02 02`: 10.0.2.2.
+
+      The transmit happens from inside the interrupt: gdb recorded `e1000_transmit` on hart
+      2 with `e1000.lock` held, noff 1, **intena 0**, into slot 1. It is legal because
+      `e1000_intr` released the lock before calling `net_rx`.
+  - title: Checking an IPv4/UDP packet
+    commit: 5
+    file: kernel/net.c
+    lines: 112-139
+    focus: 119-138
+    diff: true
+    state:
+      hart: 1
+      mode: S
+      proc: none (interrupt on an idle hart)
+      intr: "off"
+      satp: kernel
+      locks: []
+      irq: 0
+      stack: [scheduler, kernelvec, kerneltrap, devintr, e1000_intr, net_rx, ip_rx]
+      sp: {"on": scheduler}
+    note: |
+      (State reasoned from the code: the call chain of the recorded `sock_rx` step, one
+      frame up, on hart 1.) Everything that arrives is checked before anyone trusts a
+      length: version 4 with a 20-byte header (`0x45`), protocol UDP, addressed to us, not a
+      fragment, a correct header checksum, and lengths that fit inside what the card
+      actually received. A UDP length larger than the frame would otherwise make `recv`
+      copy bytes past the end of the packet.
+
+      At this commit `udp_rx` (lines 104-110) drops the packet; commit 6 replaces it with
+      the socket layer. Recorded at commit 5: gdb stopped in `udp_rx` with the data `hello`
+      at `buf + 42`, sent from the host.
+  - title: Building a packet to send
+    commit: 5
+    file: kernel/net.c
+    lines: 14-74
+    focus: 17-22
+    diff: true
+    state:
+      hart: 2
+      mode: S
+      proc: nettest (pid 4)
+      intr: "on"
+      satp: kernel
+      locks: []
+      irq: 0
+      stack: [usertrap, syscall, sys_send, net_tx_udp]
+      sp: {"on": kernel, detail: "`sp` = `0x3fffff7f30`"}
+    note: |
+      Recorded at line 69 (commit 7): no lock held, interrupts on (`sstatus` =
+      `0x200000022`, SIE set), the normal state of a system call between critical sections.
+
+      The caller left 42 bytes free at the front of the page (`NET_HDRS`), so the headers are
+      written in front of the data without copying it (lines 51-67). Every frame goes to
+      `52:55:0a:00:02:02`, the MAC address with which slirp answers ARP for the host. That
+      works for the DNS server too, although slirp answers ARP for `10.0.2.3` with
+      `52:55:0a:00:02:03`: slirp accepts IP frames whatever their destination MAC. So xv6
+      needs no ARP requests of its own (a real network would; see "Further"). The UDP
+      checksum 0 means "none", which IPv4 allows; the IP header checksum is required, and
+      slirp checks it.
+  - title: Sockets, and the locks that guard them
+    commit: 6
+    file: kernel/socket.c
+    lines: 15-61
+    focus: 18-40
+    diff: true
+    state:
+      hart: any
+      proc: "(the definitions)"
+      locks: []
+    note: |
+      A socket is a port and a bounded queue of arrived packets. Two kinds of lock:
+
+      - `socktab.lock` protects *which socket has which port*: `bind` checks for a duplicate
+        and claims a free socket in one critical section.
+      - each `s->lock` protects that socket's queue (`head`, `n`, `q[]`); the `port` field
+        changes only with both locks held, so reading it under either is safe.
+
+      Port 0 means "free", which is why `sock_rx` drops packets for port 0 before it looks
+      (next step): otherwise they would be queued on a free socket, and the `bind` that
+      later takes it would start with `n = 0` and lose those pages. We sent 40 raw frames
+      to port 0 into a copy without that test (through QEMU's `-netdev dgram`, since
+      slirp's forwarding cannot produce port 0): free pages went from 32447 to 32431, a
+      bind/unbind of all 16 ports left 32431, and 40 more frames took it to 32415. With the
+      test, 32447 throughout.
+
+      `sockfind` returns the socket *locked*, while the caller still holds `socktab.lock`:
+      the order is `socktab.lock` → `s->lock` → `p->lock` (in [[wakeup]],
+      [[sleep_prepare]], [[killed]]). No path takes them in another order, and none of them
+      is taken while `e1000.lock` is held, so the network adds no cycle to the lock-order
+      graph of [[tour:51]].
+  - title: The interrupt queues the packet and wakes the reader
+    commit: 6
+    file: kernel/socket.c
+    lines: 63-96
+    focus: 68-95
+    diff: true
+    state:
+      hart: 1
+      mode: S
+      proc: none (interrupt on an idle hart)
+      intr: "off"
+      satp: kernel
+      locks: ["socket 2001's s->lock"]
+      irq: {noff: 1, intena: 0}
+      stack: [scheduler, kernelvec, kerneltrap, devintr, e1000_intr, net_rx, ip_rx, sock_rx]
+      sp: {"on": scheduler, detail: "`sp` = `0x8000a600`, hart 1's slice of `stack0`"}
+    note: |
+      Recorded at line 94, the second e1000 interrupt of the run, on hart 1, which was
+      idle: the echo of pid 4's byte (`sport` `ECHOPORT`, `len` 1) has been queued on port
+      2001's socket (`n` = 1), and [[wakeup]] is next. noff 1: `socktab.lock` was released
+      at line 76.
+
+      [[wakeup]] runs with `s->lock` held and takes each process's `p->lock` in turn
+      (noff 2 inside). It finds pid 4 with `chan` = `s` and makes it RUNNABLE. Because the
+      append and the wakeup happen under the lock that `recv` holds while it checks the
+      queue and registers on the channel (next step), the wakeup cannot fall between the
+      two. Clinic 3 removes this lock and loses wakeups.
+
+      A full queue drops the packet: the handler must not wait. No packet was dropped in
+      the measured runs; every socket there had one packet in flight at a time.
+    others: |
+      The cost of waking under the lock, measured: about 1,500 contended acquisitions of
+      socket locks per `nettest` run; in about 80% of them the waiter was a process, not
+      the handler. In two boots, 42% and 26% came right after `sleep()` returned (the
+      re-acquire, line 224 here): the woken process got a hart quickly and found `s->lock`
+      still held, most likely by the handler still inside [[wakeup]]'s scan of all 64
+      process slots. (Measured on a kernel without three of the branch's fixes, listed in
+      Verify; the locking is the same.)
+  - title: recv sleeps without losing the wakeup
+    commit: 6
+    file: kernel/socket.c
+    lines: 185-247
+    focus: 203-225
+    diff: true
+    state:
+      hart: 2
+      mode: S
+      proc: nettest (pid 4)
+      intr: "off"
+      satp: kernel
+      locks: ["socket 2001's s->lock"]
+      irq: {noff: 1, intena: 1}
+      stack: [usertrap, syscall, sys_recv]
+      sp: {"on": kernel, detail: "`sp` = `0x3fffff7f50`"}
+    note: |
+      Recorded at line 221, just before the interrupt of the "devintr" step: pid 4 on hart
+      2, port 2001, `n` = 0, holding only its socket's lock (noff 1, intena 1: a system
+      call).
+
+      The loop is [[virtio_disk_rw]]'s, with `s` as the channel:
+
+      1. give up if the port was unbound (and perhaps bound to another port) or the process
+         killed (215-218): [[kkill]] makes a sleeper runnable but does not clear its
+         channel, so the loop must look, also when packets are queued;
+      2. stop waiting if a packet is queued (219-220);
+      3. `sleep_prepare(s)` *while holding `s->lock`* (221);
+      4. release, [[sleep]], re-acquire, around again (222-224).
+
+      Any `sock_rx` for this socket either finished before the check (the queue is not
+      empty) or waits for `s->lock` until step 3 is done, so its [[wakeup]] finds `p->chan`
+      = `s` and clears it. [[sleep]] then returns at once, or wakes from SLEEPING. In this
+      run the ARP interrupt hit pid 4's hart between line 222 and the
+      `acquire` inside [[sleep]]; the echo came on hart 1.
+
+      One window stays open, the same as in [[piperead]]: a `kill` after the `killed(p)`
+      check and before [[sleep]] finds the process not yet SLEEPING, so it only sets
+      `killed`; the process then sleeps until the next wakeup.
+
+      After the loop the packet comes off the queue under the lock, and the copy to user
+      space happens with no lock held (236-246): [[copyout]] may fault in a lazily
+      allocated heap page, and there is no reason to make the interrupt handler wait for
+      it.
+  - title: The test, with a watchdog
+    commit: 7
+    file: user/nettest.c
+    lines: 66-134
+    focus: 117-134
+    diff: true
+    state:
+      hart: any
+      mode: U
+      proc: nettest (pid 3) and its children
+      intr: "on"
+      satp: user
+      locks: []
+      stack: [main, run, parallel]
+      sp: {"on": user}
+    note: |
+      The three-process check: three children, one per hart if the scheduler places them
+      so, each with its own port (2010-2012), each doing 300 round trips with lengths from
+      1 to 1472 bytes. Every byte of every echo is compared with what was sent, and
+      the pattern depends on the child's number, so a packet delivered to the wrong
+      socket fails the comparison.
+
+      `run` (lines 69-90) forks the check and a watchdog that kills it after a time limit;
+      a lost packet becomes `FAIL (timed out)` instead of a hang, and the next check still
+      runs. This mattered: in Clinics 1, 3 and 5 the watchdog turned every stall into a
+      line of output.
+
+      Every check first calls `unbind` on its ports. A process left over from an earlier,
+      failed run may still sleep in `recv` there; `unbind` wakes it and frees the port.
+      Without that, one failure would make every later run fail at `bind`, which is a false
+      claim of its own.
+
+      The host side is `nettest.py` at the top of the tree: `echo PORT` sends every
+      packet back; `ping FWDPORT N` times round trips to `nettest server N`.
+verify: |
+  On the branch (`ext/25-e1000`, 7 commits), built with the project toolchain and run on 3
+  harts (`-smp 3 -m 128M`), with `python3 nettest.py echo ECHOPORT 600` on the host:
+
+  ```text
+  $ nettest ECHOPORT
+  nettest: one round trip: OK
+  nettest: 100 round trips: OK
+  nettest: 3 processes x 300 round trips: OK
+  nettest: kill wakes recv: OK
+  nettest: dns: pdos.csail.mit.edu is 128.52.129.126
+  nettest: dns query to 10.0.2.3: OK
+  nettest: 1000 round trips of 64 bytes took 3 ticks
+  nettest: ALL OK
+  $ usertests -q
+  usertests starting
+  ALL TESTS PASSED
+  $ nettest ECHOPORT
+  nettest: one round trip: OK
+  nettest: 100 round trips: OK
+  nettest: 3 processes x 300 round trips: OK
+  nettest: kill wakes recv: OK
+  nettest: dns: pdos.csail.mit.edu is 128.52.129.126
+  nettest: dns query to 10.0.2.3: OK
+  nettest: 1000 round trips of 64 bytes took 1 ticks
+  nettest: ALL OK
+  ```
+
+  And the host-side ping against `nettest server 1000`:
+
+  ```text
+  $ nettest server 1000
+  nettest server: echoing 1000 packets on port 2000
+  nettest server: done
+  # on the host:
+  nettest.py: 1000 round trips: OK
+  ```
+
+  Every commit was built on its own, and `usertests -q` printed `ALL TESTS PASSED` on 3
+  harts at each of commits 1 to 6 as well. `nettest` printed `ALL OK` on all three boots
+  of the head that ran it (the run above and two gdb traces). A kernel without three of
+  the branch's fixes (the transmit "full" test, port 0, the port re-check in `recv`)
+  passed the same sequence, and `nettest` on all 8 boots of its measurement copies.
+
+  The fixes themselves were checked with scratch copies: Clinic 6's run for the
+  transmit ring, and the port-0 frames described in the reveal step on sockets. Clinics 1
+  to 5 were run on a kernel without those fixes; none of the fixes touches the code those
+  clinics change.
+
+  **DNS**: slirp's DNS server at `10.0.2.3` forwards queries to the DNS resolver the host
+  itself uses, and every recorded run got an answer. On a host without a working
+  resolver this check fails and the test says so (`ALL OK except dns`).
+
+  What this demonstrates: packets go both ways through both rings, many times around;
+  three processes on three harts send and receive at once without a packet reaching the
+  wrong socket or a byte changing; `kill` ends a `recv`; and the rest of the kernel is
+  unaffected. It does not demonstrate the absence of races: Clinic 3's lost wakeup passed
+  9 of 9 runs without help, and Clinic 2's missing fences cannot fail on QEMU at all.
+measure: |
+  **Round-trip latency, from the host.** `nettest server 1000` in xv6, `nettest.py ping
+  FWDPORT 1000` on the host, which times each round trip with `time.perf_counter`. The
+  head and a kernel without the three fixes listed in Verify, booted alternately, three
+  times each (measured while the computer was busy with other work; timings on QEMU
+  depend on what else the computer is doing, so yours will differ):
+
+  | kernel | boot | min | median | 99th percentile | max |
+  |---|---|---|---|---|---|
+  | before the fixes | 1 | 166 µs | 253 µs | 925 µs | 96,946 µs |
+  | head | 1 | 131 µs | 243 µs | 345 µs | 19,155 µs |
+  | before the fixes | 2 | 132 µs | 217 µs | 815 µs | 19,546 µs |
+  | head | 2 | 137 µs | 219 µs | 848 µs | 38,970 µs |
+  | before the fixes | 3 | 157 µs | 229 µs | 375 µs | 11,400 µs |
+  | head | 3 | 122 µs | 149 µs | 275 µs | 40,566 µs |
+
+  The extra register read of TDH in every transmit makes no difference that this
+  measurement can see; the spread between boots of the same kernel is larger. On a
+  quieter computer, three boots of the kernel without the fixes gave medians of 142, 163
+  and 202 µs.
+
+  A round trip crosses the host's kernel twice, slirp twice, the e1000 model twice, one
+  xv6 interrupt, a wakeup, a context switch into the server, and two system calls. The
+  rare maxima of 10-100 ms are host scheduling delays (QEMU's threads share the
+  computer with other work). Inside xv6, `nettest`'s 1000 round trips of 64 bytes took 1
+  to 4 ticks of about 0.1 s in the runs without gdb, which agrees within the clock's
+  resolution.
+
+  **Where the work and the waiting go.** A measurement copy (not on the branch, built
+  without the three fixes, which change nothing these counters see) counts,
+  per hart, e1000 interrupts, packets per interrupt, transmits, full transmit rings,
+  dropped packets, and contended spinlock acquisitions (an [[acquire]] whose first
+  `amoswap` failed); Ctrl-P prints and resets the counters. One run of `nettest` per
+  boot, six boots:
+
+  | per run | values |
+  |---|---|
+  | packets received / sent | 2,003 / 2,003 every run (2,001 echoes, 1 ARP, 1 DNS) |
+  | e1000 interrupts | 1,803 to 1,838 |
+  | interrupts per hart | between 424 and 869; every hart took a share in every run |
+  | packets per interrupt: 0 / 1 / 2 / 3 | about 30 / 1,600 / 165 / 20 |
+  | full transmit ring | 0 |
+  | packets dropped by a full socket queue | 0 |
+  | `recv` calls that had to sleep | 641 to 923 of about 2,000 |
+
+  Contended acquisitions per run (the last three boots also recorded whether the waiter
+  was the interrupt handler):
+
+  | lock | contended | of which the handler waited |
+  |---|---|---|
+  | `e1000.lock` | 176 to 196 | 26 to 44 |
+  | `socktab.lock` | 175 to 226 | 119 to 154 |
+  | the socket locks | 1,450 to 1,561 | 257 to 303 |
+  | for scale: `kmem.lock` | 18 to 29 | |
+
+  - **Interrupts spread over all harts.** The PLIC offers IRQ 33 to every hart and the
+    first to claim wins; in the trace that was always a hart idle in its scheduler.
+  - **The ring never filled.** QEMU's card sends during the TDT write, so a transmit
+    always finds TDH right behind TDT. On real hardware, with a card that runs in
+    parallel, a burst from three harts can get 15 packets ahead of it, and then the -1
+    path is taken; without the "slot after TDT is TDH" test the 16th packet would lock
+    the ring up for good (Clinic 6).
+  - **The busiest locks are the sockets', and the waiters are mostly processes.** Two more
+    boots recorded where each contended socket-lock acquisition came from: 1,379 and
+    1,503 in all, of which 797 and 1,107 in `sockfind` (both `recv`'s lookup and the
+    handler's) and 582 and 396 in `recv`'s re-acquire right after `sleep()` returned. A
+    process woken by `sock_rx` is runnable *before* `sock_rx` releases `s->lock`, because
+    [[wakeup]] continues through all 64 process slots, each under its `p->lock`. If an
+    idle hart picks the process up quickly, it spins on the lock its waker still holds.
+    That explanation is reasoned from the code; the counts are measured. Waking after the
+    release, or remembering the one waiting process instead of scanning all of them,
+    would shorten it (see "Further").
+  - **The cost of the network for the rest of the kernel is small.** `kmem.lock`, shared
+    with everything, was waited for 18 to 29 times per run.
+further: |
+  - **Wake without scanning.** Store the waiting process in the socket and wake only it,
+    or call `wakeup` after releasing `s->lock` (and argue why that is still safe with
+    `sleep_prepare`). Measure the socket-lock contention again.
+  - **A real ARP cache.** Send ARP requests for the next hop, keep a small table with
+    timeouts, and queue packets while a request is outstanding. This is what makes the
+    stack work on a network that is not slirp.
+  - **Transmit back-pressure.** When the transmit ring is full (15 packets in flight),
+    `send` returns -1. Make it sleep instead, enable the card's transmit-done interrupt
+    (TXDW), and wake senders from the handler. Test it with Clinic 6's switch that stops
+    the card. Then think about who frees transmitted pages when no one sends for a while.
+  - **ICMP.** Answer pings (`ping 10.0.2.15` does not reach the guest through slirp, but
+    `hostfwd` and a small host script can deliver an echo request), and turn "port
+    unreachable" into an error that `recv` reports instead of waiting forever, as Clinic 5
+    would have wanted.
+  - **Sockets as file descriptors.** Make `bind` return a file descriptor so that `read`,
+    `write`, `close` and `exit` handle sockets, and a process that dies frees its port
+    automatically.

@@ -1,0 +1,769 @@
+title: Sleep/wakeup and sleep-locks
+summary: How this tree's sleep_prepare, sleep and wakeup avoid lost wakeups without passing a lock to sleep, why every sleep sits in a loop, and how sleep-locks are built on top of them.
+questions:
+  - id: slp-01
+    level: 1
+    type: choice
+    q: |
+      `wc` finds the pipe empty, and [[piperead]] calls `sleep_prepare(&pi->nread)` on line
+      124. Right after that call returns, what has changed?
+    code: kernel/pipe.c:118-128@124
+    options:
+      - text: "wc's p->chan is &pi->nread. wc is still RUNNING and still holds pi->lock."
+        correct: true
+        why: |
+          [[sleep_prepare]] only records the channel, under `p->lock`, and releases `p->lock`
+          again. It does not touch `p->state`, and the caller's `pi->lock` is released by the
+          caller itself on the next line.
+      - text: wc is SLEEPING, and pi->lock has been released for it.
+        why: |
+          You may be thinking of the MIT book's `sleep(chan, lk)`, which did both. In this tree
+          [[sleep_prepare]] only registers; the state changes later, inside [[sleep]], and the
+          caller releases `pi->lock` itself (line 125).
+      - text: "wc's p->chan is set, and wc still holds its own p->lock until it calls sleep()."
+        why: |
+          You may have thought `p->lock` stays held from registration to sleep. sleep_prepare
+          releases it before returning ([[kernel/proc.c:555]]); [[sleep]] takes it again.
+      - text: wc has been put on a queue of processes waiting for the pipe.
+        why: |
+          You may have expected a wait queue. There is none: the only record is `p->chan` in
+          wc's own `struct proc`, and [[wakeup]] finds waiters by scanning all 64 slots.
+    explain: |
+      Registration and sleeping are two separate steps here. [[sleep_prepare]] says "a wakeup
+      on this channel concerns me" while the caller still holds the condition lock; [[sleep]]
+      goes to sleep later only if no wakeup has cleared the registration
+      ([[concept:locks#sleep-wakeup]]).
+
+  - id: slp-02
+    level: 1
+    type: tf
+    q: |
+      True or false: in this kernel, the caller passes its condition lock to [[sleep]], and
+      `sleep` releases it before the process goes to sleep.
+    answer: false
+    why_tf: |
+      You may have learned sleep and wakeup from the MIT xv6 book, where it is
+      `sleep(chan, lk)`. This tree split that into [[sleep_prepare]] and a `sleep` with no
+      arguments.
+    reasons:
+      - text: "sleep takes no arguments (void sleep(void)); the caller releases its own condition lock between sleep_prepare and sleep."
+        correct: true
+        why: |
+          See [[kernel/proc.c:561-572]] and any caller, for example [[kernel/pipe.c:124-126]]:
+          `sleep_prepare`, then `release(&pi->lock)`, then `sleep()`.
+      - text: sleep takes only the channel; the caller keeps holding its lock while asleep.
+        why: |
+          sleep takes no channel either (the channel was given to sleep_prepare), and no
+          spinlock other than `p->lock` may be held at the switch: [[sched]] panics with
+          `sched locks`.
+      - text: "It's true: sleep(chan, lk) releases lk after taking p->lock, so no wakeup is lost."
+        why: |
+          That describes older xv6, not this commit. Here `sleep` never sees the condition lock.
+    explain: |
+      `sleep_prepare(chan)` registers while the condition lock is held, the caller releases
+      the lock, and `sleep()` decides under `p->lock` whether to sleep. No lock is passed
+      anywhere ([[concept:locks#sleep-wakeup]], [[tour:16]]).
+
+  - id: slp-03
+    level: 1
+    type: choice
+    q: |
+      [[wakeup]] finds a process that is `SLEEPING` with `p->chan` equal to the channel. What
+      state does it give that process?
+    code: kernel/proc.c:574-595@589-591
+    options:
+      - text: RUNNABLE
+        correct: true
+        why: |
+          Line 590 sets `RUNNABLE`: the process may now be picked by some hart's scheduler. It
+          does not run until a scheduler chooses it.
+      - text: RUNNING
+        why: |
+          You may have believed the comment on lines 587-588, which says "set it back to
+          RUNNING". The comment is out of date; the code sets `RUNNABLE`. Only a scheduler,
+          holding `p->lock`, makes a process `RUNNING`.
+      - text: It stays SLEEPING; only p->chan is cleared, and the scheduler runs any process whose chan is 0.
+        why: |
+          You may have confused the two cases. Clearing chan alone is what happens to a process
+          that has *not* gone to sleep yet. A `SLEEPING` one is also made `RUNNABLE`, because the
+          scheduler only looks at `p->state`.
+      - text: USED
+        why: |
+          `USED` is the state of a slot that [[allocproc]] is still building. A woken process
+          is ready to run, which is `RUNNABLE`.
+    explain: |
+      wakeup does two things to each matching process: it clears `p->chan`, and if the
+      process is `SLEEPING` it makes it `RUNNABLE`. Which hart runs it, and when, is up to the
+      schedulers ([[concept:locks#sleep-wakeup]]).
+
+  - id: slp-04
+    level: 1
+    type: choice
+    q: |
+      [[piperead]] sleeps on the channel `&pi->nread`. When [[pipewrite]] calls
+      `wakeup(&pi->nread)`, what does [[wakeup]] do with the integer stored at that address?
+    options:
+      - text: Nothing. It only compares the address with each process's p->chan.
+        correct: true
+        why: |
+          A channel is just a number both sides agree on. Line 582 compares pointers; nothing
+          is read from or written to `pi->nread` by wakeup.
+      - text: It reads nread to check whether the reader has data, and wakes the reader only if so.
+        why: |
+          You may have thought wakeup knows the condition. It doesn't; it wakes every process
+          registered on the address, and each sleeper re-checks the condition itself.
+      - text: It sets pi->nread to 0, which marks the channel as signalled.
+        why: |
+          You may have confused the channel with `p->chan`. wakeup sets the *sleeper's*
+          `p->chan` to 0; the channel's own memory is untouched.
+      - text: It increments it, counting the number of wakeups.
+        why: |
+          There is no counter of wakeups anywhere. If nobody is registered, a wakeup leaves no
+          trace at all.
+    explain: |
+      A channel is an address used as a name. Using the address of the field the condition is
+      about (`nread`) makes the name unique and easy to agree on, but any non-zero address
+      would work ([[g:sleep-wakeup]], [[concept:locks#sleep-wakeup]]).
+
+  - id: slp-05
+    level: 1
+    type: choice
+    q: |
+      Why must [[piperead]] release `pi->lock` (line 125) before it calls [[sleep]] (line 126)?
+    code: kernel/pipe.c:118-128@125-126
+    options:
+      - text: The writer needs pi->lock to add data and wake the reader, and sched refuses to switch away while any spinlock other than p->lock is held.
+        correct: true
+        why: |
+          Holding `pi->lock` while asleep would leave the writer spinning with interrupts off,
+          waiting for a sleeper that only the writer can wake. [[sched]] catches it first:
+          noff would be 2, and it panics with `sched locks`.
+      - text: Because sleep() needs interrupts on, and releasing the lock turns them on.
+        why: |
+          You may have thought sleeping needs interrupts on. [[sleep]] immediately takes
+          `p->lock`, which turns them off again, and [[sched]] *requires* them off.
+      - text: So that sleep() can acquire pi->lock itself and release it at the right moment.
+        why: |
+          You may be thinking of the older `sleep(chan, lk)`. This tree's [[sleep]] never sees
+          the condition lock.
+      - text: It isn't required; holding it would only make other readers wait longer.
+        why: |
+          Holding it is fatal, not slow: [[sched]] panics with `sched locks`, and without that
+          check the writer and the reader would wait for each other forever.
+    explain: |
+      Only one spinlock may cross a context switch, the process's own `p->lock`. Every
+      condition lock is released between [[sleep_prepare]] and [[sleep]]
+      ([[concept:locks#rules]], [[tour:16]]).
+
+  - id: slp-06
+    level: 1
+    type: multi
+    q: |
+      Which of these are true of a [[g:sleeplock|sleep-lock]] but *not* of a spinlock, in this
+      kernel?
+    options:
+      - text: A process that finds it held gives up the CPU instead of spinning.
+        correct: true
+        why: |
+          [[acquiresleep]] calls [[sleep]] while the lock is held by someone else
+          ([[kernel/sleeplock.c:25-30]]).
+      - text: Its holder may go to sleep, for example while waiting for a disk read, without breaking any rule.
+        correct: true
+        why: |
+          Owning a sleep-lock is just `locked = 1` in memory and adds nothing to noff, so
+          [[sched]] allows it. [[bread]] holds a buffer's sleep-lock across the disk read.
+      - text: Its owner is recorded as a process ID.
+        correct: true
+        why: "`lk->pid` ([[kernel/sleeplock.c:32]]); a spinlock records a hart (`lk->cpu`)."
+      - text: Interrupts stay off on the holder's hart for as long as it is held.
+        why: |
+          That is true of a spinlock, not a sleep-lock. The inner spinlock `lk->lk` is held only
+          inside [[acquiresleep]] and [[releasesleep]]; a process holding the sleep-lock runs
+          with interrupts on.
+      - text: An interrupt handler may acquire it.
+        why: |
+          It's the other way round: handlers do take spinlocks (`tickslock`, `cons.lock`...),
+          but never a sleep-lock, because acquiring one may sleep and a handler is not a process
+          that can sleep.
+    explain: |
+      A sleep-lock is a flag and a pid guarded by a small spinlock. Its waiters sleep, so it
+      can be held for a long time, but only processes can use it
+      ([[concept:locks#sleep-locks]], [[tour:17]]).
+
+  - id: slp-07
+    level: 1
+    type: match
+    q: |
+      Match each place that sleeps with the channel it registers on.
+    pairs:
+      - left: "[[piperead]], pipe empty"
+        right: "&pi->nread"
+        why: "[[kernel/pipe.c:124]]. Writers wake it after adding bytes."
+      - left: "[[pipewrite]], pipe full"
+        right: "&pi->nwrite"
+        why: "[[kernel/pipe.c:90]]. Readers wake it after taking bytes (line 140)."
+      - left: "[[consoleread]], no complete line yet"
+        right: "&cons.r"
+        why: "[[kernel/console.c:104]]. [[consoleintr]] wakes it when a line, Ctrl-D or a full buffer arrives."
+      - left: "[[sys_pause]], not enough ticks yet"
+        right: "&ticks"
+        why: "[[kernel/sysproc.c:83]]. [[clockintr]] on hart 0 calls `wakeup(&ticks)` on every tick."
+      - left: "[[kwait]], children still running"
+        right: "p, the waiting parent's own struct proc"
+        why: "[[kernel/proc.c:414]]. A child's [[kexit]] calls `wakeup(p->parent)`."
+      - left: "[[acquiresleep]], lock held by someone else"
+        right: "lk, the sleep-lock itself"
+        why: "[[kernel/sleeplock.c:26]]. [[releasesleep]] calls `wakeup(lk)`."
+    explain: |
+      Sleeper and waker must agree on one address. The usual choice is the address of the
+      thing the condition is about: a counter, a buffer index, the lock, or the parent's own
+      process slot ([[concept:locks#sleep-wakeup]]).
+
+  - id: slp-08
+    level: 1
+    type: choice
+    q: |
+      Line 119 of [[piperead]] is a `while`, not an `if`. Why?
+    code: kernel/pipe.c:111-128@119
+    options:
+      - text: A return from sleep() only means something happened on the channel, or the process was killed; the pipe may still be empty, so the condition must be tested again.
+        correct: true
+        why: |
+          Another reader may have taken the bytes first, [[kkill]] may have woken the process
+          with no data, or a zero-byte write may have called wakeup. Only a fresh test under
+          `pi->lock` tells the truth.
+      - text: Because wakeup wakes only one sleeper at a time, and the loop gives the others their turn.
+        why: |
+          You may have thought wakeup picks one process. It wakes *every* process registered on
+          the channel ([[kernel/proc.c:580-594]]), which is one reason the loop is needed.
+      - text: Because sleep() sometimes returns on its own when a timer interrupt hits the sleeping process.
+        why: |
+          A sleeping process is not running, so no timer interrupt lands "in" it. Only a
+          [[wakeup]] on its channel or [[kkill]] makes it runnable.
+      - text: Because sleep() returns with pi->lock released, and the while re-acquires it.
+        why: |
+          The loop body re-acquires it on line 127; that is not why the test is a `while`. The
+          point is that the condition must be re-checked after re-acquiring.
+    explain: |
+      Wakeups are hints. Every sleeper in xv6 re-takes the condition lock and re-tests the
+      condition, and the ones that may wait indefinitely also test [[killed]] inside the loop
+      ([[concept:locks#sleep-wakeup]], [[tour:16]]).
+
+  - id: slp-09
+    level: 2
+    type: order
+    q: |
+      `wc` reads from an empty pipe whose writer is still open and goes to sleep. Put the
+      steps in order.
+    code: kernel/pipe.c:111-128
+    items:
+      - text: "acquire(&pi->lock)"
+        why: Nothing about the pipe may be read before the condition lock is held.
+      - text: "see nread == nwrite with writeopen set, and killed() returning 0"
+        why: The condition is tested under the lock, before deciding to wait.
+      - text: "sleep_prepare(&pi->nread): p->chan is set under p->lock"
+        why: Registration must happen while pi->lock is still held, so no writer can slip in between the test and the registration.
+      - text: "release(&pi->lock)"
+        why: The writer needs the lock; it is released only after registering.
+      - text: "sleep(): under p->lock, p->chan is still set, so p->state = SLEEPING"
+        why: sleep decides whether to sleep by looking at p->chan, after the condition lock is gone.
+      - text: "sched() switches to this hart's scheduler"
+        why: The state must be SLEEPING before sched is called; sched panics if it is still RUNNING.
+      - text: "the scheduler releases wc's p->lock"
+        why: The lock taken in sleep() crosses the switch and is released by the scheduler, after wc is off its stack.
+    why_wrong: Ask for each step which lock must already be held, or already released, for it to be safe.
+    explain: |
+      Test and register under the condition lock, release it, then decide under `p->lock`.
+      The `p->lock` taken in [[sleep]] is handed across [[swtch]] and released by the
+      scheduler ([[concept:locks#handoff]], [[concept:locks#sleep-wakeup]]).
+
+  - id: slp-10
+    level: 2
+    type: line
+    q: |
+      A process has called [[sleep_prepare]] but not yet [[sleep]]; it is still `RUNNING`.
+      Another hart calls [[wakeup]] on its channel. Click the line of `wakeup` that makes the
+      process's coming `sleep()` return without sleeping.
+    code: kernel/proc.c:574-595
+    answer: 585
+    lines:
+      590: |
+        This line runs only if the process is `SLEEPING`. Ours is `RUNNING`, so the state is
+        left alone. What saves it is the cleared channel.
+      582: |
+        This line only *compares* the channel. Something must change for `sleep()` to notice
+        later.
+      581: |
+        Taking `p->lock` makes the check safe, but changes nothing by itself.
+      593: |
+        Releasing `p->lock` lets the process continue into [[sleep]], but `sleep` returns early
+        only because of what was done before the release.
+    why_wrong: Look at what sleep() tests on line 567, and find the line here that changes it.
+    explain: |
+      Line 585 sets `p->chan = 0`. [[sleep]] tests `p->chan != 0` under the same `p->lock`
+      ([[kernel/proc.c:567]]); seeing 0, it returns at once. So a wakeup that lands between the
+      caller's release of its condition lock and `sleep()` is not lost
+      ([[concept:locks#sleep-wakeup]]).
+
+  - id: slp-11
+    level: 2
+    type: choice
+    q: |
+      `wc` is between lines 125 and 126 of `pipe.c`: registered on `&pi->nread`, `pi->lock`
+      released, `sleep()` not yet called. On another hart, `cat` takes `pi->lock`, writes 512
+      bytes and calls `wakeup(&pi->nread)`. What happens to `wc`?
+    code: kernel/pipe.c:118-128@125-126
+    options:
+      - text: wakeup clears wc's p->chan and leaves it RUNNING; wc's sleep() sees chan == 0 and returns at once, and the loop finds the data.
+        correct: true
+        why: |
+          This is the window the split design was built for. The registration was already in
+          place, so the wakeup finds it, and [[sleep]] turns it into "already woken".
+      - text: wakeup finds no SLEEPING process on the channel and does nothing, so wc sleeps until the next write.
+        why: |
+          You may have thought wakeup only looks at sleeping processes. It matches on `p->chan`,
+          whatever the state, and clears it. That is exactly what prevents this lost wakeup.
+      - text: wakeup spins on wc's p->lock until wc has gone to sleep, then makes it RUNNABLE.
+        why: |
+          You may have thought wc holds its `p->lock` in this gap. It holds no lock at all
+          between lines 125 and 126, so wakeup gets the lock immediately.
+      - text: wakeup sets wc RUNNABLE while it is still running, so two harts may end up running it.
+        why: |
+          wakeup changes the state only of a `SLEEPING` process (line 589). A `RUNNING` process
+          keeps its state; only its `chan` is cleared.
+    explain: |
+      In this tree `p->chan != 0` means "registered", not "asleep". A wakeup in the gap clears
+      the registration, and [[sleep]] checks it under `p->lock` before sleeping
+      ([[concept:locks#sleep-wakeup]], [[tour:16]]).
+
+  - id: slp-12
+    level: 2
+    type: choice
+    q: |
+      When [[pipewrite]] finds the pipe full, it calls `wakeup(&pi->nread)` on line 89 before
+      it registers on `&pi->nwrite` and sleeps. What could happen without line 89?
+    code: kernel/pipe.c:76-109@89
+    options:
+      - text: A reader asleep since the pipe was empty would never hear about the 512 bytes this write put in, and writer and reader would each sleep waiting for the other.
+        correct: true
+        why: |
+          The reader is woken only by a `wakeup(&pi->nread)`. The one on line 105 runs when the
+          write finishes, and the write cannot finish until a reader makes room. Line 89 breaks
+          that circle.
+      - text: Nothing; line 105 wakes the reader anyway.
+        why: |
+          You may have overlooked when line 105 runs: only after the `while` loop ends, that is,
+          after all `n` bytes are written. A writer stuck on a full pipe never gets there.
+      - text: The writer would panic with "sched locks", because it still holds pi->lock.
+        why: |
+          Line 91 releases `pi->lock` before `sleep()` whether or not line 89 is there. The
+          wakeup has nothing to do with the lock rules.
+      - text: The reader would wake, but read stale bytes, because wakeup is what makes the writes visible.
+        why: |
+          You may have thought wakeup publishes data. Visibility comes from `pi->lock`: the
+          release's fence makes the bytes visible to the next holder. wakeup only changes
+          process states.
+    explain: |
+      Before sleeping on a condition, make sure the party that can change it has been told
+      everything it needs. Here the writer announces its bytes before waiting for room
+      ([[tour:16]], [[tour:39]]).
+
+  - id: slp-13
+    level: 2
+    type: multi
+    q: |
+      A reader is `SLEEPING` in [[piperead]], registered on `&pi->nread`. Which of these
+      events can make it `RUNNABLE`?
+    options:
+      - text: A process writing into the same pipe with pipewrite.
+        correct: true
+        why: "[[pipewrite]] calls `wakeup(&pi->nread)` on line 89 (pipe full) and line 105 (write done)."
+      - text: "The pipe's write end being closed for the last time (pipeclose with writable = 1)."
+        correct: true
+        why: "[[pipeclose]] sets `writeopen = 0` and calls `wakeup(&pi->nread)` (line 64), so the reader can see end of file."
+      - text: Another process calling kill() on the reader.
+        correct: true
+        why: "[[kkill]] makes any `SLEEPING` victim `RUNNABLE`, whatever its channel ([[kernel/proc.c:612-615]])."
+      - text: A timer tick on hart 0.
+        why: |
+          You may have thought ticks wake all sleepers. [[clockintr]] calls `wakeup(&ticks)`,
+          which matches only processes registered on `&ticks`, such as those in `pause`.
+      - text: Another reader of the same pipe finishing its piperead.
+        why: |
+          A reader that finishes calls `wakeup(&pi->nwrite)` (line 140), to tell *writers* there
+          is room. A different address, so it does not touch processes on `&pi->nread`.
+    explain: |
+      [[wakeup]] wakes exactly the processes whose `p->chan` equals the address it is given;
+      [[kkill]] is the one way to wake a sleeper regardless of channel
+      ([[concept:locks#sleep-wakeup]]).
+
+  - id: slp-14
+    level: 2
+    type: number
+    q: |
+      One call to [[wakeup]] runs on a machine where exactly one process is registered on the
+      channel. How many times does that call execute `acquire(&p->lock)`?
+    code: kernel/proc.c:574-595
+    answer: 64
+    wrong:
+      1: |
+        You may have thought wakeup goes straight to the sleeper. It has no list of sleepers;
+        it scans the whole process table and must lock every slot to read `p->chan` safely.
+      63: |
+        You may have expected wakeup to skip the calling process. This one does not: the loop
+        on line 580 visits every slot, the caller's own included.
+      2: |
+        Counting the sleeper plus the caller? The loop locks every one of the `NPROC` slots,
+        used or not.
+    why_wrong: Read the loop bounds on line 580 and look at what the body does on every iteration.
+    explain: |
+      The loop runs over all `NPROC` = 64 slots and takes each one's `p->lock`, whatever its
+      state. Simple and correct, but every wakeup costs 64 lock round trips, which is why
+      `p->lock` is by far the most-taken lock in the measured run
+      ([[concept:locks#lock-proc]]).
+
+  - id: slp-15
+    level: 2
+    type: number
+    q: |
+      `ls` holds an inode's sleep-lock and a buffer's sleep-lock, and goes to sleep in
+      [[virtio_disk_rw]] waiting for the disk (line 290). When [[sched]] checks
+      `mycpu()->noff` on line 487, what value does it find?
+    code: kernel/virtio_disk.c:286-292
+    answer: 1
+    wrong:
+      3: |
+        You may have counted the two sleep-locks. Owning a sleep-lock adds nothing to noff:
+        its inner spinlock was released at the end of [[acquiresleep]].
+      2: |
+        You may have thought `disk.vdisk_lock` is still held. Line 289 releases it before
+        `sleep()`; otherwise sched would panic.
+      0: |
+        [[sleep]] took `ls`'s own `p->lock` on line 566 and still holds it: that is the one
+        level sched requires.
+    why_wrong: Count only the spinlocks this hart holds at that moment (and any push_off still open).
+    explain: |
+      Exactly one: `ls`'s own `p->lock`. Sleep-locks are not spinlocks and are not counted, so
+      holding them across a sleep is allowed; any other spinlock would make sched panic with
+      `sched locks` ([[concept:locks#sleep-locks]], [[tour:17]]).
+
+  - id: slp-16
+    level: 2
+    type: state
+    q: |
+      A process is writing to the console. In [[uartwrite]] it holds `tx_lock` (a sleep-lock)
+      and has just returned from `sleep_prepare(&tx_chan)` on line 86; it is about to read
+      `LSR` on line 87. What is the state of its hart?
+    code: kernel/uart.c:79-96@87
+    state:
+      mode: S
+      stack: kernel
+      satp: kernel
+      sie: "on"
+      noff: 0
+      intena: "-"
+    why:
+      sie: |
+        You may have thought holding a lock always means interrupts off. `tx_lock` is a
+        sleep-lock: its inner spinlock was released inside [[acquiresleep]], and
+        [[sleep_prepare]] released `p->lock` before returning. No spinlock is held, so SIE is
+        back on, as it was after [[usertrap]]'s `intr_on`.
+      noff: |
+        Sleep-locks add nothing to noff, and both spinlocks taken so far (`lk->lk`, `p->lock`)
+        have been released.
+      intena: |
+        intena still holds 1 in memory, left by the outermost push_off inside
+        [[sleep_prepare]] (its `myproc()` and `acquire(&p->lock)` ran at noff 0 with SIE on).
+        But with noff 0 nothing reads it, and the next outermost push_off will overwrite it, so
+        the strip shows a field that is not in use as "—".
+      stack: |
+        This is a `write` system call, so it runs on the process's own kernel stack.
+    why_wrong: List which spinlocks are held right now; a sleep-lock does not count.
+    explain: |
+      Interrupts are on here, and the UART interrupt that announces "transmitter idle" can
+      arrive at any moment, on this hart or another, and its `wakeup(&tx_chan)` clears the
+      registration if it lands before `sleep()` ([[concept:locks#sleep-wakeup]]).
+
+  - id: slp-17
+    level: 2
+    type: choice
+    q: |
+      [[holding]] checks a spinlock's owner by hart (`lk->cpu`), but [[holdingsleep]] checks
+      a sleep-lock's owner by process ID (`lk->pid`). Why the difference?
+    code: kernel/sleeplock.c:46-55
+    options:
+      - text: A sleep-lock holder may sleep while holding it and resume on a different hart, so only the process identifies the owner.
+        correct: true
+        why: |
+          A process that sleeps in [[virtio_disk_rw]] holding a buffer lock may be picked up
+          later by any hart's scheduler. A hart number recorded at acquire time would then be
+          wrong.
+      - text: Because sleep-locks are taken in interrupt handlers, which have no hart.
+        why: |
+          You may have thought handlers use sleep-locks. They never do (acquiring one may
+          sleep), and every handler runs on some hart.
+      - text: Because mycpu() may not be called while a sleep-lock is held.
+        why: |
+          mycpu() needs interrupts off, which holdingsleep has (it holds `lk->lk`). The choice
+          of pid has nothing to do with whether mycpu() is allowed.
+      - text: Because a pid is shorter to compare than a pointer.
+        why: |
+          You may have looked for a speed reason. The reason is correctness: a spinlock's holder
+          never leaves its hart while holding it, a sleep-lock's holder may.
+    explain: |
+      A spinlock is held by a hart for a few instructions with interrupts off, so the hart is
+      the owner. A sleep-lock is held by a process across sleeps and harts, so the process is
+      the owner ([[concept:locks#sleep-locks]], [[concept:locks#holding]]).
+
+  - id: slp-18
+    level: 2
+    type: order
+    q: |
+      `ls` holds a buffer's sleep-lock. `grep` calls [[acquiresleep]] on the same lock, and
+      `ls` calls [[releasesleep]] only after `grep` is fully asleep. No third process wants the
+      lock. Put the events in order.
+    code: kernel/sleeplock.c:21-44
+    items:
+      - text: "grep: acquire(&lk->lk), sees locked == 1"
+        why: grep must hold the inner spinlock to read `locked` safely.
+      - text: "grep: sleep_prepare(lk) sets grep's p->chan = lk"
+        why: grep registers while still holding lk->lk, so ls's release cannot slip in before the registration.
+      - text: "grep: release(&lk->lk)"
+        why: The inner spinlock must be released before sleeping, or sched would panic.
+      - text: "grep: sleep() marks grep SLEEPING and switches away"
+        why: The registration is still in place, so sleep() really sleeps.
+      - text: "ls: under lk->lk, locked = 0 and pid = 0"
+        why: The lock is freed first, then the waiters are told.
+      - text: "ls: wakeup(lk) makes grep RUNNABLE"
+        why: releasesleep calls wakeup after clearing locked, still holding lk->lk.
+      - text: "grep: re-acquires lk->lk, sees locked == 0, sets locked = 1 and pid"
+        why: grep re-tests in the while loop and takes the lock only when it finds it free.
+    why_wrong: The sleep-lock is the sleep/wakeup pattern with lk->lk as the condition lock and locked as the condition.
+    explain: |
+      [[acquiresleep]] is the standard pattern: test under the condition lock (`lk->lk`),
+      register, release, sleep, re-take, re-test. [[releasesleep]] changes the condition under
+      the same lock and calls [[wakeup]] ([[concept:locks#sleep-locks]], [[tour:17]]).
+
+  - id: slp-19
+    level: 2
+    type: number
+    q: |
+      [[pipewrite]] is about to go to sleep because the pipe is full (line 88 was true). At
+      that moment, what is `pi->nwrite - pi->nread`?
+    code: kernel/pipe.c:83-93@88
+    answer: 512
+    wrong:
+      511: |
+        You may know ring buffers that leave one slot empty to tell "full" from "empty". This
+        one doesn't need to: `nread` and `nwrite` are never reduced modulo the size, so their
+        difference can reach the full `PIPESIZE`.
+      0: |
+        `nwrite == nread` means the pipe is *empty*, which is the reader's sleep condition
+        (line 119), not the writer's.
+      1024: |
+        The ring holds `PIPESIZE` = 512 bytes ([[kernel/pipe.c:11]]); line 88 fires as soon as
+        512 unread bytes are waiting.
+    why_wrong: Read the condition on line 88 and the value of PIPESIZE.
+    explain: |
+      The counters only grow; only the index into `data` is taken `% PIPESIZE`. So
+      `nwrite - nread` is always the number of unread bytes, and the writer sleeps when it
+      reaches 512 ([[tour:39]]).
+
+  - id: slp-20
+    level: 3
+    type: state
+    q: |
+      Hart 0 is idle in its [[scheduler]]. At the top of the loop, line 441 turns interrupts on
+      and the pending timer interrupt is taken at once. [[clockintr]] holds `tickslock` and is
+      inside [[wakeup]]`(&ticks)`, holding one process's `p->lock`. What is the state of hart 0?
+    code: kernel/trap.c:166-180@170-172
+    state:
+      mode: S
+      stack: scheduler
+      satp: kernel
+      sie: "off"
+      noff: 2
+      intena: 0
+    why:
+      stack: |
+        You may have assumed interrupt handlers run on some process's kernel stack. A trap
+        from the kernel runs [[kernelvec]] on whatever stack is current, and hart 0 was in its
+        scheduler, on its slice of `stack0`.
+      intena: |
+        The trap cleared SIE before [[kerneltrap]] ran, so when `acquire(&tickslock)` took noff
+        from 0 to 1, the old SIE was 0. Interrupt handlers always record intena 0.
+      noff: |
+        Two spinlocks: `tickslock` and the `p->lock` wakeup is examining. The scheduler held
+        nothing at line 441 (it released the last `p->lock` on line 463).
+      sie: |
+        The hardware cleared SIE when it took the trap, and two spinlocks are held.
+    why_wrong: Start from the scheduler at line 441 holding no locks, take the trap, then count the acquires in clockintr and wakeup.
+    explain: |
+      An interrupt taken in the scheduler's window runs on the scheduler stack with intena 0,
+      so every release in the handler leaves interrupts off. Because `myproc()` is 0 there,
+      [[kerneltrap]] does not call `yield` afterwards ([[concept:locks#intena]],
+      [[concept:locks#handlers]], [[tour:50]]).
+
+  - id: slp-21
+    level: 3
+    type: tf
+    q: |
+      True or false: once [[kkill]] has set `wc`'s `killed` flag, `wc` cannot go to sleep in
+      [[piperead]]'s wait loop until it has noticed the kill.
+    code: kernel/pipe.c:118-128
+    answer: false
+    why_tf: |
+      You may have thought kkill always wakes its victim. It changes the state only of a
+      process that is already `SLEEPING`, and it never clears `p->chan`.
+    reasons:
+      - text: "A kill landing after line 120's killed() check but before sleep() finds wc RUNNING (or RUNNABLE) and leaves p->chan set, so sleep() still puts wc to sleep."
+        correct: true
+        why: |
+          [[kkill]] sets `killed = 1` and, since the state is not `SLEEPING`, does nothing else.
+          [[sleep]] tests only `p->chan`, which is still `&pi->nread`. wc sleeps until a real
+          wakeup on that channel (a write or the last close), then the loop sees the flag.
+      - text: sleep() checks the killed flag and refuses to sleep if it is set.
+        why: |
+          [[sleep]] tests only `p->chan` ([[kernel/proc.c:567]]); it never looks at `killed`.
+          The killed checks are in the callers, before each sleep.
+      - text: kkill clears p->chan, so the next sleep() returns at once.
+        why: |
+          That is what [[wakeup]] does, not [[kkill]]. kkill leaves `p->chan` alone
+          ([[kernel/proc.c:610-616]]).
+    explain: |
+      A kill can arrive in the gap between the caller's `killed()` test and `sleep()`. The
+      process then sleeps until the next wakeup on its channel: almost at once for `pause`
+      (the next tick), possibly much longer for a pipe or the console. The wait loops that can
+      block for a long time ([[piperead]], [[pipewrite]], [[consoleread]], `pause`, [[kwait]])
+      test [[killed]] every time round, so the kill is noticed after that wakeup
+      ([[concept:locks#sleep-wakeup]], [[tour:23]]).
+
+  - id: slp-22
+    level: 3
+    type: choice
+    q: |
+      [[uartwrite]] sleeps on `&tx_chan` without holding any spinlock: its condition is the
+      `LSR_TX_IDLE` bit of a device register, and the waker is [[uartintr]]. Why can't the
+      "transmitter is idle" wakeup be lost?
+    code: kernel/uart.c:79-96@86-91
+    options:
+      - text: It calls sleep_prepare(&tx_chan) before reading LSR, so if the UART goes idle after that read, the interrupt's wakeup finds it registered and clears p->chan.
+        correct: true
+        why: |
+          Registering *before* testing replaces the condition lock. Any idle interrupt after the
+          test is also after the registration, so [[sleep]] sees `chan == 0` and returns, and
+          the loop re-reads `LSR`.
+      - text: tx_lock is held, which keeps the UART interrupt from running until uartwrite sleeps.
+        why: |
+          You may have thought holding a lock blocks interrupts. `tx_lock` is a sleep-lock: no
+          spinlock is held and SIE is on, so [[uartintr]] can run at any moment, on any hart.
+      - text: Interrupts are off on this hart from the LSR read until the process is asleep.
+        why: |
+          They are on between line 87 and the `acquire(&p->lock)` inside [[sleep]]. And turning
+          them off on this hart would not stop [[uartintr]] running on another hart.
+      - text: It can be lost, but it doesn't matter, because the next UART interrupt will wake the process.
+        why: |
+          If the process slept after the UART went idle, nothing might ever wake it: an idle
+          transmitter raises no further "idle" interrupt until it is given another byte, and
+          only this process was going to give it one through `uartwrite`. (Any other byte sent
+          to the UART, by printk or a keystroke's echo, would rescue it, but only by luck.)
+    explain: |
+      The split design needs no lock when the condition is changed only by an event that
+      always comes with a wakeup: register first, test second, sleep third
+      ([[concept:locks#sleep-wakeup]], [[tour:16]]).
+
+  - id: slp-23
+    level: 3
+    type: choice
+    q: |
+      [[iput]] calls `acquiresleep(&ip->lock)` on line 362 while holding the spinlock
+      `itable.lock`. Why doesn't this break the rule "never sleep while holding a spinlock"?
+    code: kernel/fs.c:349-378@357-363
+    options:
+      - text: It runs only when ip->ref == 1, so no other process can hold or be waiting for ip->lock; acquiresleep finds it free and never sleeps.
+        correct: true
+        why: |
+          The comment on line 361 says so. If acquiresleep did sleep here, [[sched]] would find
+          noff 2 (`itable.lock` and `p->lock`) and panic with `sched locks`.
+      - text: acquiresleep detects that a spinlock is held and spins instead of sleeping.
+        why: |
+          You may have expected a safety check. [[acquiresleep]] has none: if `locked` were 1,
+          it would call sleep_prepare and sleep regardless of what else is held.
+      - text: acquiresleep releases itable.lock before it sleeps and re-acquires it after.
+        why: |
+          acquiresleep knows nothing about `itable.lock`; it releases only its own `lk->lk`.
+          `itable.lock` is released by iput on line 363, after acquiresleep returns.
+      - text: It does break the rule; this is a known bug that can deadlock under load.
+        why: |
+          The code is correct because of the `ref == 1` guarantee. The measured run took this
+          path 344 times, never sleeping ([[concept:locks#nesting]]).
+    explain: |
+      Calling a function that *might* sleep while holding a spinlock is safe only if you can
+      prove that it won't. Here the proof is the reference count
+      ([[concept:locks#unusual]], [[concept:locks#order]]).
+
+  - id: slp-24
+    level: 3
+    type: tf
+    q: |
+      True or false: in [[kexit]], swapping lines 353 and 355, so that the process takes its
+      own `p->lock` *before* calling `wakeup(p->parent)`, would be harmless.
+    code: kernel/proc.c:347-364@353-355
+    answer: false
+    why_tf: |
+      You may have thought the order of these two lines is a matter of style. With the swap,
+      the very first exit in the system crashes the kernel.
+    reasons:
+      - text: wakeup acquires every slot's p->lock, including the caller's own, so acquire would find this hart already holding it and panic.
+        correct: true
+        why: |
+          The loop on line 580 visits the exiting process's slot too, and line 581's `acquire`
+          sees [[holding]] true: `panic("acquire")`. [[reparent]]'s `wakeup(initproc)` (line
+          350) also comes before line 355 for the same reason.
+      - text: The parent would see the child as ZOMBIE before the child is ready.
+        why: |
+          `p->state = ZOMBIE` is on line 358, after both lines in either order, and the parent
+          cannot reap it while `wait_lock` and `p->lock` are held.
+      - text: "It's harmless: wakeup skips the calling process's own slot."
+        why: |
+          You may be remembering a version of wakeup that skipped `myproc()`. This one doesn't:
+          [[kernel/proc.c:580-581]] lock every slot.
+    explain: |
+      Never call [[wakeup]] while holding your own `p->lock`. kexit does all its waking under
+      `wait_lock` first, and only then takes its own `p->lock` for the switch
+      ([[concept:locks#holding]], [[concept:locks#rules]]).
+
+  - id: slp-25
+    level: 3
+    type: multi
+    q: |
+      A process `P` has `p->chan != 0`. Which of these could be true at that moment?
+    options:
+      - text: P is SLEEPING, waiting for a wakeup on that channel.
+        correct: true
+        why: "The ordinary case: [[sleep]] found `chan` set and went to sleep."
+      - text: P is RUNNING, between its sleep_prepare and its sleep().
+        correct: true
+        why: "[[sleep_prepare]] sets `chan` but leaves the state alone; nothing has woken it yet."
+      - text: P is RUNNABLE because kkill woke it, and nothing has cleared chan since.
+        correct: true
+        why: "[[kkill]] makes a `SLEEPING` process `RUNNABLE` without clearing `p->chan`."
+      - text: P is back in user mode after a console write whose uartwrite never had to sleep.
+        correct: true
+        why: |
+          [[uartwrite]] calls `sleep_prepare(&tx_chan)` before every byte and leaves the last
+          registration in place when the transmitter was ready. It stays until a
+          `wakeup(&tx_chan)` or the next `sleep_prepare`.
+      - text: A wakeup on that same channel has run since P's most recent sleep_prepare.
+        why: |
+          That wakeup would have found `p->chan` equal to its channel and set it to 0
+          ([[kernel/proc.c:585]]). Since chan is still non-zero, no such wakeup has run.
+      - text: P is UNUSED.
+        why: |
+          [[freeproc]] sets `p->chan = 0` when it frees a slot ([[kernel/proc.c:167]]), so an
+          unused slot has chan 0.
+    explain: |
+      In this tree `p->chan != 0` means "registered for a wakeup that has not come", not
+      "asleep". The comment on [[kernel/proc.h:87]] ("If non-zero, sleeping on chan") is out
+      of date. A stale registration is harmless, because every [[sleep]] is preceded by a
+      fresh [[sleep_prepare]] ([[concept:locks#sleep-wakeup]]).

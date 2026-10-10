@@ -1,0 +1,1914 @@
+published: true
+title: "Doubly-indirect blocks: large files"
+area: File system
+stars: 2
+branch: ext/22-bigfile
+prerequisites: {tours: [29, 30, 31, 32, 33, 36], concepts: [locks]}
+summary: |
+  In this tree a file can have at most 268 blocks: 12 whose numbers sit in the
+  [[g:inode|inode]] itself, and 256 more listed in one [[g:indirect-block|indirect block]].
+  At 1024 bytes a block, that is 268 KiB, and `write` refuses to go further. In this lab you
+  give the inode one more level: a *doubly-indirect* block that lists 256 indirect blocks,
+  each listing 256 data blocks. One direct slot is traded for it, so the on-disk inode keeps
+  its size, and the limit grows to 11 + 256 + 65,536 = 65,803 blocks, a little over 64 MiB.
+
+  The change to [[bmap]] is about thirty lines. What makes the lab worth doing is everything those
+  lines touch. Each new level is a block that must be allocated *inside* a
+  [[g:transaction|transaction]], zeroed, recorded in its parent and logged, or a crash (or
+  just the [[g:buffer-cache|buffer cache]] running out of room) loses part of the file.
+  [[itrunc]] must free a three-level tree, in an order that is safe while other
+  [[g:hart|harts]] allocate blocks. The log's fixed budget per system call, sized for one
+  level of indirection, has to be recounted. The disk itself must grow from 2000 to 70,000
+  blocks for a maximum-size file to fit, which changes the [[g:disk-layout|layout]] that
+  [[mkfs:main|mkfs]] computes. And because the meaning of one inode slot changes, every old
+  `fs.img` is misread by the new kernel, and even written to wrongly.
+
+  The recount finds a real problem: the deeper tree lets one operation log more blocks than
+  the log promised, and on this kernel a broken promise ends in `panic: bget: no buffers`.
+  So the budget is raised too. The reference solution is eight small commits. With it, a
+  6580-block file (24 times the old limit) is written, read back and freed in about 40
+  seconds on an otherwise idle computer, and usertests' `writebig` writes a full
+  65,803-block file.
+learn:
+  - "How a file's block number becomes a disk block number through a tree of block-number tables, and how the arithmetic of [[bmap]] (subtract, divide, take the remainder) maps 65,803 file blocks onto 11 direct slots, one indirect block and a two-level tree."
+  - "Why the on-disk inode must keep its exact size (64 bytes, 16 per block), what checks that, and why changing what one slot *means* still changes the on-disk format, so `fs.img` must be rebuilt."
+  - "How a block is allocated inside a transaction: [[balloc]] marks the bitmap and zeroes the block, both through [[log_write]], and the parent that records the new number must be logged too. What happens, on a real run and after a power cut, when one `log_write` is missing."
+  - "Why a partially grown file is always consistent after a crash: each chunk of a `write` is one transaction, and recovery replays it whole or not at all (shown on a real crash)."
+  - "How to count the blocks one system call can log, and what to do when the count outgrows the budget: how many blocks can one chunk of a write, and one `unlink`, log now? What happens when a group commit fills the log, given that the buffer cache is exactly as large as the log and every logged block is pinned in it?"
+  - "What `FSSIZE` controls (bitmap size, where data starts, how much fits) and what [[mkfs:main|mkfs]] derives from it."
+spec: |
+  **Behaviour.** A file can grow to `MAXFILE` = 65,803 blocks (67,382,272 bytes). File blocks
+  0 to 10 are named directly by `addrs[0..10]` of the inode, blocks 11 to 266 through the
+  singly-indirect block named by `addrs[11]`, and blocks 267 to 65,802 through the
+  doubly-indirect block named by `addrs[12]`: its entry *i* names an indirect block whose
+  entry *j* names file block 267 + 256*i* + *j*. A `write` that would go past `MAXFILE`
+  fails. Unlinking a file (or truncating it with `O_TRUNC`) frees every block of the tree.
+
+  **What must not change.**
+
+  - `struct dinode` stays 64 bytes (16 inodes per block): `addrs` keeps 13 entries.
+  - Crash safety: every block that a write changes is part of the same transaction as
+    the bitmap bits and the inode, as before.
+  - The file system must be large enough for usertests' `writebig`, which writes exactly
+    `MAXFILE` blocks. **`usertests -q` must print `ALL TESTS PASSED` on 3 harts.**
+  - `mkfs` must keep producing a valid image (it only builds small files).
+
+  **The test program**, `bigfiletest` (not `bigfile`: usertests' `partial_write` creates and
+  removes a file of that name, [[user/usertests.c:2897]]), and a test-only system call
+  `freeblocks()` that counts the clear bits in the free-block bitmap:
+
+  ```text
+  $ bigfiletest
+  bigfiletest: 6580 blocks (old limit 268, new limit 65803)
+  bigfiletest: create: OK
+  bigfiletest: write: OK
+  bigfiletest: size: OK
+  bigfiletest: blocks used 6607 = 6580 data + 27 indirect
+  bigfiletest: block count: OK
+  bigfiletest: read back: OK
+  bigfiletest: unlink: OK
+  bigfiletest: free blocks 68930 before, 68930 after
+  bigfiletest: all blocks freed: OK
+  bigfiletest: ALL OK
+  ```
+
+  - **write / size**: 6580 blocks of 1024 bytes, each one `write`; `stat` must report
+    6,737,920 bytes. Every block starts with its own number and then a pattern that differs
+    from block to block, so two file blocks that share a disk block are caught.
+  - **block count**: the number of free blocks must drop by exactly 6580 + 27: one
+    singly-indirect block, the doubly-indirect block and 25 indirect blocks below it.
+  - **read back**: every block is read and compared byte by byte.
+  - **all blocks freed**: after `unlink`, the free count is back to the value taken just
+    after the (empty) file was created.
+
+  `bigfiletest n` uses *n* blocks; with `n` = 65803 it also checks that one more block cannot
+  be written. `bigfiletest -w n` writes a file and keeps it, `bigfiletest -r` checks a file
+  left by an earlier boot: the tools for the crash experiments below.
+think:
+  - title: Where does the extra block number come from?
+    q: |
+      An inode on disk is a `struct dinode`: four `short`s, a size, and 13 block numbers
+      ([[kernel/fs.h:32]]). The doubly-indirect block needs a slot of its own. You can make
+      the array one entry longer, or give up one of the 12 direct slots. Which do you choose,
+      and what exactly breaks with the other choice? Commit to an answer before the hints.
+    hints:
+      - "Look below `struct dinode` in [[kernel/fs.h]]: how are `IPB` and `IBLOCK` computed? Then look at the first `assert` in [[mkfs:main|mkfs's main]] ([[mkfs/mkfs.c:88]])."
+      - "2 + 2 + 2 + 2 + 4 + 13 × 4 = 64 bytes, and 1024 / 64 = 16 inodes per block with nothing left over. Inode *i* is found by arithmetic alone, so every inode's position depends on that size, in the kernel and in mkfs alike."
+      - "Keep 13 entries and lower `NDIRECT` to 11: slot 11 stays the singly-indirect block, slot 12 becomes the doubly-indirect one. The in-memory `struct inode` has its own copy of the array and must change the same way."
+    answer: |
+      Give up a direct slot. With 14 entries `struct dinode` would be 68 bytes. 1024 is not a
+      multiple of 68, so `IPB` would be 15 with 4 bytes wasted per block, and mkfs refuses to
+      run at all: its `assert((BSIZE % sizeof(struct dinode)) == 0)` fails. Even if you padded
+      the inode to 128 bytes to keep the division exact, `IPB` would halve, every inode would
+      move, and the 200 inodes would need 26 blocks instead of 13.
+
+      Keeping 13 entries keeps the inode at 64 bytes and 16 per block; only the *meaning* of
+      the slots changes:
+
+      | slot | before | after |
+      |---|---|---|
+      | `addrs[0..10]` | direct | direct |
+      | `addrs[11]` | direct (file block 11) | singly-indirect block |
+      | `addrs[12]` | singly-indirect block | doubly-indirect block |
+
+      The cost is small: a file of exactly 12 blocks now needs the indirect block for its
+      last one. The in-memory copy, `struct inode` in [[kernel/file.h]], must get the same
+      13-entry array: [[ilock]] and [[iupdate]] copy `sizeof(ip->addrs)` bytes between the two
+      with `memmove`.
+
+      One thing does break: the *format*. On an image made by the old mkfs, `addrs[11]` holds a
+      data block, which the new kernel reads as a table of block numbers. Clinic 6 shows what a
+      new kernel does with an old `fs.img`.
+    checks:
+      - id: lab22-01
+        level: 1
+        type: number
+        q: |
+          How many bytes is `struct dinode` in this tree (four `short`s, a `uint` size and 13
+          `uint` block numbers)? The kernel and mkfs both depend on it.
+        code: kernel/fs.h:31-39
+        answer: 64
+        wrong:
+          60: |
+            You may have counted 12 block numbers, the direct ones, and forgotten the
+            singly-indirect slot `addrs[NDIRECT]`: the array has `NDIRECT + 1` = 13 entries.
+          56: |
+            You may have left out the four shorts. A `short` is 2 bytes: 8 bytes of shorts,
+            4 of size, 52 of addresses.
+          68: |
+            That would be the size with 14 block numbers, the design this question argues
+            against.
+        why_wrong: "Add it up: 4 × 2 (shorts) + 4 (size) + 13 × 4 (addrs) bytes; there is no padding, since every field is aligned."
+        explain: |
+          64 bytes means `IPB` = 1024 / 64 = 16 inodes per block exactly, and inode *i* lives
+          in block `i / 16 + inodestart` at offset `(i % 16) * 64`. See [[g:dinode]] and
+          [[kernel/fs.h:42]].
+      - id: lab22-02
+        level: 2
+        type: choice
+        q: |
+          A learner lowers `NDIRECT` to 11 but leaves `uint addrs[NDIRECT + 1]` in both structs,
+          so the array has 12 entries. They run `make qemu`. What happens first?
+        code: mkfs/mkfs.c:85-90
+        options:
+          - text: "mkfs stops on its assertion: 1024 is not a multiple of the new 60-byte inode, and no fs.img is built."
+            correct: true
+            why: |
+              2 × 4 + 4 + 12 × 4 = 60, and 1024 % 60 = 4. The check at line 88 exists exactly
+              to catch an inode size that does not divide the block size.
+          - text: "Everything builds, and the kernel panics at boot with `ilock: no type`."
+            why: |
+              You may be thinking of what a kernel does with an image in a *different* format.
+              Here mkfs never gets that far. (Clinic 4 runs such a kernel on a correctly built
+              image anyway: it panics, but differently.)
+          - text: "The C compiler rejects `addrs[NDIRECT + 1]` because the kernel uses addrs[NDIRECT + 1]."
+            why: |
+              You may expect C to check array bounds. It does not: `ip->addrs[NDIRECT + 1]`
+              with a 12-entry array compiles and silently touches the next field (or the next
+              inode).
+          - text: "Nothing visible: one fewer block number simply makes MAXFILE smaller."
+            why: |
+              You may have thought only the limit depends on the array. The inode's *size*
+              depends on it too, and with it the position of every inode on disk.
+        explain: |
+          `sizeof(struct dinode)` is part of the on-disk format: it fixes `IPB`, `IBLOCK` and
+          the number of inode blocks mkfs reserves. Keep 13 entries and change only what they
+          mean. Clinic 4 has the real output.
+  - title: How far can a file grow, and where does block n live?
+    q: |
+      With 11 direct slots, one singly-indirect block and one doubly-indirect block, how many
+      blocks can a file have? Given a file block number `bn`, how do you find the entry of the
+      doubly-indirect block, and the entry of the indirect block below it, that hold its disk
+      block number? Which file block is the first to need the doubly-indirect block?
+    hints:
+      - "`NINDIRECT` ([[kernel/fs.h:27]]) is how many block numbers fit in one block. Look at how [[bmap]] turns `bn` into an index in the singly-indirect block ([[kernel/fs.c:435]])."
+      - "Each level multiplies the reach by 256. An index into a table must be relative to the first file block that table covers, so the ranges before it must be subtracted first."
+      - "Subtract `NDIRECT`, then `NINDIRECT`; what is left is a number from 0 to 65,535. Its quotient by 256 picks the indirect block, its remainder the entry in it."
+    answer: |
+      11 + 256 + 256 × 256 = **65,803 blocks**, 67,382,272 bytes. `writei` checks
+      `off + n > MAXFILE * BSIZE`: `off + n` is 32-bit (its overflow is caught by the test
+      `off + n < off` just before), and `MAXFILE * BSIZE` is a 64-bit `size_t` because
+      `NINDIRECT` is computed with `sizeof`. Either way the largest offset, 67,382,272, is far
+      below 4 GiB, and so is the `uint size` in the inode.
+
+      The ranges:
+
+      | file block | found through |
+      |---|---|
+      | 0 to 10 | `addrs[bn]` |
+      | 11 to 266 | singly-indirect block, entry `bn - 11` |
+      | 267 to 65,802 | doubly-indirect block, entry `(bn - 267) / 256`, then that indirect block's entry `(bn - 267) % 256` |
+
+      So file block 267 (byte offset 273,408) is the first to need the doubly-indirect block,
+      and block 523 the first to need a second indirect block under it. The last block of the
+      6580-block test file, 6579, is entry 6312 / 256 = 24 of the doubly-indirect block and
+      entry 6312 % 256 = 168 of indirect block 24.
+
+      The same subtract-then-compare shape as the existing code keeps each range check honest:
+      every comparison is `bn < size of this range`, with `bn` already relative to the range's
+      start. Clinic 2 shows what one `<=` does instead.
+    checks:
+      - id: lab22-03
+        level: 1
+        type: number
+        q: |
+          With `NDIRECT` = 11, one singly-indirect and one doubly-indirect block of 256 entries
+          each, what is `MAXFILE`, in blocks?
+        answer: 65803
+        wrong:
+          65804: |
+            You may have kept 12 direct blocks. The doubly-indirect slot is paid for with one
+            direct slot: 11 + 256 + 65,536.
+          65547: |
+            You may have replaced the singly-indirect block instead of adding a level: 11 +
+            65,536. The reference keeps both.
+          65536: |
+            That is only the doubly-indirect range, 256 × 256. The direct and singly-indirect
+            ranges come before it.
+        why_wrong: "Add the three ranges: NDIRECT + NINDIRECT + NINDIRECT × NINDIRECT, with NDIRECT = 11 and NINDIRECT = 1024 / 4."
+        explain: |
+          The old limit was 12 + 256 = 268 blocks. The new one is 245 times larger, for the
+          price of one direct slot: 65,803 blocks of 1024 bytes, about 64.3 MiB.
+      - id: lab22-04
+        level: 2
+        type: number
+        q: |
+          File block 6579 is the last block of `bigfiletest`'s file. Which entry (counting
+          from 0) of the doubly-indirect block names the indirect block that maps it?
+        answer: 24
+        wrong:
+          25: |
+            You may have divided 6579 - 11 = 6568 by 256 (25.6), forgetting to subtract the 256
+            blocks of the singly-indirect range as well.
+          6312: |
+            That is the block's index inside the doubly-indirect range. Divide it by 256 to
+            get the entry.
+          168: |
+            That is the entry inside the indirect block (6312 % 256), the second step. The
+            question asks for the first.
+        why_wrong: "Subtract 11 and 256, then divide by 256: (6579 - 267) / 256."
+        explain: |
+          6579 - 11 - 256 = 6312; 6312 / 256 = 24 (remainder 168). So the file uses indirect
+          blocks 0 to 24 under the doubly-indirect block: 25 of them, which is part of the 27
+          indirect blocks `bigfiletest` counts.
+      - id: lab22-05
+        level: 2
+        type: match
+        q: |
+          Match each file block with where the new [[bmap]] finds its disk block number.
+        pairs:
+          - left: "file block 10"
+            right: "addrs[10] in the inode"
+            why: "Blocks 0 to 10 are direct: `bn < NDIRECT` = 11."
+          - left: "file block 11"
+            right: "entry 0 of the singly-indirect block"
+            why: "With NDIRECT = 11, block 11 is the first one past the direct slots: 11 - 11 = 0. In the original tree it was direct."
+          - left: "file block 266"
+            right: "entry 255 of the singly-indirect block"
+            why: "266 - 11 = 255, the last entry of the singly-indirect block, not yet the doubly-indirect range."
+          - left: "file block 267"
+            right: "entry 0 of indirect block 0 under the doubly-indirect block"
+            why: "267 - 11 - 256 = 0: the first block of the new range."
+          - left: "file block 523"
+            right: "entry 0 of indirect block 1 under the doubly-indirect block"
+            why: "523 - 267 = 256 = 1 × 256 + 0: the first block that needs a second indirect block."
+        explain: |
+          Subtract each range's size before moving to the next range, and every index is
+          relative to the start of its table. The boundaries 11, 267 and 523 are where
+          off-by-one errors live.
+  - title: Allocating a path of blocks inside a transaction
+    q: |
+      Writing file block 267 of a growing file needs three new disk blocks: the
+      doubly-indirect block, indirect block 0 under it, and the data block. Each new block
+      has a bit in the free bitmap and contents of its own, and each parent must record its
+      child's number. Which blocks must be logged with [[log_write]]? Does the order of
+      those calls matter? And if the machine loses power halfway through a large `write`,
+      what can the file look like after the reboot?
+    hints:
+      - "Read [[balloc]] and the `bzero` above it ([[kernel/fs.c:52]]), then how the existing singly-indirect branch records a new block ([[kernel/fs.c:445]]-[[kernel/fs.c:455]]) and how [[writei]] ends ([[kernel/fs.c:570]]-[[kernel/fs.c:576]])."
+      - "The log puts every block passed to [[log_write]] in a system call's transaction on disk together, or none of them ([[tour:31]], [[tour:32]]). A buffer modified in the cache but never passed to [[log_write]] belongs to no transaction: nothing will ever write it, and it is lost when the cache reuses its slot."
+      - "For each level: read the number from the parent; if it is 0, [[balloc]] a block (bitmap bit and zeroed contents, both logged), store the number in the parent and [[log_write]] the parent. The inode's own slot is saved by [[iupdate]] at the end of [[writei]]. A `write` that [[filewrite]] splits into chunks is several transactions."
+    answer: |
+      Every block whose contents change must be logged: the bitmap block (by [[balloc]]),
+      each new block (zeroed and logged by `bzero`), each parent whose entry changed (the
+      doubly-indirect block when a new indirect block is added, the indirect block when a new
+      data block is added), the data block itself (by [[writei]]), and the inode's block (by
+      [[iupdate]], which also saves `addrs[12]`). Then the whole path from the inode to the
+      data appears after a crash, or none of it does.
+
+      The order of the [[log_write]] calls inside one transaction does not matter for crash
+      safety: the commit writes all logged blocks to the log, then the header, then installs
+      them, and it copies each block's *current* cached contents at commit time
+      ([[tour:31]]). What matters is completeness, plus one rule about content: a new
+      indirect block must be zeroed, because 0 is how [[bmap]] recognizes "not allocated
+      yet". A table of leftover numbers from a freed block would send later writes into
+      blocks owned by other files.
+
+      A large `write` is not one transaction: [[filewrite]] splits it into chunks of at most
+      3 blocks, each with its own `begin_op` / `end_op` ([[kernel/file.c:160]]-[[kernel/file.c:165]]),
+      and `bigfiletest` writes one block per `write` anyway. So after a crash the file ends at
+      some transaction boundary, and everything up to there is intact. We tested it: QEMU was
+      killed 13 seconds into `bigfiletest -w 6580`. On the next boot the log held a committed
+      transaction and recovery replayed it (`recovering tail 0 dst 55` ... `dst 43`), and
+      `bigfiletest -r` found a 555-block file with every block correct and exactly
+      555 + 4 blocks fewer free than on a fresh image. Five more kills at other moments gave
+      the same kind of result (reveal step 7).
+    checks:
+      - id: lab22-06
+        level: 2
+        type: tf
+        q: |
+          True or false: inside one transaction, [[bmap]] must call [[log_write]] on a newly
+          allocated indirect block *before* it stores that block's number in the parent;
+          otherwise a crash could leave the parent pointing at a block of garbage.
+        answer: false
+        why_tf: |
+          You may have pictured [[log_write]] as a disk write that happens at the call. It
+          only records the block number in the in-memory log header and pins the buffer; the
+          disk writes happen at commit, all together.
+        reasons:
+          - text: "A transaction commits all its logged blocks at once, so the order of log_write calls within it does not matter; what matters is that every changed block is logged and new indirect blocks start zeroed."
+            correct: true
+            why: |
+              Right. [[commit]] copies every logged block's current contents to the log and
+              then writes the header: the commit point. A crash before it loses all of the
+              transaction, after it recovery installs all of it.
+          - text: "It does not matter because bzero writes the zeroed block straight to disk."
+            why: |
+              You may have read `bzero` as a disk operation. It zeroes the cached buffer and
+              calls [[log_write]] like any other change ([[kernel/fs.c:57]]-[[kernel/fs.c:59]]).
+          - text: "It does not matter because recovery rebuilds the indirect blocks from the inode."
+            why: |
+              Recovery knows nothing about inodes. It copies whole logged blocks to their home
+              locations ([[kernel/log.c:72]]-[[kernel/log.c:84]]).
+        explain: |
+          Atomicity comes from the commit, not from the order of calls. The only ordering
+          that matters is the one the log enforces itself: log blocks, then header, then home
+          locations. See [[tour:31]] and [[g:write-ahead-log]].
+      - id: lab22-07
+        level: 2
+        type: choice
+        q: |
+          The power fails in the middle of `bigfiletest -w 6580` (one block per `write`). After
+          the reboot, what can `bigtest.dat` look like on the reference branch?
+        options:
+          - text: "A shorter file, every block of it correct, and no blocks marked in use that the file does not reach."
+            correct: true
+            why: |
+              Each `write` is a transaction that commits the bitmap bits, the new indirect
+              blocks, the data and the new size together. Recovery replays the last
+              committed one or drops the uncommitted one whole.
+          - text: "The full 6580-block size, with zeros in the blocks that were not written yet."
+            why: |
+              You may have thought the size is set first. [[writei]] sets `ip->size` as each
+              chunk completes, inside the same transaction as the chunk's blocks.
+          - text: "A correct shorter file, but some blocks leaked: marked in use in the bitmap and reachable from no inode."
+            why: |
+              That would happen if the bitmap and the pointer to the block could be committed
+              separately. [[balloc]] and [[bmap]] log both in the same transaction.
+          - text: "Possibly a doubly-indirect block full of garbage block numbers, if the crash came between allocating it and zeroing it."
+            why: |
+              Allocation and zeroing are in the same transaction as everything else. A crash
+              before the commit loses the allocation too.
+        explain: |
+          Measured: killed after 13 seconds, the next boot recovered a 555-block file, all
+          blocks correct, and the free count was exactly 555 data + 4 indirect blocks lower
+          than on a fresh image. See [[tour:32]] for how recovery replays the log.
+  - title: How many blocks can one chunk of a write log now?
+    q: |
+      Every file-system system call promises to log at most `MAXOPBLOCKS` = 10 blocks, and
+      `begin_op` admits operations on that promise ([[kernel/log.c:138]]). [[filewrite]] keeps
+      its side of it by writing at most `((MAXOPBLOCKS - 1 - 1 - 2) / 2) * BSIZE` = 3 blocks
+      per transaction ([[kernel/file.c:149]]-[[kernel/file.c:153]]); the comment says what the
+      formula budgets for. That budget was made for one level of indirection. Recount it for
+      the new tree: what is the largest number of distinct blocks one 3-block chunk can log
+      now? Is the promise still kept?
+    hints:
+      - "Read the comment above the formula, and how [[log_write]] treats a block that is already in the transaction ([[kernel/log.c:234]]-[[kernel/log.c:242]]). A chunk that starts in the middle of a block touches 4 blocks."
+      - "A new data block in the doubly-indirect range can need up to two *extra* allocations: the doubly-indirect block (once per file) and an indirect block (once per 256 data blocks). Each allocation sets a bit in some bitmap block, and [[balloc]] takes the lowest free block, which on a fragmented disk can be in a different bitmap block every time."
+      - "Take the chunk that crosses from file block 266 into 267 and count by kind: the inode's block; 4 data blocks; the singly-indirect, doubly-indirect and indirect blocks; and one bitmap block per allocation in the worst case."
+    answer: |
+      The old formula budgets 1 inode block + 1 indirect block + 2 blocks of slop + 2 per
+      data block (the block and its bitmap block): 3 data blocks. Count the worst chunk now, an
+      unaligned 3072-byte chunk covering file blocks 264 (already there) to 267:
+
+      | logged block | how many |
+      |---|---|
+      | data blocks 264 to 267 | 4 |
+      | singly-indirect block (entries for 265, 266), doubly-indirect block (new), indirect block 0 (new) | 3 |
+      | inode block | 1 |
+      | bitmap blocks: 5 allocations (265, 266, the two tables, 267) | 1 to 5 |
+
+      On a fresh disk the 5 allocations are consecutive blocks, so 1 or 2 bitmap blocks: 9 or
+      10 in all, just inside the promise. But [[balloc]] takes the lowest free block each time.
+      On a disk with one free block in each of the first five bitmap blocks, the five
+      allocations land in five different bitmap blocks: **13**. We built that disk (a scratch
+      program, `frag13`, that leaves one hole in each of bitmap blocks 0 to 4) and printed
+      every large commit in a copy of the kernel. One `write` logged:
+
+      ```text
+      commit: 13 blocks: 1457 55 1458 1203 56 9684 57 17910 58 26136 59 34362 43
+      ```
+
+      Data 264 and 265 (1457, 1458), the singly-indirect block (1203), data 266 (9684), the
+      doubly-indirect block (17910), indirect block 0 (26136), data 267 (34362), five bitmap
+      blocks (55 to 59) and the inode block (43). (This was measured on the finished branch,
+      where the bitmap starts at block 55; see think 6 for why it moved.)
+
+      So the promise is broken: a write can log 13 blocks while `begin_op` reserved 10. The
+      general count, for a chunk of *m* data blocks: 1 inode + up to 3 tables + the bitmap
+      blocks of 2 new tables + 1 existing data block at an unaligned start + 2 per new data
+      block = 2*m* + 7. Think 6 counts the other operation the new tree enlarges, and then
+      decides what to do about both.
+    checks:
+      - id: lab22-08
+        level: 2
+        type: number
+        q: |
+          On a deliberately fragmented disk (one free block in each of the first five bitmap
+          blocks), how many distinct blocks did one 3-block chunk of a `write` log, crossing
+          from the singly- into the doubly-indirect range?
+        answer: 13
+        wrong:
+          10: |
+            That is the old budget, and roughly what a fresh disk gives (9 or 10): the
+            allocations are consecutive there, so they touch one or two bitmap blocks. On a
+            fragmented disk each allocation can touch its own bitmap block.
+          9: |
+            You may have counted one bitmap block for all five allocations. [[balloc]] takes the
+            lowest free block, wherever it is; here each allocation found it in a different
+            bitmap block.
+          8: |
+            You may have counted 3 data blocks and one table. An unaligned chunk touches 4 data
+            blocks, and crossing into the doubly-indirect range touches 3 tables.
+        why_wrong: "4 data blocks + 3 table blocks + the inode block + 5 bitmap blocks (one per allocation)."
+        explain: |
+          13 = 2 × 3 + 7. Log absorption ([[kernel/log.c:234]]) keeps each block once, so the
+          count is of distinct blocks; fragmentation is what makes the bitmap blocks distinct.
+      - id: lab22-09
+        level: 3
+        type: multi
+        q: |
+          Which of these blocks are in the transaction of the chunk that writes file blocks 264
+          to 267 (the doubly-indirect block does not exist yet)?
+        options:
+          - text: "the doubly-indirect block"
+            correct: true
+            why: "It is allocated here: `bzero` logs it, and setting its entry 0 changes it again (absorbed)."
+          - text: "the singly-indirect block"
+            correct: true
+            why: "File blocks 265 and 266 are new and are recorded in it."
+          - text: "the block that holds the file's inode"
+            correct: true
+            why: "[[writei]] ends with [[iupdate]], which saves the new size and `addrs[12]`."
+          - text: "the superblock"
+            why: |
+              You may have thought allocation updates a free count. This file system keeps no
+              free count; the superblock is written only by mkfs.
+          - text: "the log header block"
+            why: |
+              The header is written by [[commit]] to describe the transaction, but it is not
+              one of the transaction's logged blocks and does not count against `MAXOPBLOCKS`.
+          - text: "the directory block that names the file"
+            why: |
+              Writing to an open file does not touch its directory entry; the name was written
+              when the file was created.
+        explain: |
+          A write transaction touches the file's own metadata (inode, indirect blocks), its
+          data, and the bitmap. See [[tour:36]] for the original path through [[writei]].
+  - title: How big must the disk be, and what follows from its size?
+    q: |
+      usertests' `writebig` writes exactly `MAXFILE` blocks to one file
+      ([[user/usertests.c:583]]), and it is one of the quick tests. The disk is `FSSIZE` =
+      2000 blocks. What must change, what in the disk layout follows from `FSSIZE`, and does
+      the kernel need to know the new size?
+    hints:
+      - "[[mkfs:main|mkfs]] computes the layout from `FSSIZE` ([[mkfs/mkfs.c:28]]-[[mkfs/mkfs.c:31]], [[mkfs/mkfs.c:96]]-[[mkfs/mkfs.c:106]]) and writes it into the [[g:superblock|superblock]]. Where does the kernel get the size from? ([[kernel/fs.c:74]])"
+      - "One bitmap block has a bit for each of `BPB` = 8192 blocks. A 65,803-block file also needs its indirect blocks, and mkfs has already used about a thousand blocks for the programs."
+      - "65,803 + 258 indirect blocks + what mkfs uses, rounded up generously. Then work out `nbitmap` and the first data block for that size; the kernel needs no change at all."
+    answer: |
+      A maximum-size file needs 65,803 data blocks + 1 singly-indirect + 1 doubly-indirect +
+      256 indirect blocks = 66,061 blocks. The reference sets `FSSIZE` to 70,000. What mkfs
+      derives from it:
+
+      | | `FSSIZE` 2000 | `FSSIZE` 70,000 | the finished branch (log grown, think 6) |
+      |---|---|---|---|
+      | bitmap blocks (`FSSIZE / BPB + 1`) | 1 | 9 | 9 |
+      | metadata (boot, super, log, 13 inode, bitmap) | 47 (31-block log) | 55 (31-block log) | 64 (40-block log) |
+      | first data block | 47 | 55 | 64 |
+      | free after mkfs, with `bigfiletest` on the disk | 947 | 68,939 | 68,930 |
+      | `fs.img` | 2 MB | 70 MB | 70 MB |
+
+      On the finished branch 68,930 free blocks leave 2869 to spare when `writebig` runs. The kernel reads the size
+      from the superblock ([[kernel/fs.c:44]]), and [[balloc]] loops over `sb.size` in steps of
+      `BPB`, reading one bitmap block per step: nine instead of one, with no code change.
+
+      Two costs come with it. mkfs writes all 70,000 blocks of zeros to create the image, and
+      [[balloc]] always scans from bitmap block 0: late in `writebig`, every allocation first
+      walks about 65,000 set bits in eight full bitmap blocks (cached, but still a loop).
+
+      Without the change, `writebig` stops at `balloc: out of blocks` after 933 blocks, which
+      with its 5 indirect blocks is exactly the 938 blocks free on the finished branch's
+      2000-block image (clinic 5). And since `fs.h` and
+      `param.h` changed, `make` rebuilds mkfs and `fs.img` ([[Makefile:123]]); an old image
+      kept around by hand is a different format (clinic 6).
+    checks:
+      - id: lab22-10
+        level: 1
+        type: number
+        q: |
+          With `FSSIZE` = 70,000, how many bitmap blocks does mkfs reserve
+          (`nbitmap = FSSIZE / BPB + 1`, with `BPB` = 8192)?
+        code: mkfs/mkfs.c:28-31
+        answer: 9
+        wrong:
+          8: |
+            You may have done the division (8.54) and rounded down without the `+ 1`. Eight
+            bitmap blocks cover only 65,536 blocks.
+          69: |
+            You may have divided by `BSIZE` (1024) instead of `BPB`. Each bitmap block holds
+            1024 bytes of 8 bits each: 8192 blocks.
+          70: |
+            You may have divided by 1000 and forgotten the `+ 1`. A bitmap block covers
+            `BSIZE * 8` = 8192 blocks.
+        why_wrong: "70000 / 8192 = 8 in integer division, plus 1."
+        explain: |
+          The `+ 1` rounds up (and wastes a block when `FSSIZE` is an exact multiple of 8192).
+          With 9 bitmap blocks, the metadata grows from 47 to 55 blocks (64 once the log is
+          enlarged in think 6). See [[g:disk-layout]].
+      - id: lab22-11
+        level: 2
+        type: choice
+        q: |
+          You implement the doubly-indirect block correctly but leave `FSSIZE` at 2000. What
+          does `usertests -q` do?
+        options:
+          - text: "writebig fails with `balloc: out of blocks` and `write big file failed`, and usertests stops with SOME TESTS FAILED."
+            correct: true
+            why: |
+              writebig now tries 65,803 blocks; the disk runs out after 933. Measured exactly
+              so (clinic 5).
+          - text: "The kernel panics with `bmap: out of range`."
+            why: |
+              You may have expected the limit to show up in [[bmap]]. The block numbers are in
+              range; it is the disk that is full, and [[balloc]] returns 0 with a message.
+          - text: "All tests pass, because writebig only writes as many blocks as fit."
+            why: |
+              writebig loops to `MAXFILE` and fails on the first short write
+              ([[user/usertests.c:593]]-[[user/usertests.c:598]]).
+          - text: "mkfs refuses to build the image."
+            why: |
+              mkfs only checks its own files; nothing in it compares `MAXFILE` with `FSSIZE`.
+        explain: |
+          `MAXFILE` is what the inode can address; `FSSIZE` is what the disk can hold. A test
+          that writes `MAXFILE` blocks needs both.
+  - title: Freeing a tree, and re-budgeting the log
+    q: |
+      When the last link to a file is removed and nobody has it open, [[iput]] calls
+      [[itrunc]] ([[kernel/fs.c:365]]). For the doubly-indirect tree, what must be freed, and
+      in what order? Then count: unlinking `writebig`'s 65,803-block file, how many distinct
+      blocks does that one system call log? With this count and think 4's, is
+      `MAXOPBLOCKS` = 10 still a promise the kernel keeps, what happens if it is not, and what
+      should change?
+    hints:
+      - "Read [[bfree]]: what does it change, and what does it leave alone? Then think about another hart running [[balloc]] in a concurrent transaction."
+      - "Once a block's bit is clear, another process may allocate it and zero it at any moment. And every [[bfree]] writes only a bitmap block: log absorption keeps each one once, however many blocks are freed in it."
+      - "For each nonzero entry of the doubly-indirect block: read that indirect block, free every nonzero entry, release it, then free it. Last, free the doubly-indirect block itself and clear `addrs[12]`. For the count: which bitmap blocks does a 66,061-block file starting near block 1070 span? For the consequences: compare `LOGBLOCKS` and `NBUF` in [[kernel/param.h]], and see what [[log_write]] does to every buffer it logs ([[kernel/log.c:240]])."
+    answer: |
+      Free every block the tree contains, *reading each table before freeing it*: data blocks
+      listed in an indirect block, then the indirect block, and, after all 256 entries, the
+      doubly-indirect block. [[bfree]] does not change the freed block, but once its bit is
+      clear another hart's [[balloc]] may hand it out and `bzero` it in another transaction. A
+      table read after its own `bfree` could come back as zeros, and its data blocks would
+      leak. Order *within* the transaction does not matter for crashes (the whole unlink
+      commits at once); it matters for this concurrency.
+
+      The count. Every [[bfree]] logs a bitmap block, and log absorption keeps each one once,
+      so freeing any number of blocks costs one logged block per bitmap block they span. A
+      maximum-size file occupies 66,061 consecutive blocks on a fresh disk, from about block
+      1070 to 67,130: bitmap blocks 0 to 8, all nine. Add the directory block whose entry is
+      cleared, the directory's inode block and the file's inode block: `unlink` logs
+      `nbitmap + 3` = **12** blocks. A copy of the kernel that prints large commits recorded
+      exactly that during `usertests -q` (`writebig` runs alone, so the commit is that one
+      operation). In the original tree a file had at most 269 blocks (268 data + 1 indirect)
+      on a disk with a single bitmap block, so this never happened.
+
+      **Why a broken promise is fatal.** `begin_op` admits a new operation only while
+      `lh.n + (outstanding + 1) * MAXOPBLOCKS <= LOGBLOCKS` ([[kernel/log.c:138]]): the log
+      is never promised more than 30 blocks. And `NBUF`, the size of the buffer cache, is
+      *also* 30 (`3 * MAXOPBLOCKS`, [[kernel/param.h]]). That matters because [[log_write]]
+      pins every logged buffer in the cache until the commit has installed it
+      ([[kernel/log.c:240]]): if one group commit logs 30 distinct blocks, all 30 buffers are
+      pinned, and [[commit]], which must [[bread]] a log block to copy each one into, finds
+      no buffer to reuse. [[bget]] panics `bget: no buffers` ([[kernel/bio.c:87]]).
+
+      With operations that overrun, 30 is reachable. A race test, `lograce`, builds one
+      group commit of four operations: a write that crosses
+      into the doubly-indirect range (8 blocks after absorption), two small overwrites (5
+      each), and the `unlink` of a 9-block file whose blocks lie in 9 different bitmap blocks
+      (12). `begin_op` admits the unlink because 10 + 2 × 10 ≤ 30; together they log
+      10 + 12 + 8 = 30. Clinic 7 shows the panic, on the branch with `MAXOPBLOCKS` left at 10.
+
+      **Re-budget.** The reference raises `MAXOPBLOCKS` to 13, which covers both counts: a
+      write chunk is at most 2*m* + 7 = 13 for *m* = 3, so [[filewrite]]'s formula is
+      rewritten term by term as `(MAXOPBLOCKS - 1 - 3 - 2 - 1) / 2` and still gives 3 blocks;
+      and an `unlink` is at most `nbitmap + 3` = 12, which mkfs now checks
+      (`assert(nbitmap + 3 <= MAXOPBLOCKS)`), because a bigger disk would need a bigger
+      budget. `LOGBLOCKS` and `NBUF` follow as 39. The cost: a 40-block log (9 more blocks of
+      metadata, so the inodes, bitmap and data all start 9 blocks later) and 9 more buffers
+      in the cache. With it, `lograce` produces the same kind of group commit and survives.
+
+      The alternative fix, truncating a large file over several transactions, scales to any
+      disk size (and [[ireclaim]] would make a crash halfway through safe), but every caller
+      of [[iput]] runs inside someone else's transaction; it is a stretch goal.
+    checks:
+      - id: lab22-12
+        level: 2
+        type: order
+        q: |
+          Put the reference [[itrunc]]'s work on the doubly-indirect tree in order, for a file
+          with two indirect blocks under it.
+        items:
+          - text: "read the doubly-indirect block"
+            why: "Its entries are the only record of which indirect blocks exist."
+          - text: "read indirect block 0 and free every data block it lists"
+            why: "A table must be read before anything it lists is freed, and before it is freed itself."
+          - text: "free indirect block 0"
+            why: "Only after its entries have been used; once its bit is clear, another hart may reuse it."
+          - text: "read indirect block 1, free its data blocks, then free it"
+            why: "The loop handles each entry of the doubly-indirect block the same way, in order."
+          - text: "free the doubly-indirect block and clear addrs[12]"
+            why: "The root goes last, after all its entries have been read."
+          - text: "write the inode back with size 0 (iupdate)"
+            why: "The inode's slots and size change in the same transaction as all the bitmap bits."
+        why_wrong: "Each table is read before anything it lists is freed, and freed only after its entries have been used; the inode is written last."
+        explain: |
+          Children first, root last, and each block read before its bit is cleared. The whole
+          sequence is one transaction, so a crash leaves either the full file or nothing.
+      - id: lab22-13
+        level: 3
+        type: number
+        q: |
+          `usertests`'s `writebig` writes a 65,803-block file on a fresh 70,000-block disk and
+          unlinks it. How many distinct blocks did that `unlink`'s transaction log, as measured?
+        answer: 12
+        wrong:
+          10: |
+            You may have assumed every operation stays within the old `MAXOPBLOCKS` of 10.
+            Freeing touches one bitmap block per 8192 disk blocks the file spans: nine here.
+          66061: |
+            You may have counted every freed block. [[bfree]] changes only bitmap bits; the
+            freed blocks themselves are not written.
+          11: |
+            Close: nine bitmap blocks and the file's inode block, plus the directory's data
+            block. The directory's inode block is written too: [[writei]] always ends with
+            [[iupdate]] of the directory.
+        why_wrong: "9 bitmap blocks + the directory's data block + the directory's inode block + the file's inode block."
+        explain: |
+          Log absorption makes the cost of freeing proportional to the number of bitmap blocks
+          touched, not to the number of blocks freed: `nbitmap + 3` at most. Twelve broke the
+          old budget of 10; the reference raises it to 13.
+  - title: How do you prove the blocks came back?
+    q: |
+      Reading the file back proves that the data is there. It cannot prove that unlinking
+      freed every block, including the 27 indirect ones. What would, from a user program, and
+      what could make such a check lie?
+    hints:
+      - "The free bitmap ([[g:free-bitmap]]) is the only record of which blocks are free; [[balloc]] reads it bit by bit ([[kernel/fs.c:74]]-[[kernel/fs.c:87]]). User programs cannot read disk blocks."
+      - "Creating a file can allocate a block that is not the file's: the directory may grow. And on 3 harts, another process may allocate between two counts."
+      - "A small system call that counts the clear bits through the buffer cache; take the first count after `open(O_CREATE)`, require that the write used exactly n data + the expected indirect blocks, and that the count after `unlink` equals the first."
+    answer: |
+      Count the free blocks. The reference adds a test-only system call, `freeblocks()`, that
+      reads each bitmap block with [[bread]] and counts clear bits. It reads through the buffer
+      cache, so it sees changes of transactions that have not committed yet; that is what a
+      test running alone wants.
+
+      `bigfiletest` then checks two equalities. After writing *n* blocks, the free count must
+      have dropped by exactly *n* + the number of indirect blocks: 0 up to 11 blocks, 1 up to
+      267, and 2 + ⌈(n − 267) / 256⌉ above that (27 for 6580, 258 for 65,803). This catches a
+      kernel that allocates too many or too few tables, or maps two file blocks to one disk
+      block (clinic 2 fails here). And after `unlink`, the count must equal the first one
+      (clinic 3 fails here).
+
+      Where it could lie: the first count is taken *after* creating the empty file, because
+      `create` may add a block to the directory, which `unlink` does not give back. And
+      nothing locks the bitmap between two counts, so another process writing at the same
+      time would change them: the comment on the kernel function says the count can be stale,
+      and the test assumes it runs alone.
+    checks:
+      - id: lab22-14
+        level: 1
+        type: number
+        q: |
+          How many indirect blocks (singly-indirect, doubly-indirect and the indirect blocks
+          under it) does a 6580-block file use?
+        answer: 27
+        wrong:
+          26: |
+            You may have counted the indirect blocks under the doubly-indirect block and the
+            singly-indirect block, but not the doubly-indirect block itself.
+          25: |
+            That is only the indirect blocks under the doubly-indirect block. The
+            singly-indirect block and the doubly-indirect block count too.
+          28: |
+            You may have counted one indirect block too many under the doubly-indirect block.
+            Its range holds 6580 − 267 = 6313 blocks, and ⌈6313 / 256⌉ = 25.
+        why_wrong: "1 singly-indirect + 1 doubly-indirect + ⌈(6580 − 267) / 256⌉ = 25 indirect blocks."
+        explain: |
+          27 blocks of metadata for 6580 blocks of data, 0.4%. The measured run: `blocks used
+          6607 = 6580 data + 27 indirect`.
+      - id: lab22-15
+        level: 3
+        type: number
+        q: |
+          A kernel whose [[itrunc]] forgets the doubly-indirect tree runs `bigfiletest`
+          (6580 blocks). By how many blocks is the free count after `unlink` lower than
+          before the write?
+        answer: 6339
+        wrong:
+          6313: |
+            You counted the leaked data blocks (6580 − 267) but not the 25 indirect blocks and
+            the doubly-indirect block, which leak with them.
+          6607: |
+            That is every block of the file. The 11 direct blocks, the singly-indirect block
+            and its 256 data blocks are still freed.
+          27: |
+            That would be the leak if only the indirect blocks were forgotten. Here the whole
+            tree below `addrs[12]` is skipped, data included.
+        why_wrong: "Leaked: 6313 data blocks + 25 indirect blocks + 1 doubly-indirect block."
+        explain: |
+          Everything reachable only through `addrs[12]` leaks: 6313 + 25 + 1 = 6339. Clinic 3
+          shows the real run.
+build: |
+  **Start.**
+
+  ```text
+  git checkout -b my-bigfile 06aad25
+  ```
+
+  Write your test program first (`user/bigfiletest.c`, added to `UPROGS` in the `Makefile`).
+  Do not call it `bigfile`: usertests' `partial_write` overwrites and deletes a file of that
+  name, and your program would vanish after the first `usertests` run. To count free blocks
+  you need a small system call (the usual five places: `syscall.h`, `syscall.c`,
+  `sysfile.c`, `user.h`, `usys.pl`) and a function in `fs.c` that counts clear bits in the
+  bitmap. On the unmodified kernel, `bigfiletest -w 300` must report `wrote 268 blocks`:
+  that is the old limit, and your test seeing it.
+
+  **Milestones, in an order that keeps the system bootable after each one.**
+
+  1. **The inode layout.** `NDIRECT` 11, `addrs[NDIRECT + 2]` in `struct dinode` *and*
+     `struct inode`. `MAXFILE` stays `NDIRECT + NINDIRECT` (now 267). `make` rebuilds mkfs
+     and `fs.img`. Test: boot, `ls`, `usertests -q` (`writebig` now writes 267 blocks, all
+     through the old code paths).
+  2. **[[bmap]].** The third range. Nothing reaches it yet. Test: it compiles; reread the
+     index arithmetic against the table in think 2.
+  3. **[[itrunc]].** The tree, children first. Test: still nothing reaches it; `usertests -q`.
+  4. **`FSSIZE`.** 70,000. Look at mkfs's output line `nmeta 55 (boot, super, log blocks 31,
+     inode blocks 13, bitmap blocks 9) blocks 69945 total 70000`. Test: boot, `usertests -q`.
+  5. **Flip the switch: `MAXFILE`.** Add the doubly-indirect range, and make mkfs's own
+     assertion say what *it* supports (`NDIRECT + NINDIRECT`). Test: `bigfiletest 300` first
+     (one indirect block under the doubly-indirect block, quick), then `bigfiletest`, then
+     `usertests -q`, then `bigfiletest` again.
+  6. **Recount, then re-budget the log.** Work through think 4 and think 6, then raise
+     `MAXOPBLOCKS` to cover the worst cases, rewrite [[filewrite]]'s formula term by term,
+     and give mkfs an assertion that ties the bitmap size to the budget. Test: `usertests
+     -q`; if you can, a race like the one in clinic 7.
+
+  **What to expect.** On an otherwise idle computer `bigfiletest` took 37 seconds and
+  `usertests -q` 7 minutes (421 s; the original kernel takes 43 s). Measured while the
+  computer was busy with other work, they took 114 s and 57 minutes; timings on QEMU depend
+  on what else the computer is doing, so yours will differ. Most of it is `writebig`: 65,803 one-block
+  writes, each its own transaction. While you iterate, use `bigfiletest 300` and
+  `usertests writebig`.
+
+  **Debugging advice.** Start QEMU halted with `make qemu-gdb` (it picks its own gdb port
+  and writes it into `.gdbinit`), and set breakpoints before the first `continue`.
+
+  - The interesting moments are rare, so break on lines, not functions: `tbreak fs.c:<line of
+    the doubly-indirect balloc>` fires once per file. `bmap` and `balloc` are not inlined in
+    this build, so breakpoints inside them work. With `-O`, gdb can show wrong values for
+    `bn` (both `bn` and `bn@entry`; we saw `bn=4294967029` where it was 0): print
+    `ip->addrs` and the table contents, or work `bn` out from `writei`'s `off`.
+  - `p ip->addrs` shows the whole inode slot array; `p *(uint (*)[256])bp->data` shows a
+    table block in the cache.
+  - `p 'log.c'::log.lh` shows how many blocks the current transaction has logged and which.
+  - A panic `log_write outside of trans` from [[readi]] means [[bmap]] tried to *allocate*
+    while reading: some table on disk lacks an entry your write put in the cache (clinic 1).
+  - `balloc: out of blocks` from `writebig` means the disk is too small or blocks leaked:
+    compare `freeblocks()` before and after.
+  - After any change to `fs.h` or `param.h`, check that `make` rebuilt `fs.img`. A kernel run
+    on an image of the other format fails in ways that look like anything but a format
+    problem (clinics 4 and 6).
+clinic:
+  - bug: The doubly-indirect block is changed but not logged
+    change: |
+      In [[bmap]], the new indirect block's number is stored in the doubly-indirect block, but
+      that buffer is never passed to [[log_write]]:
+
+      ```diff
+           if ((addr = a[bn / NINDIRECT]) == 0) {
+             addr = balloc(ip->dev);
+             if (addr) {
+               a[bn / NINDIRECT] = addr;
+      -        log_write(bp);
+             }
+           }
+      ```
+    symptom: |
+      $ bigfiletest
+      bigfiletest: 6580 blocks (old limit 268, new limit 65803)
+      bigfiletest: create: OK
+      bigfiletest: write: OK
+      bigfiletest: size: OK
+      bigfiletest: blocks used 6607 = 6580 data + 27 indirect
+      bigfiletest: block count: OK
+      panic: log_write outside of trans
+
+      # a fresh image: write the file, then cut the power (no sync, QEMU killed):
+      $ bigfiletest -w 6580
+      bigfiletest: wrote 6580 blocks
+      $ echo off
+      off
+      # next boot, same fs.img:
+      $ bigfiletest -r
+      panic: log_write outside of trans
+
+      # that image booted again, with gdb and a breakpoint on panic; it printed
+      # the hart and noff, then bt:
+      hart 1 noff 1
+      #0  panic (s=s@entry=0x80007548 "log_write outside of trans") at kernel/printk.c:139
+      #1  0x00000000800040c4 in log_write (b=b@entry=0x80016508 <bcache+3360>) at kernel/log.c:232
+      #2  0x0000000080002e38 in balloc (dev=1) at kernel/fs.c:80
+      #3  0x000000008000302c in bmap (ip=ip@entry=0x80020708 <itable+296>, warning: left shift count is negative
+      warning: right shift count is negative
+      bn=256, bn@entry=0) at kernel/fs.c:493
+      #4  0x0000000080003870 in readi (ip=0x80020708 <itable+296>, user_dst=user_dst@entry=1, dst=dst@entry=15136, off=535552, n=n@entry=1024) at kernel/fs.c:599
+      #5  0x00000000800044ac in fileread (f=0x80022238 <ftable+64>, addr=15136, n=1024) at kernel/file.c:122
+      [...]
+      # p bn, p ip->inum, p ip->size, p ip->addrs[12], p 'log.c'::log.outstanding in frame 3:
+      $1 = 256
+      $2 = 25
+      $3 = 6737920
+      $4 = 1338
+      $5 = 0
+    why: |
+      Writing worked and the block count was right: every new indirect block was allocated,
+      zeroed, logged and filled. What was lost is the doubly-indirect block's *record* of
+      them. That change lived only in the buffer cache.
+
+      Why entry 0 survived: the first indirect block is allocated in the same transaction as
+      the doubly-indirect block itself, which `bzero` had just logged. [[commit]] copies each
+      logged block's cached contents at commit time, so entry 0 rode along. Entries 1 to 24
+      were set in later transactions in which the doubly-indirect block (number 1338) was not
+      logged. During the write it stayed in the cache, because every block's [[bmap]] used it
+      and the cache evicts the least recently used buffer. Reading the file from the start
+      does not touch it for 267 blocks, long enough for the 39-buffer cache to evict it
+      (reasoned; we did not trace the first run). When [[bmap]] needed it again it reread
+      block 1338 from disk, found an entry 0 and did what it does with a missing block:
+      allocate one. The gdb run shows where: file block 523 (byte 535,552, `bn` = 256 in the
+      doubly-indirect range, entry 1). [[readi]] runs outside any transaction
+      (`log.outstanding` = 0), so the first [[log_write]], in [[balloc]], panics
+      ([[kernel/log.c:231]]).
+
+      After the power cut it is the same story with nothing cached: the disk never had entries
+      1 to 24. `sync` would not have helped. `bigfiletest` runs alone, so each of its
+      [[end_op]]s is the last outstanding one and commits before returning ([[kernel/log.c:163]]):
+      `sync` has nothing to flush, and a block that was never logged is in no transaction at
+      all. Indirect blocks 1 to 24 and the 6057 data blocks under them are
+      marked in use in the bitmap and reachable from nowhere: 6081 blocks that no [[itrunc]]
+      will ever free.
+
+      Without the panic (a kernel whose [[readi]] did not allocate) the read would have
+      returned zeros or another file's data. The rule: every block you change, you log, in the
+      same transaction.
+  - bug: Off by one at the end of the singly-indirect range
+    change: |
+      ```diff
+         bn -= NDIRECT;
+
+      -  if (bn < NINDIRECT) {
+      +  if (bn <= NINDIRECT) {
+           // Load indirect block, allocating if necessary.
+      ```
+
+      File block 267 (`bn` = 256 after the subtraction) now goes to the singly-indirect
+      branch, which reads and writes `a[256]`: four bytes past the end of the block's
+      1024-byte `data` array.
+    symptom: |
+      $ bigfiletest 300
+      bigfiletest: 300 blocks (old limit 268, new limit 65803)
+      bigfiletest: create: OK
+      bigfiletest: write: OK
+      bigfiletest: size: OK
+      bigfiletest: blocks used 302 = 300 data + 3 indirect
+      bigfiletest: block count: FAIL
+      bigfiletest: SOME TESTS FAILED
+      $ echo off
+      off
+      # QEMU killed, then booted again on the same fs.img:
+
+      xv6 kernel is booting
+
+      hart 1 starting
+      hart 2 starting
+      panic: invalid file system
+
+      # a fresh image, gdb breaking at `if ((addr = a[bn]) == 0)` when bn == 256;
+      # printed: bp->blockno, bp - bcache.buf, sizeof(struct buf), &a[bn],
+      # &bcache.buf[that + 1], &bcache.head, a[bn], bcache.buf[that + 1].valid,
+      # bcache.buf[that + 1].blockno
+      # first `bigfiletest 300` (writing file block 267):
+      $1 = 1081
+      $2 = 26
+      $3 = 1112
+      $4 = (uint *) 0x8001cd48 <bcache+30048>
+      $5 = (struct buf *) 0x8001cd48 <bcache+30048>
+      $6 = (struct buf *) 0x80020168 <bcache+43392>
+      $7 = 1
+      $8 = 1
+      $9 = 1330
+      # second `bigfiletest 300` (writing file block 267):
+      $10 = 1081
+      $11 = 16
+      $12 = 1112
+      $13 = (uint *) 0x8001a1d8 <bcache+18928>
+      $14 = (struct buf *) 0x8001a1d8 <bcache+18928>
+      $15 = (struct buf *) 0x80020168 <bcache+43392>
+      $16 = 1
+      $17 = 1
+      $18 = 1334
+      # the three runs' output:
+      bigfiletest: blocks used 302 = 300 data + 3 indirect
+      bigfiletest: block count: FAIL
+      [...]
+      bigfiletest: blocks used 302 = 300 data + 3 indirect
+      bigfiletest: block count: FAIL
+      [...]
+      bigfiletest: blocks used 6606 = 6580 data + 27 indirect
+      bigfiletest: block count: FAIL
+    why: |
+      `a[256]` is not in the indirect block. The buffer's `data` array is the last field of
+      `struct buf` (1112 bytes), and the cache's buffers sit next to each other in
+      `bcache.buf[]`, so the four bytes after `data` are the **`valid` field of the next
+      buffer** (or of `bcache.head` after the last one). gdb shows exactly that: `&a[256]`
+      equals `&bcache.buf[27]` when the singly-indirect block (1081) was in slot 26, and
+      `&bcache.buf[17]` when it was in slot 16. What the bug does depends on what that
+      neighbouring field holds:
+
+      - **Next buffer valid** (`a[256]` reads 1): [[bmap]] believes file block 267 is already
+        allocated, at disk block **1**, the [[g:superblock|superblock]]. No block is
+        allocated (302 instead of 303), and the file's data for block 267 is logged and
+        installed over the superblock. The running kernel does not notice, since it read the
+        superblock at boot; the next boot finds the magic number gone: `panic: invalid file
+        system`.
+      - **Next buffer not valid** (`a[256]` reads 0): a block is allocated and its number
+        written into the neighbour's `valid` field. The count is then right, but [[itrunc]]
+        frees only `a[0..255]`, so that block leaks. All three traced runs on the finished
+        branch found a valid neighbour; with a 30-buffer cache (before commit 6 raises
+        `NBUF`) the indirect block once sat in the last slot, next to `bcache.head`, whose `valid` is 0,
+        and `bigfiletest 300` then passed its count and reported one block lost after
+        `unlink`.
+
+      All three runs failed the count, 302 for 300 and 6606 for 6580. A related slip, forgetting `bn -= NINDIRECT` before the doubly-indirect
+      range, passes `bigfiletest` completely (every block shifts by one table, consistently)
+      and dies only in `usertests`: `test writebig: panic: bmap: out of range`, when the
+      shifted index runs off the end 256 blocks early. Boundary blocks 266, 267 and 523, and a
+      run up to `MAXFILE`, are the tests that matter.
+  - bug: itrunc does not free the doubly-indirect tree
+    change: |
+      [[itrunc]] is left as it was: it frees the direct blocks and the singly-indirect tree,
+      and never looks at `addrs[NDIRECT + 1]`:
+
+      ```diff
+      -  if (ip->addrs[NDIRECT + 1]) {
+      -    bp = bread(ip->dev, ip->addrs[NDIRECT + 1]);
+      -    ...
+      -    bfree(ip->dev, ip->addrs[NDIRECT + 1]);
+      -    ip->addrs[NDIRECT + 1] = 0;
+      -  }
+      ```
+    symptom: |
+      $ bigfiletest
+      bigfiletest: 6580 blocks (old limit 268, new limit 65803)
+      bigfiletest: create: OK
+      bigfiletest: write: OK
+      bigfiletest: size: OK
+      bigfiletest: blocks used 6607 = 6580 data + 27 indirect
+      bigfiletest: block count: OK
+      bigfiletest: read back: OK
+      bigfiletest: unlink: OK
+      bigfiletest: free blocks 68930 before, 62591 after
+      bigfiletest: all blocks freed: FAIL
+      bigfiletest: SOME TESTS FAILED
+      $ usertests -q
+      usertests starting
+      test copyin: OK
+      [...]
+      test writebig: balloc: out of blocks
+      writebig: error: write big file failed i=62346
+      FAILED
+      SOME TESTS FAILED
+      $ bigfiletest
+      bigfiletest: 6580 blocks (old limit 268, new limit 65803)
+      bigfiletest: create: OK
+      balloc: out of blocks
+      bigfiletest: write: FAIL
+      bigfiletest: SOME TESTS FAILED
+    why: |
+      Everything reachable only through `addrs[12]` stays marked in use: 6313 data blocks, 25
+      indirect blocks and the doubly-indirect block, 6339 blocks, exactly `68930 − 62591`.
+      Nothing else notices. The inode is freed and reused (its slot array is cleared by
+      [[ialloc]]), so the blocks are reachable from nowhere, and no tool in xv6 rebuilds the
+      bitmap from the inodes; the leak survives every reboot.
+
+      It shows up as lost capacity. `writebig` then needs 65,803 + 258 blocks but only 62,591
+      are free: it stops at block 62,346, and 62,346 data + 245 indirect blocks is exactly
+      62,591. Its failed test leaves the partial file behind, the disk is full, and the next
+      `bigfiletest` cannot even start writing. On a 70,000-block disk one leaked large file
+      is enough to make `usertests` fail; that is how a learner usually finds this bug, long
+      after making it. The free-block count in the test finds it at once.
+  - bug: NDIRECT lowered, but the arrays not lengthened
+    change: |
+      `NDIRECT` becomes 11, but both arrays keep their old declaration, which now means 12
+      entries:
+
+      ```c
+      #define NDIRECT    11 // addrs[NDIRECT] is singly, addrs[NDIRECT+1] doubly indirect
+      ...
+        uint addrs[NDIRECT + 1]; // in struct dinode, and the same in struct inode
+      ```
+
+      [[bmap]] and [[itrunc]] are as in the reference, so they use `addrs[NDIRECT + 1]`, one
+      past the end of the array.
+    symptom: |
+      # make fs.img (mkfs is built with the host's compiler; macOS's assert message):
+      mkfs/mkfs fs.img README user/_cat user/_echo user/_forktest user/_grep user/_init user/_kill user/_ln user/_ls user/_mkdir user/_rm user/_sh user/_stressfs user/_usertests user/_grind user/_wc user/_zombie user/_logstress user/_forphan user/_dorphan user/_sync user/_bigfiletest 
+      Assertion failed: ((BSIZE % sizeof(struct dinode)) == 0), function main, file mkfs.c, line 88.
+      make: *** [fs.img] Abort trap: 6
+
+      # the kernel itself compiled without a warning; booted on an image made by the
+      # reference mkfs (64-byte inodes):
+
+      xv6 kernel is booting
+
+      hart 1 starting
+      hart 2 starting
+      ireclaim: orphaned inode 4
+      panic: freeing free block
+    why: |
+      With 12 entries, `struct dinode` is 2 × 4 + 4 + 12 × 4 = 60 bytes, and 1024 is not a
+      multiple of 60: mkfs's first check stops the build (the message format is macOS's
+      `assert`; Linux prints the same condition differently). The C compiler is no help:
+      `ip->addrs[NDIRECT + 1]` on a 12-entry array compiles silently, even with `-Wall
+      -Werror`.
+
+      Suppose an image is around anyway, made with 64-byte inodes. The buggy kernel computes
+      `IPB` = 1024 / 60 = 17 and looks for inode *i* at offset `(i % 17) * 60`. At boot,
+      [[ireclaim]] scans all inodes for "allocated but no links". Decoding the image with the
+      buggy layout, inode 4 lands at byte 240 of the first inode block, which is the tail of
+      the real inode 3 (its `addrs[9]` to `addrs[12]`) and the start of inode 4. The kernel
+      reads `type` = 77 (the low half of block number 77), `nlink` = 0: an orphan. Reclaiming
+      it, [[itrunc]] frees its "blocks": 2 (the log's header block, whose bit is set, so it is
+      cleared without complaint), then 65,536, a block that is free: `panic: freeing free block`.
+
+      A different `sizeof(struct dinode)` in two programs that share a disk is a format
+      mismatch, and its symptoms point everywhere except at the cause. Keep the array at 13.
+  - bug: FSSIZE left at 2000
+    change: |
+      Everything as in the reference, except `kernel/param.h`:
+
+      ```diff
+      -#define FSSIZE      70000             // size of file system in blocks
+      +#define FSSIZE      2000              // size of file system in blocks
+      ```
+    symptom: |
+      $ usertests -q
+      usertests starting
+      test copyin: OK
+      [...]
+      test writetest: OK
+      test writebig: balloc: out of blocks
+      writebig: error: write big file failed i=933
+      FAILED
+      SOME TESTS FAILED
+
+      # a fresh image:
+      $ bigfiletest
+      bigfiletest: 6580 blocks (old limit 268, new limit 65803)
+      bigfiletest: create: OK
+      balloc: out of blocks
+      bigfiletest: write: FAIL
+      bigfiletest: SOME TESTS FAILED
+    why: |
+      The doubly-indirect code works; the disk is too small. mkfs made 2000 blocks, used 1062
+      of them (56 of metadata, the rest for the programs), and left 938 free. `writebig`
+      wrote 933 blocks, which with their 5 indirect blocks (one singly-indirect, the
+      doubly-indirect block and 3 under it) is exactly 938, and the 934th write found nothing:
+      [[balloc]] printed its message and returned 0, [[writei]] stopped, `write` returned
+      less than asked.
+
+      `MAXFILE` and `FSSIZE` are independent: the first is how many blocks an inode can name,
+      the second how many the disk has. A test that writes `MAXFILE` blocks needs both.
+  - bug: Running the new kernel on an old fs.img
+    change: |
+      The reference kernel, booted on an `fs.img` built by the *original* mkfs (`NDIRECT` 12,
+      2000 blocks), for example a copy kept from before the lab.
+    symptom: |
+      xv6 kernel is booting
+
+      hart 1 starting
+      hart 2 starting
+      init: starting sh
+      $ ls
+      exec ls
+       failed
+      $ echo hi
+      exec echo hi
+       failed
+    why: |
+      It boots, which is the dangerous part. The superblock describes a valid 2000-block file
+      system and the inodes are where the kernel expects them (the inode size did not change).
+      Only the meaning of `addrs[11]` and `addrs[12]` changed: in the old image `addrs[11]`
+      is file block 11 of data, and the new kernel reads that data block as a table of block
+      numbers.
+
+      `exec` reads only the parts of a program file that are loaded, and for `init` (text at
+      file offset `0x1000`, 2.5 KiB, data at `0x2000`) those are all in blocks 0 to 10. So
+      `init` runs. `sh` has its 16 bytes of initialized data, `whitespace` and `symbols`, at
+      file offset `0x3000`: file block 12, which the new kernel finds as entry 1 of the
+      "indirect block" `addrs[11]`. In the old image that is the second word of one of `sh`'s
+      own data blocks, and it is 0 (we decoded the image). So [[bmap]] allocates a fresh zero
+      block, inside `exec`'s transaction, and records its number at file offset `0x2C04` of
+      `sh`: ELF padding between the text (which ends at `0x23d9`) and the data at `0x3000`,
+      which the old kernel never loads (we booted the original kernel on this image
+      afterwards: `ls` and `echo hi` worked). What the old format really loses
+      is that block: marked in use, reachable from nothing. `sh` runs with `whitespace` = "":
+      it no longer treats the newline as whitespace, so it tries to run a program called
+      `"ls\n"`, which does not exist.
+
+      The lesson: changing what a field *means* is a format change even when no size changes.
+      `make` rebuilds `fs.img` because the `fs.img` rule depends on mkfs, and mkfs on `fs.h`
+      and `param.h` ([[Makefile:123]]). Any image kept outside that rule must be rebuilt by
+      hand.
+  - bug: MAXOPBLOCKS left at 10
+    change: |
+      Everything as in the reference except commit 6: `MAXOPBLOCKS` stays 10 (so `LOGBLOCKS`
+      and `NBUF` stay 30), [[filewrite]] keeps its old formula, and mkfs has no
+      `nbitmap + 3` check:
+
+      ```diff
+      -#define MAXOPBLOCKS 13                // max # of blocks any FS op writes
+      +#define MAXOPBLOCKS 10                // max # of blocks any FS op writes
+      ```
+
+      The trigger is `lograce`, a separate test program (not part of the branch). It sets
+      up files so that one group commit holds four operations:
+      a 3-block write `W` to a file `f` across file blocks 264 to 267, which `begin_op`
+      admits and which then waits for `f`'s inode lock (a child is reading all of `f`); two
+      3-block overwrites of other files that finish meanwhile; and the `unlink` of a 9-block
+      file whose blocks lie in 9 different bitmap blocks. It repeats this 12 times with
+      different timings.
+    symptom: |
+      $ lograce
+      lograce: g inode 32
+      [...]
+      lograce: setup done, 3086 free
+      panic: bget: no buffers
+
+      # the reference kernel (MAXOPBLOCKS 13) with commit printing and a count of free
+      # buffers, same program, first attempt:
+      commit: 30 blocks: 1192 1193 1194 1195 44 1196 1197 1198 1199 45 1200 42 46 55 56 57 58 59 60 61 62 63 67275 1201 67021 9427 17653 25879 34105 47
+      bcache: min free buffers 10
+      bcache: min free buffers 8
+      lograce: attempt 1 (spin 200000) survived
+      [...]
+      lograce: attempt 12 (spin 2400000) survived
+    why: |
+      The two overwrites log 5 blocks each (4 data blocks and an inode block): `lh.n` = 10.
+      The `unlink` begins next; `begin_op` admits it because 10 + (1 + 1) × 10 ≤ 30, counting
+      on it to log at most 10. It logs 12: the directory block, two inode blocks and nine
+      bitmap blocks. Then `W` gets its lock and logs 8 more (its bitmap writes are absorbed
+      into the unlink's nine). That is the 30-block commit the instrumented reference kernel
+      printed: 10 + 12 + 8 = `LOGBLOCKS`.
+
+      Thirty is not too many for the log, but it is too many for the cache. [[log_write]]
+      pins every logged buffer ([[kernel/log.c:240]]), and `NBUF` is also 30, so all 30
+      buffers are pinned when [[commit]] starts. Its first step, `write_log`, must
+      [[bread]] log block 1 to copy a logged block into it; [[bget]] finds no buffer with
+      `refcnt` 0 and panics ([[kernel/bio.c:87]]). Without the unlink's overrun of 2 the
+      same group peaks at 28 and survives.
+
+      On the reference, the same 30-block group leaves 9 of 39 buffers free (8 at the lowest,
+      while `write_log` holds one), and all 12 attempts survive; so do 12 attempts on the
+      uninstrumented reference kernel. The lesson of think 4 and think 6: when a change
+      makes operations log more, recount every operation's worst case and raise the budget
+      that admission control relies on, or the kernel's promise to itself fails in a place
+      far from the code you changed.
+reveal:
+  - title: Thirteen slots, new meanings
+    commit: 1
+    file: kernel/fs.h
+    lines: 23-46
+    focus: 26-39
+    diff: true
+    state:
+      hart: any
+      proc: "(definitions shared by the kernel and by mkfs)"
+      locks: []
+    note: |
+      The story of this tour was recorded in one run on the finished branch, on three harts,
+      with gdb attached: `bigfiletest 300` (pid 3, file `bigtest.dat`, inode 25) writes 300 blocks,
+      reads them back and unlinks the file. 300 blocks is enough to need the doubly-indirect
+      block and one indirect block under it; the later steps follow file block 267, the first
+      one in the new range.
+
+      Commit 1 makes room. `NDIRECT` drops from 12 to 11 and the array is declared
+      `addrs[NDIRECT + 2]`: still 13 entries, so `struct dinode` is still 64 bytes, `IPB` is
+      still 16, and inode 25 is still at offset `(25 % 16) * 64` = 576 of the second inode
+      block (block 43 on the finished branch, whose larger log pushes the inodes back). What changes is the meaning of two slots: `addrs[11]` was a data block
+      and is now the singly-indirect block; `addrs[12]` was the singly-indirect block and will
+      be the doubly-indirect one.
+
+      `MAXFILE` is still `NDIRECT + NINDIRECT`, now 267 blocks, one fewer than before: nothing
+      can reach slot 12 yet, so the kernel works at every commit of this branch. But this is
+      already an on-disk format change. An image made by the old mkfs has data where the new
+      kernel expects a table (clinic 6). `make` rebuilds mkfs and `fs.img` because both depend
+      on this header.
+  - title: The in-memory inode must agree
+    commit: 1
+    file: kernel/file.h
+    lines: 16-30
+    focus: 29
+    diff: true
+    state:
+      hart: any
+      proc: "(a definition used by every inode operation)"
+      locks: []
+    note: |
+      `struct inode` is the kernel's cached copy of an inode, one of the 50 entries in
+      `itable`. Its `addrs` array is separate from the on-disk one, and the two are connected
+      only by `memmove(ip->addrs, dip->addrs, sizeof(ip->addrs))` in [[ilock]] and the reverse
+      in [[iupdate]] ([[kernel/fs.c:313]], [[kernel/fs.c:240]]). Both copy the *in-memory*
+      array's size. Lengthen one array and not the other and the copy silently drops or
+      invents a slot; that is why this line changes in the same commit.
+
+      The fields "below `lock`" in this struct are protected by `ip->lock`, a
+      [[g:sleeplock|sleep-lock]]: [[bmap]] and [[itrunc]] change `ip->addrs[]` and are only
+      ever called with it held ([[concept:locks#lock-inode]]). Nothing in this lab needs a new
+      lock. Every new block is reached from one inode, and that inode's sleep-lock serializes
+      everything done to its tree; the shared pieces (the bitmap blocks, the log) already have
+      their own locks.
+  - title: "bmap, third range: the doubly-indirect block"
+    commit: 2
+    file: kernel/fs.c
+    lines: 419-497
+    focus: 459-468
+    diff: true
+    state:
+      hart: 2
+      mode: S
+      proc: bigfiletest (pid 3)
+      intr: "on"
+      satp: kernel
+      locks: ["inode 25 lock (sleep-lock)"]
+      irq: 0
+      stack: [usertrap, syscall, sys_write, filewrite, writei, bmap]
+      sp: {"on": kernel, detail: "pid 3's kernel stack: `sp` = `0x3fffff9e80`, base `0x3fffff9000`"}
+    note: |
+      The new range follows the shape of the singly-indirect one: subtract the size of the
+      range just passed (`bn -= NINDIRECT`, line 459), then compare with the size of this one.
+      After both subtractions `bn` is 0 to 65,535.
+
+      This is the moment gdb recorded, on hart 2: `writei` was called with `off` = 273,408,
+      file block 267, so `bn` is 0 here. The inode's slots were `{1070, ..., 1080, 1081, 0}`:
+      11 direct blocks, the singly-indirect block 1081, and no doubly-indirect block yet. So
+      line 464 calls [[balloc]], which will return 1338, the next free block on this disk, and
+      line 467 stores it in the in-memory inode. That store is not logged here and does not
+      need to be: [[writei]] ends with [[iupdate]], which copies `ip->addrs` into the inode's
+      block and logs it, in this same transaction.
+
+      State: a `write` system call, so interrupts are on (`sstatus` = `0x200000022`, SIE set)
+      and no spinlock is held (noff 0). The process holds inode 25's sleep-lock, taken by
+      [[filewrite]] through [[ilock]]. The transaction is open (`log.outstanding` = 1) and has
+      logged nothing yet (`log.lh.n` = 0).
+    others: |
+      Another process writing another file on hart 1 can be inside its own [[bmap]] at the same
+      time; they share nothing but the bitmap blocks and the log. The bitmap block is a buffer
+      with a sleep-lock, so two [[balloc]]s serialize on it and never hand out the same block.
+      Both writes join the same group commit if their transactions overlap ([[tour:31]]).
+  - title: Allocating a block inside the transaction
+    commit: 2
+    file: kernel/fs.c
+    lines: 51-90
+    focus: 76-81
+    state:
+      hart: any
+      mode: S
+      proc: bigfiletest (pid 3)
+      intr: "on"
+      satp: kernel
+      locks: ["inode 25 lock (sleep-lock)", "buf 55, bitmap block 0 (sleep-lock)"]
+      irq: 0
+      stack: [usertrap, syscall, sys_write, filewrite, writei, bmap, balloc]
+      sp: {"on": kernel}
+    note: |
+      [[balloc]] is unchanged by this lab, but every level of the tree goes through it, so it
+      is worth seeing what one allocation logs. (The state shown is for the first call, from
+      line 464, which allocates the doubly-indirect block itself, so no table buffer is held
+      yet; for the later levels the parent table's buffer is held too.) It finds the first clear bit in the bitmap,
+      sets it, and logs the bitmap block (line 80). Then `bzero` (lines 52-61) reads the new
+      block, fills it with zeros and logs it too. Two logged blocks per allocation, and the
+      zeroing is essential for tables: 0 is how [[bmap]] recognizes an empty entry.
+
+      `bzero` reads the block from disk only to overwrite it. On a cache miss that is a real
+      disk read, and the process sleeps in [[virtio_disk_rw]] until the interrupt: allowed,
+      because only sleep-locks are held. A process that sleeps (or is made to yield by a timer
+      interrupt, which [[kerneltrap]] does whenever no spinlock is held) may resume on another
+      hart. In the recorded run it did: [[bmap]] started on hart 2, was on hart 1 after the
+      first two allocations and on hart 0 after the third, always with the same kernel stack
+      (`sp` = `0x3fffff9e80` each time).
+      That is why this step says "any".
+
+      After the doubly-indirect block and the first indirect block are allocated, gdb showed
+      `log.lh.n` = 3: bitmap block 55, block 1338 and block 1339, each logged once although
+      the bitmap block was changed twice ([[log_write]] absorbs repeats).
+    others: |
+      While this process holds buf 55's sleep-lock, any other process that needs a block waits
+      in [[bread]] (it sleeps; the hart runs something else). The lock is held from line 75 to
+      line 81 only, then released before the zeroing, so the bitmap is never held across a
+      disk read of the new block.
+  - title: The middle level, logged with its parent
+    commit: 2
+    file: kernel/fs.c
+    lines: 459-494
+    focus: 471-478
+    state:
+      hart: 1
+      mode: S
+      proc: bigfiletest (pid 3)
+      intr: "on"
+      satp: kernel
+      locks: ["inode 25 lock (sleep-lock)", "buf 1338, the doubly-indirect block (sleep-lock)"]
+      irq: 0
+      stack: [usertrap, syscall, sys_write, filewrite, writei, bmap]
+      sp: {"on": kernel, detail: "pid 3's kernel stack, `sp` = `0x3fffff9e80`, now on hart 1"}
+    note: |
+      The doubly-indirect block (1338) is read into the cache and its entry `bn / NINDIRECT` = 0
+      is examined. It is 0, so a new indirect block is allocated (1339), its number stored in
+      entry 0, and the doubly-indirect block **logged** (line 476). gdb at line 475, on hart 1:
+      `addr` = 1339, `bp->blockno` = 1338, the buffer locked, `refcnt` 2 (this [[bread]] plus
+      the pin that [[log_write]] put on it when `bzero` logged it), and `ip->addrs[12]` = 1338.
+
+      Line 476 is the line clinic 1 deletes. In this first transaction its absence would go
+      unnoticed, because block 1338 is already in the transaction (`bzero` logged it) and the
+      commit copies its current contents. For indirect blocks 1 to 24, allocated in later
+      transactions, it is the only thing that puts the change on disk.
+
+      Only one table buffer is held at a time: the doubly-indirect block is released (line
+      479) before the indirect block is read (483). During [[balloc]] at line 473, though, it
+      is held while [[balloc]] locks the bitmap block and then the new block that `bzero`
+      reads: always the table first, like the singly-indirect code. [[balloc]] holds no
+      table's lock, so the order is never reversed.
+  - title: The bottom level, and the data block
+    commit: 2
+    file: kernel/fs.c
+    lines: 459-494
+    focus: 484-491
+    state:
+      hart: 0
+      mode: S
+      proc: bigfiletest (pid 3)
+      intr: "on"
+      satp: kernel
+      locks: ["inode 25 lock (sleep-lock)", "buf 1339, indirect block 0 (sleep-lock)"]
+      irq: 0
+      stack: [usertrap, syscall, sys_write, filewrite, writei, bmap]
+      sp: {"on": kernel}
+    note: |
+      The indirect block (1339) is read, entry `bn % NINDIRECT` = 0 examined, a data block
+      allocated (1340), stored, and the indirect block logged. gdb at line 488 recorded hart 0
+      (the process moved again while `bzero` read block 1340), `addr` = 1340,
+      `bp->blockno` = 1339, and `log.lh.n` = 4: the transaction now holds bitmap block 55 and
+      blocks 1338, 1339 and 1340. (gdb printed `bn` = 4294967029 here: with `-O`, gdb's view of
+      `bn` is wrong at this line; `writei`'s `off` says it is 0.)
+
+      The function returns 1340 to [[writei]], which reads the block, copies the user's 1024
+      bytes into it and logs it (absorbed: it is in the transaction already), and then
+      [[iupdate]] logs inode block 43: five blocks in this write's transaction, counted from the
+      code. File block 268 will cost far less: only entry 1 of block 1339 changes, plus the
+      bitmap, the data block and the inode block.
+
+      If [[balloc]] fails at any level, [[bmap]] returns 0 and [[writei]] stops. A table
+      allocated before the failure stays allocated and recorded (its parent was logged), empty;
+      [[itrunc]] frees it later like any other.
+  - title: Why a crash leaves a consistent file
+    commit: 2
+    file: kernel/fs.c
+    lines: 574-617
+    focus: 592-614
+    state:
+      hart: any
+      mode: S
+      proc: bigfiletest (pid 3)
+      intr: "on"
+      satp: kernel
+      locks: ["inode 25 lock (sleep-lock)"]
+      irq: 0
+      stack: [usertrap, syscall, sys_write, filewrite, writei]
+      sp: {"on": kernel}
+    note: |
+      Everything the previous steps changed belongs to one transaction: bitmap bits, the two
+      new tables, the parent entries, the data, and (line 614) the inode with its new size and
+      `addrs[12]`. [[filewrite]] opened it with `begin_op` and will close it with `end_op`
+      right after this function returns, and `end_op` commits before returning
+      ([[tour:31]]). There is no moment at which the disk shows a block marked in use but not
+      reachable, or a pointer to a block not marked in use.
+
+      So a crash during a long `write` loses at most the chunk in progress. We cut the power
+      between 9 and 17 seconds into `bigfiletest -w 6580` (one block per `write`), six times,
+      on fresh images. Every next boot found a consistent file: 357, 452, 555, 568, 693 and
+      808 good blocks, each time with the free count exactly *n* data + `nindirect(n)` below
+      68,930. Once (13 seconds) the kill landed after a commit point and before the
+      installation finished, and the boot replayed the log:
+
+      ```text
+      recovering tail 0 dst 55
+      recovering tail 1 dst 1628
+      recovering tail 2 dst 1596
+      recovering tail 3 dst 43
+      ```
+
+      That is the bitmap block, the data block for file block 554, indirect block 1 (1596),
+      which received its entry, and the inode block. `bigfiletest -r` then reported
+      `bigtest.dat has 555 good blocks, 68371 blocks free`: 68,930 − 555 data − 4 tables.
+      Nothing leaked, nothing dangled.
+  - title: "itrunc: children first, root last"
+    commit: 3
+    file: kernel/fs.c
+    lines: 499-550
+    focus: 534-540
+    diff: true
+    state:
+      hart: 2
+      mode: S
+      proc: bigfiletest (pid 3)
+      intr: "on"
+      satp: kernel
+      locks: ["inode 25 lock (sleep-lock)", "buf 1338, the doubly-indirect block (sleep-lock)", "buf 1339, indirect block 0 (sleep-lock)"]
+      irq: 0
+      stack: [usertrap, syscall, sys_unlink, iunlockput, iput, itrunc]
+      sp: {"on": kernel, detail: "`sp` = `0x3fffff9e30`"}
+    note: |
+      Now the end of the scenario: `unlink("bigtest.dat")`. The new block mirrors [[bmap]]'s
+      tree. For each nonzero entry of the doubly-indirect block, read that indirect block,
+      free every data block it lists, release it, free it. Then free the doubly-indirect block
+      and clear the slot. gdb stopped at line 540 on hart 2 with `i` = 0, `a[0]` = 1339,
+      `bp->blockno` = 1338 and `bp2->blockno` = 1339 (both buffers still held: line 540 is the
+      `brelse`), and `log.lh.n` = 4.
+
+      Why read before free: [[bfree]] only clears a bit. But the moment it is clear, another
+      process on another hart may [[balloc]] that block and `bzero` it. Freeing indirect block
+      1339 before reading it could let its 256 entries turn into zeros under us, and their
+      data blocks would leak. So each table is used, released, and only then freed (line
+      541).
+
+      The zero test on line 531 matters too: a file of 300 blocks uses one indirect block, so
+      255 of the 256 entries are empty and skipped, without reading anything.
+    others: |
+      Hart 0 or 1 may be running another process's [[balloc]] right now, in a transaction
+      that will commit together with this one. It can receive a block that this loop has
+      already freed. That is correct: the reuse and the free are in the same group commit, or
+      the reuse is in a later one; either way the disk never shows the block owned twice.
+  - title: One transaction for the whole truncation
+    commit: 3
+    file: kernel/fs.c
+    lines: 342-378
+    focus: 365
+    state:
+      hart: 1
+      mode: S
+      proc: bigfiletest (pid 3)
+      intr: "on"
+      satp: kernel
+      locks: ["inode 25 lock (sleep-lock)"]
+      irq: 0
+      stack: [usertrap, syscall, sys_unlink, iunlockput, iput]
+      sp: {"on": kernel}
+    note: |
+      [[itrunc]] is called from [[iput]] when the last reference to an unlinked inode goes
+      away, here inside `unlink`'s transaction. gdb at [[itrunc]]'s entry: hart 1,
+      `log.outstanding` = 1, `log.lh.n` = 3, `ip->size` = 307,200 and slots
+      `{1070, ..., 1081, 1338}`. By the code, those 3 logged blocks are the directory's data
+      block (the cleared entry), the directory's inode block and the file's inode block
+      (`nlink` 0), all logged by [[sys_unlink]] before it let go of the inode.
+
+      `itrunc` runs with the inode's sleep-lock (taken at line 362) and no spinlock: `iput`
+      released `itable.lock` at line 363, because freeing may sleep on disk reads.
+
+      How big does this transaction get? Each [[bfree]] logs one bitmap block, absorbed after
+      the first time. For this 303-block file that is one block (all its blocks are in bitmap
+      block 0): 4 logged blocks in all. For `writebig`'s 66,061 blocks it is nine bitmap
+      blocks, 12 logged blocks in all: more than the original budget of 10, within the 13 of
+      commit 6 (think 6). The original tree never had this problem: its largest file was 268
+      data blocks + 1 indirect block, on a disk with a single bitmap block.
+
+      After `itrunc`, [[ifree]] clears the type (line 377), in the same transaction: the
+      inode and all its blocks become free at one commit. If the machine crashed before
+      that commit, the next boot would find the file still linked, untouched.
+  - title: FSSIZE, the size of the disk
+    commit: 4
+    file: kernel/param.h
+    lines: 1-14
+    focus: 9-12
+    diff: true
+    state:
+      hart: any
+      proc: "(a constant used by mkfs; the kernel reads the size from the superblock)"
+      locks: []
+    note: |
+      `FSSIZE` is the number of 1024-byte blocks in `fs.img`. The kernel never uses this
+      constant: it reads `sb.size` from the superblock at boot. mkfs is the one that uses it,
+      to size the image and lay out the metadata.
+
+      The three lines above it tie the log to the buffer cache: `MAXOPBLOCKS` = 10 blocks per
+      operation, `LOGBLOCKS` = 30 in the on-disk log, `NBUF` = 30 buffers. They do not change
+      in this commit; commit 6 raises all three, after think 4 and think 6 have recounted
+      what one operation can log with the new tree.
+
+      70,000 holds one maximum-size file (66,061 blocks with its tables) plus the roughly
+      1000 blocks that mkfs fills with programs. The image grows from 2 MB to 70 MB.
+  - title: What mkfs derives from FSSIZE
+    commit: 4
+    file: mkfs/mkfs.c
+    lines: 72-120
+    focus: 95-112
+    state:
+      hart: any
+      proc: "mkfs, a program on your computer (not running in xv6)"
+      locks: []
+    note: |
+      mkfs runs on your computer during `make`, and its output shows the new layout:
+
+      ```text
+      nmeta 55 (boot, super, log blocks 31, inode blocks 13, bitmap blocks 9) blocks 69945 total 70000
+      balloc: first 1014 blocks have been allocated
+      ```
+
+      `nbitmap` = 70,000 / 8192 + 1 = 9 (line 28), so the metadata is 2 + 31 + 13 + 9 = 55
+      blocks and the first data block is 55, where it was 47. The superblock written at line
+      119 records each region's start (`bmapstart` is still 46: the bitmap comes after the
+      log and the inodes, so only what follows it moves). Line 114 writes all 70,000 blocks
+      of zeros, which is why the image is 70 MB on disk.
+
+      Then mkfs copies the programs in: 1014 blocks in use when it is done at this commit.
+      (On the finished branch, with a 40-block log and `bigfiletest` on the disk: `nmeta 64`,
+      1070 in use, 68,930 free, the `before` number `bigfiletest` prints.) mkfs's own
+      `balloc` marks the first bits in the first bitmap block only (and asserts that they fit
+      in it); the other eight bitmap blocks stay zero, which means free.
+  - title: balloc scans every bitmap block, from the start
+    commit: 4
+    file: kernel/fs.c
+    lines: 63-90
+    focus: 76-85
+    state:
+      hart: any
+      mode: S
+      proc: "usertests, the child running writebig"
+      intr: "on"
+      satp: kernel
+      locks: ["the file's inode lock (sleep-lock)", "the indirect block being filled (sleep-lock)", "one bitmap block's buffer (sleep-lock)"]
+      irq: 0
+      stack: [usertrap, syscall, sys_write, filewrite, writei, bmap, balloc]
+      sp: {"on": kernel}
+    note: |
+      The kernel side needs no change: the outer loop runs `b` over `sb.size` in steps of
+      `BPB` = 8192, reading one bitmap block per step with `BBLOCK(b, sb)`, nine of them now.
+
+      But look at the cost. Every call starts at block 0. Late in `writebig`, with 65,000
+      blocks in use, each allocation reads eight full bitmap blocks (from the cache: they are
+      used on every allocation, so they stay recently used) and tests some 65,000 bits before
+      it finds a clear one, each block's sleep-lock held while it is scanned (and the indirect
+      block being filled held throughout, since [[bmap]] calls [[balloc]] with it locked).
+      That is a loop of 65,000 iterations per allocated block, reasoned from the code; we did
+      not measure what it costs. A hint ("start looking where the last search ended") would
+      remove it; see the stretch goals.
+    others: |
+      While one process scans bitmap block 7 here, a process on another hart that needs a
+      block waits for that buffer's sleep-lock. The scan is short compared with a disk
+      access, but it is all done under the lock.
+  - title: "The switch: MAXFILE"
+    commit: 5
+    file: kernel/fs.h
+    lines: 23-31
+    focus: 26-29
+    diff: true
+    state:
+      hart: any
+      proc: "(definitions shared by the kernel and by mkfs)"
+      locks: []
+    note: |
+      With every piece in place, one line lets [[writei]] use them: `MAXFILE` = 11 + 256 +
+      65,536 = 65,803. [[writei]]'s guard `off + n > MAXFILE * BSIZE` ([[kernel/fs.c:551]])
+      now allows offsets up to 67,382,272, and the 65,804th block is refused there, before
+      [[bmap]] could reach its `panic("bmap: out of range")`. `bigfiletest 65803` checks
+      exactly that: `write past MAXFILE fails: OK`.
+
+      `MAXFILE` is also used by user programs: usertests includes this header, so `writebig`
+      and `diskfull` now write 65,803-block files. That is the reason `FSSIZE` had to come
+      first: at commit 4 nothing used the bigger disk yet; from here on, `usertests -q` needs
+      it.
+  - title: mkfs keeps its own, smaller limit
+    commit: 5
+    file: mkfs/mkfs.c
+    lines: 256-300
+    focus: 271-288
+    diff: true
+    state:
+      hart: any
+      proc: "mkfs, a program on your computer (not running in xv6)"
+      locks: []
+    note: |
+      mkfs has its own implementation of the block map in [[mkfs:iappend]]: direct slots and
+      the singly-indirect block, nothing more. Its assertion used to say `fbn < MAXFILE`,
+      which was true when `MAXFILE` was exactly what this code handles. With the new
+      `MAXFILE`, a 300-block program would pass the assertion and the `else` branch would
+      index `indirect[fbn - NDIRECT]` past the end of its 256-entry array on mkfs's stack.
+
+      The files mkfs copies are far smaller (`usertests` is the largest: 209,624 bytes, 205
+      blocks), so instead of teaching mkfs the new level, the assertion now states the limit
+      this code really has. Two programs that write the same format with two
+      implementations: when one changes, the other's assumptions must be checked.
+  - title: "Re-budget the log: MAXOPBLOCKS 13"
+    commit: 6
+    file: kernel/param.h
+    lines: 1-14
+    focus: 9-11
+    diff: true
+    state:
+      hart: any
+      proc: "(constants used by the log, the buffer cache and mkfs)"
+      locks: []
+    note: |
+      Think 4 and think 6 recounted what one operation can log with the new tree: a 3-block
+      write chunk up to 13 blocks (measured on a fragmented disk), an `unlink` up to
+      `nbitmap + 3` = 12 (measured for `writebig`). The old promise, 10, is what `begin_op`'s
+      admission test relies on, so this commit raises it to 13, and `LOGBLOCKS` and `NBUF`
+      follow as 39.
+
+      Why `NBUF` must follow: [[log_write]] pins every logged buffer until the commit has
+      installed it, and [[commit]] then needs a free buffer for each log block it reads. With
+      `NBUF` equal to `LOGBLOCKS`, a group commit that really logs `LOGBLOCKS` distinct blocks
+      leaves no buffer at all, and [[bget]] panics `bget: no buffers`. That is exactly what
+      clinic 7 shows on the branch without this commit: a four-operation group commit that
+      reached 30 blocks because one `unlink` logged 12 where 10 were reserved. With the new
+      budget the same 30-block group leaves 9 of 39 buffers free.
+
+      The cost is a log of 40 blocks instead of 31. mkfs puts the log before the inodes, so
+      everything after it moves 9 blocks: the inodes now start at block 42, the bitmap at 55,
+      and data at 64 (`nmeta 64`).
+  - title: The write chunk, recounted term by term
+    commit: 6
+    file: kernel/file.c
+    lines: 132-181
+    focus: 148-160
+    diff: true
+    state:
+      hart: any
+      mode: S
+      proc: bigfiletest (pid 3)
+      intr: "on"
+      satp: kernel
+      locks: []
+      irq: 0
+      stack: [usertrap, syscall, sys_write, filewrite]
+      sp: {"on": kernel}
+    note: |
+      The formula now lists what think 4 counted: the inode block (1), up to 3 table blocks
+      (singly-indirect, doubly-indirect, an indirect block), the bitmap blocks of 2 new tables
+      (2), one existing data block at an unaligned start (1), and 2 per new data block. With
+      `MAXOPBLOCKS` = 13 that is `(13 - 1 - 3 - 2 - 1) / 2` = 3 blocks per chunk, the same
+      chunk size as before, so writes cost no more transactions than they did.
+
+      The measured worst case fits exactly. On a disk with one free block in each of the
+      first five bitmap blocks, one chunk crossing into the doubly-indirect range logged:
+
+      ```text
+      commit: 13 blocks: 1457 55 1458 1203 56 9684 57 17910 58 26136 59 34362 43
+      ```
+
+      The ordinary case is much smaller: `bigfiletest` writes one block per call, which by the
+      code logs at most 6 blocks, and the instrumented runs printed no commit of 9 or more
+      during it.
+
+      mkfs gets the matching check for the other operation: `assert(nbitmap + 3 <=
+      MAXOPBLOCKS)`, so a larger `FSSIZE` (more bitmap blocks than an `unlink` can log within
+      the budget) is refused at build time instead of panicking someday at run time.
+  - title: A system call to count free blocks
+    commit: 7
+    file: kernel/fs.c
+    lines: 92-128
+    focus: 117-126
+    diff: true
+    state:
+      hart: any
+      mode: S
+      proc: bigfiletest (pid 3)
+      intr: "on"
+      satp: kernel
+      locks: ["one bitmap block's buffer (sleep-lock)"]
+      irq: 0
+      stack: [usertrap, syscall, sys_freeblocks, nfreeblocks]
+      sp: {"on": kernel}
+    note: |
+      A test-only addition: `nfreeblocks` walks the bitmap exactly as [[balloc]] does and
+      counts clear bits; `sys_freeblocks` in `sysfile.c` calls it for the root device. It runs
+      outside any transaction. That is fine because it only reads: [[bread]] returns the cached
+      bitmap blocks, including bits changed by transactions not yet committed, and holds each
+      block's sleep-lock while counting, so it never sees a half-updated byte.
+
+      What it cannot promise is that the count is still true when the program uses it:
+      nothing stops another process from allocating right after `brelse`. The comment says so,
+      and `bigfiletest` runs alone. On a fresh image it returns 68,930.
+  - title: The test
+    commit: 8
+    file: user/bigfiletest.c
+    lines: 95-148
+    focus: 119-147
+    diff: true
+    state:
+      hart: any
+      mode: U
+      proc: bigfiletest (pid 3)
+      intr: "on"
+      satp: user
+      locks: []
+      stack: [main]
+      sp: {"on": user}
+    note: |
+      The test follows the think questions. The first free count is taken right after
+      `open(O_CREATE)` (line 128), so a directory block that `create` might add is not
+      counted against the file. Each block is written with its own number and a pattern
+      (`fill`), so two file blocks mapped to one disk block, or a block mapped to the
+      superblock (clinic 2), cannot both read back correctly.
+
+      The block count is checked exactly: `used == n + nindirect(n)`, 6580 + 27. This is the
+      check that caught clinic 2's missing allocation (302 for 300), and the final comparison
+      caught clinic 3's leak (`68930 before, 62591 after`). The size comes from `stat`, the
+      contents from reading every byte back.
+
+      With `n` = `MAXFILE`, one more 1024-byte write must fail. The `-w` and `-r` modes write a
+      file and stop, or check an existing one: what the crash experiments in this lab used.
+verify: |
+  On the branch (`ext/22-bigfile`, 8 commits; each commit builds, and mkfs runs, on its own),
+  built with the project toolchain and run on 3 harts (`-smp 3 -m 128M`), on a fresh
+  `fs.img`:
+
+  ```text
+  $ bigfiletest
+  bigfiletest: 6580 blocks (old limit 268, new limit 65803)
+  bigfiletest: create: OK
+  bigfiletest: write: OK
+  bigfiletest: size: OK
+  bigfiletest: blocks used 6607 = 6580 data + 27 indirect
+  bigfiletest: block count: OK
+  bigfiletest: read back: OK
+  bigfiletest: unlink: OK
+  bigfiletest: free blocks 68930 before, 68930 after
+  bigfiletest: all blocks freed: OK
+  bigfiletest: ALL OK
+  $ usertests -q
+  usertests starting
+  test copyin: OK
+  test copyout: OK
+  [...]
+  test writebig: OK
+  [...]
+  test kernmem: usertrap(): unexpected scause 0xd pid=6477
+              sepc=0x1b64 stval=0x80000000
+  [...]
+  ALL TESTS PASSED
+  $ bigfiletest
+  [...]
+  bigfiletest: blocks used 6607 = 6580 data + 27 indirect
+  bigfiletest: block count: OK
+  bigfiletest: read back: OK
+  bigfiletest: unlink: OK
+  bigfiletest: free blocks 68927 before, 68927 after
+  bigfiletest: all blocks freed: OK
+  bigfiletest: ALL OK
+  ```
+
+  The `usertrap()` lines are `kernmem` checking that user code cannot read kernel memory:
+  expected kills. `writebig` now writes and reads back a 65,803-block file and unlinks it,
+  and everything else in the suite (truncation, unlinking open files, concurrent writers
+  in `fourfiles` and `sharedfd`) still works. The second `bigfiletest` starts from 68,927
+  free blocks, 3 fewer, as on the original kernel (948 before `usertests`, 945 after):
+  `usertests` leaves a few small files (`x`, `junk`, `bigarg-ok`, `stopforking`) and a
+  grown root directory behind. What matters is that before and after are equal.
+
+  The full-size case, on a fresh image:
+
+  ```text
+  $ bigfiletest 65803
+  bigfiletest: 65803 blocks (old limit 268, new limit 65803)
+  bigfiletest: create: OK
+  bigfiletest: write: OK
+  bigfiletest: write past MAXFILE fails: OK
+  bigfiletest: size: OK
+  bigfiletest: blocks used 66061 = 65803 data + 258 indirect
+  bigfiletest: block count: OK
+  bigfiletest: read back: OK
+  bigfiletest: unlink: OK
+  bigfiletest: free blocks 68930 before, 68930 after
+  bigfiletest: all blocks freed: OK
+  bigfiletest: ALL OK
+  ```
+
+  The race of clinic 7, on the branch:
+
+  ```text
+  $ lograce
+  [...]
+  lograce: setup done, 3086 free
+  lograce: attempt 1 (spin 200000) survived
+  [...]
+  lograce: attempt 12 (spin 2400000) survived
+  ```
+
+  On the original kernel (with only `freeblocks` and the test added), `bigfiletest -w 300`
+  prints `bigfiletest: wrote 268 blocks`, and `bigfiletest 268` passes with `blocks used 269
+  = 268 data + 1 indirect`: the old limit, measured with the same tool. Six power cuts during
+  `bigfiletest -w 6580` all left a consistent file (reveal step 7).
+measure: |
+  All numbers from recorded runs (QEMU 10.2.1, 3 harts), except where a row says "from
+  mkfs". Timings on QEMU depend on what else the computer is doing: "quiet" times were
+  measured on an otherwise idle computer, "busy" ones while it was busy with other work;
+  your times will differ. Ranges are over our runs.
+
+  | | original (06aad25) | this branch |
+  |---|---|---|
+  | largest file | 268 blocks, 274,432 bytes | 65,803 blocks, 67,382,272 bytes |
+  | `struct dinode`, inodes per block | 64 bytes, 16 | 64 bytes, 16 |
+  | `FSSIZE`, image size (from mkfs) | 2000 blocks, 2 MB | 70,000 blocks, 70 MB |
+  | log, buffer cache (`MAXOPBLOCKS` × 3) | 30 blocks, 30 buffers | 39 blocks, 39 buffers |
+  | metadata, first data block (from mkfs) | 47 | 64 |
+  | free blocks on a fresh image (with the test program) | 948 at the first count | 68,930 |
+  | `bigfiletest 268`: write, read back, unlink | 1.5 s | 1.5 s |
+  | `bigfiletest` (6580 blocks) | not possible | 36.8 s quiet; 114 s with the computer busy |
+  | `bigfiletest 65803` | not possible | 384 s quiet; 3157 s busy |
+  | `usertests -q` | 43.0 s, 45.1 s | 421 s quiet; 3390 s busy |
+
+  **Metadata cost.** 27 indirect blocks for 6580 data blocks, 258 for 65,803: 0.4% either
+  way. One table block per 256 data blocks, plus two.
+
+  **What the log sees.** A copy of each kernel printed every commit of 9 or more blocks
+  during `usertests -q`, and the copy of the branch also kept the lowest number of free
+  buffers it ever saw:
+
+  | | original | this branch |
+  |---|---|---|
+  | commits of 9 or more blocks | 11, 10 (`sharedfd`); 11, 13, 9 (`fourfiles`) | 12 (`writebig`); 15 (`sharedfd`) |
+  | largest commit of a *single* operation | under 9 (none printed) | 12, `writebig`'s `unlink` |
+  | fewest free buffers | not measured | 23 of 39 |
+  | `lograce` (clinic 7) | (with `MAXOPBLOCKS` 10:) `panic: bget: no buffers` | a 30-block group commit, 8 of 39 buffers free at the lowest; 12 of 12 attempts survive |
+  | one write chunk on a fragmented disk (`frag13`) | not possible | 13 blocks |
+
+  The `sharedfd` and `fourfiles` commits are group commits: several processes write at once
+  and their operations share one transaction. With the larger budget more operations fit
+  in one group, so the branch's `sharedfd` commit is larger. The 12-block one is a single
+  operation: `writebig` runs alone, and its `unlink` logged `64 42 43 55 56 57 58 59 60 61
+  62 63`, the directory block, two inode blocks and all nine bitmap blocks.
+
+  **Time.** `usertests -q` takes about ten times longer. The only quick test whose work
+  grew is `writebig`, which now writes, reads and frees 65,803 blocks instead of 268, one
+  transaction per block, so the difference is its (reasoned; we timed the suite, not each
+  test). `bigfiletest 268` takes the same 1.5 s on both kernels: the new code only adds
+  work beyond block 266 (on the branch the 268-block file already has 3 table blocks
+  instead of 1, which costs nothing measurable). Every one-block `write` is a transaction
+  of its own: typically 4 logged blocks (bitmap, indirect block, data, inode), so 10 disk
+  writes at commit (4 to the log, the header, 4 installs, the header again; [[commit]]).
+further: |
+  - **Truncate in pieces.** The `unlink` bound is `nbitmap + 3`, so the reference's budget of
+    13 only works up to 10 bitmap blocks, about 80,000 blocks of disk; mkfs refuses more.
+    Free a large tree a few bitmap blocks at a time, each part in its own transaction, so the
+    budget no longer grows with the disk. Work out why this is crash-safe in this tree
+    ([[ireclaim]] finishes an unlinked inode at the next boot), what a reader of the
+    half-truncated file could see, and how `O_TRUNC` in `sys_open` and every other caller of
+    [[iput]] (each already inside someone's transaction) must change.
+  - **A version number for the format.** Clinic 6 shows the new kernel silently misreading
+    an old image. Change `FSMAGIC` (or add a version field to the superblock) whenever the
+    meaning of `addrs[]` changes, so that an old image stops at `panic: invalid file system`
+    instead.
+  - **One spare buffer.** With `NBUF == LOGBLOCKS`, a group commit that really logs
+    `LOGBLOCKS` distinct blocks still pins every buffer, and [[commit]] cannot read a log
+    block (the original xv6 has the same edge at 30). Give the cache a few more buffers than
+    the log and argue that no admitted group can then exhaust it.
+  - **A smarter balloc.** Remember where the last search ended and start there. Measure
+    `bigfiletest 65803` before and after on a quiet machine; the late allocations of a large
+    file currently scan eight full bitmap blocks each.
+  - **Extents.** Replace the block tree with a list of (start, length) runs, as ext4 does.
+    Compare the metadata blocks and the number of block reads per `bmap` for a file written
+    sequentially, and think about what fragmentation does to it.
+  - **mkfs, too.** Teach [[mkfs:iappend]] the doubly-indirect level and put a file of more
+    than 267 blocks into `fs.img`. Two implementations of one format must agree; write a test
+    that would catch them disagreeing.

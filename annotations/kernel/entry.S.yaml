@@ -1,0 +1,120 @@
+summary: |
+  These 21 lines are the first xv6 code any CPU runs. When QEMU starts, every
+  [[g:hart]] (CPU core) starts running in parallel, in no particular order; after a few
+  instructions in QEMU's boot ROM, each one arrives here, in
+  [[g:privilege-mode|machine mode]], with no [[g:stack]], no
+  [[g:virtual-memory|virtual memory]] and no interrupts.
+
+  Compiled C code needs a stack before it can run, so this file does exactly one job: give
+  each hart its own stack, then call the C function [[start]] in [[kernel/start.c]]. It is
+  written in RISC-V assembly because C cannot set the stack pointer for itself.
+
+  **Read before:** [[kernel/kernel.ld]], which places this code at address `0x80000000`.
+  **Read next:** [[kernel/start.c]].
+
+blocks:
+  - lines: 1-4
+    title: Why this code is at 0x80000000
+    note: |
+      QEMU's `virt` machine has its RAM starting at physical address `0x80000000` (2 GiB).
+      Every hart first runs a few instructions in a tiny boot ROM at `0x1000`, which always
+      jumps to the start of RAM, `0x80000000`. Normally QEMU puts firmware (OpenSBI) there;
+      the Makefile passes `-bios none`, so no firmware is loaded, and the `-kernel` option
+      puts `kernel/kernel` in memory instead. Whatever xv6 code sits at `0x80000000` is what
+      every hart runs first.
+
+      Nothing about this file *by itself* puts it at that address. The
+      [[g:linker-script]] arranges it: [[kernel/kernel.ld:10]] sets the starting address and
+      [[kernel/kernel.ld:13]] makes the linker place this file's code first.
+
+  - lines: 5-7
+    title: Declare the entry point
+    note: |
+      These lines put the code that follows in the [[g:text|.text]] section (where code
+      belongs) and create the label [[_entry]], the name of its first instruction.
+      `.global` makes the label visible outside this file, so that the linker script can name
+      it as the program's [[g:entry-point]] with `ENTRY(_entry)` ([[kernel/kernel.ld:2]]).
+
+  - lines: 8-17
+    title: Give each hart its own stack
+    note: |
+      Every hart arrives here, in parallel and in no particular order, and runs the same
+      instructions. If they shared one stack
+      they would overwrite each other's data, so each hart takes its own 4096-byte slice of
+      the array [[stack0]], which [[kernel/start.c:11]] defines as `4096 * NCPU` bytes.
+
+      A RISC-V stack grows *downward*, so the stack pointer must start at the *top* (highest
+      address) of the slice. Hart number *h* owns bytes `stack0 + h*4096` up to
+      `stack0 + (h+1)*4096`, so its starting `sp` is:
+
+      ```
+      sp = stack0 + (h + 1) * 4096
+      ```
+
+      For hart 0 that is the end of the first slice, for hart 1 the end of the second, and
+      so on. The six instructions compute exactly this formula, using `a0` and `a1` as
+      scratch registers.
+
+  - lines: 18-19
+    title: Jump into C
+    note: |
+      With a valid stack, the hart can run compiled C code. It calls [[start]] in
+      [[kernel/start.c]], still in machine mode.
+
+  - lines: 20-21
+    title: A safety net that never runs
+    note: |
+      [[start]] never returns: it ends with [[g:insn:mret|mret]], which jumps into [[main]]
+      in supervisor mode. If it ever did return, the hart would land here and loop forever,
+      instead of running whatever bytes happen to follow in memory.
+
+lines:
+  5: |
+    `.section .text`: assemble what follows into the [[g:text|.text]] section, the one for
+    instructions. See [[g:dir-section|.section]].
+  6: |
+    Export the label `_entry` to other files ([[g:dir-globl|.global]]). The linker script
+    refers to it in `ENTRY(_entry)`.
+  7: |
+    The label itself. It names the address of the next instruction; it generates no code. In
+    the built kernel, `_entry` is at `0x80000000`.
+  12: |
+    `sp = &stack0[0]`: load the *address* of the array [[stack0]] into the stack pointer
+    [[g:reg:sp|sp]]. `la` ([[g:insn:la|load address]]) is a pseudo-instruction; the
+    disassembly in `kernel/kernel.asm` (from our build) shows the assembler expanded it to
+    `auipc sp,0x8` followed by `addi sp,sp,-1904`, which builds the address relative to the
+    current instruction. (The C files reach their data the same PC-relative way because the
+    Makefile compiles them with `-mcmodel=medany`.)
+  13: |
+    `a0 = 4096`. The assembler evaluates `1024*4` itself; the CPU never multiplies. 4096 is
+    the size of each hart's stack slice. ([[g:insn:li|li]] means "load immediate".)
+  14: |
+    `a1 = this hart's ID`, read from the [[g:csr:mhartid|mhartid]] CSR with
+    [[g:insn:csrr|csrr]]. This is how each hart learns which slice is its own. It works only
+    because we are still in machine mode; supervisor mode cannot read `mhartid`.
+  15: |
+    `a1 = hartid + 1`. The `+ 1` turns "start of my slice" into "end of my slice", because
+    the stack grows down from the end.
+  16: |
+    `a0 = 4096 * (hartid + 1)`: the offset of this hart's stack top from the start of
+    [[stack0]]. [[g:insn:mul|mul]] comes from the "M" extension included in `rv64gc`.
+  17: |
+    `sp = stack0 + 4096 * (hartid + 1)`. The stack pointer now points at the top of this
+    hart's own slice. [[stack0]] is declared with `aligned(16)` and 4096 is a multiple of 16,
+    so `sp` is 16-byte aligned, as the [[g:calling-convention]] requires.
+
+    This is the hart's first stack switch. Line 12 already put `stack0`'s base address in
+    `sp` as a first step of the calculation; this line adds the hart's offset, so only now
+    does `sp` point at the top of a usable slice. From now on
+    the hart runs on its [[g:boot-stack]] (top `0x80008890` on hart 0, `0x80009890` on hart 1,
+    `0x8000a890` on hart 2 in this build). The same memory later becomes the hart's
+    [[g:scheduler-stack]] ([[concept:stacks#boot]]).
+  19: |
+    Call [[start]]. [[g:insn:call|call]] is really two instructions (`auipc` + `jalr`);
+    because `start` is close by, the linker replaced them with one `jal`, as you can see in
+    `kernel/kernel.asm`. `jal` still saves the return address in `ra`, but that address is
+    never used, because `start` never returns.
+  20: |
+    The label `spin`, a target for the jump below. It is local to this file (no `.global`).
+  21: |
+    `j spin` jumps to itself: an infinite loop. See the block note above.

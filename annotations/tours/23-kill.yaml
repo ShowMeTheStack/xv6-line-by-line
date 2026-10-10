@@ -1,0 +1,623 @@
+title: kill
+group: Processes
+prerequisites: [5, 11, 16, 21]
+summary: |
+  `kill 5` sounds like an order: stop process 5, now. In xv6 it is closer to a note left
+  on the victim's desk. [[kernel:kkill]] sets a flag, `p->killed`, and if the victim is
+  asleep, nudges it awake. That is all. The victim itself notices the flag later, at a point
+  where it is safe to stop, and calls [[kernel:kexit]] on its own.
+
+  This tour runs `kill 5` from the shell on hart 0 twice, against two different victims:
+  (a) pid 5 spinning in user mode on hart 1, which notices at its next timer tick, and (b)
+  pid 5 asleep in [[kernel:piperead]], waiting for data that may never come, which `kill`
+  wakes up so that it can notice. You will see why the kernel never stops a process from
+  the outside, which code checks the flag and which deliberately does not, the narrow
+  window in which a kill is noticed late, and a bug fixed only recently: `kill(0)` (the fix
+  landed on the same day as the commit this site is built from).
+
+  Every access to `killed` is made under the victim's `p->lock`, on whichever hart is
+  looking. That lock, and the places where the flag is checked, are the whole design.
+cast: |
+  The machine has three [[g:hart|harts]]. Pid 5 was started earlier as a background job.
+  You type `kill 5`; the shell (pid 2) forks pid 8, which runs `/kill`. When the tour
+  starts:
+
+  | Hart | What it is doing |
+  |---|---|
+  | 0 | Running `kill` (pid 8) in user mode, about to call `kill(5)` |
+  | 1 | Case (a): running pid 5 in user mode, a loop that never makes a system call |
+  | 2 | Running whatever else is runnable, or idle in its [[kernel:scheduler]] |
+
+  For case (b), rewind: pid 5 is instead a process reading from a pipe whose writer has
+  written nothing yet (for example, a child of a program that called `pipe` and `fork`),
+  asleep in [[kernel:piperead]].
+steps:
+  - title: The kill program
+    file: user/kill.c
+    lines: 5-17
+    focus: 14-15
+    state:
+      hart: 0
+      mode: U
+      proc: kill (pid 8)
+      intr: on
+      satp: user
+      locks: []
+      stack: [main]
+      sp: user
+    note: |
+      `kill` is an ordinary program ([[user/kill.c]]). For each argument it calls
+      [[atoi]] and the `kill` system call: here `kill(5)`. It ignores the result, so
+      `kill 99` for a pid that does not exist prints nothing.
+
+      xv6 has no signals, no `SIGTERM`, no handlers a program could install to clean up or
+      refuse. There is one thing you can do to another process: ask the kernel to end it.
+      There is also no permission check. Any process may kill any other, except that
+      killing `init` would make the kernel panic when `init` tries to exit
+      ([[kernel/proc.c:330]]).
+
+      The [[g:syscall-stub]] puts [[kernel:SYS_kill]] (6) in `a7` and executes `ecall`.
+      From there, the path to [[kernel:sys_kill]] is the one in [[tour:5]].
+
+  - title: sys_kill passes the pid along
+    file: kernel/sysproc.c
+    lines: 92-99
+    focus: 97-98
+    state:
+      hart: 0
+      mode: S
+      proc: kill (pid 8)
+      intr: on
+      satp: kernel
+      locks: []
+      irq: 0
+      stack: [usertrap, syscall, sys_kill]
+      sp: {"on": kernel, switched: "`ld sp, 8(a0)` in [[uservec]] ([[kernel/trampoline.S:76]])", detail: "kill's (pid 8's) kernel stack"}
+    note: |
+      [[sys_kill]] fetches the pid from the saved `a0` with [[argint]] and calls [[kkill]].
+      Its return value (0 if a process with that pid was found, -1 if not) goes back to
+      user space in `a0`.
+
+      Notice that `kill`'s own process, pid 8, is the one executing all of the code that
+      follows. The kernel does not switch to the victim to kill it. Hart 0, on pid 8's
+      behalf, reaches into the shared process table and changes one field of another
+      process's `struct proc`. That is why everything from here on is about the victim's
+      lock.
+
+      It is also why the stack in the display is `kill`'s own: hart 0 runs on pid 8's
+      kernel stack, entered at the `ecall`. The victim's stacks are never touched by `kill`.
+      Each process has its own kernel stack and each hart its own `sp`, and `kkill` neither
+      runs on nor writes to any stack of the victim's ([[concept:stacks]]).
+
+  - title: pid 0 is not a process
+    file: kernel/proc.c
+    lines: 597-622
+    focus: 605-606
+    state:
+      hart: 0
+      mode: S
+      proc: kill (pid 8)
+      intr: on
+      satp: kernel
+      locks: []
+      irq: 0
+      stack: [usertrap, syscall, sys_kill, kkill]
+      sp: kernel
+    note: |
+      [[kkill]] first rejects pid 0. Those two lines come from commit `bd77f8e`, "prevent
+      kill(0) from marking UNUSED proc as killed", written 13 September 2026 and committed
+      on 26 September.
+
+      The bug they fix: an unused slot in `proc[]` has `pid = 0`, because [[freeproc]] sets
+      it so (and never-used slots start zeroed). Without the check, `kill(0)` scanned the table, matched the **first unused
+      slot**, and set its `killed` flag. Nothing cleared it: [[allocproc]] does not reset
+      `killed` (only `freeproc` does, [[kernel/proc.c:168]]). And `allocproc` hands out the
+      first unused slot. So the *next* `fork` got that slot, flag already set, and the new
+      child was killed at its first trap into the kernel, before it could make a single system call.
+
+      A process asking to kill "nobody" silently murdered an innocent, unborn process.
+    others: |
+      Why didn't the fix make `allocproc` clear `killed` instead? Either would work. The
+      chosen fix keeps the meaning of the flag simple: only a real process with a real pid
+      can ever be marked.
+
+  - title: The regression test, killzero
+    file: user/usertests.c
+    lines: 827-852
+    focus: 833-851
+    state:
+      hart: any
+      mode: U
+      proc: the killzero test process
+      intr: on
+      satp: user
+      locks: []
+      stack: [main, drivetests, runtests, run, killzero]
+      sp: user
+    note: |
+      The fix was written on 13 September and committed on 26 September, together with its
+      test (commit `ddc8d99`, "Test case for kill 0"; `06aad25`, "Add killzero test", the
+      commit this site is built from, only removes a comment from it). It
+      recreates the bug exactly: `kill(0)`, then `fork()`. The child does nothing but
+      `exit(7)`, which is a system call, so its first trap is normally the `ecall` for `exit`.
+
+      On a kernel without the check, [[kernel:usertrap]] would find `killed` set at line
+      57 ([[kernel/trap.c:57]]), or at line 81 if a timer interrupt happened to come first, and call `kexit(-1)` instead of running `exit(7)`. The
+      parent's `wait` would report status -1, and the test fails with "child exited with
+      status -1, expected 7".
+
+      This is a typical [[g:regression-test]]: it looks pointless unless you know the bug
+      it guards against.
+
+  - title: Find the victim, one lock at a time
+    file: kernel/proc.c
+    lines: 597-622
+    focus: 608-611
+    state:
+      hart: 0
+      mode: S
+      proc: kill (pid 8)
+      intr: off
+      satp: kernel
+      locks: ["pid 5's p->lock"]
+      irq: {noff: 1, intena: 1}
+      stack: [usertrap, syscall, sys_kill, kkill]
+      sp: kernel
+    note: |
+      [[kkill]] walks `proc[]`. For each slot it takes `p->lock`, compares `p->pid` with 5,
+      and releases the lock if it does not match. At pid 5's slot it matches, and with the
+      lock held it sets `p->killed = 1`.
+
+      Why read `pid` under the lock? Because `pid` changes. While `kkill` is scanning, pid 5
+      might exit and be reaped by its parent on another hart: [[kwait]] calls [[freeproc]]
+      under the victim's `p->lock`, setting `pid = 0`, and the slot may then be reused by
+      a new process with a new pid. Holding the lock while comparing *and* setting the flag
+      makes them one action: the flag goes on the process that really is pid 5 at that
+      instant, never on a stranger who has just moved into its slot.
+    others: |
+      Without the lock, this interleaving could happen:
+
+      | Time | Hart 0 (kill) | Hart 2 |
+      |---|---|---|
+      | t1 | reads `proc[4].pid`: 5, a match | |
+      | t2 | | pid 5's parent reaps it: `freeproc`, slot free |
+      | t3 | | `fork` allocates `proc[4]` for a new pid 9 |
+      | t4 | sets `proc[4].killed = 1` | |
+
+      Pid 9, which nobody asked to kill, dies at its first trap: the same harm as the
+      `kill(0)` bug. With the lock, `freeproc` (t2) cannot run between t1 and t4.
+
+  - title: "Case (a): the victim is running"
+    file: kernel/proc.c
+    lines: 597-622
+    focus: 612-615
+    state:
+      hart: 0
+      mode: S
+      proc: kill (pid 8)
+      intr: off
+      satp: kernel
+      locks: ["pid 5's p->lock"]
+      irq: {noff: 1, intena: 1}
+      stack: [usertrap, syscall, sys_kill, kkill]
+      sp: kernel
+    note: |
+      Pid 5 is `RUNNING`, on hart 1, in user mode. `kkill` does nothing more: it releases the
+      lock and returns 0. `kill` prints nothing and exits; the shell prints its prompt.
+
+      And pid 5 keeps running. Nothing has happened on hart 1. No instruction there has
+      changed; the flag sits in memory that pid 5's user code cannot see and never reads.
+      Hart 1's `sp` is in pid 5's **user** stack, and pid 5's kernel stack is **empty**, as
+      every process's is while it runs in user mode: there is no kernel work of pid 5's in
+      progress that `kill` could cut short.
+      xv6 has no way to interrupt another hart on purpose: it sends no inter-processor
+      interrupts. Hart 1 will find out only when it next enters the kernel, for its own
+      reasons.
+
+      So `kill` returning is not the same as the victim being dead. `kill 5; ps` on a real
+      system can still show the victim for a moment, and on xv6 the gap can be a whole
+      tick.
+    others: |
+      Even if hart 1 were in the kernel right now, running a system call for pid 5, `kkill`
+      would not stop it there. The victim might be holding a [[g:sleeplock]] on an inode, or
+      be halfway through a file-system transaction ([[tour:31]]). Stopping it in place
+      would leave the lock held forever and the transaction half done. The victim must
+      reach a point where it holds nothing, and only the victim knows when that is.
+
+  - title: Hart 1's next tick
+    file: kernel/trap.c
+    lines: 80-95
+    focus: 81-82
+    state:
+      hart: 1
+      mode: S
+      proc: pid 5
+      intr: off
+      satp: kernel
+      locks: []
+      irq: {noff: 0, note: "`killed` on line 81 takes and releases `p->lock`, so noff is 1 for a moment"}
+      stack: [usertrap]
+      sp: {"on": kernel, switched: "`ld sp, 8(a0)` in [[uservec]] ([[kernel/trampoline.S:76]])", detail: "pid 5's kernel stack, empty until this trap; now just usertrap's frame"}
+    note: |
+      Up to 0.1 s later, hart 1's timer fires. Pid 5 traps into [[usertrap]] exactly as in
+      [[tour:11]]: `devintr` returns 2 for the timer. [[uservec]] saved pid 5's user `sp` in
+      its trapframe and switched hart 1 to pid 5's kernel stack, so the victim is now
+      running kernel code on its own stack, the only place it can safely end itself.
+
+      But before the `yield` on line 86, line 81 asks [[killed]]. This time the answer is 1.
+      `usertrap` calls `kexit(-1)` and never reaches `yield` or `prepare_return`: pid 5 will
+      not return to user mode again.
+
+      This check is the reason a process that never makes a system call can be killed at
+      all. The timer forces it into the kernel at least ten times a second, and every trip
+      out of `usertrap` passes line 81. If pid 5 is running when the flag is set, it dies at
+      its next tick, at most about 0.1 s later. If the kill lands while pid 5 sits
+      `RUNNABLE` after the `yield` on line 86, `usertrap` does not check again when `yield`
+      returns, so pid 5 runs one more slice before the following tick catches it.
+
+  - title: Reading the flag under the lock
+    file: kernel/proc.c
+    lines: 624-641
+    focus: 637-638
+    state:
+      hart: 1
+      mode: S
+      proc: pid 5
+      intr: off
+      satp: kernel
+      locks: ["pid 5's p->lock"]
+      irq: {noff: 1, intena: 0, note: "intena 0: this `usertrap` came from a timer interrupt, so interrupts were already off at the acquire, and the release leaves them off"}
+      stack: [usertrap, killed]
+      sp: kernel
+    note: |
+      [[killed]] takes pid 5's own `p->lock` to read one `int`. The flag was written on hart
+      0 under that lock and is read on hart 1 under the same lock. The release on hart 0 and
+      the acquire on hart 1 order the memory accesses ([[g:memory-barrier]]): if hart 0's
+      `release` came first, hart 1 is guaranteed to see `killed = 1`.
+
+      Without the lock, the read would probably still work on QEMU. But the C compiler would
+      be free to assume no one else changes `p->killed` and, in a loop, keep a stale copy in
+      a register; and the hardware would be free to delay when hart 1 sees hart 0's store.
+      The lock rules both out.
+
+      [[setkilled]], the writer used by `usertrap` itself when a program causes an
+      unexpected exception ([[kernel/trap.c:78]]), takes the same lock.
+
+  - title: kexit, on the victim's own terms
+    file: kernel/proc.c
+    lines: 322-365
+    focus: 355-360
+    state:
+      hart: 1
+      mode: S
+      proc: pid 5
+      intr: off
+      satp: kernel
+      locks: [wait_lock, "pid 5's p->lock"]
+      irq: {noff: 2, intena: 0, note: "`wait_lock` and pid 5's `p->lock`. intena is 0 because this `kexit` started in a timer-interrupt trap, where interrupts are never turned on"}
+      stack: [usertrap, kexit]
+      sp: kernel
+    note: |
+      [[kexit]] is the same function a voluntary `exit` uses. Pid 5 closes its files,
+      releases its working directory, hands any children to `init`, wakes its parent, sets
+      `xstate = -1` and `state = ZOMBIE`, and calls [[sched]] for the last time.
+
+      Everything here runs in pid 5's own kernel thread, on pid 5's own kernel stack
+      (`usertrap → kexit`, then `sched`), with all of pid 5's locks and resources known.
+      That stack is not freed when pid 5 dies: kernel stacks belong to process-table slots,
+      and the next process in this slot will reuse it ([[tour:21]]). That is the point of the flag-and-check design: no code ever has to
+      clean up another process's half-finished work. The exit status -1 is what the parent
+      will see from `wait`: the status a killed child reports (`killstatus` in usertests
+      checks for it), though a program could also call `exit(-1)` itself.
+
+      Unlike a voluntary `exit`, this one runs with interrupts **off** from start to finish.
+      `usertrap` took the timer interrupt and never called `intr_on`, so every outermost
+      `acquire` in `kexit` records `intena` 0 and every matching `release` leaves interrupts
+      off; even if `kexit` sleeps on the disk, [[sched]] brings that 0 back
+      ([[concept:locks#intena]], [[concept:locks#sched-intena]]).
+
+      [[tour:21]] follows `kexit` and `wait` in detail.
+
+  - title: The other boundary, at system-call entry
+    file: kernel/trap.c
+    lines: 54-68
+    focus: 57-58
+    state:
+      hart: 1
+      mode: S
+      proc: pid 5
+      intr: off
+      satp: kernel
+      locks: []
+      irq: {noff: 0, note: "`killed` on line 57 takes and releases `p->lock`, so noff is 1 for a moment"}
+      stack: [usertrap]
+      sp: kernel
+    note: |
+      If pid 5 had been making system calls instead of spinning, its next `ecall` might have
+      come before its next tick. Line 57 checks the flag *before* the system call runs: a
+      killed process never starts a new system call. It exits at once with status -1.
+
+      Together, lines 57 and 81 mean every passage between user mode and the kernel is a
+      checkpoint: on the way in for system calls, on the way out for everything (system
+      calls, device interrupts, timer ticks, page faults).
+
+      What about a system call that is already running when the kill arrives, such as a
+      `write` to a file? It runs to completion, and line 81 catches it on the way out. The
+      only exceptions are system calls that can wait indefinitely, which is case (b).
+
+  - title: "Case (b): the victim is asleep in piperead"
+    file: kernel/pipe.c
+    lines: 111-128
+    focus: 126
+    state:
+      hart: 2
+      mode: S
+      proc: pid 5 (pipe reader)
+      intr: on
+      satp: kernel
+      locks: []
+      irq: 0
+      stack: [usertrap, syscall, sys_read, fileread, piperead]
+      sp: kernel
+    note: |
+      Rewind. This time pid 5 is reading a pipe whose writer has written nothing. Some time
+      ago, on hart 2, [[piperead]] found the pipe empty (`nread == nwrite`) with the write
+      end still open. It checked `killed` (no), registered on `&pi->nread`, released
+      `pi->lock` and called `sleep()` on line 126.
+
+      Here is the victim's state while it sleeps. It occupies no hart. Its kernel stack is
+      frozen in the middle of the `read` system call, and `p->context` holds the `sp` and
+      `ra` that [[swtch]] saved when hart 2 left it ([[kernel/swtch.S:26]]):
+
+      ```text
+      pid 5's kernel stack (one page)
+        top ─► usertrap   32 bytes
+               syscall    32
+               sys_read   48
+               fileread   48
+               piperead   96
+               sleep      32
+               sched      48
+               ◄─ p->context.sp (336 bytes below the top)
+      ```
+
+      Its user stack, holding the frames of the code that called `read`, waits in its own
+      page table, and the user `sp` waits in the trapframe.
+
+      Pid 5 is now `SLEEPING`. It will be woken by [[wakeup]]`(&pi->nread)`, which
+      [[pipewrite]] calls after writing and [[pipeclose]] calls when the writer closes its
+      end. If the writer never does either, pid 5 would sleep forever, and setting a flag
+      alone would never be noticed: a sleeping process makes no traps.
+
+      That is why `kill` must do more than set the flag. ([[tour:39]] covers pipes.)
+
+  - title: kkill wakes the sleeper
+    file: kernel/proc.c
+    lines: 597-622
+    focus: 611-615
+    state:
+      hart: 0
+      mode: S
+      proc: kill (pid 8)
+      intr: off
+      satp: kernel
+      locks: ["pid 5's p->lock"]
+      irq: {noff: 1, intena: 1}
+      stack: [usertrap, syscall, sys_kill, kkill]
+      sp: kernel
+    note: |
+      Back on hart 0, `kkill` has found pid 5 and set `killed`. Now `state == SLEEPING`, so
+      it sets `RUNNABLE`. This is the second half of `kill`: **set the flag, and if the
+      victim is asleep, wake it.**
+
+      This is not a normal [[wakeup]]. `kkill` does not check what pid 5 is waiting for, and
+      it leaves `p->chan` set to `&pi->nread`. Pid 5 will wake up for no reason related to
+      its pipe. That is fine, because every sleep loop in xv6 re-checks its condition after
+      waking ([[tour:16]]). For the sleep loops that can wait forever, the re-check includes
+      `killed`.
+
+      Notice that `kkill` changes two words in pid 5's `struct proc` and nothing else. The
+      frozen kernel stack from step 11 stays exactly as it is; pid 5 will pick it up itself.
+
+      The leftover `p->chan` is harmless: pid 5 will either register on a new channel
+      (which overwrites it) before it sleeps again, or exit, and [[freeproc]] clears it. A
+      stray `wakeup(&pi->nread)` meanwhile would only clear it.
+    others: |
+      Why under `p->lock`? The state test and the change must be one step. Without the lock,
+      `kkill` could read `SLEEPING` just as an ordinary `wakeup` on hart 2 makes pid 5
+      `RUNNABLE` and hart 1's scheduler makes it `RUNNING`; `kkill`'s late write of
+      `RUNNABLE` would then mark a running process as runnable, and a second hart could
+      start running it too.
+
+  - title: Pid 5 wakes up somewhere
+    file: kernel/proc.c
+    lines: 561-572
+    focus: 569-571
+    state:
+      hart: 1
+      mode: S
+      proc: pid 5 (pipe reader)
+      intr: off
+      satp: kernel
+      locks: ["pid 5's p->lock"]
+      irq: {noff: 1, intena: 1, note: "`sched` restored pid 5's own intena, 1 (it went to sleep inside a system call), so the release on line 571 turns interrupts back on on hart 1"}
+      stack: [usertrap, syscall, sys_read, fileread, piperead, sleep]
+      sp: {"on": kernel, switched: "`ld sp, 8(a1)` in [[swtch]] ([[kernel/swtch.S:26]]), called by hart 1's scheduler", detail: "pid 5's kernel stack, the frames frozen in step 11"}
+    note: |
+      Some scheduler, say hart 1's, finds pid 5 `RUNNABLE` and switches to it. [[swtch]]
+      loads pid 5's saved `sp`, so hart 1 now stands on the stack that hart 2 left frozen.
+      Pid 5 returns from [[sched]] inside [[sleep]], on hart 1, and `sleep` releases `p->lock`, the lock
+      hart 1's scheduler acquired ([[tour:13]]). After line 571, interrupts come back on, as
+      they were when it went to sleep on hart 2.
+
+      `sleep` returns no value. It does not tell its caller *why* it returned: a real
+      wakeup, a kill, or (as in [[sys_pause]]'s case) a wakeup meant for the condition not yet
+      being true. The caller must look.
+
+  - title: piperead notices and gives up
+    file: kernel/pipe.c
+    lines: 111-128
+    focus: 119-123
+    state:
+      hart: 1
+      mode: S
+      proc: pid 5 (pipe reader)
+      intr: off
+      satp: kernel
+      locks: [pi->lock]
+      irq: {noff: 1, intena: 1}
+      stack: [usertrap, syscall, sys_read, fileread, piperead]
+      sp: kernel
+    note: |
+      [[piperead]] reacquires `pi->lock` (line 127) and goes around the `while`: the pipe is
+      still empty and the writer still open, so the loop body runs again. Line 120 checks
+      [[killed]] (taking `p->lock` briefly, after `pi->lock`): yes. It releases `pi->lock`
+      and returns -1.
+
+      The -1 travels up through [[fileread]] and [[sys_read]] into `p->trapframe->a0`, a
+      return value pid 5's user code will never see. Back in [[usertrap]], line 81 finds
+      `killed` set, and pid 5 calls `kexit(-1)`, exactly as in case (a).
+
+      Note the order inside the loop: the check comes *before* `sleep_prepare`, while
+      holding `pi->lock`. A process that was killed before it ever reached `piperead` never
+      sleeps at all.
+
+  - title: The window where a kill arrives late
+    file: kernel/pipe.c
+    lines: 111-128
+    focus: 120-124
+    state:
+      hart: 2
+      mode: S
+      proc: pid 5 (pipe reader)
+      intr: off
+      satp: kernel
+      locks: [pi->lock]
+      irq: {noff: 1, intena: 1}
+      stack: [usertrap, syscall, sys_read, fileread, piperead]
+      sp: kernel
+    note: |
+      There is one narrow window this design does not cover. `kkill` takes only the victim's
+      `p->lock`, not `pi->lock`, so it can run between pid 5's `killed` check (line 120)
+      and its `sleep()` (line 126):
+
+      | Time | Hart 2 (pid 5) | Hart 0 (kill) |
+      |---|---|---|
+      | t1 | `killed(pr)`: 0 | |
+      | t2 | `sleep_prepare(&pi->nread)` | `kkill(5)`: `killed = 1`; state is `RUNNING`, so no wake |
+      | t3 | `release(&pi->lock)`, `sleep()`: `chan` is set, so `SLEEPING` | |
+      | t4 | asleep, with `killed = 1` | |
+
+      `kkill` did not clear `p->chan`, so `sleep()` goes ahead. Pid 5 now sleeps until a real
+      `wakeup(&pi->nread)`: the writer writes, or closes its end (its last open reference to the write end; this also happens when
+      the writer exits). Then the loop re-checks, sees `killed`, and returns -1.
+
+      So a kill in this window is not lost as long as the pipe is eventually written or
+      closed, but it can be delayed for as long as the pipe stays silent. The window runs
+      from the `killed` check to `sleep()`'s `acquire(&p->lock)`: usually a few dozen
+      instructions, but interrupts are on again after line 125 (that release takes `noff`
+      to 0, and `intena` is 1 inside a system call; [[concept:locks#intena]]), so a timer interrupt there
+      can preempt pid 5 and stretch the window across a whole scheduling delay. `sleep()`
+      looks only at `chan`, never at `killed`; had `kkill` also cleared `p->chan`, `sleep()`
+      would return at once and the loop would see the flag. xv6 accepts the window instead.
+      Besides a real `wakeup(&pi->nread)`, a second `kill 5` also ends the sleep. The same window
+      exists in every sleep loop that checks `killed`: in [[sys_pause]] it costs at most one
+      tick ([[tour:14]]).
+
+  - title: Which sleeps check, and which do not
+    file: kernel/proc.c
+    lines: 369-419
+    focus: 407-408
+    state:
+      hart: any
+      mode: S
+      proc: a parent in wait
+      intr: off
+      satp: kernel
+      locks: [wait_lock]
+      irq: {noff: 1, intena: 1, note: "noff 1 is `wait_lock`; `killed` on line 408 makes it 2 for a moment"}
+      stack: [usertrap, syscall, sys_wait, kwait]
+      sp: kernel
+    note: |
+      [[kwait]] is one of the sleep loops that check `killed`. Each of them waits for something
+      that may never happen:
+
+      | Loop | Waits for | Check |
+      |---|---|---|
+      | [[kwait]] | a child to exit | [[kernel/proc.c:408]] |
+      | [[piperead]] / [[pipewrite]] | data / space in a pipe | [[kernel/pipe.c:120]], [[kernel/pipe.c:84]] |
+      | [[consoleread]] | a line typed at the keyboard | [[kernel/console.c:100]] |
+      | [[sys_pause]] | the clock | [[kernel/sysproc.c:79]] |
+
+      The other sleeps in the kernel do not check: [[acquiresleep]] (waiting for a
+      sleep-lock), [[begin_op]] and [[sys_sync]] (waiting for the log), [[virtio_disk_rw]]
+      (waiting for the disk), [[uartwrite]] (waiting for the UART). Each of these waits for
+      something that will happen soon by itself, and each is in the middle of an operation
+      that should finish: a killed process that abandoned a disk read, or a log
+      transaction, halfway would leave buffers locked or the file system inconsistent. Such
+      a process finishes the operation, and dies at the next boundary.
+
+  - title: A note, not a bullet
+    file: user/kill.c
+    lines: 5-17
+    focus: 16
+    state:
+      hart: 0
+      mode: U
+      proc: kill (pid 8)
+      intr: on
+      satp: user
+      locks: []
+      stack: [main]
+      sp: {"on": user, switched: "`ld sp, 48(a0)` in [[userret]] ([[kernel/trampoline.S:118]]) and `sret` ([[kernel/trampoline.S:153]])"}
+    note: |
+      `kill` exits, long before its victim may have died. The whole mechanism is a few dozen
+      lines spread over five files (`proc.c`, `trap.c`, `pipe.c`, `console.c`,
+      `sysproc.c`).
+
+      The key ideas:
+
+      - **`kkill` only marks.** It sets `p->killed` under the victim's `p->lock` and, if the
+        victim is `SLEEPING`, makes it `RUNNABLE`. It never touches the victim's stacks,
+        locks or memory: a running victim's kernel stack is empty, a sleeping victim's is
+        frozen until the victim itself resumes on it.
+      - **The victim kills itself, at a boundary.** [[usertrap]] checks on entry to a system
+        call and before every return to user mode; sleep loops that may wait forever check
+        each time around. At those points the victim holds no locks that it cannot release
+        in `kexit`.
+      - **The delay is bounded, mostly.** A running process dies within a tick; a sleeper
+        in a checking loop dies as soon as it is scheduled; a sleeper in a non-checking
+        loop dies after its operation completes; a kill landing in the check-to-sleep window
+        waits for the next real wakeup.
+      - **One lock for one flag.** `killed`, `pid` and `state` are all protected by
+        `p->lock`, which is what made the `kill(0)` fix (and the safety of killing while
+        slots are reused) possible.
+locks:
+  - lock: "pid 5's p->lock (spinlock)"
+    where: "[[kernel:kkill]], [[kernel:killed]], [[kernel:setkilled]], [[kernel:sleep]], schedulers"
+    protects: "`p->pid`, `p->killed` and `p->state`: the victim's identity, the flag, and the decision to wake it"
+  - lock: "each p->lock in turn (spinlock)"
+    where: "[[kernel:kkill]]'s scan"
+    protects: "Reading each slot's `pid` without a reaper changing it mid-comparison"
+  - lock: "pi->lock (spinlock)"
+    where: "[[kernel:piperead]]"
+    protects: "The pipe's buffer and counters; held while checking `killed` and registering, but not taken by `kkill`"
+  - lock: "wait_lock (spinlock)"
+    where: "[[kernel:kexit]], [[kernel:kwait]]"
+    protects: "`p->parent`, so that a killed child's exit and its parent's wait do not miss each other"
+  - lock: "pi->lock (not taken by kkill)"
+    where: "[[kernel:kkill]]"
+    protects: "Nothing: kkill does not know what the victim waits on, which is why a kill can land in the check-to-sleep window"
+quiz:
+  - q: "Why doesn't `kkill` simply call `kexit` on the victim's behalf?"
+    a: "`kexit` must run in the dying process's own thread: it closes that process's files, may sleep in `begin_op`, and finally switches away from it. The victim may be running on another hart, or hold sleep-locks or be mid-transaction; only the victim can release those safely, so it exits itself at a boundary."
+  - q: "Pid 5 spins in user mode on hart 1 and never makes a system call. How long after `kill(5)` returns can it go on running, and which line kills it?"
+    a: "If pid 5 is running when the flag is set, until hart 1's next timer interrupt, at most about 0.1 s; [[kernel:usertrap]] checks `killed` at [[kernel/trap.c:81]] after `devintr` and calls `kexit(-1)` before it would yield. If the kill lands while pid 5 sits `RUNNABLE` after line 86's `yield`, it runs one more slice, because `usertrap` does not re-check after `yield` returns."
+  - q: "Before commit `bd77f8e`, `kill(0)` followed by `fork()` produced a child that died immediately. Explain the chain of events."
+    a: "Free slots have `pid == 0`, so `kkill(0)` matched the first free slot and set its `killed`. `allocproc` doesn't clear `killed` and allocates the first free slot, so the next fork's child got that slot, and `usertrap` killed it at its first trap."
+  - q: "`kkill` sets a `SLEEPING` victim `RUNNABLE` without checking what it was waiting for. Why is that safe?"
+    a: "Every sleep in xv6 is in a loop that re-checks its real condition after waking. Loops that could wait forever also check `killed` and return an error; the others find their condition still false and sleep again until their operation completes."
+  - q: "Describe an interleaving in which a kill is not noticed by a process in `piperead` until someone writes to (or closes) the pipe."
+    a: "The reader checks `killed` (0) and calls `sleep_prepare`; `kkill` then sets `killed` while the reader is still `RUNNING`, so it does not wake it; the reader's `sleep()` sees `chan` still set and sleeps. Only a real `wakeup(&pi->nread)` lets the loop re-check and see `killed`."
+  - q: "Why must `kkill` compare `p->pid` while holding `p->lock`?"
+    a: "The victim could be reaped and its slot reused by a new process between the comparison and setting the flag. `freeproc` changes `pid` under `p->lock`, so holding it makes compare-and-mark atomic, and an innocent new process can never be marked."

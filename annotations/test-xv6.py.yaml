@@ -1,0 +1,282 @@
+summary: |
+  A Python 3 script that tests xv6 automatically, with no person at the keyboard. It runs
+  `make qemu` as a child process, connected through pipes: whatever it writes to QEMU's
+  standard input arrives at xv6's [[g:console]] as if typed, and everything xv6 prints comes
+  back on QEMU's standard output for the script to search. (With `-nographic`, QEMU connects
+  the emulated [[g:uart|UART]] to its own standard input and output.)
+
+  It knows two kinds of test:
+
+  - **`usertests`**: boot xv6, type `usertests` into the shell, and wait up to ten minutes
+    for the line `ALL TESTS PASSED` ([[user/usertests.c]]).
+  - **crash tests**: start a program that is in the middle of changing the file system,
+    kill QEMU abruptly (like pulling the power cord), boot again from the same `fs.img`, and
+    check that the kernel's recovery code ran: replaying the
+    [[g:write-ahead-log|log]] ([[kernel:recover_from_log]]) and freeing
+    [[g:orphan-inode|orphaned inodes]] ([[kernel:ireclaim]]).
+
+  The CI job runs `./test-xv6.py usertests` and `./test-xv6.py crash`
+  ([[.github/workflows/test.yml:11]]); you can run the same on your machine (Linux; the
+  crash tests use a Linux-only `ps` option). A failure prints `FAIL` and saves the whole
+  console output in `test-xv6.out`.
+
+blocks:
+  - lines: 1-9
+    title: How to run it
+    note: |
+      The first line (a "shebang") lets you run the file directly as `./test-xv6.py`:
+      the system finds `python3` on your `PATH` through `env`. The comments list the usual
+      commands. The argument is a regular expression matched against the names of the
+      `test_` functions below; anything that matches none of them is treated as the name of
+      a single usertests test (see [[:210]]), so `./test-xv6.py sbrkbasic` runs only that
+      test.
+
+  - lines: 11-12
+    title: Standard-library modules
+    note: |
+      Only Python's standard library is used: `argparse` for the command line,
+      `subprocess` to start `make`, `os` for low-level reads and `kill`, `re` for regular
+      expressions, `inspect` to find the test functions, `signal`, `sys` and `time`.
+
+  - lines: 14
+    title: Print each line at once
+    note: |
+      When standard output is not a terminal (in CI it is a pipe to the runner's log), Python normally
+      collects output in a buffer and writes it out in large pieces. Line buffering
+      flushes after every line, so progress messages appear in the CI log as they happen,
+      and are not lost if the job is killed for taking too long.
+
+  - lines: 16-19
+    title: Parse the command line
+    note: |
+      One required argument, `testrex` (a test name or regular expression), and an
+      optional `-q` flag that passes `-q` on to usertests, which then runs only its quick
+      tests. `args` is a global used by [[:210|main]] and [[:197|test_usertests]].
+
+  - lines: 21-35
+    title: Start xv6 in QEMU
+    note: |
+      A `QEMU` object stands for one running xv6. Creating it with `reset=True` first
+      builds the kernel and makes a fresh `fs.img`; without it, the existing image is reused,
+      which is how the crash tests boot a disk that was left mid-update.
+
+      `Popen` starts `make qemu` without waiting for it. Its standard input and output
+      become pipes the script holds (`stdin=PIPE`, `stdout=PIPE`), and error output is
+      merged into the same stream (`stderr=STDOUT`), so the script sees make's messages
+      too. `make` runs QEMU as its child, and QEMU inherits these pipes.
+
+      Line 31 makes reading the output pipe *non-blocking*: a read returns what is
+      available, or fails at once if nothing is, instead of waiting. That lets [[:76|read]]
+      collect output without ever hanging. `output` is all console text so far,
+      `outbytes` the same as raw bytes, `reported` how much of it [[:109|progress]] has already
+      shown. The one-second pause gives make and QEMU time to start.
+
+  - lines: 37-48
+    title: Rebuild the kernel and a fresh disk image
+    note: |
+      `run(..., check=True)` runs a command, waits for it, and raises
+      `CalledProcessError` if it exits with a non-zero status. Deleting `fs.img` before
+      `make fs.img` forces [[mkfs/mkfs.c|mkfs]] to build a clean image, wiping any files a
+      previous run created or left half-written. A failed build is only reported here;
+      the test then fails later, when the expected output never appears.
+
+  - lines: 50-57
+    title: Save the console output for inspection
+    note: |
+      Writes everything xv6 printed into `test-xv6.out` in the current directory, so
+      that after a failure you can see what happened. (The explicit `close()` is
+      unnecessary: the `with` statement closes the file anyway. The indentation of this
+      method is 6 spaces instead of 4, which Python accepts as long as it is consistent
+      within the block.)
+
+  - lines: 58-62
+    title: Type into xv6
+    note: |
+      Sends text to QEMU's standard input; it reaches xv6's UART as keystrokes, and the
+      [[g:console]] driver collects them into a line for the shell. Strings are converted
+      to UTF-8 bytes because pipes carry bytes. `flush()` pushes the bytes out immediately
+      instead of letting them sit in Python's buffer. Commands end in `\n`, the Enter key.
+
+  - lines: 64-71
+    title: Pull the plug
+    note: |
+      Simulates a power failure. `self.proc` is the `make` process; the process to kill is
+      its child, QEMU itself (make starts a simple command like this one directly, without
+      a shell in between). `ps -o pid --no-headers --ppid PID` lists the process IDs whose
+      parent is make; these options are the Linux `ps`, and macOS's `ps` rejects them.
+
+      `SIGKILL` cannot be caught, so QEMU stops instantly, in the middle of whatever
+      xv6 was doing. Whatever disk writes QEMU had already made to `fs.img` stay there, and
+      nothing more is written: exactly the situation the
+      [[g:crash-recovery|crash recovery]] code must handle on the next boot.
+
+  - lines: 73-74
+    title: Stop xv6 normally
+    note: |
+      Sends `SIGTERM` to make. GNU make passes the signal on to the command it is running,
+      so QEMU exits too. After [[:64|crash]] make has usually exited already, and this does
+      nothing harmful.
+
+  - lines: 76-85
+    title: Collect whatever xv6 has printed
+    note: |
+      Reads the output pipe in chunks of up to 4096 bytes until no more data is waiting
+      (the non-blocking read raises `BlockingIOError`) or the pipe has closed (a read of
+      zero bytes means QEMU and make have exited). The bytes are kept, and the whole
+      output is decoded again each time, so a multi-byte UTF-8 character split between two
+      chunks still decodes correctly. `"replace"` turns any invalid byte into a placeholder
+      instead of raising an error.
+
+  - lines: 87-88
+    title: The output as lines
+    note: |
+      Splits the output so far into lines, for [[:96|match]].
+
+  - lines: 90-94
+    title: Fail the whole run
+    note: |
+      Called when the expected output did not appear: print which patterns failed, save
+      the output to `test-xv6.out`, stop QEMU, and exit with status 1. That status is what
+      makes the CI step, and the CI job, fail.
+
+  - lines: 96-104
+    title: Look for expected lines
+    note: |
+      Checks every line of output against the regular expressions. `re.match` only matches
+      at the *start* of a line, so `'^ALL TESTS PASSED'` and `'f5'` both mean "a line
+      beginning with this". Matching lines are printed. With `exit=True` (the default) a
+      missing match ends the run through [[:90|error]]; with `exit=False` the caller gets
+      `True` or `False` and decides.
+
+  - lines: 106-116
+    title: Show progress lines once each
+    note: |
+      During a long run such as usertests, prints each newly completed line that matches
+      `regexp` (usertests prints `test NAME: OK` for each test). `reported` remembers how far
+      the output has been shown. Only text up to the last newline is considered, because
+      usertests prints `test NAME: ` first and `OK` only when the test finishes; printing
+      the partial line would show it twice, or cut in half.
+
+  - lines: 118-129
+    title: Wait for an expected line, with a deadline
+    note: |
+      The script's main loop while xv6 runs. Once per second it reads new output, shows
+      progress, and returns as soon as one of the patterns appears anywhere in the output.
+      If `timeout` seconds pass first, [[:90|error]] fails the run. Polling once a second is
+      crude but enough: the tests take minutes, and a second's delay does not matter.
+
+  - lines: 131-147
+    title: "Crash during logging, then check log recovery"
+    note: |
+      [[:131|crash_log]] boots a fresh image and runs [[user/logstress.c|logstress]] with six
+      file names: it forks six processes that each try to write 500,000 bytes to their own
+      file (more than the 274,432-byte maximum file size, so each writer eventually gets
+      an error; the test only needs them busy when QEMU is killed), keeping
+      the [[g:write-ahead-log|log]] constantly busy committing
+      [[g:transaction|transactions]]. After two seconds QEMU is killed.
+
+      [[:138|recover_log]] boots the *same* image without resetting it. If the kill happened
+      after a transaction was committed to the log but before it was fully installed, the
+      kernel replays it at boot and prints `recovering tail N dst B` for each block
+      ([[kernel/log.c:74]]). The test then runs `ls` and waits for a line starting with
+      `f5`, a basic check that the file system is still usable. If no
+      recovery message appears, the kill simply landed at a moment when no committed
+      transaction was pending, and the function returns `False` so that the caller tries
+      again.
+
+  - lines: 149-166
+    title: Crash with an orphaned inode, then check it is reclaimed
+    note: |
+      An [[g:orphan-inode|orphaned inode]] is one with no directory entry left
+      ([[g:link-count]] 0) that is still in use, so the kernel cannot free it yet. If the
+      machine crashes at that moment, nothing will ever free it, and its blocks are lost,
+      unless the kernel checks at boot.
+
+      [[:149|forphan]] runs [[user/forphan.c|forphan]], which creates a file, keeps it open and
+      unlinks it, then prints `wait for kill and reclaim` and sleeps. [[:156|dorphan]] runs
+      [[user/dorphan.c|dorphan]], which does the same with a directory it has made its
+      current directory. Once the `wait` line appears, QEMU is killed.
+
+      [[:163|recover_orphan]] boots the same image and waits up to 30 seconds for a line starting
+      with `ireclaim`, which [[kernel:ireclaim]] prints when it finds and frees such an inode
+      during boot ([[kernel/fs.c:396]]).
+
+  - lines: 168-178
+    title: "test_log: try up to 20 times"
+    note: |
+      Whether a kill catches a committed but uninstalled transaction is a matter of timing,
+      so this test repeats crash and reboot until a recovery is observed, at most 20
+      times. `OK` means the kernel replayed a log at least once and that afterwards `ls`
+      still listed `f5`, a basic check that the file system is usable. If 20 attempts never
+      catch a recovery, the test fails. (If `f5` is not listed after a recovery, the run
+      fails earlier, in [[:118|monitor]].)
+
+  - lines: 180-195
+    title: The orphan tests and the combined crash test
+    note: |
+      [[:180|test_forphan]] and [[:186|test_dorphan]] each crash once and check for reclamation. Both
+      print "an orphaned file", although `dorphan` tests an orphaned *directory*; the
+      message was copied. [[:192|test_crash]] runs all three crash tests in a row; it is what
+      `./test-xv6.py crash` selects.
+
+  - lines: 197-208
+    title: "test_usertests: run the big test suite"
+    note: |
+      Boots a fresh image, types `usertests` and waits for `ALL TESTS PASSED`, printing each
+      test's `OK` line as it arrives. The full suite gets 600 seconds (10 minutes); with
+      `-q` only the quick tests run, with 300 seconds. When called with a test name (the
+      fallback in [[:210|main]]), it types `usertests NAME` to run that one test. If a test
+      fails, usertests prints a failure message instead of `ALL TESTS PASSED`, so the run
+      ends at the timeout with `FAIL`.
+
+  - lines: 210-224
+    title: Choose which tests to run
+    note: |
+      [[:210|main]] prints the parsed arguments, then uses `inspect.getmembers` to list every
+      function in this script whose name starts with `test` (in alphabetical order:
+      `test_crash`, `test_dorphan`, `test_forphan`, `test_log`, `test_usertests`). Each one
+      whose name contains a match for the argument (`re.search`, anywhere in the name) is
+      run. So `crash` runs `test_crash`, `log` runs `test_log`, and `orphan` runs both orphan
+      tests. If nothing matched, the argument is taken as the name of one usertests test.
+
+      Line 224 calls `main()` when the file is run. Any failure exits with status 1 through
+      [[:90|error]] or `sys.exit(1)`; reaching the end means every selected test passed, and
+      Python exits with status 0.
+
+lines:
+  25: |
+    `make kernel/kernel`: rebuild the kernel if any source changed.
+  26: |
+    Delete and rebuild `fs.img`, so the test starts from a clean disk.
+  27: |
+    The command to run: the same `make qemu` you type yourself.
+  31: |
+    Reads from QEMU's output must never wait; see the block note.
+  65: |
+    List the children of the make process. Linux `ps` syntax.
+  71: |
+    Kill QEMU at once, with no chance to finish anything.
+  79: |
+    Read up to 4096 bytes without waiting.
+  133: |
+    Six concurrent writers, one file each: `f0` to `f5`.
+  134: |
+    Let them run for two seconds, long enough to be in the middle of writing.
+  142: |
+    Did the kernel replay a committed transaction at boot?
+  145: |
+    The last file must be listed by `ls` within 30 seconds.
+  152: |
+    `forphan` prints `wait for kill and reclaim N` once the orphan exists.
+  165: |
+    The kernel prints `ireclaim: orphaned inode N` during boot.
+  206: |
+    Type the command into xv6's shell.
+  207: |
+    Wait for success, showing each `test ...` line on the way.
+  213: |
+    Every function in this module whose name starts with `test`.
+  218: |
+    Run each test whose name the argument matches.
+  222: |
+    No test function matched: run that one usertests test.

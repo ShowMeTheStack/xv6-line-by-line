@@ -1,0 +1,970 @@
+summary: |
+  The heart of xv6's file system: everything between "a numbered disk [[g:block]]" and "a
+  file named `/README`". System calls in [[kernel/sysfile.c]] and the file-table code in
+  [[kernel/file.c]] call into it; it calls down into the [[g:buffer-cache]]
+  ([[kernel/bio.c]]) and the [[g:write-ahead-log]] ([[kernel/log.c]]).
+
+  The file is organized bottom-up, and you can read it in that order:
+
+  1. **Super block and blocks** (lines 24–107): read the [[g:superblock]] at boot, then
+     allocate and free data blocks with the [[g:free-bitmap]].
+  2. **Inodes** (lines 109–408): the on-disk [[g:dinode|inodes]], the in-memory
+     [[itable]], and the functions that reference, lock, update and free them.
+  3. **Inode content** (lines 410–579): map a file offset to a disk block ([[bmap]]), read
+     and write file data ([[readi]], [[writei]]), discard it ([[itrunc]]).
+  4. **Directories** (lines 581–646): a [[g:directory]] is a file of name/number pairs.
+  5. **Path names** (lines 648–741): turn `/a/b/c` into an inode by walking directories.
+
+  Two counts run through the whole file: `ref`, the number of in-memory
+  [[g:reference-count|references]] to an inode, and `nlink`, the number of directory entries
+  that name it ([[g:link-count]]). An inode's disk space is freed only when both reach zero.
+
+  **Read before:** [[kernel/fs.h]] (the on-disk format), [[kernel/bio.c]], [[kernel/log.c]].
+  **Read next:** [[kernel/file.c]], then [[kernel/sysfile.c]].
+
+blocks:
+  - lines: 1-10
+    title: A map of the file system's layers
+    note: |
+      xv6's own overview. Use it as a map, but notice that only three of the five layers are
+      implemented in this file:
+
+      - "Blocks" is split: [[kernel/bio.c]] caches and reads blocks, while [[balloc]] and
+        [[bfree]] here decide which blocks are in use.
+      - "Log" is entirely in [[kernel/log.c]]. This file only calls [[log_write]] where it
+        would otherwise write a block directly.
+      - "Files" (inodes), "Directories" and "Names" are here.
+
+      One more layer sits on top and is not listed: open files and
+      [[g:file-descriptor|file descriptors]], in [[kernel/file.c]] and [[kernel/sysfile.c]].
+
+  - lines: 12-22
+    title: Headers
+    note: |
+      Besides the usual kernel headers, this file needs [[kernel/fs.h]] (the on-disk
+      structures: [[superblock]], [[dinode]], [[dirent]]), [[kernel/buf.h]] (the cached
+      block, `struct buf`), [[kernel/file.h]] (the in-memory `struct inode`),
+      [[kernel/stat.h]] (the `T_DIR`/`T_FILE`/`T_DEVICE` type codes), and the two lock
+      headers, because every inode carries a [[g:sleeplock]] and the inode table a
+      [[g:spinlock]]. [[kernel/proc.h]] is here for [[myproc]], used to find the current
+      directory.
+
+  - lines: 24-27
+    title: The in-memory copy of the super block
+    note: |
+      `min` is a helper macro used by [[readi]] and [[writei]].
+
+      [[sb]] is the kernel's copy of the [[g:superblock]]: the disk's size and where each
+      region (log, inodes, bitmap, data) starts. [[readsb]] fills it once at boot and nothing
+      changes it afterwards. The macros [[IBLOCK]] and [[BBLOCK]] from [[kernel/fs.h]] take a
+      superblock argument, and every call in this file passes this global, `sb`.
+
+      As the comment says, a real system would keep one per mounted disk; xv6 has exactly
+      one file-system disk, device [[ROOTDEV]].
+
+  - lines: 29-38
+    title: "readsb(): read the super block from block 1"
+    note: |
+      The [[g:disk-layout]] puts the boot block at block 0 and the super block at block 1.
+      [[bread]] returns a locked, cached copy of block 1; the first `sizeof(*sb)` bytes are
+      a `struct superblock` written by [[mkfs:main|mkfs]] when it built `fs.img`, so a
+      [[memmove]] copies them into the caller's structure. [[brelse]] then gives the buffer
+      back to the cache.
+
+      For the default `fs.img` the values are: size 2000 blocks, 1953 data blocks, 200
+      inodes, 31 log blocks starting at block 2, inode blocks starting at 33, and the
+      bitmap at block 46 ([[mkfs/mkfs.c]] computes them from [[FSSIZE]], [[LOGBLOCKS]] and
+      its `NINODES`).
+
+  - lines: 40-49
+    title: "fsinit(): bring the file system up at boot"
+    note: |
+      Called once, by the first process, from [[forkret]] ([[kernel/proc.c:528]]). It
+      cannot run from [[main]] because reading the disk puts the caller to sleep until the
+      disk interrupt arrives, and only a process can sleep.
+
+      The three steps must happen in this order:
+
+      1. Read the [[g:superblock]] and check its magic number, [[FSMAGIC]]
+         (`0x10203040`). Any other value means the disk does not hold an xv6 file system,
+         and continuing would interpret random bytes as file-system structures.
+      2. [[initlog]] performs [[g:crash-recovery]]: if the previous run crashed after a
+         [[g:transaction]] committed but before it was fully written, the log replays it.
+      3. [[ireclaim]] frees "orphaned" inodes, files that were deleted but still open when
+         the machine went down. It must come after recovery so that it sees the disk in a
+         consistent state.
+
+  - lines: 51-61
+    title: "bzero(): fill a block with zeros"
+    note: |
+      Used only by [[balloc]], so that a newly allocated block never contains leftover data
+      from a file that used it before. The case that needs it is a new
+      [[g:indirect-block]]: there a zero entry means "no block", and leftover bytes would
+      be read as garbage block numbers. [[balloc]] does not know what the block will be
+      used for, so it zeroes every block. (For a data block, the old bytes could never be
+      read anyway: xv6 files have no holes, so every byte below `size` was written first,
+      and [[readi]] never reads past `size`.)
+
+      The zeroing happens in the cached copy and is recorded with [[log_write]], not written
+      to disk directly: it becomes part of the current [[g:transaction]], like every other
+      modification in this file. Note that this `bzero` is xv6's own, unrelated to the C
+      library function of the same name.
+
+  - lines: 63-90
+    title: "balloc(): find a free block in the bitmap and claim it"
+    note: |
+      The [[g:free-bitmap]] has one bit per block on the disk, including the metadata
+      blocks: bit *b* is 1 if block *b* is in use. [[mkfs/mkfs.c]] sets the bits of all
+      metadata blocks and of the blocks it filled with files, so a scan from block 0 can
+      never hand out the boot block, the log or an inode block.
+
+      One bitmap block holds [[BPB]] = 1024 × 8 = 8192 bits. The outer loop steps through
+      the disk 8192 blocks at a time, reading the bitmap block that covers them
+      ([[BBLOCK]]); the inner loop tests each bit. The default disk has only 2000 blocks,
+      so there is a single bitmap block and the outer loop runs once.
+
+      What stops two processes from claiming the same free block at the same time? The
+      buffer's [[g:sleeplock]]: [[bread]] returns the bitmap block locked, so the test on
+      line 78 and the set on line 79 happen with no other process able to look at that
+      block in between.
+
+      Block number 0 doubles as "failure", which is safe because block 0 is the boot block
+      and is never free.
+
+  - lines: 92-107
+    title: "bfree(): mark a block free again"
+    note: |
+      The inverse of [[balloc]]: find the bitmap bit for block `b` and clear it. `b % BPB`
+      is the block's position within its bitmap block; the byte and bit within the byte are
+      computed exactly as in `balloc`.
+
+      Freeing a block that is already free means the file system's bookkeeping is corrupt
+      (for example, two inodes listing the same block), so the kernel stops with a
+      [[panic]] instead of making things worse. `bfree` does not erase the block's
+      contents; [[balloc]] zeroes blocks when they are handed out again.
+
+      Like every change in this file, this one goes through [[log_write]], so the caller
+      must be inside a [[g:transaction]]. Its only caller is [[itrunc]].
+
+  - lines: 109-125
+    title: What an inode is, and the inode table
+    note: |
+      An [[g:inode]] is the file system's record for one file, directory or device. It has
+      no name: names live in [[g:directory|directories]], which map a name to an
+      [[g:inode-number]]. The record holds the type, size, [[g:link-count]] and the list of
+      blocks with the content, in the on-disk form `struct` [[dinode]], 64 bytes, 16 per
+      block, starting at block `sb.inodestart`.
+
+      When a process uses an inode, the kernel keeps a copy in memory: a `struct`
+      [[inode@kernel/file.h]] in the table [[itable]] below. The in-memory copy adds fields
+      that are not on disk: `ref` (how many kernel pointers refer to this entry) and `valid`
+      (whether the on-disk fields have been read in yet).
+
+  - lines: 126-168
+    title: The life of an inode, as xv6 describes it
+    note: |
+      xv6's comment separates four independent facts about an inode. Keeping them apart is
+      the key to reading the rest of the file:
+
+      | State | Recorded in | Set by | Cleared by |
+      |---|---|---|---|
+      | allocated on disk | `type != 0` in the [[dinode]] | [[ialloc]] | [[iput]] (through [[ifree]]) |
+      | has a table entry | `ref > 0` | [[iget]], [[idup]] | [[iput]] |
+      | contents loaded | `valid == 1` | [[ilock]] | [[iget]] on reuse; [[iput]] only when deleting |
+      | locked | `ip->lock` held | [[ilock]] | [[iunlock]] |
+
+      The typical sequence on lines 152–156 is the pattern you will see everywhere in
+      [[kernel/sysfile.c]]. Getting a reference and locking are separate steps on purpose:
+      an open file keeps its reference for as long as it is open but locks the inode only
+      during each `read` or `write`, and path lookup ([[namex]]) can hold a reference to a
+      directory without holding its lock, which avoids [[g:deadlock|deadlocks]] (see
+      [[namex]]).
+
+      One detail is imprecise: lines 131–132 say `iput` frees the inode when "the
+      reference and link counts have fallen to zero". The check is made while the caller's
+      reference is still counted, so the condition is `ref == 1` (the caller's own
+      reference is the last one) and `nlink == 0`; see [[:357]].
+
+      Lines 144–145 are inaccurate: `iput` clears `valid` only when it deletes the inode
+      ([[:366]], inside `if (last)`). After an ordinary last `iput` the entry keeps
+      `valid == 1` with `ref == 0`; [[iget]] resets `valid` when it reuses the entry
+      ([[:275]]).
+
+  - lines: 169-176
+    title: Which lock protects which field
+    note: |
+      Two kinds of lock guard the inode table, and each protects different fields:
+
+      - **`itable.lock`**, a [[g:spinlock]], protects `ref`, `dev` and `inum` of every
+        entry. These decide which entry holds which inode and whether an entry is free, so
+        they must be read and changed atomically with the search in [[iget]]. It is held
+        only for a few instructions and never across disk I/O.
+      - **`ip->lock`**, a [[g:sleeplock]] in each entry, protects everything else: `valid`
+        and the copy of the on-disk fields (`type`, `size`, `nlink`, `addrs`...). It may be
+        held for a long time, across disk reads and writes, which is why it must be a lock
+        that sleeps rather than spins.
+
+      Holding `ip->lock` also protects the inode's *content*: [[readi]] and [[writei]]
+      require it, so two writes to the same file never interleave inside one call.
+
+  - lines: 178-181
+    title: The inode table
+    note: |
+      [[NINODE]] = 50 entries, plus the spinlock that guards their allocation. This bounds
+      how many distinct inodes can be in use at once (open files, current directories,
+      inodes being looked up); [[iget]] panics if all 50 are taken.
+
+      Despite looking like a cache, it does not keep inodes around after their last
+      reference is dropped: [[iget]] only matches entries whose `ref` is above 0. Repeated
+      lookups are still cheap because the inode *blocks* stay in the [[g:buffer-cache]].
+
+  - lines: 183-192
+    title: "iinit(): initialize the table's locks"
+    note: |
+      Called once by hart 0 from [[main]]. The table itself is in `.bss`, so every entry
+      already starts with `ref == 0` (free) and `valid == 0`; only the locks need setting
+      up: the table's spinlock and one [[g:sleeplock]] per entry.
+
+  - lines: 194
+    title: Forward declaration of iget
+    note: |
+      [[ialloc]] below calls [[iget]], which is defined later and is `static` (private to
+      this file), so it is declared here first.
+
+  - lines: 196-221
+    title: "ialloc(): allocate a fresh inode on disk"
+    note: |
+      Called by [[create]] in [[kernel/sysfile.c]] when a new file, directory or device is
+      made. It scans the on-disk inodes for one whose `type` is 0 (free), claims it by
+      writing the new type, and returns an in-memory reference to it.
+
+      The scan starts at [[g:inode-number]] 1: inode 0 is never used, because a directory
+      entry with `inum == 0` means "empty slot". [[ROOTINO]] = 1 is the root directory,
+      which [[mkfs/mkfs.c]] allocates first.
+
+      As in [[balloc]], the buffer's sleeplock makes the test and the claim atomic: while
+      this process holds the inode block, no other `ialloc` can see the same free entry.
+
+      The returned inode is referenced but not locked and not yet loaded (`valid == 0`).
+      The caller's [[ilock]] reads the new contents back from the cached block. Running out
+      of inodes is reported with a message and a return value of 0, and `create` fails
+      cleanly.
+
+  - lines: 223-243
+    title: "iupdate(): write the in-memory inode back"
+    note: |
+      The in-memory inode is a copy; changing `ip->size` or `ip->nlink` does nothing to the
+      disk by itself, and nothing writes the copy back automatically when the entry is
+      recycled. So every function that changes an on-disk field calls `iupdate` afterwards:
+      [[writei]], [[itrunc]], and [[sys_link]], [[sys_unlink]] and [[create]] when they
+      change link counts.
+
+      It finds the inode's block with [[IBLOCK]], copies every on-disk field into the
+      [[dinode]] slot, and records the block with [[log_write]], so the change becomes part
+      of the caller's [[g:transaction]]. The caller must hold `ip->lock`, so that no one
+      changes the fields while they are being copied.
+
+  - lines: 245-279
+    title: "iget(): find or create the table entry for an inode"
+    note: |
+      Returns a pointer to the [[itable]] entry for inode `inum` on device `dev`, with one
+      more reference counted. It neither locks the inode nor reads it from disk. That keeps
+      `iget` short enough to run entirely under the `itable.lock` spinlock, and lets callers
+      like [[namex]] and [[dirlookup]] obtain a reference without the risk of
+      [[g:deadlock]] that taking the inode's lock would bring.
+
+      In one pass over the table under the spinlock it either finds an entry already in use
+      for this inode, and shares it, or remembers the first free entry (`ref == 0`) and
+      recycles it. Because the search and the claim happen under the same lock, two
+      processes looking up the same inode at the same time are guaranteed to get the same
+      entry; they can never end up with two separate copies whose fields disagree.
+
+      A recycled entry gets `valid = 0`, so its old contents (from whatever inode it held
+      before) are ignored and the next [[ilock]] reads the real ones.
+
+  - lines: 281-290
+    title: "idup(): take one more reference"
+    note: |
+      Adds a reference to an inode the caller already holds a reference to. [[kfork]] uses
+      it so the child shares the parent's current directory ([[kernel/proc.c:288]]), and
+      [[namex]] uses it to start a relative path lookup from the current directory. The
+      increment is done under `itable.lock` because `ref` is one of the fields that lock
+      protects. Returning `ip` allows the one-line idiom `np->cwd = idup(p->cwd)`.
+
+  - lines: 292-319
+    title: "ilock(): lock an inode, loading it from disk if needed"
+    note: |
+      After `ilock` returns, the caller has exclusive access to the inode's fields and
+      content, and those fields are guaranteed to hold the on-disk values.
+
+      The lock is a [[g:sleeplock]] because the next lines may wait for the disk, and
+      because callers keep holding it across [[readi]] and [[writei]], which do too. If
+      another process holds the lock, [[acquiresleep]] puts this one to sleep until it is
+      released.
+
+      The first time anyone locks an entry since [[iget]] filled it (`valid == 0`), `ilock`
+      copies the [[dinode]] from its block into the in-memory fields. Doing this here,
+      rather than in `iget`, means the disk is read only by a process that holds the lock,
+      so two processes never load the same entry at once.
+
+  - lines: 321-329
+    title: "iunlock(): release the inode's lock"
+    note: |
+      Releases the sleeplock, waking any process waiting in [[ilock]]. The checks catch
+      callers that unlock an inode they do not hold locked ([[holdingsleep]] also checks
+      that the *current process* is the holder) or that has no references left; both are
+      kernel bugs, so the response is a [[panic]].
+
+  - lines: 331-340
+    title: "ifree(): mark an inode free on disk"
+    note: |
+      Writes `type = 0` into the inode's on-disk slot. From that moment the
+      [[g:inode-number]] is free: the next [[ialloc]] that scans past it can claim it.
+      Only [[iput]] calls this, as the very last step of deleting a file, after
+      [[itrunc]] has already released the data blocks. The other on-disk fields are left as
+      they are; [[ialloc]] zeroes the whole slot when it reuses it.
+
+  - lines: 342-349
+    title: "iput(): drop a reference, and maybe delete the file"
+    note: |
+      Every [[iget]], [[idup]], [[ialloc]] or [[dirlookup]] reference is eventually given
+      back with `iput`. Usually that only decrements `ref`. But if this was the last
+      reference *and* no directory entry names the inode any more (`nlink == 0`), the file
+      has become unreachable: no one has it open and no path leads to it. Then `iput` frees
+      its data blocks and the inode itself.
+
+      That is how a file deleted with `rm` while some process still has it open survives
+      until the last `close`: [[sys_unlink]] drops `nlink` to 0, but the open file's
+      reference keeps `ref` above 1, so the deletion waits for the final `iput`.
+
+      Because `iput` may write to the disk, every call must be inside a
+      [[g:transaction]] ([[begin_op]] ... [[end_op]]), even calls that look like plain
+      cleanup, such as in [[fileclose]] or [[kexit]].
+
+  - lines: 350-378
+    title: Truncate first, free the inode number last
+    note: |
+      The function works in two phases.
+
+      **Decide** (lines 352–358, under `itable.lock`). Is this the last reference to an
+      unlinked inode? Save `dev` and `inum` in local variables for later.
+
+      **Delete** (only if so). Lock the inode, drop the spinlock (the next step sleeps on
+      the disk), and free the data blocks with [[itrunc]]. Then take the spinlock again,
+      drop the reference, and only after that clear the on-disk type with [[ifree]].
+
+      The order of the last two steps fixes a real bug (xv6 commit `d7e85f1`). Earlier
+      versions set `type = 0` *before* decrementing `ref`. In that window another process
+      could [[ialloc]] the same inode number, its [[iget]] would find this entry, still
+      referenced, and share it, and the two processes' reference counts would get tangled:
+      the new file could later be deleted with `ref` still above 1, so its inode was never
+      freed. It stayed allocated but unreachable until a reboot ran [[ireclaim]]. Now the
+      inode number becomes allocatable only once this entry is no longer in use.
+
+      Everything happens inside the caller's [[g:transaction]], so after a crash either all
+      of the deletion is on disk or none of it is.
+
+  - lines: 380-386
+    title: "iunlockput(): the usual way to finish with an inode"
+    note: |
+      Most code paths end with an inode both locked and referenced, so this pair is
+      combined. The order matters: [[iput]] may need to lock the inode itself (and assumes
+      no one holds the lock when `ref == 1`), so the caller's lock must be released first.
+
+  - lines: 388-408
+    title: "ireclaim(): free inodes orphaned by a crash"
+    note: |
+      Called from [[fsinit]] at boot, after log recovery. It looks for inodes that are
+      allocated (`type != 0`) but have no links (`nlink == 0`). Such an inode is
+      unreachable and would leak forever. The usual cause is a file that was deleted while
+      still open (see [[iput]]) when the machine crashed or was shut down: the unlink was
+      committed, but the final `iput` that would have freed it never ran. The user programs
+      [[user/forphan.c]] and [[user/dorphan.c]] create exactly this situation for testing.
+
+      For each orphan it reproduces a final close: take a reference with [[iget]], lock it
+      once so that `valid` becomes 1 (which [[iput]]'s "last reference" test requires),
+      unlock, and `iput`. Since `ref == 1` and `nlink == 0`, `iput` truncates and frees it.
+      Each orphan gets its own [[g:transaction]].
+
+      Note the order on lines 397–399: the inode block is released with [[brelse]] *before*
+      [[ilock]] runs, because `ilock` reads that same block, and a process that tried to
+      lock a buffer it already holds would wait for itself forever.
+
+  - lines: 410-415
+    title: Where a file's data blocks are listed
+    note: |
+      A file's content is a sequence of [[g:block|blocks]] numbered 0, 1, 2... within the
+      file (its "logical" block numbers). The inode records which disk block holds each
+      one:
+
+      - `addrs[0]` to `addrs[11]` ([[NDIRECT]] = 12 entries) give the disk addresses of the
+        first 12 blocks directly.
+      - `addrs[12]` points to an [[g:indirect-block]], a whole disk block filled with
+        [[NINDIRECT]] = 1024 / 4 = 256 more block numbers, for logical blocks 12 to 267.
+
+      So the largest file is [[MAXFILE]] = 268 blocks = 274,432 bytes (268 KiB). An address
+      of 0 means "no block allocated yet".
+
+  - lines: 417-459
+    title: "bmap(): which disk block holds block bn of this file?"
+    note: |
+      Translates a logical block number `bn` into a disk block number, allocating blocks on
+      the way if they do not exist yet. [[readi]] and [[writei]] call it once per block they
+      touch. The caller holds `ip->lock` and, if allocation may happen, a
+      [[g:transaction]].
+
+      For `bn < 12` the answer is in `ip->addrs[bn]`. Otherwise `bn` is reduced by 12 to an
+      index into the [[g:indirect-block]], which is itself allocated the first time a file
+      grows past 12 blocks, and then read to find (or record) the data block's address.
+
+      Two kinds of change need recording differently. The indirect block lives in its own
+      disk block, so writing an entry into it needs [[log_write]] right here. A change to
+      `ip->addrs[]` only changes the in-memory inode; `bmap` does not call [[iupdate]], and
+      relies on its caller to do so ([[writei]] always does, see [[:573]]).
+
+      When the disk is full, [[balloc]] returns 0 and `bmap` passes the 0 up so the write
+      can stop with a short count.
+
+      In practice [[readi]] never makes `bmap` allocate: xv6 files have no holes (see
+      [[writei]]), so every block below the file's size already exists. That matters,
+      because [[fileread]] calls `readi` outside any transaction.
+
+  - lines: 461-491
+    title: "itrunc(): free all of a file's data blocks"
+    note: |
+      Releases every block the inode uses and sets its size to 0. Called by [[iput]] when a
+      file is deleted, and by [[sys_open]] for `O_TRUNC` (opening an existing file to
+      overwrite it).
+
+      It frees the direct blocks first, then each block listed in the
+      [[g:indirect-block]], then the indirect block itself. The indirect block must be read
+      before it is freed, since it holds the list. Every entry is reset to 0 so the inode no
+      longer claims blocks that may soon belong to another file, and [[iupdate]] writes the
+      emptied inode back.
+
+      All of this is one [[g:transaction]], so it is crash-safe: either all of the
+      [[g:free-bitmap]] updates and the new inode reach the disk or none do. It stays small
+      on the default disk because the single bitmap block is logged only once, however many
+      bits change (the log's "absorption" of repeated writes to a block).
+
+  - lines: 493-503
+    title: "stati(): fill in a struct stat"
+    note: |
+      Copies the inode's public metadata into a `struct` [[stat]], the structure the
+      `fstat` system call returns to user programs ([[filestat]]). Note that the device
+      numbers `major`/`minor` and the block list are not included. The caller holds the
+      lock, so the five fields are a consistent snapshot.
+
+  - lines: 505-534
+    title: "readi(): read bytes from a file"
+    note: |
+      Reads up to `n` bytes starting at byte offset `off` of the inode, into either a user
+      address (for `read`) or a kernel address (for [[dirlookup]] and [[kexec]]). It returns
+      the number of bytes read, 0 at or past the end of the file, or -1 if copying to the
+      destination failed.
+
+      The loop handles one block per iteration. The first and last blocks may be partial: a
+      read of 100 bytes at offset 1000 takes 24 bytes from the end of block 0 and 76 from
+      the start of block 1. For each block it maps the logical block to a disk block
+      ([[bmap]]), gets it from the [[g:buffer-cache]], copies the needed piece with
+      [[either_copyout]], and releases the buffer at once, so the loop never holds more
+      than one buffer.
+
+  - lines: 536-579
+    title: "writei(): write bytes into a file"
+    note: |
+      The mirror image of [[readi]], with three differences:
+
+      - It may **grow** the file: [[bmap]] allocates missing blocks, and line 571 extends
+        the size. It can write at the end of the file but not past it (line 549), so a file
+        never has holes, gaps of unallocated blocks below its size.
+      - Every modified block goes to [[log_write]] rather than to the disk, so the caller
+        must be inside a [[g:transaction]], and the transaction must have room for all the
+        blocks one call can touch. That is why [[filewrite]] splits large writes into
+        chunks.
+      - It reports partial success: it returns how many bytes it wrote, which is less than
+        `n` if the disk filled up or the source address was bad. Callers treat a short
+        count as an error.
+
+      The caller holds `ip->lock`, which keeps two writers from interleaving inside the
+      same file and keeps the size consistent.
+
+  - lines: 581-587
+    title: "namecmp(): compare two file names"
+    note: |
+      Directory entry names are at most [[DIRSIZ]] = 14 bytes and are not
+      NUL-terminated when they use all 14 (see [[dirent]]). [[strncmp]] with a limit of
+      `DIRSIZ` handles both cases: it stops at a NUL or after 14 characters, whichever
+      comes first. A consequence is that names are only compared on their first 14
+      characters, so `abcdefghijklmnop` and `abcdefghijklmnXY` count as the same name.
+
+  - lines: 589-615
+    title: "dirlookup(): find a name in a directory"
+    note: |
+      A [[g:directory]] is an ordinary inode of type `T_DIR` whose content is an array of
+      16-byte [[dirent]] records: a 2-byte [[g:inode-number]] and a 14-byte name. Looking
+      up a name means reading the records one by one with [[readi]] and comparing names.
+      Records with `inum == 0` are empty slots left by deleted entries.
+
+      On a match it returns the named inode via [[iget]]: referenced but **not locked**.
+      The caller holds `dp`'s lock, and the name might be `.`, which refers to `dp` itself;
+      locking the result here would then deadlock. If `poff` is not null, the entry's byte
+      offset is stored there, which [[sys_unlink]] uses to erase the entry.
+
+      The caller must hold `dp`'s lock. Directory sizes are always a multiple of 16 bytes,
+      so a short read means the directory is corrupt and the kernel panics.
+
+  - lines: 617-646
+    title: "dirlink(): add a name to a directory"
+    note: |
+      Adds the entry `(name, inum)` to directory `dp`. Used by [[create]] (for the new name
+      and, in a new directory, for `.` and `..`) and by [[sys_link]].
+
+      1. Refuse duplicates: if the name is already there, give back the reference that
+         [[dirlookup]] took and fail.
+      2. Find a slot: the first empty entry (`inum == 0`), or, if there is none, the offset
+         just past the end, `off == dp->size`.
+      3. Write the entry with [[writei]]. Writing at the end grows the directory by 16
+         bytes, which may allocate a new block; if the disk is full, `writei` returns a
+         short count and `dirlink` fails instead of panicking.
+
+      `dirlink` does not touch the target inode's [[g:link-count]]; its callers adjust
+      `nlink` themselves. The caller must hold `dp`'s lock and be inside a
+      [[g:transaction]].
+
+  - lines: 648-685
+    title: "skipelem(): split off the next path element"
+    note: |
+      A [[g:path-name]] like `/a/bb/c` is a sequence of elements separated by slashes.
+      `skipelem` copies the next element into `name` and returns the rest of the path with
+      the separating slashes removed. xv6's examples, plus two more:
+
+      | `path` | `name` set to | returns |
+      |---|---|---|
+      | `"a/bb/c"` | `a` | `"bb/c"` |
+      | `"///a//bb"` | `a` | `"bb"` |
+      | `"a"` | `a` | `""` |
+      | `"a/"` | `a` | `""` |
+      | `""` or `"////"` | unchanged | 0 (no element) |
+      | `"abcdefghijklmnopq/x"` | `abcdefghijklmn` (14 bytes, no NUL) | `"x"` |
+
+      Because trailing slashes are skipped, the caller can test `*path == '\0'` to know that
+      the element just copied was the last one; [[namex]] relies on this.
+
+      Elements longer than [[DIRSIZ]] are silently cut to 14 bytes and then fill `name`
+      completely, with no terminating NUL. That is why `name` must have room for `DIRSIZ`
+      bytes and why names are compared with [[namecmp]], which never reads past 14.
+
+  - lines: 687-728
+    title: "namex(): walk a path, one directory at a time"
+    note: |
+      The engine behind [[namei]] and [[nameiparent]]. It starts at the root directory
+      (absolute path) or the current directory (relative path), and for each element locks
+      the current directory, checks it, looks up the element, and moves to the result.
+      Following `/a/b`: start at `/`, find `a` in it, find `b` in `a`, return `b`.
+
+      Notice the hand-over on lines 716–721: [[dirlookup]] returns `next` referenced but
+      unlocked, then the current directory is unlocked and released *before* `next` is
+      locked on the following iteration. The walk never holds two inode locks at once, and
+      that avoids two [[g:deadlock|deadlocks]]:
+
+      - Looking up `.` returns the directory itself. Locking `next` while still holding
+        `ip`'s lock would mean waiting for a lock this process already holds.
+      - Looking up `..` goes from child to parent, the opposite order of a process walking
+        down from parent to child. If both held one lock and waited for the other, neither
+        could proceed.
+
+      The reference that `dirlookup` took on `next` is what keeps it safe in the gap:
+      while referenced, its table entry cannot be recycled and its blocks cannot be freed.
+
+      With `nameiparent` set, the walk stops one level early and returns the *parent*
+      directory, with the final element left in `name`. Callers that create or remove a
+      name ([[create]], [[sys_unlink]], [[sys_link]]) need exactly that.
+
+      Its [[iput]] calls may free an inode, so `namex` must run inside a
+      [[g:transaction]]. The one exception is [[userinit]]'s
+      `namei("/")` at boot, which returns before any `iput`.
+
+  - lines: 730-741
+    title: "namei() and nameiparent(): the public entry points"
+    note: |
+      [[namei]] returns the inode a path names, referenced and unlocked, or 0 if any part of
+      the path does not exist or is not a directory. It still needs a buffer for the
+      elements [[namex]] copies out, so it provides a local one of [[DIRSIZ]] bytes.
+
+      [[nameiparent]] returns the inode of the directory that would contain the path's last
+      element, and copies that element into the caller's `name`, which must have room for
+      `DIRSIZ` bytes. For `/a/b` it returns `/a` and sets `name` to `b`.
+
+lines:
+  24: |
+    The smaller of two values. Being a macro, it works for any type, but evaluates the
+    chosen argument twice, which is harmless here because both arguments are plain
+    expressions without side effects.
+  27: |
+    The global copy of the [[g:superblock]], in `.bss` until [[readsb]] fills it.
+  35: |
+    Get block 1, the super block, from the [[g:buffer-cache]], reading it from the disk if
+    it is not cached.
+  36: |
+    Copy the `struct superblock` out of the start of the block. Only the first 32 bytes
+    of the 1024-byte block are used.
+  44: |
+    Fill the global [[sb]]. Inside [[readsb]] the parameter `sb` is a pointer to this
+    global.
+  45-46: |
+    Refuse to mount a disk without the xv6 magic number [[FSMAGIC]] (`0x10203040`).
+  47: |
+    Start the logging layer and replay any committed but unfinished [[g:transaction]] from
+    before a crash. See [[initlog]].
+  48: |
+    Free inodes that were left allocated but unreachable by a crash. See [[ireclaim]].
+  57: |
+    Get block `bno` into the cache. If it is not cached, its old contents are read from the
+    disk even though they are about to be overwritten: the buffer cache offers no public
+    "get without reading" call ([[bget]] is private to [[kernel/bio.c]]).
+  58: |
+    Fill all [[BSIZE]] = 1024 bytes with zeros.
+  59: |
+    Record the block as part of the current [[g:transaction]]; it reaches the disk when the
+    transaction commits.
+  73: |
+    A defensive initialization; `bp` is always set on line 75 before it is used.
+  74: |
+    `b` is the number of the first block described by the current bitmap block: 0, then
+    8192, 16384...
+  75: |
+    Read the bitmap block covering blocks `b` to `b + 8191`. [[BBLOCK]] computes
+    `b / BPB + sb.bmapstart`, here always block 46.
+  76: |
+    `bi` is the bit number within this bitmap block. The second condition stops at the end
+    of the disk: the last bitmap block may describe more blocks than exist.
+  77: |
+    The mask for bit `bi % 8` within its byte. Block `b + bi`'s bit lives in byte `bi / 8`
+    of the bitmap block, bit `bi % 8` (bit 0 being the least significant). For block 50,
+    that is byte 6, mask `1 << 2`.
+  78-79: |
+    If the bit is 0 the block is free; set it to claim the block. The buffer lock held
+    since [[bread]] makes this test-and-set atomic with respect to other processes.
+  80: |
+    Log the modified bitmap block as part of the current [[g:transaction]].
+  82: |
+    Zero the new block before handing it out; see [[bzero]].
+  83: |
+    Return the block number: the bitmap block's base plus the bit index.
+  86: |
+    No free bit in this bitmap block; release it before moving on to the next one.
+  88-89: |
+    Disk full. Callers treat 0 as failure: [[bmap]] passes it up and [[writei]] stops
+    early, so the `write` system call fails instead of the kernel panicking.
+  99: |
+    Get the bitmap block that holds block `b`'s bit.
+  100-101: |
+    The bit's index within this bitmap block, and its mask within its byte, computed as in
+    [[balloc]].
+  102-103: |
+    The bit is already 0: this block is being freed twice, a sign of corruption.
+  104: |
+    Clear only this block's bit: `~m` has every bit set except that one.
+  105: |
+    Log the modified bitmap block in the current [[g:transaction]].
+  180: |
+    The 50 in-memory inodes. Each is a `struct inode` from [[kernel/file.h]].
+  188: |
+    Initialize the spinlock that guards `ref`, `dev` and `inum` of all entries.
+  189-191: |
+    Give every entry its own [[g:sleeplock]], all with the name `"inode"` (the name is
+    only used for debugging).
+  207: |
+    Try every inode number from 1 to `ninodes - 1` (199 on the default disk).
+  208: |
+    Read the block that holds inode `inum`. [[IBLOCK]] computes
+    `inum / IPB + sb.inodestart`: with 16 inodes per block, inodes 0–15 are in block 33,
+    16–31 in block 34, and so on. Consecutive inode numbers usually hit the same cached
+    block.
+  209: |
+    Point at inode `inum` inside that block. The cast applies before the `+`, so the
+    addition counts in whole 64-byte `dinode`s: slot `inum % 16` of the block.
+  210: |
+    Type 0 means the on-disk inode is free.
+  211-213: |
+    Claim it: clear every field (size 0, no blocks, `nlink` 0), set the type, and log the
+    block. Setting the type is what marks the inode allocated. The caller sets `nlink` and
+    the device numbers afterwards and calls [[iupdate]].
+  215: |
+    Return an in-memory reference to the new inode, via [[iget]]. The buffer has already
+    been released, since `iget` does not touch the disk.
+  219-220: |
+    No free inode (all 199 are in use). The caller, [[create]], returns failure.
+  233-234: |
+    Locate this inode's 64-byte slot in its inode block, exactly as [[ialloc]] does.
+  235-240: |
+    Copy every field that exists on disk. `ref`, `valid` and the lock are in-memory only
+    and are not written.
+  241: |
+    Record the inode block in the current [[g:transaction]].
+  253: |
+    Every read or write of `ref`, `dev` and `inum` in the table happens under this lock.
+  257-261: |
+    Scan all 50 entries. An entry that is in use (`ref > 0`) for the same device and inode
+    number is shared: take another reference and return it.
+  263-264: |
+    Meanwhile remember the first free entry, in case the inode is not in the table. An
+    entry with `ref == 0` is never matched above, even if it still holds this inode's old
+    data.
+  268-269: |
+    All 50 entries are in use. xv6 treats this as fatal rather than returning an error.
+  271-275: |
+    Claim the free entry for this inode, with one reference. `valid = 0` says the
+    remaining fields are stale until [[ilock]] reads the disk.
+  287: |
+    One more in-memory pointer to this entry; it now takes one more [[iput]] to release.
+  300-301: |
+    Locking requires a reference: without one, the entry could be recycled for another
+    inode at any moment.
+  303: |
+    Take the inode's [[g:sleeplock]], sleeping if another process holds it.
+  305: |
+    Not loaded yet: this entry was filled by [[iget]] and has not been read from disk
+    since.
+  306-307: |
+    Read the inode's block and locate its slot, as [[ialloc]] does.
+  308-313: |
+    Copy every on-disk field into the in-memory inode; the reverse of [[iupdate]].
+  315: |
+    Mark the fields as loaded, so later `ilock` calls skip the disk read.
+  316-317: |
+    An in-use reference to a free inode means something went wrong, for example a
+    directory entry pointing to an inode that was already freed. See [[namex]]'s
+    `nlink` check for one such bug that was fixed.
+  325-326: |
+    Panic if the inode is null, not locked by this process, or has no references.
+  328: |
+    Release the sleeplock and wake waiters.
+  335-336: |
+    Locate the on-disk slot for `inum`. The function receives `dev` and `inum` by value,
+    not the in-memory inode, because [[iput]] calls it after giving up the table entry.
+  337: |
+    Type 0 marks the on-disk inode free.
+  338: |
+    Record the change in the current [[g:transaction]].
+  357: |
+    The deletion test. `ref == 1`: the caller's reference is the only one, so no open file,
+    current directory or lookup in progress uses the inode. `nlink == 0`: no directory
+    entry names it. `valid`: the fields were loaded, so `nlink` is meaningful; an entry
+    that was never locked was never changed and has nothing to free.
+
+    `nlink` and `valid` are protected by `ip->lock`, which is not held here. Reading them
+    is still safe in the case that matters: with `ref == 1`, no other process can hold or
+    take that lock. With `ref > 1` the `&&` stops before reading them.
+  358: |
+    Save the identity now. Once `ref` reaches 0 and `itable.lock` is released, another
+    process's [[iget]] may reuse this very entry for a different inode, overwriting
+    `ip->dev` and `ip->inum`.
+  362: |
+    Lock the inode before changing it. This never waits: the caller has released its own
+    lock (as [[iunlockput]] does), and with `ref == 1` no one else holds a reference, so no
+    one else can hold the lock. That matters, because sleeping while holding the
+    `itable.lock` spinlock is not allowed.
+  363: |
+    Release the spinlock: [[itrunc]] reads and writes disk blocks and so may sleep.
+  365: |
+    Free all data blocks and set the size to 0. The inode's `type` stays non-zero on disk,
+    so no [[ialloc]] can take this inode number yet.
+  366: |
+    Mark the in-memory copy as no longer loaded. (With the current code [[iget]] also
+    resets `valid` whenever it reuses an entry, so this is a safety measure.)
+  368: |
+    The truncation is done; release the inode's lock.
+  370: |
+    Retake the spinlock to change `ref`.
+  373-374: |
+    Drop the caller's reference. If it reaches 0, the entry is free for [[iget]] to reuse
+    as soon as the spinlock is released.
+  376-377: |
+    Finally clear the type on disk, using the saved `dev` and `inum`. Only now can
+    [[ialloc]] hand this inode number to a new file, and when it does, its [[iget]] finds
+    no entry still in use for that number.
+  384-385: |
+    Unlock first, then drop the reference; see the block note.
+  391: |
+    Visit every inode number, as [[ialloc]] does.
+  395-398: |
+    An allocated inode that no directory names is an orphan. Print a notice and take a
+    reference to it.
+  399: |
+    Release the inode block before [[ilock]] reads it again below.
+  401: |
+    Start a [[g:transaction]]: the [[iput]] below will free blocks and the inode.
+  402-403: |
+    Lock and unlock only to load the inode (`valid = 1`), which [[iput]] requires before it
+    will free anything.
+  404: |
+    The last reference to an inode with `nlink == 0`: [[iput]] truncates and frees it.
+  426: |
+    One of the 12 direct blocks?
+  427-432: |
+    If no block is assigned to this position yet, allocate one and record it in the
+    in-memory inode. If the disk is full, report failure with 0.
+  435: |
+    Not direct: turn `bn` into an index into the [[g:indirect-block]] (0 to 255).
+  437: |
+    Within the range the indirect block can describe?
+  439-444: |
+    Allocate the indirect block itself if the file has never needed one. [[balloc]]
+    zeroes it, so all 256 entries start as "not allocated".
+  445-446: |
+    Read the indirect block and view its 1024 bytes as an array of 256 `uint` block
+    numbers.
+  447-453: |
+    If entry `bn` is empty, allocate a data block and record it. Since the indirect block
+    is a disk block of its own, the change is logged here. If [[balloc]] fails, `addr`
+    stays 0 and is returned as the failure value.
+  454-455: |
+    Release the indirect block and return the data block's address (or 0).
+  458: |
+    `bn` was beyond the largest possible file. [[writei]] checks the size limit first, so
+    reaching here is a kernel bug.
+  470-475: |
+    Free each direct block that is in use and clear its entry.
+  477-479: |
+    If there is an indirect block, read it and view it as 256 block numbers.
+  480-483: |
+    Free every data block the indirect block lists.
+  484-486: |
+    Release the buffer, then free the indirect block itself and clear `addrs[12]`.
+  489-490: |
+    The file is now empty; write the cleared inode back with [[iupdate]].
+  498-502: |
+    Copy device, inode number, type, link count and size. `size` widens from `uint` to
+    `uint64`.
+  515-516: |
+    Starting past the end reads nothing. `off + n < off` is true only if the unsigned sum
+    wrapped around past 2^32 - 1, which would make the next check meaningless.
+  517-518: |
+    Clamp the read so it stops at the end of the file. If `off == ip->size`, `n` becomes
+    0 and the loop does nothing.
+  520: |
+    One iteration per block: `tot` counts bytes done, and `off` and `dst` advance with it.
+  521-523: |
+    Find the disk block holding byte `off`. Every block below the file's size already
+    exists, so [[bmap]] only looks it up here; 0 (disk full during an allocation) cannot
+    occur in practice, but the loop would stop if it did.
+  524: |
+    Get that block from the cache.
+  525: |
+    How many bytes to take from this block: the rest of the request, or the rest of the
+    block from `off % BSIZE`, whichever is smaller.
+  526-530: |
+    Copy to user or kernel memory, as `user_dst` says ([[either_copyout]]). If the copy
+    fails (for example, a user address that is not mapped), the read returns -1, even if
+    earlier blocks were copied.
+  531: |
+    Done with this block.
+  533: |
+    `tot` is a `uint`, so -1 is stored as `0xffffffff`; returned as `int` it becomes -1
+    again.
+  549-550: |
+    Writing may start at the end of the file but not beyond it, so files have no holes.
+    The second test catches unsigned wrap-around, as in [[readi]].
+  551-552: |
+    Refuse writes that would make the file larger than [[MAXFILE]] blocks (274,432 bytes).
+  554: |
+    One iteration per block, as in [[readi]].
+  555-557: |
+    Find the disk block for byte `off`, allocating it if this extends the file. Stop if
+    the disk is full.
+  558-559: |
+    Get the block and compute how many bytes go into it.
+  560-565: |
+    Copy the new bytes in. If the copy fails partway (a bad user address), some bytes may
+    already be in the cached block, so the block is logged anyway; otherwise the cache
+    would hold changes the log does not know about, which could be lost when the buffer is
+    evicted, or written later as part of an unrelated transaction. (This is our reading:
+    the commit that added the line, `fb0fed8`, says only "fix writei bug".)
+  566-567: |
+    Log the modified block and release it. It reaches the disk when the
+    [[g:transaction]] commits.
+  570-571: |
+    If the write went past the old end, the file grew. `off` has advanced only over bytes
+    actually written.
+  573-576: |
+    Write the inode back unconditionally. [[bmap]] may have changed `ip->addrs` even when
+    the size did not change, for example when a copy failed right after a new block was
+    allocated, and `bmap` relies on this call to save `addrs`. If nothing changed, the
+    write is harmless.
+  578: |
+    The number of bytes written; less than `n` on failure.
+  586: |
+    Compare at most 14 characters; equal names give 0, as with `strcmp`.
+  597-598: |
+    Only directories can be searched; callers check the type first.
+  600-602: |
+    Read each 16-byte entry in turn. `0` as the second argument means `&de` is a kernel
+    address.
+  603-604: |
+    An empty slot; skip it.
+  605-611: |
+    A match: report the offset if asked, and return a new reference to the named inode.
+  614: |
+    Not found.
+  627-630: |
+    The name exists already. [[dirlookup]] returned a reference, which must be given back
+    with [[iput]].
+  633-638: |
+    Look for a free slot. If the loop runs to the end, `off` equals `dp->size` and the
+    entry will be appended.
+  640: |
+    Copy the name. [[strncpy]] pads shorter names with zeros up to 14 bytes, and a name of
+    14 or more characters fills the field with no NUL.
+  641: |
+    The inode number this name refers to.
+  642-643: |
+    Write the 16-byte entry into the directory. A short write means the directory could
+    not grow (disk full).
+  668-671: |
+    Skip leading slashes. If nothing is left, there is no element: return 0.
+  672-675: |
+    Remember where the element starts, advance to the next `/` or the end, and compute the
+    element's length.
+  676-677: |
+    Too long: copy only the first 14 bytes, without a terminating NUL.
+  678-681: |
+    Copy the element and terminate it with a NUL.
+  682-684: |
+    Skip the slashes after the element, so the returned path starts at the next element
+    or is empty.
+  696-699: |
+    Choose the starting directory. An absolute path starts at the root, inode [[ROOTINO]]
+    on device [[ROOTDEV]]; a relative one at the process's current directory, with an
+    extra reference so the walk can release it like any other step.
+  701: |
+    Take the next element into `name`. The loop ends when there are no more elements.
+  702: |
+    Lock the current directory, reading it from disk if needed, so its type, link count
+    and entries can be examined.
+  703-706: |
+    A path like `/README/x` treats a file as a directory; fail.
+  707-710: |
+    Refuse to search a directory that has been deleted. A deleted directory can still be
+    a process's current directory, and its `..` entry may point to a parent that has since
+    been freed. Before this check (xv6 commit `9da28f5`), the commands `mkdir /a`,
+    `mkdir /a/b`, `cd /a/b`, `rm /a/b`, `rm /a`, `ls ..` ended in `panic: ilock: no type`.
+  711-715: |
+    For [[nameiparent]]: if this was the last element, return the directory that would
+    contain it, unlocked but referenced. `name` holds the last element.
+  716-719: |
+    Look the element up. Not found: release the directory and fail.
+  720-721: |
+    Release the current directory (lock and reference) before moving to the next one; see
+    the block note for why the lock must go first.
+  723-726: |
+    Reached only by [[nameiparent]] when the path had no elements at all (`"/"` or `""`),
+    so there is no parent to return.
+  727: |
+    The inode the path names, referenced and unlocked. An empty path `""` returns the
+    current directory.
+  733-734: |
+    A scratch buffer for path elements; the caller of [[namei]] does not need the name.
+  740: |
+    The caller's `name` receives the final path element.

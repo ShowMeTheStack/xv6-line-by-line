@@ -1,0 +1,810 @@
+title: Spinlocks from the hardware up
+group: Concurrency primitives
+prerequisites: [5, 11]
+summary: |
+  Two harts want the same page of memory at the same moment. There is one list of free pages
+  in the whole machine, [[kernel:kmem]]`.freelist`, and if both harts pop it at once they can
+  both walk away with the *same* page. Two processes would then scribble over each other's
+  memory, and nothing would crash until much later, somewhere unrelated.
+
+  This tour follows one call to `acquire(&kmem.lock)` on hart 1 while hart 2 wants the same
+  lock, down to the individual instructions the compiler produced (quoted from
+  `kernel/kernel.asm` of this build). You will see interrupts switched off with one
+  [[g:insn:csrrc|csrrci]], a nesting counter that remembers whether to switch them back on,
+  the [[g:insn:amoswap|amoswap.w.aq]] that decides who wins, the spin of the loser, and the
+  `fence rw,w; sw zero` that hands the lock over.
+
+  Every other synchronization mechanism in xv6 ([[g:sleeplock|sleep-locks]],
+  [[g:sleep-wakeup|sleep and wakeup]], the [[g:context-switch]]) is built on these
+  two functions. If you understand why each instruction in them is there, the rest of the
+  concurrency tours ([[tour:16]] to [[tour:19]]) are variations on a theme.
+cast: |
+  The machine has three [[g:hart|harts]]. You pasted two lines at once, `forktest &` and
+  `echo hi`, so `forktest` (pid 4) is still forking child after child in the background
+  when the shell starts on `echo hi`. (If the process table were completely full at that
+  instant, the shell's own fork would fail.) When the tour starts:
+
+  | Hart | What it is doing |
+  |---|---|
+  | 0 | Running whatever else is runnable, or idle in its [[kernel:scheduler]] |
+  | 1 | The shell's new child is parsing `echo hi`. Its first `malloc` needs heap, so it is in `sbrk`: the thread this tour follows |
+  | 2 | `forktest` is inside `fork`, setting up a new child: it will need a page too |
+
+  Neither hart holds any spinlock when the tour begins, except that hart 2 is about to take
+  one (the new child's `p->lock`) before it asks for memory.
+steps:
+  - title: The shell's child needs sixteen pages
+    file: kernel/vm.c
+    lines: 214-242
+    focus: 227-228
+    state:
+      hart: 1
+      mode: S
+      proc: sh's child (parsing `echo hi`)
+      intr: on
+      satp: kernel
+      locks: []
+      stack: [usertrap, syscall, sys_sbrk, growproc, uvmalloc]
+      sp: kernel
+      irq: 0
+    note: |
+      The shell forks a child to parse and run each command line ([[user/sh.c:172]]).
+      Parsing builds a tree of command structs with `malloc`, and the child's first
+      `malloc` finds no free memory, so [[user:morecore]] asks the kernel for at least 4096
+      `Header`s: `sbrk(65536)`, 64 KiB ([[user/umalloc.c:54]]). User `sbrk` is the eager kind
+      ([[user/ulib.c:155]]), so [[sys_sbrk]] calls [[growproc]], which calls [[uvmalloc]].
+
+      `uvmalloc` loops over the new range one page at a time, and every iteration starts
+      with [[kalloc]]: 16 pages, 16 calls. (Mapping them can call `kalloc` a few more times
+      inside [[walk]], for page-table pages.)
+
+      This thread holds no locks, and interrupts are on: [[usertrap]] turned them on before
+      dispatching the system call. Keep those two facts in mind; the first thing
+      [[acquire]] does is change the second one.
+    others: |
+      On hart 2, `forktest` is in [[kfork]]. A new process needs a page for its
+      [[g:trapframe]], so it is about to call [[kalloc]] as well. Two harts, one free list.
+      Nothing in `uvmalloc` itself needs a lock: the page table it fills belongs to this
+      process alone, and a process runs on only one hart at a time.
+
+  - title: One free list for the whole machine
+    file: kernel/kalloc.c
+    lines: 17-24
+    focus: 21-24
+    state:
+      hart: 1
+      mode: S
+      proc: sh's child (parsing `echo hi`)
+      intr: on
+      satp: kernel
+      locks: []
+      stack: [usertrap, syscall, sys_sbrk, growproc, uvmalloc, kalloc]
+      sp: kernel
+      irq: 0
+    note: |
+      Free physical pages are kept as a linked list threaded through the pages themselves
+      ([[g:free-list-allocator]]). `kmem` pairs the list head with the lock that protects it.
+      In this build `kmem` sits at `0x8000f980` (`kernel/kernel.sym`): the lock's `locked`
+      word is at `0x8000f980` and `freelist` at `0x8000f998` (`kmem+0x18`).
+
+      [[kalloc]] pops the head: `r = kmem.freelist; kmem.freelist = r->next`. Compiled, that
+      is a load from `kmem+0x18`, a load of `r->next`, and a store back to `kmem+0x18`
+      (`0x80000b28`, `0x80000b2e`, `0x80000b34`). Three instructions, and another hart can
+      run its own three in between. Without a lock:
+
+      | Time | Hart 1 (sh's child) | Hart 2 (forktest) |
+      |---|---|---|
+      | t1 | `r = kmem.freelist` → page A | |
+      | t2 | | `r = kmem.freelist` → page A |
+      | t3 | `kmem.freelist = A->next` (B) | |
+      | t4 | | `kmem.freelist = A->next` (B) |
+      | t5 | maps A into the shell child | uses A as the new trapframe |
+
+      Both harts got page A. The program's heap and a process's saved registers now share
+      memory. This is a textbook [[g:race-condition]]: it needs exact timing, so it might
+      happen once a week, and the crash comes long after the cause.
+    others: |
+      Hart 2 is about to run these exact instructions on the same `kmem`. Every allocation
+      and every free in the kernel, from every hart, goes through this one list, which is
+      why its [[g:critical-section]] is kept to a handful of instructions.
+
+  - title: A lock is one word
+    file: kernel/spinlock.h
+    lines: 1-8
+    focus: 3
+    state:
+      hart: 1
+      mode: S
+      proc: sh's child (parsing `echo hi`)
+      intr: on
+      satp: kernel
+      locks: []
+      stack: [usertrap, syscall, sys_sbrk, growproc, uvmalloc, kalloc]
+      sp: kernel
+      irq: 0
+    note: |
+      A [[g:spinlock]] is a `uint`: 0 means free, 1 means held. The other two fields are for
+      debugging and for [[holding]]: `name` (here `"kmem"`, set by [[initlock]] in [[kinit]])
+      and `cpu`, the `struct cpu` of the holder.
+
+      The compiled code confirms the layout: [[acquire]] swaps into offset 0 of the lock
+      (`amoswap.w.aq a5,a5,(s1)`), and [[holding]] reads `cpu` with `ld a5,16(a0)`. Offset 8
+      is `name`; the 4 bytes after `locked` are padding so that the pointer is 8-byte
+      aligned.
+
+      All the cleverness of a spinlock is in *how* `locked` is read and written: not with
+      ordinary C assignments, but with instructions that are indivisible and that order the
+      hart's other memory accesses around them. The rest of this tour is about those
+      instructions.
+    others: |
+      `kmem.lock` is one of dozens of spinlocks in xv6: one per process (`p->lock`), one for
+      the buffer cache, one for the log, one per pipe, and so on. Each protects specific
+      data, and every hart must take the same lock before touching that data, or the lock
+      protects nothing ([[g:critical-section]]).
+
+  - title: acquire starts by switching interrupts off
+    file: kernel/spinlock.c
+    lines: 19-42
+    focus: 24
+    state:
+      hart: 1
+      mode: S
+      proc: sh's child (parsing `echo hi`)
+      intr: on
+      satp: kernel
+      locks: []
+      stack: [usertrap, syscall, sys_sbrk, growproc, uvmalloc, kalloc, acquire]
+      sp: kernel
+      irq: 0
+    note: |
+      [[acquire]] has three phases: interrupts off ([[push_off]]), a self-check
+      ([[holding]]), and the spin on the atomic swap. The order matters. Interrupts go off
+      *before* the swap, because if they went off after it there would be a window, one or
+      two instructions wide, in which this hart held the lock with interrupts still on.
+
+      The compiled prologue (`0x80000be8`) saves `lk` in the callee-saved register `s1`, so
+      every later step can find the lock: `mv s1,a0`, then `jal push_off`.
+
+      Why interrupts at all? The comment says "to avoid deadlock", and step 7 shows the
+      deadlock. There is a second reason in [[push_off]]'s own comment: [[mycpu]] reads the
+      hart number from `tp`, and a timer interrupt could move this thread to another hart
+      between reading `tp` and using the answer. With interrupts off, this thread cannot be
+      moved, so "this hart" stays meaningful until the matching [[release]].
+    others: |
+      Turning interrupts off affects **only hart 1**. `sstatus.SIE` is a per-hart bit. Harts
+      0 and 2 keep taking interrupts whenever their own `SIE` is on (hart 2's is off too
+      right now, for its own lock); the [[g:plic|PLIC]] can deliver a device interrupt to
+      a hart that has them on. A spinlock never stops the other harts. It only
+      stops them from entering the same critical section.
+
+  - title: "push_off: one instruction reads and clears SIE"
+    file: kernel/spinlock.c
+    lines: 88-103
+    focus: 97-102
+    state:
+      hart: 1
+      mode: S
+      proc: sh's child (parsing `echo hi`)
+      intr: off
+      satp: kernel
+      locks: []
+      stack: [usertrap, syscall, sys_sbrk, growproc, uvmalloc, kalloc, acquire, push_off]
+      sp: kernel
+      irq: {noff: 1, intena: 1, note: "mid-acquire: csrrci cleared SIE, intena 1 saved, noff 1; kmem.lock is not held yet"}
+    note: |
+      [[rc_sstatus]] compiles to a single instruction (`0x80000bb8`):
+
+      ```
+      csrrci  a5,sstatus,2     # a5 = old sstatus; clear bit 1 (SIE)
+      ```
+
+      [[g:insn:csrrc|csrrci]] reads the old value of [[g:csr:sstatus|sstatus]] and clears
+      the `SIE` bit in one step, so no interrupt can slip in between "was it on?" and "turn
+      it off". `old` is that bit (`srli a5,s1,1; andi a5,a5,1`).
+
+      Then the bookkeeping, in this hart's [[kernel:cpu|struct cpu]]. `cpus` is at
+      `0x8000f9d0` and each entry is 128 bytes (`slli a5,a5,0x7` in [[mycpu]]), so hart 1's
+      is at `0x8000fa50`; `noff` is at offset 120 and `intena` at 124 (`lw a5,120(a0)`,
+      `sw a5,124(a0)`).
+
+      - `noff` was 0: this is the outermost lock, so `intena = 1` records "interrupts were on
+        before".
+      - `noff` becomes 1.
+
+      Only the [[pop_off]] that brings `noff` back to 0 may turn interrupts on again, and
+      only if `intena` says so ([[g:interrupts-and-locks]], [[concept:locks#intena]]).
+    others: |
+      `noff` and `intena` need no lock: each hart only ever touches its *own* `cpus[]` entry,
+      and with interrupts off nothing else on this hart can run in between. Per-CPU data is
+      the cheapest kind of safe.
+
+  - title: Meanwhile hart 2 nests a second lock
+    file: kernel/proc.c
+    lines: 109-133
+    focus: 129
+    state:
+      hart: 2
+      mode: S
+      proc: forktest (pid 4)
+      intr: off
+      satp: kernel
+      locks: ["new child's p->lock"]
+      stack: [usertrap, syscall, sys_fork, kfork, allocproc]
+      sp: kernel
+      irq: {noff: 1, intena: 1}
+    note: |
+      On hart 2, [[allocproc]] scanned the process table taking each `p->lock` in turn, found
+      an `UNUSED` slot and kept that slot's lock: from line 117 on, it holds the new child's
+      `p->lock`. Its `push_off` found `noff == 0`, saved `intena = 1` and set `noff = 1`.
+      Interrupts on hart 2 are off.
+
+      Line 125 already nested one lock deeper and came back: [[allocpid]] took `pid_lock`
+      (`noff` 1 → 2) and released it (`noff` 2 → 1), and interrupts stayed off, because
+      `noff` did not reach 0.
+
+      Now line 129 calls [[kalloc]] for the trapframe, so hart 2 also heads for
+      `acquire(&kmem.lock)`. Its `push_off` reads the old `SIE`: 0, interrupts are already
+      off. Because `noff` is 1, not 0, it leaves `intena` alone (still 1, from the first
+      lock) and only increments `noff` to 2.
+
+      This is why `push_off` keeps a counter instead of a flag. A plain "off on acquire, on
+      on release" would turn interrupts back on at the inner release, while the new child's
+      `p->lock` is still held ([[concept:locks#noff]]).
+    others: |
+      Hart 2 holding the child's `p->lock` matters to everyone else: every hart's
+      [[scheduler]] takes each `p->lock` in turn, and hart 0's will spin on this one if it
+      reaches that slot now (possibly for a while: the lock stays held through all of
+      `kfork`'s copying). It sees the slot as `USED`, not `RUNNABLE`, so it will not
+      try to run a half-built process.
+
+  - title: "The deadlock push_off prevents: an interrupt on the same hart"
+    file: kernel/virtio_disk.c
+    lines: 299-311
+    focus: 303
+    state:
+      hart: 0
+      mode: S
+      proc: none (hart 0 idle in its scheduler)
+      intr: off
+      satp: kernel
+      locks: []
+      stack: [main, scheduler, kernelvec, kerneltrap, devintr, virtio_disk_intr, acquire]
+      sp: {"on": scheduler, detail: "hart 0's slice of `stack0`, with a `kernelvec` frame on top"}
+      irq: {noff: 1, intena: 0, note: "acquire's push_off has run (intena 0: SIE was already off in the handler); vdisk_lock is not held yet"}
+    note: |
+      `kmem.lock` is never taken by an interrupt handler, but some spinlocks are, and
+      [[acquire]] treats every lock the same way. Here is one: the disk driver's
+      `disk.vdisk_lock`, taken by [[virtio_disk_rw]] in process context and by
+      [[virtio_disk_intr]] in the disk's interrupt handler.
+
+      In this step the disk interrupt is being handled on hart 0, and line 303 wants
+      `vdisk_lock`. Hart 0 was idle, so the interrupt was taken in its scheduler's interrupt
+      window and [[kernelvec]] pushed its frame onto hart 0's scheduler stack. If a process on hart 1 holds it, hart 0 spins until hart 1 releases it. A
+      short wait; harmless.
+
+      Now imagine `acquire` did **not** turn interrupts off:
+
+      | Time | Hart 1 | Hart 0 |
+      |---|---|---|
+      | t1 | `virtio_disk_rw`: `acquire(&disk.vdisk_lock)` | |
+      | t2 | disk interrupt arrives **on hart 1** | |
+      | t3 | `virtio_disk_intr`: `acquire(&disk.vdisk_lock)` | |
+      | t4 | waits for the lock holder… which is itself, frozen at t2 | |
+      | t5 | | later wants `vdisk_lock` and spins too |
+
+      The stack shows it plainly. At t2 [[kernelvec]] pushes its frame onto the stack hart 1
+      is already using, the process's kernel stack, directly on top of the frames of the
+      `virtio_disk_rw` that holds the lock (`… bread, virtio_disk_rw, kernelvec, kerneltrap,
+      devintr, virtio_disk_intr, acquire`). The holder is buried underneath the
+      waiter on one stack, and only the waiter's return could uncover it.
+
+      The holder cannot run until the handler returns, and the handler cannot return until
+      the holder releases. In xv6, [[holding]] would usually catch this and panic with
+      `acquire`. But if the interrupt arrived in the few instructions between the swap and
+      `lk->cpu = mycpu()`, `lk->cpu` would still be 0 and hart 1 would spin forever, as it
+      would in a kernel without the check, and every hart that later wanted the disk would
+      join it. With interrupts off, the interrupt stays pending on
+      hart 1 (or a hart with interrupts on claims it) and is taken after the release.
+      That is the invariant: whenever `noff` > 0, `SIE` is 0, so a handler never
+      interrupts a critical section on its own hart ([[concept:locks#invariant]]). Hart
+      0's handler itself got here at `noff` 0, and its `push_off` records `intena = 0`,
+      because the trap had already turned interrupts off.
+    others: |
+      The same pattern exists for `tickslock` ([[sys_pause]] and [[clockintr]]),
+      `cons.lock` ([[consoleread]] and [[consoleintr]]), and every `p->lock`, because
+      [[wakeup]] runs inside interrupt handlers and takes them all. Rather than remember
+      which locks interrupt handlers use, xv6 turns interrupts off for all of them.
+
+  - title: "holding(): a hart waiting for itself"
+    file: kernel/spinlock.c
+    lines: 78-86
+    focus: 84
+    state:
+      hart: 1
+      mode: S
+      proc: sh's child (parsing `echo hi`)
+      intr: off
+      satp: kernel
+      locks: []
+      stack: [usertrap, syscall, sys_sbrk, growproc, uvmalloc, kalloc, acquire, holding]
+      sp: kernel
+      irq: {noff: 1, intena: 1, note: "acquire's push_off level; kmem.lock is not held yet"}
+    note: |
+      Back on hart 1, `acquire` calls [[holding]]: "does *this* hart already hold `lk`?" If
+      it did, the spin below could never end, because the only hart that could release the
+      lock is the one spinning. Panicking with `acquire` turns a silent freeze into a
+      message.
+
+      The compiled code is short-circuited (`0x80000b82`): `lw a5,0(a0)`, and if `locked` is
+      0, return 0 at once. Only if the lock is held does it load `lk->cpu` (`ld a5,16(a0)`)
+      and compare it with [[mycpu]].
+
+      These are plain loads, not atomics, and `lk->cpu` can be changing on another hart. Why
+      is the answer still right? Only *this* hart ever writes this hart's `struct cpu`
+      pointer into `lk->cpu`, and it clears it again in [[release]] before freeing the lock.
+      With interrupts off, nothing on this hart can run between those points. So
+      "`lk->cpu` equals me" is true exactly when this hart holds the lock; another hart's
+      writes can only ever put *its own* pointer there. The comment "Interrupts must be off"
+      on line 79 is the condition that makes this reasoning work ([[concept:locks#holding]]).
+    others: |
+      At this moment hart 2 may be one instruction away from swapping 1 into `kmem.lock`.
+      Hart 1's `holding` might read `locked == 1` and `cpu == 0` (hart 2 has swapped but not
+      yet recorded itself). The answer is still "not mine", which is the truth.
+
+  - title: amoswap.w.aq decides who wins
+    file: kernel/spinlock.c
+    lines: 28-38
+    focus: 37-38
+    state:
+      hart: 1
+      mode: S
+      proc: sh's child (parsing `echo hi`)
+      intr: off
+      satp: kernel
+      locks: []
+      stack: [usertrap, syscall, sys_sbrk, growproc, uvmalloc, kalloc, acquire]
+      sp: kernel
+      irq: {noff: 1, intena: 1, note: "acquire's push_off level; the lock is held only once a swap returns 0"}
+    note: |
+      The loop compiles to four instructions (`0x80000c02`–`0x80000c0a`), exactly as the
+      comment predicts, with `a4 = 1` loaded once before it:
+
+      ```
+      mv            a5,a4           # a5 = 1
+      amoswap.w.aq  a5,a5,(s1)      # a5 = lk->locked; lk->locked = 1, indivisibly
+      sext.w        a5,a5
+      bnez          a5,<mv>         # old value was 1: someone holds it, try again
+      ```
+
+      [[g:insn:amoswap|amoswap.w]] is an atomic read-modify-write from the RISC-V "A"
+      extension. No other hart's access to that word can come between its load and its
+      store. When two harts swap the same word "at the same time", the memory system puts
+      the two swaps in *some* order:
+
+      | Time | Hart 1 | Hart 2 |
+      |---|---|---|
+      | t1 | `amoswap`: issued | `amoswap`: issued |
+      | t2 | gets 1: hart 2 was first | gets 0: lock was free, now 1 |
+      | t3 | `bnez`: loop | `bnez` falls through: hart 2 holds `kmem.lock` |
+
+      In this run hart 2 wins. Which hart wins is not decided by xv6 and is not fair: a hart
+      that just released the lock can win it straight back. Writing 1 over 1 at t2 changed
+      nothing, so losing costs nothing but time.
+    others: |
+      Why not `while (lk->locked) ; lk->locked = 1;`? That is a load, a branch and a store:
+
+      | Time | Hart 1 | Hart 2 |
+      |---|---|---|
+      | t1 | `lw`: `locked` is 0 | `lw`: `locked` is 0 |
+      | t2 | `sw 1` | `sw 1` |
+      | t3 | in the critical section | in the critical section too |
+
+      Testing and setting must be one indivisible operation, and only the hardware can
+      provide one.
+
+  - title: Hart 2 pops the list while hart 1 spins
+    file: kernel/kalloc.c
+    lines: 65-82
+    focus: 74-76
+    state:
+      hart: 2
+      mode: S
+      proc: forktest (pid 4)
+      intr: off
+      satp: kernel
+      locks: ["new child's p->lock", kmem.lock]
+      stack: [usertrap, syscall, sys_fork, kfork, allocproc, kalloc]
+      sp: kernel
+      irq: {noff: 2, intena: 1}
+    note: |
+      Hart 2 is inside the [[g:critical-section]]. It records itself in `kmem.lock.cpu`
+      ([[kernel/spinlock.c:41]]) and pops page A off the list: `r = A`,
+      `kmem.freelist = A->next`. Now no other hart can reach these lines until hart 2
+      releases the lock, so the t1–t4 interleaving from step 2 is impossible.
+
+      The critical section is three instructions of real work. That is deliberate: the
+      [[memset]] that fills the page with junk (line 80) touches 4096 bytes, and it happens
+      *after* the release, because page A is already private to hart 2 and needs no
+      protection. Hold a spinlock for as short a time as you can: every hart that wants it
+      is wasting its time meanwhile.
+    others: |
+      Hart 1 is spinning in the four-instruction loop, **with interrupts off**. Each pass is
+      an `amoswap` that writes 1 over 1. On typical multicore hardware each swap needs
+      exclusive ownership of the cache line holding `locked`, so spinning harts keep pulling
+      that line away from each other and from the holder (some designs do atomics farther
+      out in the memory system, but contention costs either way). Production kernels spin with plain loads first,
+      and use queue locks for fairness; xv6 keeps the simplest correct loop.
+
+      Spinning with interrupts off also means hart 1 cannot be preempted, so a spinlock
+      holder must never wait for anything slow. Suppose hart 2 could be switched out while
+      holding `kmem.lock`: the timer → [[yield]] → [[sched]] path would actually panic with
+      `sched locks`, because `noff` would be 3 (the child's `p->lock`, `kmem.lock`, and
+      forktest's own `p->lock` that `yield` just took), not 1. Without that check, forktest
+      would sit `RUNNABLE` while holding `kmem.lock`. Every hart that then called `kalloc`
+      or `kfree` would spin with interrupts off; once all three harts were spinning, none
+      could take a timer interrupt or get back to its scheduler, nothing could run forktest
+      to release the lock, and the whole machine would stop. (And if forktest were resumed
+      on a different hart, `release` would panic, because `lk->cpu` still names hart 2.)
+
+  - title: "Hart 2 releases: fence rw,w, then sw zero"
+    file: kernel/spinlock.c
+    lines: 44-76
+    focus: 48-73
+    state:
+      hart: 2
+      mode: S
+      proc: forktest (pid 4)
+      intr: off
+      satp: kernel
+      locks: ["new child's p->lock", kmem.lock]
+      stack: [usertrap, syscall, sys_fork, kfork, allocproc, kalloc, release]
+      sp: kernel
+      irq: {noff: 2, intena: 1}
+    note: |
+      [[release]] checks that hart 2 really holds the lock, clears `lk->cpu` (before the
+      lock becomes free, so it never wipes out the *next* owner's record), and frees it. The
+      build matches the comment exactly (`0x80000c82`–`0x80000c8a`):
+
+      ```
+      sd      zero,16(s1)     # lk->cpu = 0
+      fence   rw,w            # all earlier loads and stores before any later store
+      sw      zero,0(s1)      # lk->locked = 0
+      ```
+
+      The [[g:insn:fence|fence]] is the point of `__ATOMIC_RELEASE`. RISC-V's memory model
+      (RVWMO) lets a hart make its stores visible to other harts in a different order than
+      the program wrote them, when they go to different addresses. Without the fence:
+
+      | Time | Hart 2 | Hart 1 |
+      |---|---|---|
+      | t1 | store `kmem.freelist = B`, not yet visible | spinning |
+      | t2 | store `locked = 0` becomes visible first | swap gets 0: lock acquired |
+      | t3 | | reads `kmem.freelist`: still **A** |
+      | t4 | `freelist = B` becomes visible | hart 1 hands out page A again |
+
+      `fence rw,w` forbids t2 before t1: every load and store of the critical section is
+      ordered before the store that frees the lock. The loads matter too: a load from inside
+      the critical section must not be satisfied late, after the next holder has changed the
+      data. The compiler is bound by the same rule: it may not move memory accesses of the
+      critical section below the atomic store.
+    others: |
+      Whether you could ever observe the bad interleaving depends on the hardware (and, under
+      QEMU, on the host CPU QEMU runs on). The RISC-V specification allows it, so correct
+      code must forbid it. [[tour:19]] looks at this memory model more closely.
+
+  - title: "Hart 2's pop_off: noff 2 → 1, interrupts stay off"
+    file: kernel/spinlock.c
+    lines: 105-116
+    focus: 108-115
+    state:
+      hart: 2
+      mode: S
+      proc: forktest (pid 4)
+      intr: off
+      satp: kernel
+      locks: ["new child's p->lock"]
+      stack: [usertrap, syscall, sys_fork, kfork, allocproc, kalloc, release, pop_off]
+      sp: kernel
+      irq: {noff: 1, intena: 1, note: "pop_off has just taken noff 2 → 1"}
+    note: |
+      [[pop_off]] first checks two invariants: interrupts must still be off (otherwise
+      someone turned them on inside a critical section, a bug), and `noff` must be at least
+      1 (more pops than pushes, also a bug).
+
+      Then it decrements `noff`, from 2 to 1 on hart 2. `noff` is not 0, so the
+      `csrsi sstatus,2` at `0x80000c4c` is skipped: hart 2 still holds the new child's
+      `p->lock`, and interrupts must stay off until that one is released too
+      ([[concept:locks#noff]]).
+
+      `kalloc` returns page A to [[allocproc]], which fills in the trapframe pointer and
+      continues building the child with its `p->lock` held.
+    others: |
+      Hart 1's spin has just ended: the `sw zero` made `locked` 0, and hart 1's next
+      `amoswap` reads 0. Hart 2 never "hands" the lock to hart 1; it simply stops holding it,
+      and whichever spinning hart swaps next wins. Had hart 0 also been spinning, it could
+      have won instead.
+
+  - title: "Hart 1 gets the lock: what .aq promises"
+    file: kernel/spinlock.c
+    lines: 28-42
+    focus: 40-41
+    state:
+      hart: 1
+      mode: S
+      proc: sh's child (parsing `echo hi`)
+      intr: off
+      satp: kernel
+      locks: [kmem.lock]
+      stack: [usertrap, syscall, sys_sbrk, growproc, uvmalloc, kalloc, acquire]
+      sp: kernel
+      irq: {noff: 1, intena: 1}
+    note: |
+      Hart 1's swap returned 0. It now holds `kmem.lock` and records itself:
+      `lk->cpu = mycpu()` (`jal mycpu; sd a0,16(s1)`).
+
+      The `.aq` ("acquire") bit on the swap is the mirror image of the release fence. It
+      guarantees that no *later* load or store of hart 1 can be seen to happen before the
+      swap. Without it, the hart could perform the critical section's first load early:
+
+      | Time | Hart 1 | Hart 2 |
+      |---|---|---|
+      | t1 | load of `kmem.freelist` performed early: **A** | still in its critical section |
+      | t2 | | `freelist = B`; `fence rw,w`; `locked = 0` |
+      | t3 | swap gets 0: "acquired" | |
+      | t4 | uses the stale A it loaded at t1 | |
+
+      Together: `.rl` (or a `fence rw,w` before the store, which is what GCC emits for
+      `release`) means "everything before me stays before me"; `.aq` means "everything after
+      me stays after me". A critical section is boxed in on both sides. An AMO with both
+      bits set (`.aqrl`) would be a two-way barrier; xv6's acquire needs only one.
+    others: |
+      These orderings say nothing about hart 0. A hart that reads `kmem.freelist`
+      *without* taking `kmem.lock` gets no guarantee at all. Locks only work if every
+      access to the protected data is inside the lock.
+
+  - title: Hart 1's turn at the list
+    file: kernel/kalloc.c
+    lines: 65-82
+    focus: 74-77
+    state:
+      hart: 1
+      mode: S
+      proc: sh's child (parsing `echo hi`)
+      intr: off
+      satp: kernel
+      locks: [kmem.lock]
+      stack: [usertrap, syscall, sys_sbrk, growproc, uvmalloc, kalloc]
+      sp: kernel
+      irq: {noff: 1, intena: 1}
+    note: |
+      Hart 1 reads `kmem.freelist`. Thanks to hart 2's `fence rw,w` and hart 1's `.aq`, it
+      is guaranteed to see **B**, the value hart 2 stored, not the stale A. It pops B and
+      sets the head to `B->next`. If the list were empty, `r` would be 0 and `kalloc` would
+      return 0; [[uvmalloc]] would undo its partial work and `sbrk` would fail.
+
+      Look at what made this correct. Not one property, but three working together:
+
+      1. **Atomicity**: the swap let exactly one hart see 0.
+      2. **Ordering**: release and acquire made hart 2's writes visible to hart 1 before
+         hart 1 could read them.
+      3. **No preemption**: interrupts off kept the holder running until it released.
+
+      Then line 77: [[release]] again, the same `fence rw,w; sw zero` as in step 11.
+    others: |
+      If hart 2's `forktest` is fast, it may already be calling [[kalloc]] again (for the
+      child's page table, through [[proc_pagetable]] → [[uvmcreate]]). Then hart 2 is the one
+      spinning now, with *its* interrupts off and `noff` at 2.
+
+  - title: Release, interrupts back on, junk outside the lock
+    file: kernel/kalloc.c
+    lines: 65-82
+    focus: 79-81
+    state:
+      hart: 1
+      mode: S
+      proc: sh's child (parsing `echo hi`)
+      intr: on
+      satp: kernel
+      locks: []
+      stack: [usertrap, syscall, sys_sbrk, growproc, uvmalloc, kalloc]
+      sp: kernel
+      irq: 0
+    note: |
+      In `release`, hart 1's [[pop_off]] brings `noff` from 1 to 0. `intena` is 1, saved by
+      the `push_off` in step 5, so it runs `csrsi sstatus,2` (`0x80000c4c`): interrupts are
+      on again. A timer interrupt that became pending while hart 1 spun is taken now, and
+      this thread may be switched out right here. That is fine: it holds no locks.
+
+      [[memset]] then fills page B with the byte 5. That is 4096 stores, outside the lock:
+      the page belongs to hart 1's caller alone now. Junk instead of zeros catches code that
+      forgets to initialize what it allocated; [[uvmalloc]] zeroes the page itself right
+      after.
+
+      Count what one uncontended `acquire` + `release` costs on the outermost lock: one
+      `csrrci`, one `amoswap.w.aq`, one `fence rw,w`, one `sw`, one `csrr` (the
+      [[intr_get]] check in `pop_off`, `0x80000c34`), one `csrsi`, and six calls
+      to [[mycpu]] (three in `push_off`, one in `acquire`, one in `release`'s `holding`, one
+      in `pop_off`). Contended, add one swap per spin.
+    others: |
+      Fifteen more pages to go for this `sbrk`, so hart 1 will do this fifteen more times,
+      competing with hart 2's `forktest` each time. Most attempts find the lock free; the
+      critical section is so short that collisions are rare.
+
+  - title: Hart 2 releases the child, and its interrupts come back
+    file: kernel/proc.c
+    lines: 284-305
+    focus: 294
+    state:
+      hart: 2
+      mode: S
+      proc: forktest (pid 4)
+      intr: off
+      satp: kernel
+      locks: ["new child's p->lock"]
+      stack: [usertrap, syscall, sys_fork, kfork]
+      sp: kernel
+      irq: {noff: 1, intena: 1}
+    note: |
+      [[allocproc]] returned to [[kfork]] still holding the new child's `p->lock`. `kfork`
+      copies memory, registers and open files, then line 294 releases it. That
+      `pop_off` takes `noff` from 1 to 0, finds `intena == 1` (saved way back when
+      `allocproc` took the lock) and turns interrupts on.
+
+      So interrupts were off on hart 2 across many nested acquire/release pairs (`pid_lock`,
+      `kmem.lock` again and again, `ftable.lock` in [[filedup]], `itable.lock` in [[idup]]),
+      never more than two deep, and a whole memory copy, and came back on exactly once, at
+      the outermost release. This is what
+      the counter buys.
+
+      Notice too that `kfork` *releases* the child's lock before taking `wait_lock` on line
+      296, and then takes the child's lock again on line 300. That is not carelessness: xv6
+      requires `wait_lock` to be taken before any `p->lock`, and [[tour:18]] shows the
+      deadlock that rule prevents.
+    others: |
+      Copying the parent's memory ([[uvmcopy]]) calls [[kalloc]] once per page, every time
+      with the child's `p->lock` held and so with `noff` going 1 → 2 → 1. Each of those can
+      collide with hart 1's `sbrk`. Neither hart ever waits long, because `kmem.lock` is held
+      for three instructions at a time.
+
+  - title: The one lock held across a context switch
+    file: kernel/proc.c
+    lines: 479-497
+    focus: 485-495
+    state:
+      hart: 1
+      mode: S
+      proc: sh's child (parsing `echo hi`)
+      intr: off
+      satp: kernel
+      locks: ["sh child's p->lock"]
+      stack: [usertrap, syscall, sys_sbrk, growproc, uvmalloc, kernelvec, kerneltrap, yield, sched]
+      sp: {"on": kernel, detail: "a `kernelvec` frame sits in the middle, between `uvmalloc` and `kerneltrap`"}
+      irq: {noff: 1, intena: 0, note: "intena 0: yield's acquire ran inside kerneltrap, where SIE was already off"}
+    note: |
+      A timer interrupt finally arrives on hart 1 while the shell's child is between two
+      `kalloc` calls, holding no locks. [[kerneltrap]] calls [[yield]], which takes the
+      child's own `p->lock` and calls [[sched]].
+
+      The interrupt came from kernel code, so there was no stack switch: [[kernelvec]] pushed
+      its 256-byte register frame onto the child's kernel stack, right below `uvmalloc`. When
+      `swtch` saves the child, that frame is frozen in the middle of the stack:
+
+      ```text
+      sh child's kernel stack
+        top ─► usertrap
+               syscall
+               sys_sbrk
+               growproc
+               uvmalloc
+               kernelvec    registers of the interrupted uvmalloc
+               kerneltrap
+               yield
+               sched       ◄─ saved sp
+      ```
+
+      Whichever hart resumes the child will unwind through it: `sched` returns, `yield`
+      releases the lock, `kerneltrap` returns, and `kernelvec` restores the registers and
+      `sret`s back into `uvmalloc`. `kernelvec` deliberately does not restore `tp`
+      ([[kernel/kernelvec.S:44]]), because that hart may not be hart 1.
+
+      `sched` checks the spinlock rules explicitly: the caller must hold `p->lock`, and
+      `noff` must be exactly 1, meaning **no other spinlock** is held. This is the check
+      that would have caught a switch inside `kmem.lock`'s critical section.
+
+      `p->lock` is special: it is acquired by this thread and released by a *different*
+      thread, the scheduler, on the other side of [[swtch]]. Since `intena` describes this
+      thread rather than this hart, `sched` saves it in a local variable across the switch
+      and puts it back afterwards. The thread may resume on any hart, hart 0 or 2 as easily as hart 1, and it must
+      bring its own "were interrupts on?" with it. [[tour:13]] follows that handoff.
+      Here that value is 0, not 1: `yield`'s `acquire` ran inside [[kerneltrap]], where
+      the trap had already turned interrupts off. When the child resumes, `yield`'s
+      release leaves them off, and [[kernelvec]]'s `sret` turns them back on for
+      `uvmalloc` from the `SPIE` bit the trap saved ([[concept:locks#sched-intena]]).
+    others: |
+      Any hart sitting in its own [[scheduler]] loop (hart 0, say) is scanning the process
+      table, taking each `p->lock` in turn. The sh child's lock is held until hart 1's
+      scheduler releases it, so no other hart can start running the child while hart 1 is
+      still executing on the child's kernel stack. Each hart has its own `sp`, but nothing
+      in the hardware stops two harts from pointing theirs into the same stack. Only this
+      lock does.
+
+  - title: What a spinlock is made of
+    file: kernel/spinlock.c
+    lines: 19-42
+    focus: 41
+    state:
+      hart: any
+      mode: S
+      proc: sh's child (parsing `echo hi`)
+      intr: off
+      satp: kernel
+      locks: [kmem.lock]
+      stack: [usertrap, syscall, sys_sbrk, growproc, uvmalloc, kalloc, acquire]
+      sp: kernel
+      irq: {noff: 1, intena: 1}
+    note: |
+      Step back and look at `acquire` as a whole (the state shown is at line 41, the moment
+      the lock is fully taken). Each line exists because of a specific
+      failure:
+
+      | Line | Without it |
+      |---|---|
+      | `push_off()` | an interrupt handler on the same hart spins on a lock its own hart holds (step 7); or the holder is preempted and other harts spin |
+      | `holding()` check | a hart re-acquiring its own lock freezes silently |
+      | `amoswap` | two harts both see 0 and both enter (step 9) |
+      | `.aq` | the critical section's loads run before the lock is held (step 13) |
+      | `lk->cpu` | `holding` cannot tell whose lock it is |
+
+      and `release` mirrors it: clear `cpu`, `fence rw,w`, one store, `pop_off`.
+
+      A spinlock is cheap when uncontended and wasteful when contended: the waiter burns
+      its hart with interrupts off. So xv6 uses spinlocks only for short critical sections
+      and never waits for anything slow while holding one. For waits that can take
+      milliseconds, such as a disk read, it builds [[g:sleeplock|sleep-locks]] on top of
+      spinlocks ([[tour:17]]); for "wait until something happens", it uses
+      [[g:sleep-wakeup|sleep and wakeup]] ([[tour:16]]). Both are made of the instructions
+      you have just seen.
+locks:
+  - lock: "kmem.lock (spinlock)"
+    where: "[[kalloc]], [[kfree]]"
+    protects: "The free-page list `kmem.freelist`, shared by all harts"
+  - lock: "new child's p->lock (spinlock)"
+    where: "[[allocproc]] (taken), [[kfork]] (released at line 294)"
+    protects: "The new process's `state` and fields while it is being built; nested outside `kmem.lock`"
+  - lock: "pid_lock (spinlock)"
+    where: "[[allocpid]]"
+    protects: "`nextpid`; taken and released inside `allocproc`, nested inside `p->lock`"
+  - lock: "ftable.lock (spinlock)"
+    where: "[[filedup]] ([[kernel/file.c:50]]), called by [[kfork]] line 287"
+    protects: "Open-file reference counts; nested inside the new child's `p->lock`"
+  - lock: "itable.lock (spinlock)"
+    where: "[[idup]] ([[kernel/fs.c:286]]), called by [[kfork]] line 288"
+    protects: "Inode-table reference counts; nested inside the new child's `p->lock`"
+  - lock: "wait_lock (spinlock)"
+    where: "[[kfork]] ([[kernel/proc.c:296]])"
+    protects: "`np->parent`; taken only after the child's `p->lock` is released (step 16, [[tour:18]])"
+  - lock: "tickslock, cons.lock (spinlocks)"
+    where: "[[sys_pause]] / [[clockintr]], [[consoleread]] / [[consoleintr]]"
+    protects: "Further examples of locks shared with interrupt handlers (step 7)"
+  - lock: "disk.vdisk_lock (spinlock)"
+    where: "[[virtio_disk_rw]], [[virtio_disk_intr]]"
+    protects: "The virtio rings and descriptors; the example of a lock shared with an interrupt handler"
+  - lock: "sh child's p->lock (spinlock)"
+    where: "[[yield]] → [[sched]], released by the scheduler"
+    protects: "`p->state`; the only spinlock that may be held across [[swtch]]"
+  - lock: "cpus[].noff / intena (no lock: per-hart, interrupts off)"
+    where: "[[push_off]], [[pop_off]]"
+    protects: "Each hart touches only its own entry, so no lock is needed"
+quiz:
+  - q: "Why does `acquire` turn interrupts off *before* the `amoswap`, not after it?"
+    a: "If the swap came first, there would be a window in which this hart holds the lock with interrupts still on. An interrupt in that window whose handler wants the same lock would spin on a lock held by the code it interrupted."
+  - q: "Hart 2 holds a `p->lock` and then takes `kmem.lock`. When it releases `kmem.lock`, why do interrupts stay off?"
+    a: "`push_off` counts nesting in `noff`. Releasing `kmem.lock` takes `noff` from 2 to 1, and [[pop_off]] only turns interrupts on when `noff` reaches 0 and `intena` (saved at the outermost `push_off`) is 1. That happens when the `p->lock` is released."
+  - q: "Replace the `amoswap` loop with `while (lk->locked) ; lk->locked = 1;`. Trace an interleaving that breaks mutual exclusion."
+    a: "Both harts load `locked == 0`, both leave the loop, both store 1 and both enter the critical section. Testing and setting must be one indivisible operation, which `amoswap` provides."
+  - q: "`release` executes `fence rw,w` before `sw zero,0(s1)`. What could another hart observe if the fence were missing?"
+    a: "It could see `locked == 0` before the stores of the critical section (for example the new `kmem.freelist`), acquire the lock and read stale data, handing out the same page twice. The fence orders every earlier load and store before the freeing store."
+  - q: "A timer interrupt is pending on hart 1 while it holds `kmem.lock`. When is it taken, and why is that safe?"
+    a: "It stays pending (interrupts are off) until `pop_off` in `release` turns them on. Then the hart holds no spinlock, so [[yield]] and [[sched]] are allowed and no handler can find a lock held by the code it interrupted."
+  - q: "`holding()` reads `lk->cpu` without any atomic or lock while another hart may be writing it. Why is its answer reliable?"
+    a: "Only this hart ever writes its own `struct cpu` pointer into `lk->cpu`, and with interrupts off nothing else on this hart can run while it checks. Another hart can only write its own pointer or 0, so the comparison with `mycpu()` is true exactly when this hart holds the lock."

@@ -1,0 +1,268 @@
+summary: |
+  The layer between [[g:file-descriptor|file descriptors]] and the things they refer to. A
+  file descriptor is a small integer that indexes the process's `ofile` array; each slot
+  points to a `struct` [[file]], an [[g:open-file]], kept in the system-wide table [[ftable]]
+  defined here. A `struct file` records *what* is open (a [[g:pipe]], an [[g:inode]], or a
+  device), whether it may be read or written, and the current offset.
+
+  This file allocates and frees those structures with a [[g:reference-count]], and routes
+  `read`, `write` and `fstat` to the right implementation: [[kernel/pipe.c]] for pipes,
+  [[readi]]/[[writei]] in [[kernel/fs.c]] for files and directories, and the [[devsw]] table
+  for devices such as the [[g:console]].
+
+  Its callers are the system calls in [[kernel/sysfile.c]] (which turn the descriptor
+  number into a `struct file *`), [[kfork]] and [[kexit]] in [[kernel/proc.c]], and
+  [[pipealloc]].
+
+  **Read before:** [[kernel/file.h]], [[kernel/fs.c]]. **Read next:** [[kernel/sysfile.c]],
+  [[kernel/pipe.c]].
+
+blocks:
+  - lines: 1-14
+    title: Headers
+    note: |
+      The usual kernel headers plus those that define the objects an open file can refer
+      to: [[kernel/fs.h]] and [[kernel/file.h]] (inodes and `struct file`), the two lock
+      headers, [[kernel/stat.h]] for `struct stat`, and [[kernel/proc.h]] for [[myproc]].
+      `struct pipe` stays opaque: only [[kernel/pipe.c]] knows its fields, and this file only
+      passes pointers to it along.
+
+  - lines: 16-20
+    title: The device switch and the open-file table
+    note: |
+      [[devsw]] ("device switch") has one entry per major device number, up to [[NDEV]] = 10.
+      Each entry holds two [[g:function-pointer|function pointers]], the device's `read`
+      and `write`. Drivers fill in their entry at boot; the only one in xv6 is the console,
+      [[consoleinit]] sets `devsw[CONSOLE]` ([[kernel/console.c:201]]). Entries left at
+      zero mean "no such device".
+
+      [[ftable]] holds all open files in the system, [[NFILE]] = 100 of them, with a
+      [[g:spinlock]] protecting each entry's `ref`. An entry with `ref == 0` is free. Being
+      in `.bss`, the table starts all zeros: every entry free, of type `FD_NONE`.
+
+      Descriptors and table entries are not one-to-one. Several descriptors, in one process
+      (after `dup`) or in several (after `fork`), can point to the same `struct file`, and
+      then they share its offset. `ref` counts those pointers.
+
+  - lines: 22-26
+    title: "fileinit(): set up the table's lock"
+    note: |
+      Called once by hart 0 from [[main]]. The entries need no initialization (see above).
+
+  - lines: 28-44
+    title: "filealloc(): claim a free open-file entry"
+    note: |
+      Finds an entry with `ref == 0` and claims it by setting `ref = 1`, both under
+      `ftable.lock`, so two processes can never claim the same entry. The other fields are
+      left for the caller to fill in: [[sys_open]] sets the type, inode, offset and access
+      mode, and [[pipealloc]] sets up the two ends of a pipe. Filling them in after the
+      lock is released is safe, since no other code looks at an entry that it did not
+      allocate or receive.
+
+      Returns 0 when all 100 entries are in use; `open` and `pipe` then fail.
+
+  - lines: 46-56
+    title: "filedup(): one more descriptor for the same open file"
+    note: |
+      Increments the reference count. [[sys_dup]] calls it when a second descriptor is made
+      for the same file, and [[kfork]] calls it for each of the parent's open descriptors,
+      so that parent and child share the open files ([[kernel/proc.c:287]]).
+
+      Duplicating a free entry (`ref < 1`) would resurrect something that may already
+      have been handed to someone else, so it is a kernel bug and panics.
+
+  - lines: 58-83
+    title: "fileclose(): drop a reference, and close for real on the last one"
+    note: |
+      Called by [[sys_close]], by [[kexit]] for every descriptor the process still has
+      open, and by [[sys_open]] and [[sys_pipe]] to undo a half-finished allocation.
+
+      If other descriptors still refer to the file, only the count changes. On the last
+      reference the entry is freed, and then the object behind it is released: a pipe end
+      is closed with [[pipeclose]], an inode reference is dropped with [[iput]].
+
+      Notice the two-step shape. The entry is copied into the local `ff`, marked free, and
+      the lock released *before* the cleanup. The cleanup may sleep (`iput` may wait for
+      the disk), and xv6 does not allow sleeping while holding a spinlock. The copy is
+      needed because once the entry is marked free and the lock released, [[filealloc]] on
+      another CPU may hand it out and overwrite its fields.
+
+      The `iput` is wrapped in [[begin_op]]/[[end_op]] because it may be the last
+      reference to a file that was deleted while open, in which case `iput` frees the
+      file's blocks and inode, and those writes must be part of a [[g:transaction]].
+
+  - lines: 85-102
+    title: "filestat(): fstat for an open file"
+    note: |
+      Implements the `fstat` system call ([[sys_fstat]]). Only files that have an inode,
+      plain files, directories and devices, have metadata; for a pipe it returns -1.
+
+      The inode is locked while [[stati]] copies the fields, so they come from a single
+      moment (and, if the inode has not been read yet, [[ilock]] reads it from disk). The
+      result is built in a kernel variable and then copied to the user's address with
+      [[copyout]], which fails, giving -1, if `addr` is not valid writable user memory.
+
+  - lines: 104-130
+    title: "fileread(): read from whatever the file is"
+    note: |
+      The common entry point of the `read` system call ([[sys_read]]). After checking that
+      the file was opened for reading and `n` is not negative, it dispatches on the type:
+
+      - **`FD_PIPE`**: [[piperead]] takes bytes from the pipe's buffer, sleeping until a
+        writer provides some.
+      - **`FD_DEVICE`**: call the device's read function from [[devsw]], after checking
+        that the major number is in range and the device has a read function. The first
+        argument, 1, says that `addr` is a user address.
+      - **`FD_INODE`**: lock the inode, [[readi]] from the file's current offset, and
+        advance the offset by what was read. A return of 0 means end of file.
+
+      The inode case needs no [[g:transaction]]: reading never writes to the disk.
+      The offset is updated while the inode lock is held, so two processes sharing one
+      `struct file` (after `fork`) cannot both read the same bytes with the same offset.
+
+  - lines: 132-147
+    title: "filewrite(): checks, pipes and devices"
+    note: |
+      The `write` counterpart of [[fileread]], called from [[sys_write]]. The access check,
+      the pipe case ([[pipewrite]]) and the device case (through [[devsw]]) mirror
+      `fileread` exactly. Only writing to an inode is different, because it changes the
+      disk and must be cut into file-system operations of bounded size, each part of a
+      [[g:transaction]].
+
+  - lines: 148-154
+    title: Why writes are split into 3-block chunks
+    note: |
+      Every block a file system operation (one [[begin_op]]/[[end_op]] pair) changes is
+      held in the log until the [[g:transaction]] it belongs to commits; the log may group
+      several concurrent operations into one transaction. `begin_op` reserves room for at
+      most [[MAXOPBLOCKS]] = 10 blocks per outstanding operation. A single [[writei]] of a
+      large buffer could change far more blocks than that, so `filewrite` writes at most
+      `max` bytes per operation:
+
+      `((MAXOPBLOCKS - 1 - 1 - 2) / 2) * BSIZE` = `((10 - 4) / 2) * 1024` = 3072 bytes.
+
+      Each term is a block one chunk might have to log:
+
+      - **`- 1`**: the inode's own block, rewritten by [[iupdate]] at the end of `writei`
+        (new size, new block addresses).
+      - **`- 1`**: the [[g:indirect-block]], changed when [[bmap]] records a newly
+        allocated block in it.
+      - **`- 2`**: slop for a write that does not start on a block boundary: 3072 bytes
+        then touch 4 data blocks instead of 3. (The first of them always exists already,
+        because the write starts at or before the end of the file, so at most 3 are newly
+        allocated.)
+      - **`/ 2`**: each data block may cost two log entries: the data block itself and the
+        [[g:free-bitmap]] block whose bit [[balloc]] sets when the block is new.
+
+      Worst case: 4 data blocks, 4 bitmap updates (3 new data blocks plus the new
+      indirect block), the indirect block, and the inode = 10 = `MAXOPBLOCKS`. (On the default disk there is only one bitmap block, so the real use is
+      lower: repeated writes to one block occupy a single log slot.)
+
+  - lines: 155-172
+    title: One file-system operation per chunk
+    note: |
+      Each chunk is a complete file system operation: [[begin_op]], [[ilock]], [[writei]]
+      at the current offset, advance the offset, [[iunlock]], [[end_op]]. The order
+      matters: `begin_op` comes before the inode lock. `begin_op` may sleep until the log
+      commits, and a commit waits for every operation in progress to finish. A process
+      sleeping in `begin_op` while holding an inode lock could block an operation that
+      needs that lock, which then never finishes, so the commit never happens.
+
+      Two consequences you can observe. A large `write` is **not atomic**: after a crash,
+      the first chunks may be on disk and the rest not. And another process's writes to the
+      same file can land between chunks, since the inode lock is released after each one.
+
+      If `writei` wrote less than asked (disk full, bad user address, file at its maximum
+      size), the loop stops.
+
+  - lines: 173-179
+    title: All or error
+    note: |
+      The return value is `n` if every byte was written and -1 otherwise, even if some
+      chunks were written successfully; those bytes stay in the file. A file type other
+      than the three known ones means the `struct file` is corrupt, and the kernel panics.
+
+lines:
+  16: |
+    The device switch: [[NDEV]] entries of read/write function pointers, indexed by major
+    device number.
+  17-20: |
+    The open-file table: a lock and [[NFILE]] = 100 `struct file` entries, in a structure
+    defined and instantiated in one go.
+  25: |
+    Initialize the spinlock that protects every entry's `ref`.
+  34-41: |
+    Scan for a free entry under the lock; claim the first one by giving it one reference.
+  42-43: |
+    The table is full.
+  50-54: |
+    Under the lock, check that the entry is in use and add a reference.
+  64-66: |
+    Closing a file nobody has open is a kernel bug.
+  67-70: |
+    Drop this reference. If others remain, nothing else to do.
+  71: |
+    Copy the whole entry: the fields are needed below, after the entry has been given up.
+  72-73: |
+    Mark the entry free. From the moment the lock is released, [[filealloc]] may reuse it.
+  74: |
+    Release the spinlock before cleanup that may sleep.
+  76-77: |
+    Close this end of the pipe. `ff.writable` tells [[pipeclose]] which end it is, so that,
+    for example, a reader waiting for data learns that the writer has gone.
+  78-82: |
+    Files and devices hold an inode reference; give it back inside a [[g:transaction]],
+    because [[iput]] may delete the file.
+  93: |
+    Only inode-backed files (including devices, which are inodes of type `T_DEVICE`) have
+    metadata.
+  94-96: |
+    Lock the inode, copy its metadata into the local `st`, unlock.
+  97-98: |
+    Copy the `struct stat` to the user's address. [[copyout]] fails on addresses that are
+    not writable user memory; `p->sz` lets it allocate a page that lies inside the
+    process's memory but has no physical page yet (memory grown with `sbrklazy` gets
+    its pages only on first use).
+  111-112: |
+    Fail if the file was opened write-only, or the requested count is negative (a
+    negative `int` would become a huge unsigned count further down).
+  114-115: |
+    A pipe: read from its buffer.
+  116-119: |
+    A device: check that `major` indexes a real [[devsw]] entry with a read function,
+    then call it. For the console, that is [[consoleread]].
+  120-124: |
+    A file or directory: read at the current offset under the inode lock, and move the
+    offset forward by the number of bytes read. On an error (-1) or end of file (0) the
+    offset stays.
+  125-126: |
+    No other type can be open; reaching here means the entry is corrupt.
+  139-140: |
+    Fail if the file was opened read-only, or the count is negative.
+  142-143: |
+    A pipe: append to its buffer, sleeping while it is full.
+  144-147: |
+    A device: check `major`, then call the device's write function, such as
+    [[consolewrite]].
+  153: |
+    3072 bytes: the most one file-system operation (one `begin_op`/`end_op` pair) may
+    write. See the block note.
+  154: |
+    `i` counts the bytes written so far.
+  155-158: |
+    `n1` is the size of the next chunk: what is left, but at most `max`.
+  160-161: |
+    Begin a file-system operation (it joins the current [[g:transaction]]), then lock the
+    inode, in that order.
+  162-163: |
+    Write the chunk at the current offset, from the user address `addr + i` (1 means a
+    user address), and advance the offset.
+  164-165: |
+    Unlock, then end the transaction. The last [[end_op]] of a group commits it.
+  167-170: |
+    A short or failed write ends the loop. The offset has already moved past whatever was
+    written.
+  171: |
+    Account for the chunk and continue.
+  173: |
+    Success only if all `n` bytes were written.

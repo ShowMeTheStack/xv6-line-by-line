@@ -1,0 +1,625 @@
+title: pause(n) and the tick counter
+group: Time and scheduling
+prerequisites: [5, 11, 16]
+summary: |
+  xv6 has exactly one notion of time: `ticks`, a counter that goes up by one about ten times
+  a second. Only hart 0 increments it. Every process that wants to wait for time to pass,
+  through the `pause` system call, sleeps on the address of that counter and is woken at
+  every tick to check whether it has waited long enough.
+
+  This tour follows `zombie` (pid 3), which calls `pause(5)` on hart 2 to give its child a
+  head start. You will see [[kernel:sys_pause]] read the clock under `tickslock`, register
+  on the channel `&ticks` and go to sleep, while hart 0, in [[kernel:clockintr]], does
+  `ticks++` and `wakeup(&ticks)`, possibly at the very instant `zombie` is about to sleep.
+  You will see why that race is harmless, why `zombie` wakes up five times, why it may
+  finish its `pause` on a different hart, and why a `kill` can cut the wait short.
+
+  It is a small system call, and a complete lesson in the [[g:sleep-wakeup]] pattern,
+  [[tour:16]], applied to a device every hart has: the clock.
+cast: |
+  The machine has three [[g:hart|harts]]. As the first command after boot, you typed
+  `zombie` at the shell (pid 2, now asleep in `wait`). The shell's child, pid 3, ran
+  `zombie`, which has just forked pid 4.
+  When the tour starts:
+
+  | Hart | What it is doing |
+  |---|---|
+  | 0 | Idle in its [[kernel:scheduler]]: but it is the hart that counts `ticks` |
+  | 1 | Running pid 4, the child, which is calling `exit(0)` |
+  | 2 | Running `zombie` (pid 3) in user mode: the process this tour follows |
+steps:
+  - title: zombie decides to wait half a second
+    file: user/zombie.c
+    lines: 8-14
+    focus: 11-12
+    state:
+      hart: 2
+      mode: U
+      proc: zombie (pid 3)
+      intr: on
+      satp: user
+      locks: []
+      stack: [main]
+      sp: user
+    note: |
+      `fork()` returned the child's pid (4) to the parent, so the parent calls `pause(5)`:
+      "do nothing for 5 ticks". The comment says why: the child should exit first. The child
+      then becomes a [[g:zombie]] (an exited process its parent has not yet waited for),
+      which is what this test program exists to create; when the parent exits too, the
+      child is handed to `init` ([[tour:21]]).
+
+      Five ticks is about half a second. `zombie` could have spun in a loop checking the
+      time instead, but that would waste a CPU for half a second. `pause` lets hart 2 run
+      something else, or rest, while `zombie` waits.
+
+      (In older xv6 this system call was called `sleep`. A 2025 commit renamed it `pause`,
+      in the same change that renamed the kernel's `fork`, `exec`, `wait`, `exit` and `kill`
+      to [[kernel:kfork]] and friends; in this kernel, [[kernel:sleep]] is only the internal
+      primitive.)
+
+  - title: The usual doorway into the kernel
+    file: user/usys.S
+    lines: 98-102
+    focus: 100-101
+    state:
+      hart: 2
+      mode: U
+      proc: zombie (pid 3)
+      intr: on
+      satp: user
+      locks: []
+      stack: [main, pause]
+      sp: user
+    note: |
+      The [[g:syscall-stub]] puts [[kernel:SYS_pause]] (13) in `a7` and executes `ecall`. The
+      argument, 5, is already in `a0`.
+
+      From here to [[kernel:sys_pause]] the path is exactly the one [[tour:5]] walks through:
+      the trampoline saves `zombie`'s registers in its trapframe, [[kernel:usertrap]] sees
+      `scause == 8`, adds 4 to the saved pc, turns interrupts on, and [[kernel:syscall]]
+      calls `syscalls[13]`.
+
+  - title: Fetch n, and refuse negative time
+    file: kernel/sysproc.c
+    lines: 67-90
+    focus: 73-75
+    state:
+      hart: 2
+      mode: S
+      proc: zombie (pid 3)
+      intr: on
+      satp: kernel
+      locks: []
+      stack: [usertrap, syscall, sys_pause]
+      sp:
+        "on": kernel
+        switched: "`ld sp, 8(a0)` in [[uservec]] ([[kernel/trampoline.S:76]])"
+        detail: "empty on entry; now `usertrap` → `syscall` → `sys_pause`"
+      irq: 0
+    note: |
+      [[argint]] reads `n = 5` from the saved `a0`.
+
+      `zombie` is running on its own [[g:kernel-stack]] now. On the way in, [[uservec]]
+      saved the user `sp` in the trapframe and loaded `kernel_sp`, the top of `zombie`'s
+      kernel stack, which is always empty while a process is in user mode
+      ([[concept:stacks]]).
+
+      The clamp on lines 74–75 looks like politeness, but it prevents a near-infinite wait.
+      The loop below compares `ticks - ticks0 < n`, where `ticks` and `ticks0` are `uint`
+      and `n` is `int`. C converts `n` to `unsigned int` for that comparison, so `n = -1`
+      would become 4,294,967,295: about 13.6 years of ticks. Turning a negative `n` into 0
+      makes `pause(-1)` return immediately instead.
+
+      Interrupts are on: this is an ordinary system call, preemptible by the timer until it
+      takes a lock.
+
+  - title: Where the clock lives
+    file: kernel/trap.c
+    lines: 1-23
+    focus: 9-10
+    state:
+      hart: 2
+      mode: S
+      proc: zombie (pid 3)
+      intr: on
+      satp: kernel
+      locks: []
+      stack: [usertrap, syscall, sys_pause]
+      sp: kernel
+      irq: 0
+    note: |
+      `ticks` is a plain `uint` in [[kernel/trap.c]] (at `0x80007880` in this build), and
+      `tickslock` is the [[g:spinlock]] that guards it, named `"time"` by [[trapinit]].
+
+      Who touches `ticks`?
+
+      | Code | Access | Hart |
+      |---|---|---|
+      | [[clockintr]] | `ticks++`, then `wakeup(&ticks)` | 0 only |
+      | [[sys_pause]] | reads it, sleeps on `&ticks` | any |
+      | [[sys_uptime]] | reads it | any |
+
+      All three hold `tickslock`. The address `&ticks` doubles as the
+      [[g:sleep-wakeup|wait channel]]: a number that the sleeper and the waker agree on.
+      Any address would do; using the counter's own address makes the code self-explanatory.
+
+  - title: Read the clock under the lock
+    file: kernel/sysproc.c
+    lines: 67-90
+    focus: 76-77
+    state:
+      hart: 2
+      mode: S
+      proc: zombie (pid 3)
+      intr: off
+      satp: kernel
+      locks: [tickslock]
+      stack: [usertrap, syscall, sys_pause]
+      sp: kernel
+      irq: {noff: 1, intena: 1}
+    note: |
+      [[acquire]] turns interrupts off on hart 2 and records `cpus[2].intena = 1` (they were
+      on; [[concept:locks#intena]]). Then `ticks0 = ticks`. Say the clock reads 1000.
+
+      Why is a lock needed to read one 32-bit number? Not for the read itself. The lock
+      matters because of what comes next: `sys_pause` will compare `ticks` with `ticks0`,
+      and if the wait is not over, register as a sleeper on `&ticks`. Holding `tickslock`
+      from the comparison until the registration means hart 0 cannot slip a `ticks++` and
+      its `wakeup` in between, unseen.
+    others: |
+      Hart 0 cannot increment `ticks` while hart 2 holds the lock: [[clockintr]] would spin in
+      `acquire(&tickslock)`, with interrupts off on hart 0, for the few dozen instructions
+      until hart 2 releases it.
+
+      And hart 2 cannot be interrupted by its *own* timer while holding the lock, because
+      interrupts are off. That matters on hart 0 too: if hart 0 were the one in `sys_pause`
+      holding `tickslock` and its timer fired, an interrupt handler that tried to acquire
+      `tickslock` on the same hart could never get it, since the holder cannot run until the
+      handler returns; xv6's [[acquire]] notices this with [[holding]] and panics. With
+      interrupts off, the tick waits, pending, until the release ([[g:interrupts-and-locks]]).
+
+  - title: The loop test, and a check for kill
+    file: kernel/sysproc.c
+    lines: 67-90
+    focus: 78-79
+    state:
+      hart: 2
+      mode: S
+      proc: zombie (pid 3)
+      intr: off
+      satp: kernel
+      locks: [tickslock]
+      stack: [usertrap, syscall, sys_pause]
+      sp: kernel
+      irq: {noff: 1, intena: 1}
+    note: |
+      `ticks - ticks0` is 0, less than 5: keep waiting.
+
+      Every time around the loop, before sleeping, `sys_pause` asks [[killed]]: has someone
+      killed this process? If so, it gives up and returns -1, and `zombie` will exit on its
+      way out of the kernel. Without this check, `kill` on a process in `pause(1000)` would
+      take 100 seconds to work. [[tour:23]] follows `kill`.
+
+      `killed` acquires `zombie`'s `p->lock` while `tickslock` is held, then releases it.
+      So the order here is `tickslock`, then `p->lock`. [[clockintr]] on hart 0 uses the same
+      order: `tickslock`, then each `p->lock` inside [[wakeup]]. Two paths that take the same
+      two locks in the same order cannot deadlock against each other ([[tour:18]]).
+
+      Subtraction rather than `ticks < ticks0 + n` is deliberate: with unsigned arithmetic,
+      `ticks - ticks0` stays correct even if `ticks` wraps around from 4,294,967,295 to 0.
+
+  - title: Register on &ticks while the clock cannot move
+    file: kernel/proc.c
+    lines: 545-556
+    focus: 551-554
+    state:
+      hart: 2
+      mode: S
+      proc: zombie (pid 3)
+      intr: off
+      satp: kernel
+      locks: [tickslock, "zombie's p->lock"]
+      stack: [usertrap, syscall, sys_pause, sleep_prepare]
+      sp: kernel
+      irq: {noff: 2, intena: 1}
+    note: |
+      `sys_pause` calls `sleep_prepare(&ticks)`. [[sleep_prepare]] takes `zombie`'s `p->lock`
+      and sets `p->chan = &ticks`. From this moment `zombie` is *registered*: any
+      `wakeup(&ticks)` will find it and clear `p->chan`, even though `zombie` is still
+      running.
+
+      Two locks are held at once here, `tickslock` and `zombie`'s `p->lock`, in the same
+      order as before. Both are spinlocks, so `noff` on hart 2 is 2, and interrupts stay off ([[concept:locks#noff]]).
+
+      The registration is done *before* releasing `tickslock`. That is the order the
+      [[g:sleep-wakeup]] pattern requires: decide to wait (under the condition's lock),
+      register, then let go of the condition's lock. Any tick that happens after the
+      decision now happens after the registration too.
+
+  - title: Let go of the clock
+    file: kernel/sysproc.c
+    lines: 67-90
+    focus: 84
+    state:
+      hart: 2
+      mode: S
+      proc: zombie (pid 3)
+      intr: on
+      satp: kernel
+      locks: []
+      stack: [usertrap, syscall, sys_pause]
+      sp: kernel
+      irq: 0
+    note: |
+      [[release]] gives up `tickslock`. `noff` returns to 0 and `intena` is 1, so interrupts
+      come back **on** on hart 2.
+
+      Now hart 0 is free to tick. `zombie` is registered but still running; it is about to
+      call `sleep()`. A tick can arrive at any point from here on, and the code must be
+      right whichever way it falls. See the timeline below.
+    others: |
+      Hart 0's timer fires right now, before `zombie` reaches `sleep()`:
+
+      | Time | Hart 2 (zombie) | Hart 0 |
+      |---|---|---|
+      | t1 | `release(&tickslock)` | timer interrupt: `acquire(&tickslock)` |
+      | t2 | about to call `sleep()` | `ticks` = 1001, `wakeup(&ticks)`: `zombie`'s `chan` cleared (state `RUNNING`, so left alone) |
+      | t3 | `sleep()`: `chan == 0`, returns at once | `release(&tickslock)` |
+      | t4 | reacquires `tickslock`, sees 1001 − 1000 = 1 | |
+
+      Nothing is lost: the tick happened, and `zombie` counted it. Compare an incorrect order
+      where `zombie` registered *after* releasing the lock: the tick at t2 would find nobody
+      registered, and `zombie` would sleep through it and wake one tick late. For `ticks`
+      that costs only 0.1 s, because another tick always comes; for a device that
+      interrupts only once, it would be a hang.
+
+  - title: zombie goes to sleep
+    file: kernel/proc.c
+    lines: 561-572
+    focus: 566-569
+    state:
+      hart: 2
+      mode: S
+      proc: zombie (pid 3)
+      intr: off
+      satp: kernel
+      locks: ["zombie's p->lock"]
+      stack: [usertrap, syscall, sys_pause, sleep]
+      sp: kernel
+      irq: {noff: 1, intena: 1}
+    note: |
+      In the usual case no tick has come yet. [[sleep]] takes `zombie`'s `p->lock`
+      (recording `cpus[2].intena = 1`), finds `p->chan` still `&ticks`, marks `zombie`
+      `SLEEPING` and calls [[sched]].
+
+      [[sched]] saves `intena`, and [[swtch]] moves hart 2 to its scheduler, which releases
+      `zombie`'s `p->lock`. [[tour:13]] follows this switch instruction by instruction. The
+      `ld sp, 8(a1)` in `swtch` ([[kernel/swtch.S:26]]) is where hart 2 leaves `zombie`'s
+      kernel stack for its own scheduler stack, the slice of `stack0` it booted on.
+      `zombie` is now frozen inside `sched`, its kernel stack holding the frames of
+      `usertrap`, `syscall`, `sys_pause`, `sleep` and `sched`.
+
+      Hart 2's scheduler looks for other work. Pid 4 is exiting on hart 1 and nothing else
+      is runnable, so hart 2 soon stalls in `wfi`.
+    others: |
+      `zombie` holds no lock while it sleeps; in particular, not `tickslock`. If a sleeping
+      process kept `tickslock`, hart 0 could never tick again, and every `pause` and
+      `uptime` in the system would stop with it.
+
+  - title: Hart 0's timer fires, and hart 0 counts
+    file: kernel/trap.c
+    lines: 166-180
+    focus: 170-172
+    state:
+      hart: 0
+      mode: S
+      proc: none (hart 0's scheduler)
+      intr: off
+      satp: kernel
+      locks: [tickslock]
+      stack: [main, scheduler, kernelvec, kerneltrap, devintr, clockintr]
+      sp: {"on": scheduler, detail: "with a 256-byte `kernelvec` frame on top"}
+      irq: {noff: 1, intena: 0}
+    note: |
+      0.1 s after its previous tick, hart 0's `time` passes its `stimecmp`. Hart 0 was idle:
+      its `wfi` returns, its scheduler opens the interrupt window, and the trap goes through
+      [[kernelvec]] and [[kerneltrap]] to [[devintr]] and [[clockintr]] ([[tour:12]] shows
+      that window; [[tour:11]] shows a tick arriving from user mode instead).
+
+      Which stack is this on? Whatever stack hart 0 was using when the interrupt hit: its
+      scheduler stack (its slice of `stack0`). [[kernelvec]] pushed its 256-byte register
+      frame there ([[kernel/kernelvec.S:14]]), and `kerneltrap`, `devintr`, `clockintr` and
+      soon `wakeup` stack up below it:
+
+      ```text
+      hart 0's scheduler stack (stack0 slice, top 0x80008890)
+        start         16 bytes, never popped (start left by mret)
+        main
+        scheduler
+        kernelvec   (256-byte register frame)
+        kerneltrap
+        devintr
+        clockintr  ◄─ sp
+      ```
+
+      `cpuid()` is 0, so this hart counts. It takes `tickslock`, and `ticks` becomes 1001.
+      Then, still holding `tickslock`, it calls `wakeup(&ticks)`.
+      This `acquire` of the same `tickslock` records `intena = 0`, not 1 as in step 5:
+      the trap had already turned interrupts off. And the tick could be taken at all
+      only because hart 0 held no spinlock at that moment ([[concept:locks#invariant]]).
+
+      Why wake while holding the lock? It is not required for correctness here, because a
+      sleeper's check and its registration both happen under `tickslock`: any sleeper that
+      saw 1000 registered before this `ticks++`, so even a wakeup after the release would
+      still find it. But holding the lock keeps the increment and the wakeup together: no
+      sleeper can observe 1001 under `tickslock` without the wakeup for 1001 having already
+      been delivered.
+
+  - title: wakeup visits every process
+    file: kernel/proc.c
+    lines: 574-595
+    focus: 580-594
+    state:
+      hart: 0
+      mode: S
+      proc: none (hart 0's scheduler)
+      intr: off
+      satp: kernel
+      locks: [tickslock, "each p->lock in turn"]
+      stack: [main, scheduler, kernelvec, kerneltrap, devintr, clockintr, wakeup]
+      sp: {"on": scheduler, detail: "with a `kernelvec` frame on top"}
+      irq: {noff: 2, intena: 0}
+    note: |
+      [[wakeup]] walks all 64 slots, taking and releasing each `p->lock`. At `zombie`'s slot
+      it finds `chan == &ticks` and `SLEEPING`: it clears `chan` and sets `RUNNABLE`.
+
+      This happens on every tick, ten times a second, whether anyone is pausing or not:
+      64 lock acquisitions while holding `tickslock`. And it wakes *every* process sleeping
+      on `&ticks`, including ones that asked for 1000 ticks and have 990 to go. Each of them
+      will run, re-check, and go back to sleep. A real kernel keeps sleepers in a list
+      sorted by wake-up time; xv6 accepts this waste to keep `pause` to a dozen lines.
+    others: |
+      `zombie`'s `p->lock` is the meeting point of three harts' interests: hart 0's
+      `wakeup` writes its state, any hart's scheduler (in this tour, hart 0's own) will read it, and if
+      `zombie` were still between `sleep_prepare` and `sleep` it would be checking its own
+      `chan`. Each of them holds the lock while doing so, so each sees a whole state:
+      unregistered, registered-but-running, or fully asleep.
+
+  - title: Re-arm, and pick up the process just woken
+    file: kernel/trap.c
+    lines: 166-180
+    focus: 174-179
+    state:
+      hart: 0
+      mode: S
+      proc: none (hart 0's scheduler)
+      intr: off
+      satp: kernel
+      locks: []
+      stack: [main, scheduler, kernelvec, kerneltrap, devintr, clockintr]
+      sp: {"on": scheduler, detail: "with a `kernelvec` frame on top"}
+      irq: 0
+    note: |
+      `clockintr` releases `tickslock` and sets hart 0's next deadline, 1,000,000 time units
+      (0.1 s) from now. [[kerneltrap]] does not yield, because no process is running on hart
+      0 (`myproc()` is 0: the trap landed on a scheduler stack, not a process's kernel
+      stack). [[kernelvec]] pops its frame and returns into the scheduler loop, which closes
+      the interrupt window and scans.
+
+      It finds `zombie` `RUNNABLE` and switches to it. `zombie` went to sleep on hart 2 and
+      will wake up on **hart 0**. Hart 2, stalled in `wfi`, will not even hear about it
+      until its own next timer or device interrupt: xv6 sends no interrupt from one hart to another, so whichever
+      scheduler scans first wins.
+    others: |
+      Hart 1 might be scanning too, if pid 4 has finished exiting. Both harts would race for
+      `zombie`'s `p->lock` in their scans; the loser sees `RUNNING` and moves on
+      ([[tour:12]]).
+
+  - title: zombie wakes, on hart 0
+    file: kernel/proc.c
+    lines: 561-572
+    focus: 571
+    state:
+      hart: 0
+      mode: S
+      proc: zombie (pid 3)
+      intr: on
+      satp: kernel
+      locks: []
+      stack: [usertrap, syscall, sys_pause, sleep]
+      sp:
+        "on": kernel
+        switched: "`ld sp, 8(a1)` in [[swtch]] ([[kernel/swtch.S:26]]), called by hart 0's scheduler"
+        detail: "`zombie`'s kernel stack, exactly as it was left on hart 2"
+      irq: 0
+    note: |
+      (The state shown is just after line 571, as in steps 8 and 17.) [[sched]] returns on
+      hart 0 and restores `cpus[0].intena = 1`, `zombie`'s value from before it slept.
+      [[sleep]] releases `p->lock`, the lock hart 0's scheduler acquired, and
+      interrupts come back on: `zombie` continues its system call on hart 0 exactly as it was
+      running on hart 2. Its kernel stack never moved; hart 0's `swtch` loaded the `sp`
+      that hart 2's `swtch` had saved, and the frames `usertrap` → `syscall` → `sys_pause`
+      → `sleep` were waiting there.
+
+      Notice what `sleep` does **not** do: check the time. It does not know what `zombie`
+      was waiting for. It only knows that someone called `wakeup` on its channel (or that it
+      was killed, [[tour:23]]). Deciding whether the wait is over is the caller's job.
+
+  - title: Not yet. Again
+    file: kernel/sysproc.c
+    lines: 67-90
+    focus: 86-87
+    state:
+      hart: 0
+      mode: S
+      proc: zombie (pid 3)
+      intr: off
+      satp: kernel
+      locks: [tickslock]
+      stack: [usertrap, syscall, sys_pause]
+      sp: kernel
+      irq: {noff: 1, intena: 1}
+    note: |
+      Back in [[sys_pause]], `zombie` retakes `tickslock` and goes around the loop:
+      `ticks - ticks0` is 1001 − 1000 = 1, still less than 5. Killed? No. Register, release,
+      sleep.
+
+      This repeats on the next four ticks. Each time, `zombie` wakes on whichever hart's
+      scheduler finds it first, which may be a different hart each time. Over the whole
+      `pause(5)`, `zombie` usually sleeps five times and tests the loop condition six times (an
+      extra wakeup, such as a `kill`, would change the count).
+
+      The loop is why `sleep` may return "early" without harm. A wakeup means only "the thing
+      you are waiting on may have changed; look again", and the `while` re-tests the real
+      condition under the real lock. Every sleep loop in xv6 is written this way.
+
+  - title: Only hart 0 keeps time
+    file: kernel/trap.c
+    lines: 166-180
+    focus: 169
+    state:
+      hart: 0
+      mode: S
+      proc: none (hart 0's scheduler)
+      intr: off
+      satp: kernel
+      locks: []
+      stack: [main, scheduler, kernelvec, kerneltrap, devintr, clockintr]
+      sp: {"on": scheduler, detail: "with a `kernelvec` frame on top"}
+      irq: 0
+    note: |
+      All three harts get a timer interrupt every 0.1 s, but only one of them may count, or
+      `ticks` would run three times too fast. Hart 0 is the obvious choice: it is the hart
+      that always exists.
+
+      Consequences of letting one hart keep time:
+
+      - **A tick can be late.** If hart 0 runs with interrupts off for a while (holding a
+        spinlock, say), its timer interrupt waits, pending. The tick is late but not lost.
+      - **Ticks drift.** [[clockintr]] schedules the next tick 0.1 s after the *handling*
+        of this one, so every delay pushes all later ticks back. Over time, `ticks` falls
+        slightly behind true time. `pause(5)` means "five ticks", not "exactly 0.5 s".
+      - **The count does not care what hart 0 is doing.** Hart 0 counts whether it is idle
+        in its scheduler, as in this tour, or running a user program, through
+        [[usertrap]]'s call to [[devintr]]. Only the stack differs: the scheduler stack
+        here, and the running process's kernel stack when hart 0 is running a process.
+    others: |
+      Harts 1 and 2 run [[clockintr]] too, and only re-arm their own timers. They never take
+      `tickslock` in `clockintr`, so the three timers never contend with each other; the
+      only code that takes `tickslock` is hart 0's tick and processes calling `pause` or
+      `uptime` (which can also contend with each other).
+
+  - title: If kill arrives during the pause
+    file: kernel/sysproc.c
+    lines: 67-90
+    focus: 79
+    state:
+      hart: 1
+      mode: S
+      proc: zombie (pid 3)
+      intr: off
+      satp: kernel
+      locks: [tickslock]
+      stack: [usertrap, syscall, sys_pause]
+      sp: kernel
+      irq: {noff: 1, intena: 1}
+    note: |
+      Suppose that, after the second tick, some other process (a background job, say) calls
+      `kill(3)`. [[kkill]] sets `zombie`'s `killed` flag and,
+      because `zombie` is `SLEEPING`, sets it `RUNNABLE` directly. No tick needed.
+
+      Hart 1's scheduler happens to pick `zombie` up. It returns from `sleep`, retakes
+      `tickslock`, finds `ticks - ticks0` = 2, less than 5, and enters the loop body. Line
+      79: killed. It releases `tickslock` and returns -1. [[usertrap]] then sees the flag
+      and calls `kexit(-1)` ([[kernel/trap.c:81]]).
+
+      The check is at the top of the loop body for a reason: every way out of `sleep` leads
+      back to it, so a kill is noticed after at most one more wakeup. (If the kill happens
+      to arrive between the `killed` check and `sleep()`, `zombie` sleeps anyway, and
+      notices at the next tick, 0.1 s later. [[tour:23]] looks at that window.)
+
+  - title: The fifth tick
+    file: kernel/sysproc.c
+    lines: 67-90
+    focus: 88-89
+    state:
+      hart: 2
+      mode: S
+      proc: zombie (pid 3)
+      intr: on
+      satp: kernel
+      locks: []
+      stack: [usertrap, syscall, sys_pause]
+      sp: kernel
+      irq: 0
+    note: |
+      Without a kill, the story ends at the fifth tick. `zombie`, now running on hart 2,
+      reads 1005 − 1000 = 5. The loop ends; it releases `tickslock` (interrupts on again)
+      and returns 0, which [[syscall]] puts in the saved `a0`.
+
+      How long did it wait? `ticks0` was read at some random moment between tick 1000 and
+      tick 1001, and `zombie` resumed after tick 1005. So the wait was between four and five
+      tick periods, roughly 0.4 to 0.5 s, plus however long it took a scheduler to notice
+      `zombie` after the last wakeup. `pause(1)` can return almost immediately, if the call
+      lands just before a tick.
+    others: |
+      [[sys_uptime]] ([[kernel/sysproc.c:104]]) is the read-only sibling: it takes `tickslock`
+      only to read `ticks` and return it. A program can measure its own `pause` by calling
+      `uptime()` before and after.
+
+  - title: What half a second cost
+    file: user/zombie.c
+    lines: 8-14
+    focus: 13
+    state:
+      hart: 2
+      mode: U
+      proc: zombie (pid 3)
+      intr: on
+      satp: user
+      locks: []
+      stack: [main]
+      sp:
+        "on": user
+        switched: "`ld sp, 48(a0)` in [[kernel:userret]] ([[kernel/trampoline.S:118]]) and `sret` ([[kernel/trampoline.S:153]])"
+    note: |
+      `zombie` returns to user mode and calls `exit(0)`. Its child, pid 4, has long since
+      exited and is a zombie; `zombie` itself will now become one until the shell waits for
+      it, and its child will be handed to `init` ([[tour:21]]).
+
+      What did `pause(5)` cost? `zombie` used almost no CPU: six passes through a ten-line
+      loop. Hart 0 did the work, five `ticks++` under `tickslock`, each followed by a
+      64-slot `wakeup`. `zombie` was usually switched out and in five times, possibly on all three
+      harts.
+
+      The key ideas:
+
+      - One counter, one lock, one hart that counts. `ticks` is the kernel's only clock.
+      - The [[g:sleep-wakeup]] pattern: check the condition under its lock, register on the
+        channel *before* letting go of the lock, then sleep; re-check in a loop after every
+        wakeup.
+      - Lock order `tickslock` before `p->lock`, the same on both sides.
+      - A loop that may wait for a long time checks `killed`.
+locks:
+  - lock: tickslock (spinlock)
+    where: "[[kernel:sys_pause]], [[kernel:clockintr]] (hart 0), [[kernel:sys_uptime]]"
+    protects: "`ticks`, and the check-then-register sequence in `sys_pause` against a concurrent `ticks++` and `wakeup`"
+  - lock: "zombie's p->lock (spinlock)"
+    where: "[[kernel:killed]], [[kernel:sleep_prepare]], [[kernel:sleep]], [[kernel:wakeup]], [[kernel:kkill]], schedulers"
+    protects: "`p->chan`, `p->state`, `p->killed`. Taken after `tickslock` whenever both are held"
+  - lock: "stimecmp (no lock: per-hart register)"
+    where: "[[kernel:clockintr]], every hart"
+    protects: "Nothing shared: each hart re-arms its own timer"
+quiz:
+  - q: "Why does `sys_pause` clamp a negative `n` to 0?"
+    a: "The test `ticks - ticks0 < n` compares an `unsigned int` with an `int`, so C converts `n` to unsigned. A negative `n` would become a huge number and the process would wait for years of ticks."
+  - q: "Hart 0's tick (`ticks++`, `wakeup(&ticks)`) happens after `zombie`'s `release(&tickslock)` but before its `sleep()`. Why doesn't `zombie` miss that tick?"
+    a: "`sleep_prepare(&ticks)` ran before the release, so `wakeup` finds `p->chan == &ticks` and clears it (leaving the `RUNNING` state alone). `sleep()` then sees `chan == 0` and returns at once, and the loop re-reads `ticks`."
+  - q: "What would happen on hart 0 if `acquire` did not turn interrupts off, and hart 0's timer fired while hart 0 itself was inside `sys_pause` holding `tickslock`?"
+    a: "`clockintr` would run on hart 0 and call `acquire(&tickslock)`, a lock that the code it interrupted holds and can never release while the handler runs. That is a deadlock of a hart with itself; xv6's `acquire` would detect it with `holding` and panic. Turning interrupts off while holding a spinlock defers the tick until the release."
+  - q: "Why does `zombie` usually wake up five times during `pause(5)`, and could it wake more often?"
+    a: "Every tick calls `wakeup(&ticks)`, which wakes all sleepers on `&ticks`; `zombie` re-checks and sleeps again until five ticks have passed. A `kill` (which makes a sleeper `RUNNABLE` directly) could wake it an extra time, and it would then return -1."
+  - q: "`ticks` is incremented only by hart 0. Give two consequences for what `pause(n)` actually measures."
+    a: "Ticks can be late when hart 0 has interrupts off, and because each tick is re-armed 0.1 s after it is handled, delays accumulate as drift. So `pause(n)` waits for n increments of a counter that runs slightly slower than 10 Hz, starting from an arbitrary point within a tick: between n−1 and n tick periods, plus scheduling delay."
+  - q: "`sys_pause` holds `tickslock` while calling `killed()`, which takes `p->lock`. `clockintr` holds `tickslock` while `wakeup` takes `p->lock`s. Why can these not deadlock?"
+    a: "Both take the locks in the same order, `tickslock` first, then a `p->lock`. Deadlock needs two threads taking two locks in opposite orders. No code in xv6 takes `tickslock` while holding a `p->lock`."

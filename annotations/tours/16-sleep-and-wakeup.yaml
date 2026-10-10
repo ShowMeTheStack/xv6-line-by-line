@@ -1,0 +1,935 @@
+title: sleep and wakeup, and the lost-wakeup problem
+group: Concurrency primitives
+prerequisites: [5, 13, 15]
+summary: |
+  You type `cat README | wc` at the shell. Two programs start at almost the same moment on
+  two different [[g:hart|harts]]. `wc` asks the [[g:pipe]] for data before `cat` has
+  written anything, so `wc` must wait. A few microseconds later `cat`, on another hart,
+  puts 512 bytes into the pipe, and `wc` must notice.
+
+  Waiting sounds simple. It is one of the most treacherous things a kernel does. The
+  waiter checks a condition ("is the pipe empty?"), decides to sleep, and goes to sleep.
+  If the waker makes the condition true and calls [[wakeup]] *between* the check and the
+  sleep, the wakeup finds nobody asleep and is lost. The waiter then sleeps forever,
+  next to a pipe full of data. This is the **lost-wakeup problem**
+  ([[g:sleep-wakeup]]).
+
+  This tour follows `wc` into [[piperead]] and to sleep, and `cat` through [[pipewrite]] to
+  the wakeup. Along the way you will see how *this* version of xv6 closes the gap with a
+  two-step [[sleep_prepare]] / [[sleep]] protocol, how older xv6 closed it by handing a
+  lock to `sleep`, why the UART driver can sleep with no condition lock at all, and why
+  every caller wraps its sleep in a `while` loop.
+cast: |
+  The machine has three harts. The shell (pid 2) has forked pid 3 to run the pipeline,
+  and pid 3 has forked `cat` (pid 4) and `wc` (pid 5). This is the first command since
+  boot, so those are the pids. pid 2 and pid 3 are asleep in [[kernel:kwait]].
+
+  | Hart | What it is doing |
+  |---|---|
+  | 0 | Idle: its [[kernel:scheduler]] finds nothing runnable and waits in `wfi` |
+  | 1 | Running `cat` (pid 4), which is reading `README` from the disk |
+  | 2 | Running `wc` (pid 5) in user mode, about to read from the empty pipe: the process this tour follows first |
+
+  Both children share one `struct pipe`: `cat`'s file descriptor 1 is its write end,
+  `wc`'s file descriptor 0 its read end.
+steps:
+  - title: wc asks for its first 512 bytes
+    file: user/wc.c
+    lines: 8-28
+    focus: 16
+    state:
+      hart: 2
+      mode: U
+      proc: wc (pid 5)
+      intr: on
+      satp: user
+      locks: []
+      stack: [main, wc]
+      sp: user
+    note: |
+      `wc` was started with no arguments, so `main` calls `wc(0, "")`: count the lines,
+      words and bytes of standard input. Line 16 calls `read(0, buf, 512)`.
+
+      Descriptor 0 is the read end of the pipe the shell built ([[user/sh.c:114]]). Through
+      the usual system-call path ([[tour:5]]) this arrives in [[kernel:sys_read]], then
+      [[kernel:fileread]], which sees `FD_PIPE` and calls [[kernel:piperead]].
+
+      Right now the pipe is empty. `cat` on hart 1 has not written anything yet: it is still
+      waiting for the disk to deliver the first block of `README`. So `wc` is about to
+      discover that it has nothing to do, and that it must wait for an event that will
+      happen on a different CPU.
+
+      The question for this whole tour: how can `wc` go to sleep in a way that can never
+      miss `cat`'s wakeup, no matter how the instructions on the two harts interleave?
+    others: |
+      `cat` on hart 1 is the producer and `wc` on hart 2 the consumer. They share exactly one
+      piece of kernel memory, the `struct pipe` ([[kernel/pipe.c:13]]): a 512-byte ring
+      buffer `data`, two counters `nread` and `nwrite`, and the flags `readopen` and
+      `writeopen`. Every access to those fields, by either process on any hart, happens
+      while holding the pipe's own [[g:spinlock]], `pi->lock`.
+
+  - title: piperead takes the pipe lock and finds it empty
+    file: kernel/pipe.c
+    lines: 111-128
+    focus: 119
+    state:
+      hart: 2
+      mode: S
+      proc: wc (pid 5)
+      intr: off
+      satp: kernel
+      locks: ["pi->lock"]
+      stack: [usertrap, syscall, sys_read, fileread, piperead]
+      sp:
+        "on": kernel
+        switched: "`ld sp, 8(a0)` in [[uservec]] ([[kernel/trampoline.S:76]])"
+      irq: {noff: 1, intena: 1}
+    note: |
+      [[piperead]] acquires `pi->lock`, so interrupts go off on hart 2 ([[tour:15]]). Then it
+      tests the condition it needs: is there data? `nread == nwrite` means every byte ever
+      written has been read: the pipe is empty. `writeopen` is still 1, because `cat` holds
+      the write end open, so more data may still come and waiting makes sense. (If every
+      writer had closed it, `piperead` would skip the loop and return 0: end of file.)
+
+      The **condition** (`nread == nwrite && writeopen`) is protected by the **condition
+      lock** `pi->lock`. That pairing is the heart of every sleep in xv6: a condition, a lock
+      that protects it, and a **channel**, an address both sides agree to use as the name of
+      the event. Here the channel is `&pi->nread`, "the reader is waiting for `nwrite` to move
+      past `nread`".
+
+      Line 120 checks [[killed]]: a killed process must not start a long wait. `killed`
+      takes `wc`'s own `p->lock` while `pi->lock` is held, which fixes a lock order you will
+      see again and again on this path: `pi->lock` first, then `p->lock`.
+    others: |
+      `cat` on hart 1 may already be in [[pipewrite]] at this instant. If so, it spins in
+      `acquire(&pi->lock)` with interrupts off until `wc` lets go. Without the lock, `cat`
+      could increment `nwrite` between `wc`'s two reads of the counters, and `wc` could act on
+      a condition that was already stale.
+
+  - title: Register on the channel while still holding the condition lock
+    file: kernel/proc.c
+    lines: 545-556
+    focus: 552-554
+    state:
+      hart: 2
+      mode: S
+      proc: wc (pid 5)
+      intr: off
+      satp: kernel
+      locks: ["pi->lock", "wc's p->lock"]
+      stack: [usertrap, syscall, sys_read, fileread, piperead, sleep_prepare]
+      sp: kernel
+      irq: {noff: 2, intena: 1}
+    note: |
+      `piperead` calls [[sleep_prepare]]`(&pi->nread)` on line 124, **before** it releases
+      `pi->lock`. `sleep_prepare` takes `wc`'s `p->lock` (the field `chan` is protected by
+      it, [[kernel/proc.h:87]]) and records the channel: `p->chan = &pi->nread`.
+
+      That is all. `wc` does not go to sleep here. Its state is still `RUNNING`. It has only
+      announced: "from now on, a wakeup on `&pi->nread` concerns me".
+
+      The timing is everything. At this moment `wc` holds `pi->lock`, so `cat` cannot have
+      changed the pipe since `wc` looked at it. Any `cat` that adds data must first acquire
+      `pi->lock`, which it can only do *after* `wc` releases it on the next line, which is
+      *after* `p->chan` is set. So any wakeup caused by new data is guaranteed to find
+      `wc` registered. The check and the registration are atomic with respect to the waker,
+      because the same lock covers both ([[concept:locks#sleep-wakeup]]).
+
+      A zero channel is forbidden (line 552): `p->chan == 0` is how [[wakeup]] says "you have
+      been woken", so 0 cannot also mean a real channel.
+    others: |
+      Two spinlocks are held, so `noff` on hart 2 is 2. Their order matters: `pi->lock`,
+      then `p->lock`. [[wakeup]], called by `cat` with `pi->lock` held, takes `p->lock`s in
+      the same order. No code anywhere in xv6 holds a `p->lock` and then asks for a pipe
+      lock, so this nesting can never form a cycle ([[tour:18]]).
+
+  - title: How older xv6 did it, by handing the lock to sleep
+    file: kernel/proc.c
+    lines: 545-572
+    focus: 552-554
+    state:
+      hart: 2
+      mode: S
+      proc: wc (pid 5)
+      intr: off
+      satp: kernel
+      locks: ["pi->lock", "wc's p->lock"]
+      stack: [usertrap, syscall, sys_read, fileread, piperead, sleep_prepare]
+      sp: kernel
+      irq: {noff: 2, intena: 1}
+    note: |
+      If you have read the xv6 book or an older xv6-riscv, you met a different `sleep`. It
+      took the channel *and the condition lock*. This is that older code, **not** the code
+      at this commit:
+
+      ```c
+      // older xv6 (not this version)
+      void sleep(void *chan, struct spinlock *lk) {
+        struct proc *p = myproc();
+        acquire(&p->lock);
+        release(lk);
+        p->chan = chan;
+        p->state = SLEEPING;
+        sched();
+        p->chan = 0;
+        release(&p->lock);
+        acquire(lk);
+      }
+      ```
+
+      and `piperead` called `sleep(&pi->nread, &pi->lock)`. The trick was a lock hand-over:
+      take `p->lock` *before* dropping `lk`, so there is no instant when the sleeper holds
+      neither. Since `wakeup` needed `p->lock` too, and the waker held `lk`, the waker ran
+      either entirely before the check or after the sleeper was fully asleep.
+
+      This version splits the job in two. [[sleep_prepare]] registers under `lk`; the caller
+      releases `lk` itself; [[sleep]] sleeps only if nobody has cleared the registration in
+      between. Same guarantee, but `sleep` no longer needs to know about any condition lock,
+      which, as you will see at the end, lets the UART driver sleep without having one.
+    others: |
+      In both designs the waker's `wakeup` must come *after* it changes the condition under
+      `lk`. Calling `wakeup` while still holding `lk` is not what makes either design
+      correct: in the new one, the registration already happened under `lk`, so any later
+      `wakeup` finds it. `pipewrite` calls `wakeup` with `pi->lock` held anyway, which is the
+      simplest way to be sure the condition change comes first. Older xv6's `wakeup` carried
+      the comment "Caller should hold the condition lock": a safe convention, but as shown
+      above, it is the condition change that must be under `lk`.
+
+  - title: The gap between release and sleep
+    file: kernel/pipe.c
+    lines: 118-128
+    focus: 126
+    state:
+      hart: 2
+      mode: S
+      proc: wc (pid 5)
+      intr: on
+      satp: kernel
+      locks: []
+      stack: [usertrap, syscall, sys_read, fileread, piperead]
+      sp: kernel
+      irq: 0
+    note: |
+      Line 125 releases `pi->lock`. `wc` now holds no lock at all, and interrupts are back on
+      on hart 2. Line 126 is about to call [[sleep]].
+
+      Between those two lines lies the dangerous gap. Anything can happen in it: `cat` on
+      hart 1 can grab the pipe lock, fill the pipe and call `wakeup`; a timer interrupt can
+      even make `wc` [[yield]] hart 2 and run again much later. In a naive design that is
+      exactly where the wakeup gets lost.
+
+      Here, it cannot be lost, because `wc` is already registered: whatever `wakeup` happens
+      in the gap clears `wc`'s `p->chan`. When `wc` finally enters `sleep()`, the first thing
+      `sleep` does is look at `p->chan`. Zero means "your event already happened", and
+      `sleep` returns without sleeping.
+
+      Why release the lock before sleeping at all? Because `cat` needs `pi->lock` to add the
+      data `wc` is waiting for. A sleeper that kept the condition lock would wait forever
+      for a waker that cannot get in.
+    others: |
+      Suppose `cat` strikes exactly in the gap:
+
+      | Time | Hart 0 | Hart 1 (cat) | Hart 2 (wc) |
+      |---|---|---|---|
+      | t1 | idle | spins on `pi->lock` | holds `pi->lock`; `sleep_prepare`: `chan = &pi->nread` |
+      | t2 | | gets `pi->lock` | `release(&pi->lock)` (line 125) |
+      | t3 | | copies 512 bytes, `wakeup(&pi->nread)`: `wc` is registered but `RUNNING`, so only `chan = 0` | between lines 125 and 126 |
+      | t4 | | `release(&pi->lock)` | `sleep()`: takes `p->lock`, sees `chan == 0`, returns at once |
+      | t5 | | | loops: takes `pi->lock`, finds 512 bytes |
+
+      Nothing is lost, and nobody slept.
+
+  - title: What the gap would do without registration
+    file: kernel/pipe.c
+    lines: 111-128
+    focus: 126
+    state:
+      hart: 2
+      mode: S
+      proc: wc (pid 5)
+      intr: on
+      satp: kernel
+      locks: []
+      stack: [usertrap, syscall, sys_read, fileread, piperead]
+      sp: kernel
+      irq: 0
+    note: |
+      To see what [[sleep_prepare]] buys, imagine a broken `piperead` that checks the
+      condition, releases the lock, and *then* registers and sleeps in one step, as a
+      careless designer might write:
+
+      ```c
+      // BROKEN, for illustration only
+      while (pi->nread == pi->nwrite && pi->writeopen) {
+        release(&pi->lock);
+        register_and_sleep(&pi->nread);   // hypothetical
+        acquire(&pi->lock);
+      }
+      ```
+
+      The window between the `release` and the registration is the classic
+      [[g:race-condition]]. It is tiny, a few dozen instructions, so the bug might appear
+      once in a million runs, and it would appear as a stall or a hang, not a crash: `wc`
+      stays asleep next to data until some later `wakeup(&pi->nread)` happens to rescue it.
+      With `cat`, one will come (its next write calls `wakeup` on line 89 or 105, and its
+      exit calls [[pipeclose]]), but a writer that sends one message and then waits for an
+      answer, on a second pipe, say, never calls `wakeup` again, and both processes hang
+      forever.
+
+      The real code moves the registration *inside* the critical section, which turns the
+      window into a harmless "already woken" state that [[sleep]] detects.
+    others: |
+      The losing interleaving with the broken code:
+
+      | Time | Hart 0 | Hart 1 (cat) | Hart 2 (wc) |
+      |---|---|---|---|
+      | t1 | idle | spins on `pi->lock` | sees the pipe empty, `release(&pi->lock)` |
+      | t2 | | writes 512 bytes, `wakeup(&pi->nread)`: **nobody is registered**, nothing happens | about to register |
+      | t3 | | returns to user space | registers on `&pi->nread`, sleeps |
+      | t4 | | returns to user space; waits for a reply on another pipe | asleep, with 512 bytes in the pipe |
+
+      If the writer never touches this pipe again, `wc` sleeps forever next to 512 bytes of
+      data.
+
+  - title: sleep, for real this time
+    file: kernel/proc.c
+    lines: 558-572
+    focus: 567-569
+    state:
+      hart: 2
+      mode: S
+      proc: wc (pid 5)
+      intr: off
+      satp: kernel
+      locks: ["wc's p->lock"]
+      stack: [usertrap, syscall, sys_read, fileread, piperead, sleep]
+      sp: kernel
+      irq: {noff: 1, intena: 1}
+    note: |
+      In our story `cat` is still waiting for the disk, so nothing has happened in the gap.
+      [[sleep]] takes `wc`'s `p->lock` (interrupts off again; they were on, so `push_off`
+      records `intena = 1`) and checks `p->chan`. It is
+      still `&pi->nread`: no wakeup yet. So `sleep` marks `wc` `SLEEPING` and calls
+      [[sched]].
+
+      Notice that the check of `p->chan` and the change to `SLEEPING` happen under the same
+      `p->lock` that [[wakeup]] must take to clear `p->chan`. So `wakeup` either runs
+      entirely before line 567 (and `sleep` returns at once) or entirely after `wc` has been
+      switched off the CPU. The window from step 5 is closed at both ends: at the start by
+      registering under `pi->lock`, at the end by deciding under `p->lock`.
+
+      `wc`'s state is now `SLEEPING` and `p->chan` names what it waits for. No scheduler on
+      any hart will pick it, because schedulers only run `RUNNABLE` processes.
+    others: |
+      Hart 1's `cat`, or any hart running [[wakeup]] for any channel, may reach `wc`'s slot
+      in the process table right now. It spins on `wc`'s `p->lock`, held here, and gets it
+      only after hart 2's scheduler releases it (step 9). By then `wc` is `SLEEPING` *and*
+      no longer running on hart 2, so the waker can safely make it runnable. See
+      [[tour:13]] for why `p->lock` stays held across the switch.
+
+  - title: sched insists on exactly one lock
+    file: kernel/proc.c
+    lines: 479-497
+    focus: 485-495
+    state:
+      hart: 2
+      mode: S
+      proc: wc (pid 5)
+      intr: off
+      satp: kernel
+      locks: ["wc's p->lock"]
+      stack: [usertrap, syscall, sys_read, fileread, piperead, sleep, sched]
+      sp: kernel
+      irq: {noff: 1, intena: 1}
+    note: |
+      [[sched]] runs four sanity checks before switching away. Line 487 is the one that
+      matters for sleeping: `mycpu()->noff` must be exactly 1. One spinlock held, and it
+      must be `p->lock` (line 485).
+
+      This is why `piperead` had to release `pi->lock` *itself* before calling `sleep()`, and
+      why this version's [[sleep]] takes no lock argument. Suppose `wc` went to sleep still
+      holding `pi->lock`:
+
+      - `cat` on hart 1 would call `acquire(&pi->lock)` and spin, with interrupts off, for
+        as long as `wc` sleeps.
+      - `wc` sleeps until someone writes to the pipe.
+      - The only someone is `cat`, spinning.
+
+      A [[g:deadlock]], and hart 1 would be lost too: with interrupts off it cannot even take
+      a timer interrupt to run something else. The `noff != 1` check turns that silent hang
+      into an immediate `panic("sched locks")`.
+
+      `p->lock` is the single exception, because [[swtch]] hands it to the scheduler, which
+      releases it ([[tour:13]]).
+      Before switching, `sched` also saves `wc`'s `intena` (1) in a callee-saved
+      register, so that whichever hart resumes `wc` gets it back
+      ([[concept:locks#sched-intena]]).
+    others: |
+      Sleep-locks are a different matter: holding one while asleep is allowed, because it is
+      not a spinlock and nobody spins on it ([[tour:17]]). `noff` counts only spinlocks.
+
+  - title: Hart 2's scheduler lets go of wc
+    file: kernel/proc.c
+    lines: 441-469
+    focus: 453-463
+    state:
+      hart: 2
+      mode: S
+      proc: none (hart 2's scheduler)
+      intr: off
+      satp: kernel
+      locks: ["wc's p->lock"]
+      stack: [main, scheduler]
+      sp:
+        "on": scheduler
+        switched: "`ld sp, 8(a1)` in [[swtch]] ([[kernel/swtch.S:26]])"
+      irq: {noff: 1, intena: 0, note: "after line 456: wc's intena 1 is safe in its saved s3; the scheduler's is 0"}
+    note: |
+      [[swtch]] saved `wc`'s registers into `wc`'s `p->context` and loaded hart 2's
+      scheduler context. Execution continues right after the `swtch` on line 453, where hart
+      2's [[scheduler]] last switched *to* `wc`.
+
+      The `ld sp` in `swtch` is where hart 2 changed stacks: from `wc`'s kernel stack to
+      its own scheduler stack, the 4 KiB slice of `stack0` it has used since boot
+      ([[concept:stacks#scheduler]]). `wc`'s kernel stack stays behind, frozen:
+
+      ```text
+      wc's kernel stack, while wc sleeps
+        top ─► usertrap
+               syscall
+               sys_read
+               fileread
+               piperead
+               sleep
+               sched     ◄─ wc->context.sp
+      ```
+
+      The scheduler sets `intena = 0` (line 456, so that this release leaves interrupts off:
+      [[concept:locks#sched-intena]]), clears `c->proc` and, on line 463, releases `wc`'s `p->lock`: the lock
+      that `wc` took in `sleep()`, carried across the switch, and released by a different
+      thread ([[concept:locks#handoff]]). From this instant `wc` is a sleeping process that any hart's [[wakeup]] can
+      inspect.
+
+      Then hart 2 goes looking for other work. `wc` uses no CPU at all while it waits. That
+      is the whole point of sleeping instead of spinning: three harts, and none of them is
+      burning cycles polling an empty pipe.
+    others: |
+      Process table right now:
+
+      | pid | Process | State | `chan` |
+      |---|---|---|---|
+      | 1 | init | `SLEEPING` | in `kwait` |
+      | 2 | sh | `SLEEPING` | in `kwait` |
+      | 3 | sh (pipeline) | `SLEEPING` | in `kwait` |
+      | 4 | cat | `SLEEPING`, waiting for the disk | the `buf` being read |
+      | 5 | wc | `SLEEPING` | `&pi->nread` |
+
+      (`cat` waits for the disk in [[virtio_disk_rw]], with the same
+      `sleep_prepare`/`sleep` pair, on channel `b`.) Every hart is idle until the disk
+      interrupts.
+
+  - title: cat arrives with data and takes the pipe lock
+    file: kernel/pipe.c
+    lines: 76-93
+    focus: 82-88
+    state:
+      hart: 1
+      mode: S
+      proc: cat (pid 4)
+      intr: off
+      satp: kernel
+      locks: ["pi->lock"]
+      stack: [usertrap, syscall, sys_write, filewrite, pipewrite]
+      sp: kernel
+      irq: {noff: 1, intena: 1}
+    note: |
+      The disk finishes, `cat` is woken and gets the first 512 bytes of `README` into its
+      `buf`. It calls `write(1, buf, 512)`, which reaches [[pipewrite]] on hart 1.
+
+      `pipewrite` acquires `pi->lock`, the same condition lock `wc` used. For each byte it
+      checks two things:
+
+      - Is the read end still open, and is `cat` not killed? Otherwise writing is pointless.
+        ([[killed]] takes `cat`'s `p->lock` under `pi->lock`: the same order as before.)
+      - Is the pipe full? `nwrite == nread + PIPESIZE` means 512 unread bytes are already
+        waiting. The counters are never reduced modulo 512; only the index into `data` is
+        (`% PIPESIZE`). So `nwrite - nread` is always the number of bytes in the pipe.
+
+      The pipe is empty, so `cat` takes the `else` branch for every one of its 512 bytes.
+    others: |
+      `wc` is asleep, so nothing contends for `pi->lock` now. Had `wc` been one instruction
+      before `sleep_prepare`, holding `pi->lock`, `cat` would be spinning here, and would get
+      the lock only after `wc` registered and released it: the ordering that step 3 relies
+      on.
+
+  - title: 512 bytes, one copyin each
+    file: kernel/pipe.c
+    lines: 83-104
+    focus: 94-103
+    state:
+      hart: 1
+      mode: S
+      proc: cat (pid 4)
+      intr: off
+      satp: kernel
+      locks: ["pi->lock"]
+      stack: [usertrap, syscall, sys_write, filewrite, pipewrite]
+      sp: kernel
+      irq: {noff: 1, intena: 1}
+    note: |
+      Each byte travels from `cat`'s user memory into the ring with its own [[copyin]] of
+      length 1, which walks `cat`'s page table by software. 512 page-table walks with a
+      spinlock held and interrupts off: simple rather than fast. After the loop, `nwrite` is
+      512 and `nread` is 0. The condition `wc` was waiting for is now false: the pipe is not
+      empty.
+
+      If [[copyin]] meets a page that was reserved lazily (with `sbrklazy`) and not yet
+      touched, it calls [[vmfault]], which calls [[kalloc]], which takes `kmem.lock`. So
+      the full nesting possible here is `pi->lock` → `kmem.lock`. `cat`'s `buf` is a global,
+      allocated eagerly when `exec` loaded the program, so in our run that does not happen.
+
+      Holding a spinlock while copying from user memory is fine because `copyin` never
+      sleeps: a bad address makes it return -1 (line 96), it does not wait for anything.
+    others: |
+      If `wc` had been woken by something else (a kill, say) and tried to read now, it would
+      spin on `pi->lock` on its hart until all 512 bytes are in. Readers therefore never see
+      a half-written batch from one `pipewrite` call, which is why a pipe write of up to
+      512 bytes arrives in one piece for the reader. (Simplified: a write larger than the
+      free space is split, as step 14 shows.)
+
+  - title: wakeup, with the condition lock still held
+    file: kernel/pipe.c
+    lines: 94-109
+    focus: 105-106
+    state:
+      hart: 1
+      mode: S
+      proc: cat (pid 4)
+      intr: off
+      satp: kernel
+      locks: ["pi->lock"]
+      stack: [usertrap, syscall, sys_write, filewrite, pipewrite]
+      sp: kernel
+      irq: {noff: 1, intena: 1}
+    note: |
+      Having made the condition false ("pipe empty"), `cat` announces it:
+      `wakeup(&pi->nread)`. Then it releases `pi->lock` and returns 512.
+
+      `pipewrite` calls [[wakeup]] *before* `release`. As step 4 explained, this version
+      would also be correct with the two lines swapped, because `wc` registered under the
+      lock. Calling it with the lock held is still the conventional, easy-to-check pattern:
+      the condition change and the announcement form one critical section.
+
+      Note that `cat` does not know whether anyone is waiting, and does not care. It calls
+      `wakeup` on every write. If nobody is registered on `&pi->nread`, `wakeup` changes
+      nothing. That is cheap insurance: xv6 does not keep a "number of waiters" counter that
+      could itself be got wrong.
+    others: |
+      The 512 bytes are now visible to any hart that takes `pi->lock` after `cat` releases
+      it. The release's `fence rw,w` ([[tour:15]], [[tour:19]]) makes sure the stores into
+      `data` and `nwrite` are visible before the lock appears free, so `wc` can never see the
+      new `nwrite` with stale bytes in `data`.
+
+  - title: wakeup visits every process, under each one's lock
+    file: kernel/proc.c
+    lines: 574-595
+    focus: 580-594
+    state:
+      hart: 1
+      mode: S
+      proc: cat (pid 4)
+      intr: off
+      satp: kernel
+      locks: ["pi->lock", "each p->lock in turn"]
+      stack: [usertrap, syscall, sys_write, filewrite, pipewrite, wakeup]
+      sp: kernel
+      irq: {noff: 2, intena: 1}
+    note: |
+      [[wakeup]] walks all 64 slots of the process table. For each, it takes that process's
+      `p->lock` and compares `p->chan` with `&pi->nread`. Under that lock a registered
+      process is always in one of three clean states:
+
+      1. **Not registered** on this channel: skipped.
+      2. **Registered but not asleep**: in the gap of step 5 (`RUNNING`, or `RUNNABLE` if a
+         timer made it yield there). `wakeup` clears `p->chan` only; its next `sleep()`
+         returns at once.
+      3. **Fully asleep**: `SLEEPING`, registers saved by [[swtch]], `p->lock` released by
+         its hart's scheduler. `wakeup` clears `p->chan` and sets `RUNNABLE`.
+
+      `wc` is in state 3. It becomes `RUNNABLE`: eligible to run, not running. (The source
+      comment on line 588 says "RUNNING"; the code correctly sets `RUNNABLE`.)
+
+      `wakeup` wakes **every** process registered on the channel, not just one. Whoever runs
+      first wins; the rest must cope (step 18).
+    others: |
+      `wakeup` even takes `cat`'s own `p->lock` when it reaches slot 4, which is safe because
+      `cat` does not hold it. Slots for `init`, both shells, and the 59 unused entries are
+      locked, checked and unlocked too: 64 lock round trips for every pipe write. The order
+      is always `pi->lock` then one `p->lock`; never two `p->lock`s at once.
+
+  - title: cat's next write finds the pipe full
+    file: kernel/pipe.c
+    lines: 76-93
+    focus: 88-90
+    state:
+      hart: 1
+      mode: S
+      proc: cat (pid 4)
+      intr: off
+      satp: kernel
+      locks: ["pi->lock"]
+      stack: [usertrap, syscall, sys_write, filewrite, pipewrite]
+      sp: kernel
+      irq: {noff: 1, intena: 1}
+    note: |
+      `cat` returns to user space, reads the next 512 bytes of `README` (block 48 already
+      held all of the first 1024 bytes, so this one is a cache hit), and writes again. Suppose
+      `wc` has not run yet. Now `nwrite == nread + 512`: the pipe is full, and this time
+      `cat` must wait, on the other channel, `&pi->nwrite`.
+
+      The same pattern, mirrored:
+
+      1. `wakeup(&pi->nread)`: make sure a reader knows there is data. (Here `wc` is already
+         `RUNNABLE` with `chan == 0`, so this changes nothing.)
+      2. [[sleep_prepare]]`(&pi->nwrite)` under `pi->lock` (the highlighted line; inside it,
+         `cat` briefly holds its `p->lock` too, nested inside `pi->lock`, as in step 3).
+      3. Release `pi->lock`, `sleep()`, re-acquire, loop.
+
+      The first `wakeup` matters when the writer sleeps in the middle of a large write. Without
+      it, a writer could fill the pipe and sleep without ever telling a reader, and the two
+      would wait for each other.
+    others: |
+      `wc` is `RUNNABLE` at this moment but not running: no scheduler has reached its slot
+      yet. If some hart already runs `wc` and `wc` is spinning on `pi->lock`, it gets the lock as soon
+      as `cat` releases it on line 91, and `cat`'s registration on `&pi->nwrite` is already
+      in place to catch `wc`'s wakeup.
+
+  - title: Hart 0 picks up wc
+    file: kernel/proc.c
+    lines: 441-463
+    focus: 447-453
+    state:
+      hart: 0
+      mode: S
+      proc: none (hart 0's scheduler)
+      intr: off
+      satp: kernel
+      locks: ["wc's p->lock"]
+      stack: [main, scheduler]
+      sp: scheduler
+      irq: {noff: 1, intena: 0}
+    note: |
+      Hart 0 was idle in `wfi`. [[wakeup]] does not signal idle harts; hart 0 notices only
+      when its next interrupt (usually its own timer tick, up to a tenth of a second later in
+      QEMU) ends the `wfi`. In this telling that tick happens to come now: it loops, and its
+      [[scheduler]] scans the table. At slot 5 it takes `wc`'s `p->lock`, sees `RUNNABLE`, marks it `RUNNING`,
+      sets `c->proc` and calls [[swtch]] into `wc`'s saved context.
+
+      Until that `swtch`'s `ld sp`, hart 0 is on its own scheduler stack; after it, on `wc`'s
+      kernel stack. `wc` went to sleep on hart 2 and wakes up on hart 0. Nothing in its kernel stack cares:
+      the call chain `usertrap → … → piperead → sleep → sched` is intact, saved on `wc`'s own
+      [[g:kernel-stack]] ([[tour:12]]).
+
+      Which hart picks `wc` is a matter of timing. In practice hart 1 is a strong candidate:
+      the moment `cat` sleeps, hart 1's scheduler continues its scan at `wc`'s slot. But
+      nothing in `sleep` remembers "my hart".
+    others: |
+      Could two schedulers both pick `wc`? No: each one must hold `wc`'s `p->lock` to read
+      `RUNNABLE` and write `RUNNING`, so whoever gets the lock first changes the state, and
+      the other sees `RUNNING` and moves on.
+
+  - title: sleep returns on a different hart
+    file: kernel/proc.c
+    lines: 558-572
+    focus: 569-570
+    state:
+      hart: 0
+      mode: S
+      proc: wc (pid 5)
+      intr: off
+      satp: kernel
+      locks: ["wc's p->lock"]
+      stack: [usertrap, syscall, sys_read, fileread, piperead, sleep]
+      sp:
+        "on": kernel
+        switched: "`ld sp, 8(a1)` in [[swtch]] ([[kernel/swtch.S:26]]), called by hart 0's scheduler"
+        detail: "the frames `wc` left on hart 2, unchanged"
+      irq: {noff: 1, intena: 1, note: "sched's line 496 restored wc's intena, 1, on hart 0"}
+    note: |
+      [[sched]] returns into [[sleep]], on hart 0, holding the `p->lock` that hart 0's
+      scheduler acquired. Line 571 releases it, and interrupts come back on as `noff` drops
+      to 0 (`sched` restored the `intena` that `wc` had when it slept,
+      [[kernel/proc.c:496]], [[concept:locks#sched-intena]]).
+
+      `sleep` does **not** clear `p->chan`: [[wakeup]] already did that, and in the kill case
+      (step 19) leaving it set is harmless because the next `sleep()` will be preceded by a
+      fresh `sleep_prepare`.
+
+      And `sleep` returns no information. It does not say *why* `wc` woke up, or whether the
+      pipe now has data. `wc` must find out for itself, under `pi->lock`.
+    others: |
+      In the old design `sleep` re-acquired the condition lock before returning. Here
+      `piperead` does that itself on the next line, [[kernel/pipe.c:127]]. If `cat` still
+      holds `pi->lock` on hart 1 (it may be in the middle of step 14), `wc` spins briefly on
+      hart 0.
+
+  - title: Re-check the condition, then take the bytes
+    file: kernel/pipe.c
+    lines: 118-142
+    focus: 129-140
+    state:
+      hart: 0
+      mode: S
+      proc: wc (pid 5)
+      intr: off
+      satp: kernel
+      locks: ["pi->lock"]
+      stack: [usertrap, syscall, sys_read, fileread, piperead]
+      sp: kernel
+      irq: {noff: 1, intena: 1}
+    note: |
+      `wc` re-acquires `pi->lock` and goes back to the top of the `while`: is the pipe still
+      empty? No: `nwrite - nread == 512`. The loop exits and the copy loop moves up to 512
+      bytes to `wc`'s `buf` with [[copyout]], one byte at a time, advancing `nread`. (Like
+      `copyin`, `copyout` could call [[kalloc]] under `pi->lock` for a lazily reserved
+      page.)
+
+      Then `wakeup(&pi->nwrite)`: the pipe has room again, and `cat`, asleep on that channel
+      since step 14, becomes `RUNNABLE`. Both directions of the pipe use the same handshake,
+      with the roles swapped.
+
+      `read` returns 512. `wc` counts those bytes in user space and calls `read` again. The
+      dance repeats until `README`'s 2441 bytes are through. When `cat` exits, closing the
+      last write end, [[pipeclose]] sets `writeopen = 0` and calls `wakeup(&pi->nread)`, so
+      a `wc` waiting on an empty pipe wakes, sees `writeopen == 0`, and returns 0: end of
+      file.
+    others: |
+      | Time | Hart 0 (wc) | Hart 1 (cat) | Hart 2 |
+      |---|---|---|---|
+      | t1 | spins on `pi->lock` | holds it: full pipe, `sleep_prepare(&pi->nwrite)` | idle |
+      | t2 | gets `pi->lock` | `release`, `sleep()`: `SLEEPING` | |
+      | t3 | copies 512 bytes, `wakeup(&pi->nwrite)`: `cat` → `RUNNABLE` | | |
+      | t4 | `release`, returns 512 | a scheduler (hart 1's, most likely) picks `cat` | |
+
+  - title: Why every sleep sits in a while loop
+    file: kernel/pipe.c
+    lines: 111-128
+    focus: 119
+    state:
+      hart: 0
+      mode: S
+      proc: wc (pid 5)
+      intr: off
+      satp: kernel
+      locks: ["pi->lock"]
+      stack: [usertrap, syscall, sys_read, fileread, piperead]
+      sp: kernel
+      irq: {noff: 1, intena: 1}
+    note: |
+      Line 119 is a `while`, not an `if`. A wakeup means "something happened on this
+      channel", never "your condition is now true". There are several ways `wc` can come out
+      of `sleep()` with the pipe still empty:
+
+      - **Several readers.** If two processes read the same pipe, `wakeup(&pi->nread)` wakes
+        both. The first to get `pi->lock` takes all the data; the second finds the pipe empty
+        again and must go back to sleep.
+      - **Kill.** [[kkill]] makes a sleeping victim `RUNNABLE` without any event at all
+        (next step).
+      - **Shared channels.** One channel can stand for several conditions. [[begin_op]] waits
+        on `&log` both for a commit to finish and for log space to free up.
+      - **Wakeups without data.** `pipewrite` calls `wakeup(&pi->nread)` on line 105 even
+        when it copied nothing: for `write(fd, buf, 0)`, or when the very first `copyin`
+        fails.
+
+      So the rule throughout xv6: re-acquire the condition lock, re-test the condition, and
+      sleep again if it does not hold. A wakeup that turns out to be useless costs one loop;
+      trusting it could cost correctness.
+    others: |
+      Two readers, same pipe:
+
+      | Time | Hart 0 (reader A) | Hart 1 (writer) | Hart 2 (reader B) |
+      |---|---|---|---|
+      | t1 | asleep on `&pi->nread` | writes 5 bytes, `wakeup`: A and B → `RUNNABLE` | asleep on `&pi->nread` |
+      | t2 | takes `pi->lock`, reads all 5 | | spins on `pi->lock` |
+      | t3 | releases | | gets it: `nread == nwrite` again, so `while` sends B back to sleep |
+
+  - title: A kill is a wakeup with no event
+    file: kernel/proc.c
+    lines: 597-622
+    focus: 610-616
+    state:
+      hart: any
+      mode: S
+      proc: some process calling kill(5)
+      intr: off
+      satp: kernel
+      locks: ["wc's p->lock"]
+      stack: [usertrap, syscall, sys_kill, kkill]
+      sp: kernel
+      irq: {noff: 1, intena: 1}
+    note: |
+      Suppose some process calls `kill(5)` while `wc` sleeps on an empty pipe. [[kkill]]
+      takes `wc`'s `p->lock`, sets `killed = 1` and, because `wc` is `SLEEPING`, makes it
+      `RUNNABLE`. It does **not** clear `p->chan`. No data arrived; the "wakeup" is fake.
+
+      `wc` returns from `sleep()` with `p->chan` still `&pi->nread`. That stale value is
+      harmless: a later `wakeup(&pi->nread)` would clear it without changing `wc`'s state
+      (state 2 of step 13), and the next `sleep()` is always preceded by a new
+      `sleep_prepare`, which overwrites it.
+
+      Back in `piperead`, the `while` re-tests: the pipe is still empty, so it goes round
+      again, and line 120's [[killed]] check sees the flag and returns -1. `wc` then dies on
+      its way back to user space ([[kernel/trap.c:81]]). This is why the `killed` test sits
+      *inside* the loop, before each sleep, not once at the top.
+    others: |
+      Without the loop's re-check, the copy loop's own test (line 130) would stop at once and
+      `piperead` would return 0, which a reader takes as end of file even though `cat` still
+      holds the write end. (A killed `wc` dies before user space sees it, but a reader woken
+      by a competing reader would see a false EOF.) Without the `killed` test inside the loop, a killed `wc` would
+      go straight back to sleep and might never exit if no writer ever comes. See
+      [[tour:23]].
+
+  - title: One channel, two conditions in begin_op
+    file: kernel/log.c
+    lines: 127-150
+    focus: 138
+    state:
+      hart: any
+      mode: S
+      proc: any process starting a file-system call
+      intr: off
+      satp: kernel
+      locks: ["log.lock"]
+      stack: [usertrap, syscall, sys_open, begin_op]
+      sp: kernel
+      irq: {noff: 1, intena: 1}
+    note: |
+      The same pattern appears all over xv6, and [[begin_op]] shows why the loop must
+      re-test *everything*. A file-system call may not start while a commit is in progress
+      (line 133), nor if its worst-case writes might overflow the log (line 138). Both waits
+      use the single channel `&log`, under the condition lock `log.lock`.
+
+      [[end_op]] calls `wakeup(&log)` in two situations: after a commit finishes, and when
+      a call ends without committing, freeing reserved space. Either one wakes every
+      sleeper in `begin_op`, whatever it was waiting for. A process woken because a
+      commit finished may find that the log is still too full; a process woken because space
+      freed may find that a commit has started meanwhile. The `while (1)` re-runs both
+      tests and sleeps again if needed. ([[sys_sync]] waits on `&log` too, for a commit to
+      complete, so one channel actually serves three waits.)
+
+      Using one channel for two conditions is a deliberate simplification. It costs some
+      useless wakeups and buys simpler code; the loop keeps it correct. ([[tour:31]] covers
+      the log itself.)
+    others: |
+      Many processes can sleep on `&log` at once. When `end_op` wakes them, they race for
+      `log.lock`, and each reserves its own space in turn under it. Without the lock, two
+      processes could both see room for one more operation and both take it.
+
+  - title: The UART sleeps with no condition lock
+    file: kernel/uart.c
+    lines: 76-96
+    focus: 84-93
+    state:
+      hart: 0
+      mode: S
+      proc: wc (pid 5)
+      intr: on
+      satp: kernel
+      locks: ["tx_lock (sleep-lock)"]
+      stack: [usertrap, syscall, sys_write, filewrite, consolewrite, uartwrite]
+      sp: kernel
+      irq: 0
+    note: |
+      `wc` finishes counting and prints `48 336 2441 ` and a newline. User `printf` writes
+      one character per `write` call ([[user/printf.c:12]]), so that is 13 trips into
+      [[uartwrite]], each with `n = 1`.
+
+      Here the "condition" is a bit in a device register, `LSR_TX_IDLE`. No kernel lock
+      protects it: the UART changes it whenever it finishes sending, and the waker is
+      [[uartintr]], an interrupt handler that may run on any hart. There is no condition lock
+      to hold across the check.
+
+      The split design handles it by ordering alone: [[sleep_prepare]]`(&tx_chan)` first,
+      *then* read `LSR`. If the transmitter becomes idle after the read, its interrupt comes
+      after the registration, so the wakeup clears `p->chan` and `sleep()` returns at once.
+      The older `sleep(chan, lk)` needed a lock to hand over, so the older driver kept a
+      software copy of the device state (a `tx_busy` flag) under a `tx_lock` spinlock that the
+      interrupt handler also took. The split design lets `uartwrite` test the hardware bit
+      directly, with no condition lock ([[concept:locks#sleep-wakeup]]). [[tour:5]] walks through this exact loop.
+
+      When `LSR` says idle, `uartwrite` writes the byte and never sleeps, leaving `p->chan`
+      set to `&tx_chan`. That stale registration is harmless, for the same reason as after a
+      kill: every `sleep()` is preceded by a fresh `sleep_prepare`.
+    others: |
+      A UART interrupt on hart 1 or 2 may run `wakeup(&tx_chan)` while `wc` still has the
+      stale `chan`. `wakeup` takes `wc`'s `p->lock`, sees `RUNNING`, clears `chan`, and
+      leaves the state alone: state 2 of step 13. The only cost is the wasted work.
+
+  - title: What it took
+    file: user/wc.c
+    lines: 8-34
+    focus: 33
+    state:
+      hart: 0
+      mode: U
+      proc: wc (pid 5)
+      intr: on
+      satp: user
+      locks: []
+      stack: [main, wc]
+      sp:
+        "on": user
+        switched: "`ld sp, 48(a0)` in [[kernel:userret]] ([[kernel/trampoline.S:118]]) and `sret` ([[kernel/trampoline.S:153]])"
+    note: |
+      `wc` has counted `README`: 48 lines, 336 words, 2441 bytes. At least five `read`s of the pipe
+      returned data; each could have gone to sleep, been woken from another hart, and
+      resumed on a third.
+
+      The key ideas:
+
+      - **Register before you release.** [[sleep_prepare]] records the channel while the
+        condition lock is held, so a wakeup can never slip between the check and the
+        registration.
+      - **Decide under `p->lock`.** [[sleep]] sleeps only if `p->chan` is still set, checked
+        under the lock [[wakeup]] also takes. A wakeup in the gap becomes "return at once".
+      - **Only `p->lock` across the switch.** [[sched]] panics if any other spinlock is
+        held, because a sleeping spinlock holder would freeze every hart that wants it.
+      - **Wakeups are hints.** Every sleep sits in a loop that re-tests the condition and
+        the `killed` flag.
+
+      Older xv6 got the first two by passing the condition lock into `sleep`. This version
+      splits the work, which costs one extra `p->lock` round trip per sleep and buys a
+      `sleep` that does not need a lock at all, as `uartwrite` shows. [[tour:39]] follows
+      pipes further; [[tour:17]] builds sleep-locks on top of this primitive.
+locks:
+  - lock: "pi->lock (spinlock)"
+    where: "[[piperead]], [[pipewrite]], [[pipeclose]]"
+    protects: "The pipe's `data`, `nread`, `nwrite`, `readopen`, `writeopen`: the condition both sides test"
+  - lock: "p->lock (spinlock)"
+    where: "[[sleep_prepare]], [[sleep]], [[wakeup]], [[killed]], [[kkill]], the schedulers"
+    protects: "`p->chan` and `p->state`: whether a process is registered, asleep, runnable or running. Always taken after `pi->lock`, never before"
+  - lock: "kmem.lock (spinlock)"
+    where: "[[kalloc]], only if [[copyin]] or [[copyout]] meets a lazily reserved page"
+    protects: "The free-page list; taken under `pi->lock` in that case"
+  - lock: "log.lock (spinlock)"
+    where: "[[begin_op]], [[end_op]]"
+    protects: "`log.committing`, `log.outstanding`, `log.lh.n`: two conditions sharing channel `&log`"
+  - lock: "tx_lock (sleep-lock)"
+    where: "[[uartwrite]]"
+    protects: "The UART transmitter, one writer at a time"
+  - lock: "no lock: the UART's LSR_TX_IDLE bit"
+    where: "[[uartwrite]], [[uartintr]]"
+    protects: "Nothing can lock a device register; register-before-check ordering prevents the lost wakeup instead"
+quiz:
+  - q: "In `piperead`, what could go wrong if `sleep_prepare(&pi->nread)` were moved to just after `release(&pi->lock)`?"
+    a: "`cat` could take `pi->lock` in between, add data and call `wakeup(&pi->nread)` while `wc` is not yet registered. The wakeup finds nobody, `wc` then registers and sleeps, and it is never woken although the pipe holds data: a lost wakeup."
+  - q: "`cat` calls `wakeup(&pi->nread)` while `wc` is between lines 125 and 126 of `pipe.c`, registered but still `RUNNING`. Trace what happens to `wc`."
+    a: "[[wakeup]] takes `wc`'s `p->lock`, sees `p->chan == &pi->nread`, clears it to 0, and leaves the state `RUNNING`. When `wc` calls `sleep()`, it sees `p->chan == 0` under `p->lock` and returns immediately; the `while` loop re-takes `pi->lock` and finds the data."
+  - q: "Why must `piperead` release `pi->lock` before calling `sleep()`, and what does `sched` do if it doesn't?"
+    a: "The writer needs `pi->lock` to add data; a sleeper holding it would leave the writer spinning forever with interrupts off, a deadlock. `sched` checks that exactly one spinlock (`p->lock`) is held (`noff == 1`) and panics with `sched locks` otherwise."
+  - q: "`wakeup` sets a process `RUNNABLE` only if it is `SLEEPING`, but it clears `p->chan` in every matching case. Why is clearing the channel alone enough for a process that has not gone to sleep yet?"
+    a: "Such a process will call `sleep()`, which decides under `p->lock` whether to sleep by testing `p->chan`. Seeing 0, it knows the event already happened and returns at once, so the wakeup is not lost even though the process was not yet asleep."
+  - q: "`uartwrite` sleeps without holding any condition lock. Why is that safe, and what did the older `sleep(chan, lk)` force the driver to do instead?"
+    a: "It registers on `&tx_chan` before reading `LSR`, so any interrupt that follows the transmitter becoming idle finds it registered and clears `p->chan`. The old `sleep` needed a lock to hand over, so the older driver kept a software `tx_busy` flag under a `tx_lock` spinlock that the interrupt handler also took; the split design tests the hardware bit directly."
+  - q: "Give two reasons why `wc` might return from `sleep()` in `piperead` while the pipe is still empty."
+    a: "A second reader of the same pipe may have been woken by the same `wakeup` and taken the data first; or [[kkill]] made `wc` `RUNNABLE` without any data. (Or a writer called `write` with 0 bytes, or a bad address, and line 105's `wakeup` fired with no data.) The `while` loop re-tests the condition and the `killed` flag."

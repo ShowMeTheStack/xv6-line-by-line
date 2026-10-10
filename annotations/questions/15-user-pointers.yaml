@@ -1,0 +1,759 @@
+title: "User pointers: copyin, copyout, arguments"
+summary: How the kernel reads system-call arguments from the trapframe and copies user memory in and out by walking the process's page table in software, page by page, so that a bad pointer becomes -1 instead of a kernel crash.
+questions:
+  - id: uptr-01
+    level: 1
+    type: choice
+    q: |
+      `cat` calls `open("README", 0)`, and in the kernel the saved `a0` is `0x3fe0`, the
+      address of the string in `cat`'s memory. Why can't [[sys_open]] simply cast that number
+      to `char *` and read the name through it?
+    options:
+      - text: The hart is running on the kernel page table, where 0x3fe0 is not cat's memory; the address only has a meaning in cat's own page table.
+        correct: true
+        why: |
+          After the trap, `satp` holds the kernel page table. In it, `0x3fe0` is unmapped, so a
+          load would fault in supervisor mode and [[kerneltrap]] would panic. Worse, some user
+          addresses (such as `0x80000000`) *are* mapped in the kernel table, to the kernel's own
+          code. The kernel must translate the number through `cat`'s page table instead.
+      - text: argaddr has already copied the string into the kernel, so reading it again would be wasted work.
+        why: |
+          You may have thought [[argaddr]] fetches what the pointer points to. It copies only the
+          64-bit *number* out of the trapframe. Nothing has read the string yet; that is the job of
+          [[fetchstr]] and [[copyinstr]].
+      - text: User pages may be out on disk, and only copyinstr knows how to bring them back.
+        why: |
+          You may be thinking of kernels that page user memory to disk. xv6 never does: every
+          mapped user page is in RAM. The only "missing" pages are lazily allocated `sbrk` pages,
+          which [[vmfault]] creates on the spot.
+      - text: 0x3fe0 is a physical address, and kernel code can only use virtual addresses.
+        why: |
+          You may have mixed up the two directions. `0x3fe0` is a *virtual* address in `cat`'s
+          address space. The physical address is what the kernel obtains by translating it, and
+          that one it *can* use, through the direct map.
+    explain: |
+      A user pointer is a number that means something only in the user's page table, and the
+      kernel runs with a different one. So every user address goes through [[walkaddr]] on
+      `p->pagetable`, inside [[copyin]], [[copyout]] or [[copyinstr]]. See [[tour:6]] and
+      [[tour:28]].
+
+  - id: uptr-02
+    level: 1
+    type: multi
+    q: |
+      A user program passes garbage in every argument register. Which of these functions
+      *reject* a bad user-supplied value themselves, by returning -1?
+    options:
+      - text: "[[argfd]]"
+        correct: true
+        why: It checks `fd < 0 || fd >= NOFILE || ofile[fd] == 0` before using the descriptor ([[kernel/sysfile.c:28]]).
+      - text: "[[fetchaddr]]"
+        correct: true
+        why: It checks the address against `p->sz` (two tests, for overflow) and then lets [[copyin]] check the page.
+      - text: "[[copyinstr]]"
+        correct: true
+        why: It returns -1 when a page is not a user page, lies beyond `p->sz`, or no NUL appears within `max` bytes.
+      - text: "[[argaddr]]"
+        why: |
+          You may have expected the function that fetches a pointer to validate it. It returns
+          `void` and stores any 64-bit number unchanged; the comment above it says the copy
+          routines do the checking ([[kernel/syscall.c:63]]).
+      - text: "[[argint]]"
+        why: |
+          You may have thought argint range-checks integers. It cannot know what range is legal;
+          it stores the low 32 bits of the saved register, and each caller checks the value where
+          it is used (argfd for descriptors, for example).
+    explain: |
+      The fetching helpers ([[argraw]], [[argint]], [[argaddr]]) never judge a value. The code
+      that knows what a value *means* checks it: [[argfd]] for descriptors, the copy routines for
+      addresses, at the moment they touch each page ([[tour:6]]).
+
+  - id: uptr-03
+    level: 1
+    type: line
+    q: |
+      `cat`'s page table maps the trapframe page and the stack guard page, both without
+      `PTE_U`. Click the line in [[walkaddr]] that stops the kernel from copying into or out of
+      such pages on a user's behalf.
+    code: kernel/vm.c:118-139
+    answer: 135
+    lines:
+      127: |
+        You may have picked the first check you saw. `va >= MAXVA` rejects addresses beyond the
+        top of the page table; the trapframe and the guard page are well below `MAXVA`.
+      131: |
+        This catches addresses with no page-table path at all. The trapframe and guard page
+        *do* have a leaf PTE, so `walk` returns non-zero for them.
+      133: |
+        You may have thought those pages are invalid. Their PTEs have `PTE_V` set: they are
+        really mapped, just not for user mode.
+      137: |
+        This line only extracts the physical address. By the time it runs, every check has
+        passed.
+    why_wrong: Look for the test of the bit that says "user mode may touch this page".
+    explain: |
+      Line 135 returns 0 when `PTE_U` is clear. The hardware enforces `PTE_U` only for user-mode
+      accesses; the kernel, translating in software, must apply the same rule itself, or
+      `read(fd, (char *)TRAPFRAME, n)` would let a program overwrite its own trapframe
+      ([[tour:6]], [[g:trapframe]]).
+
+  - id: uptr-04
+    level: 2
+    type: number
+    q: |
+      [[sys_open]] calls `argstr(0, path, MAXPATH)` with `char path[MAXPATH]` and `MAXPATH` =
+      128. What is the longest path, in characters *not counting* the NUL, that this call
+      accepts?
+    code: kernel/vm.c:411-452
+    answer: 127
+    wrong:
+      128: |
+        You may have forgotten that the NUL must also fit within `max`. With 128 non-NUL bytes,
+        the inner loop copies all 128, `max` reaches 0 before a NUL is seen, and copyinstr returns
+        -1.
+      129: |
+        You may have thought `max` limits only the characters and the NUL is extra. `max` counts
+        every byte written to `dst`, including the terminator; `path` has room for 128 in all.
+      126: |
+        You may have reserved room for the NUL twice. A 127-character string uses bytes 0-126 and
+        its NUL lands in byte 127, which is exactly the last byte of `path`.
+    why_wrong: Count how many bytes copyinstr writes into dst, terminator included, before max reaches 0.
+    explain: |
+      Each copied character decrements `max`. After 127 characters `max` is 1, so the loop can
+      still look at one more byte; if it is `'\0'`, it is written and `got_null` is set. A
+      128-character string exhausts `max` first and fails, without writing a NUL past the end of
+      `path` ([[user:copyinstr2]], [[tour:6]]).
+
+  - id: uptr-05
+    level: 2
+    type: multi
+    q: |
+      `cat` has `p->sz = 0x4000`, laid out as in [[tour:6]]: code and data at `0x0000`-`0x1fff`,
+      the guard page at `0x2000` (mapped, no `PTE_U`), and the stack page at `0x3000`, which
+      holds `"README\0"` at `0x3fe0` and `"cat\0"` at `0x3ff0`. For which of these addresses,
+      passed as the `open` path, does [[copyinstr]] return -1?
+    options:
+      - text: "`0x2f00`"
+        correct: true
+        why: Inside the guard page. [[walkaddr]] refuses it (no `PTE_U`), and [[vmfault]] refuses too, because [[ismapped]] finds its valid PTE.
+      - text: "`0x3fffffe000` (TRAPFRAME)"
+        correct: true
+        why: The trapframe page is mapped without `PTE_U`, so walkaddr returns 0, and vmfault refuses because the address is far above `p->sz`.
+      - text: "`0x4000`"
+        correct: true
+        why: This is `p->sz` itself, the first byte the process does not own. Nothing is mapped there, and vmfault refuses because `va >= psz`.
+      - text: "`0x3fe0`"
+        why: |
+          This is the legitimate case: a user page with `PTE_U`, holding a NUL-terminated string.
+          copyinstr copies `README` and returns 0.
+      - text: "`0x3ff0`"
+        why: |
+          You may have thought only the "intended" argument is accepted. The kernel cannot know
+          which string the program meant; `"cat\0"` is valid user memory, so copyinstr succeeds
+          (and `open` then looks for a file called `cat`).
+    explain: |
+      copyinstr accepts any address whose page is a valid `PTE_U` page (or a lazy page below
+      `p->sz`) and whose string ends within `max` bytes. The guard page, the trapframe and
+      anything at or beyond `p->sz` fail cleanly with -1 ([[walkaddr]], [[vmfault]],
+      [[tour:6]]).
+
+  - id: uptr-06
+    level: 3
+    type: choice
+    q: |
+      [[pipewrite]] calls [[copyin]] once per byte *while holding `pi->lock`*, a spinlock. Why
+      is that allowed?
+    code: kernel/pipe.c:77-109@94-100
+    options:
+      - text: copyin never sleeps; its slowest path, vmfault calling kalloc, only takes another spinlock briefly.
+        correct: true
+        why: |
+          A spinlock holder must not sleep ([[sched]] panics unless only `p->lock` is held). The
+          page walk is pure computation, and a lazy page costs one [[kalloc]], which holds
+          `kmem.lock` for a few instructions. Nothing in copyin waits for a disk or another
+          process.
+      - text: pi->lock is really a sleep-lock, so sleeping while holding it would be fine.
+        why: |
+          You may have confused it with the inode and buffer locks. `pi->lock` is a
+          `struct spinlock`, taken with [[acquire]]; interrupts are off while it is held.
+      - text: copyin turns interrupts back on, so the lock is effectively released while it copies.
+        why: |
+          You may have thought copyin manages interrupts. It never touches `sstatus`; while
+          `pi->lock` is held, noff is at least 1 and SIE stays off for the whole copy.
+      - text: User memory can never be missing, so copyin cannot fail while the lock is held.
+        why: |
+          It can fail, and pipewrite handles that (lines 96-99). Failing is not the danger;
+          sleeping would be. A failed copy just returns -1 quickly.
+    explain: |
+      The question to ask of any call made under a spinlock is "can it sleep?". copyin cannot:
+      it walks page tables and at worst allocates one page. If copying user memory could wait for
+      the disk, as in kernels that page to disk, this code would be a bug ([[tour:6]],
+      [[concept:locks#rules]]).
+
+  - id: uptr-07
+    level: 2
+    type: tf
+    q: |
+      True or false: a user program can make `read(fd, (char *)main, 100)` overwrite its own
+      code with file data, because the code page has `PTE_U` and lies below `p->sz`.
+    answer: false
+    why_tf: |
+      You may have thought `PTE_U` plus "below p->sz" is all the kernel checks. For a copy *into*
+      user memory, [[copyout]] also requires `PTE_W`.
+    reasons:
+      - text: "copyout checks the leaf PTE for `PTE_W` (vm.c:364), and code pages are mapped by exec without `PTE_W`, so the copy returns -1."
+        correct: true
+        why: |
+          [[flags2perm]] gives the text segment only `PTE_X` (plus the `PTE_R | PTE_U` that
+          [[uvmalloc]] adds). The hardware stops the program from writing it, and copyout applies
+          the same rule so the kernel cannot be used to bypass it.
+      - text: walkaddr refuses any page with `PTE_X` set, so code pages can never be copied to or from.
+        why: |
+          You may have thought executable pages are off-limits to the copy routines. walkaddr
+          looks only at `PTE_V` and `PTE_U`; copyin can read from a code page.
+      - text: vmfault refuses because code pages are below the guard page.
+        why: |
+          vmfault is not even consulted: walkaddr succeeds for a code page (it is valid and has
+          `PTE_U`). The refusal comes later, at the `PTE_W` test.
+    explain: |
+      copyout is the one copy routine with a write-permission test ([[kernel/vm.c:364]]). The
+      read side (copyin, copyinstr) needs only `PTE_U`. See [[tour:28]].
+
+  - id: uptr-08
+    level: 2
+    type: order
+    q: |
+      [[sys_open]] fetches its path with `argstr(0, path, MAXPATH)`; the user passed `0x3fe0`.
+      Put these steps in the order they happen.
+    items:
+      - text: "[[argaddr]] copies the saved `a0` (`0x3fe0`) out of the trapframe"
+        why: argstr starts by fetching the raw number; nothing can be copied before the kernel knows the address.
+      - text: "[[fetchstr]] calls [[copyinstr]] with `p->pagetable` and `p->sz`"
+        why: fetchstr supplies what only the kernel knows, the page table and the size, then delegates.
+      - text: "copyinstr rounds the address down to its page, `va0 = 0x3000`"
+        why: Translation works per page, so the first job is to find the page containing the string.
+      - text: "[[walkaddr]] checks the leaf PTE for `PTE_V` and `PTE_U` and returns the physical page"
+        why: The page must be translated and checked before any byte can be read.
+      - text: "bytes are copied from the physical page until the NUL"
+        why: Copying needs the physical address that walkaddr returned.
+      - text: "fetchstr returns `strlen(path)`, which is 6"
+        why: The length is computed on the kernel's copy, only after copyinstr has guaranteed a NUL.
+    why_wrong: Follow the calls downward (argstr, argaddr, fetchstr, copyinstr, walkaddr) and then back up.
+    explain: |
+      Number from the trapframe, then translation through the user's page table, then the copy,
+      then work on the kernel's own copy only. After this, `sys_open` never reads `0x3fe0` again
+      ([[tour:6]]).
+
+  - id: uptr-09
+    level: 1
+    type: choice
+    q: |
+      [[argraw]] returns `p->trapframe->a0` and so on. Why does it read the trapframe instead of
+      the hart's real `a0`-`a5` registers?
+    code: kernel/syscall.c:34-54
+    options:
+      - text: The registers have been reused since the ecall; the trapframe is the only place where the user's values survive.
+        correct: true
+        why: |
+          [[uservec]] used `a0` for the trapframe address, and every C function since then
+          (usertrap, syscall, sys_open) has passed its own arguments in `a0`-`a5`. The process may
+          also have been preempted and moved to another hart; the trapframe moves with it.
+      - text: The trapframe holds values the kernel has already checked, while the registers are untrusted.
+        why: |
+          You may have thought saving a value validates it. uservec copies the registers
+          verbatim; the trapframe values are exactly as untrusted as the registers were.
+      - text: Reading registers from C requires a spinlock, and the trapframe does not.
+        why: |
+          You may be mixing up shared data with registers. Each hart's registers are private to
+          it; no lock is involved either way. The problem is that they no longer hold the user's
+          values.
+      - text: The hart's a0 holds the system-call number, so the arguments had to be moved elsewhere.
+        why: |
+          You may have mixed up the registers: the number is in `a7`. And even `a7` is read from
+          the trapframe ([[kernel/syscall.c:142]]) for the same reason.
+    explain: |
+      The trapframe is a snapshot of the user registers taken by [[uservec]] at the trap. It is
+      the process's, not the hart's, so [[argraw]] returns the right values on any hart, however
+      many C calls have happened since ([[tour:6]], [[g:trapframe]]).
+
+  - id: uptr-10
+    level: 2
+    type: state
+    q: |
+      `cat` is in `open`, and its hart is inside the byte-copying loop of [[copyinstr]] (no
+      lazy page is involved). What is the state of that hart?
+    code: kernel/vm.c:426-445
+    state:
+      mode: S
+      stack: kernel
+      satp: kernel
+      sie: "on"
+      noff: 0
+      intena: "-"
+    why:
+      satp: |
+        You may have thought the kernel switches to the user page table to read user memory. It
+        never does: it translates in software with [[walkaddr]] and reads through the kernel's
+        direct map.
+      sie: |
+        [[usertrap]] turned interrupts on before calling [[syscall]], and copyinstr takes no
+        spinlock, so they are still on. A timer interrupt could preempt `cat` mid-copy.
+      noff: |
+        No spinlock is held on this path: argument fetching touches only the process's own
+        trapframe, page table and kernel stack.
+      intena: |
+        intena is only meaningful while noff > 0; with no push_off outstanding, it is "—".
+      stack: |
+        System calls run on the process's own kernel stack, where `path` lives too; the user
+        stack is just data being read through translation.
+    why_wrong: Trace ecall, uservec, usertrap (intr_on), syscall, sys_open, argstr, fetchstr, copyinstr, and note that none of them takes a spinlock.
+    explain: |
+      Supervisor mode, kernel page table, `cat`'s kernel stack, interrupts on, no spinlock held.
+      Nothing in argument fetching is shared between harts, so nothing needs a lock
+      ([[tour:6]], [[concept:locks#invariant]]).
+
+  - id: uptr-11
+    level: 3
+    type: state
+    q: |
+      A `write` system call on a pipe reaches [[pipewrite]], which holds `pi->lock` and calls
+      [[copyin]] on a never-touched lazy `sbrk` page. copyin calls [[vmfault]], which calls
+      [[kalloc]]. What is the hart's state at the moment `kalloc` holds `kmem.lock`?
+    state:
+      mode: S
+      stack: kernel
+      satp: kernel
+      sie: "off"
+      noff: 2
+      intena: 1
+    why:
+      noff: |
+        Two spinlocks are held at once: `pi->lock` (taken in pipewrite) and `kmem.lock` (taken in
+        kalloc). Each contributes one push_off.
+      intena: |
+        intena records SIE as it was before the *outermost* push_off, the one in
+        `acquire(&pi->lock)`. In a system call after usertrap's intr_on, that was on.
+      sie: |
+        Any held spinlock means SIE is off. It was already off from `pi->lock`; kmem.lock only
+        raises noff.
+      satp: |
+        vmfault edits the user page table as data, through the direct map; satp still holds
+        the kernel page table.
+      stack: |
+        Still the writing process's kernel stack: pipewrite, copyin, vmfault and kalloc are
+        ordinary calls in its system call.
+    why_wrong: Count the spinlocks held on this hart right now, and remember intena is set only by the outermost push_off.
+    explain: |
+      `pi->lock` then `kmem.lock`: noff 2, SIE off, intena 1. When kalloc releases `kmem.lock`,
+      noff drops to 1 and interrupts stay off; they come back on only when pipewrite releases
+      `pi->lock`, either before sleeping on a full pipe ([[kernel/pipe.c:91]]) or at the end
+      ([[kernel/pipe.c:106]]) ([[concept:locks#noff]], [[tour:6]]).
+
+  - id: uptr-12
+    level: 1
+    type: number
+    q: |
+      [[copyin]] is called with `srcva = 0x1ff0` and `len = 48`. How many bytes does the
+      *first* iteration of its `while` loop copy?
+    code: kernel/vm.c:382-405@395-397
+    answer: 16
+    wrong:
+      48: |
+        You may have assumed the whole range sits on one page. `0x1ff0 + 48 = 0x2020`, which
+        crosses into the next page at `0x2000`; the first iteration stops at the boundary.
+      4080: |
+        You may have computed the offset within the page (`0xff0` = 4080) instead of the bytes
+        *remaining* on it. `n = PGSIZE - (srcva - va0) = 4096 - 4080`.
+      32: |
+        That is what the second iteration copies, after `srcva` moves to `0x2000`.
+    why_wrong: Compute va0 = PGROUNDDOWN(srcva), then n = PGSIZE - (srcva - va0), capped at len.
+    explain: |
+      `va0 = 0x1000`, so 16 bytes remain on that page. The loop copies them, sets
+      `srcva = 0x2000`, and translates the next page separately, because consecutive virtual pages
+      need not be consecutive in physical memory ([[tour:28]]).
+
+  - id: uptr-13
+    level: 2
+    type: number
+    q: |
+      [[sys_exec]] collects the user's `argv` into `char *argv[MAXARG]`, with `MAXARG` = 32.
+      What is the largest number of argument strings (not counting the terminating 0 pointer)
+      that `exec` can accept?
+    code: kernel/sysfile.c:458-486
+    answer: 31
+    wrong:
+      32: |
+        You may have forgotten that the terminating 0 must also be stored in the array. When
+        `i` reaches 32 the loop jumps to `bad` before it can read a terminator.
+      33: |
+        You may have thought the 0 pointer is extra, beyond the 32 slots. The test at line 471
+        stops the loop at `i == 32`.
+    why_wrong: The loop stores the 0 terminator in argv[i] too, and gives up as soon as i reaches NELEM(argv).
+    explain: |
+      Slots 0-30 hold strings and slot 31 holds the 0. A user array with no 0 in its first 32
+      entries ends in `goto bad`, which frees every page already allocated, so a hostile `argv`
+      can make exec fail but not loop or leak ([[tour:6]]).
+
+  - id: uptr-14
+    level: 1
+    type: match
+    q: |
+      Match each function with what it does.
+    pairs:
+      - left: "[[argraw]]"
+        right: returns one saved user register from p->trapframe
+        why: argraw is the only helper that reads registers, and it reads the saved copies.
+      - left: "[[fetchaddr]]"
+        right: copies one 8-byte value from user memory after checking it lies below p->sz
+        why: It is used by sys_exec to read argv one pointer at a time; the range check comes first, then copyin.
+      - left: "[[copyinstr]]"
+        right: copies bytes from user memory until a NUL, at most max of them
+        why: It is the string copier; the NUL test happens byte by byte as it copies.
+      - left: "[[either_copyout]]"
+        right: copies to a user address or a kernel address, depending on a flag
+        why: readi uses it so one function can serve both read() (user buffer) and exec or directory lookup (kernel buffer).
+      - left: "[[vmfault]]"
+        right: allocates and maps a zeroed page for a lazily grown address below p->sz
+        why: The copy routines call it when walkaddr returns 0, so lazy sbrk memory works in system calls too.
+    explain: |
+      Fetch the number ([[argraw]]), copy a word ([[fetchaddr]]) or a string ([[copyinstr]]),
+      choose user or kernel destination ([[either_copyout]]), and create lazy pages on demand
+      ([[vmfault]]). See [[tour:28]].
+
+  - id: uptr-15
+    level: 3
+    type: choice
+    q: |
+      [[user:lazy_copyinstr]] grows the heap lazily by two pages with `sbrklazy(2 * PGSIZE)`,
+      writes `'/'` to the last byte of the first page (`p[4095]`), and never touches the second
+      page. Then it calls `open(&p[4095], O_RDONLY)`. The string's NUL would be at `p[4096]`, on
+      the untouched page. What happens?
+    code: user/usertests.c:2743-2761@2755-2757
+    options:
+      - text: copyinstr's walkaddr fails on the second page, vmfault allocates a zeroed page there, the first byte is NUL, and open("/") succeeds.
+        correct: true
+        why: |
+          The second page is below `p->sz` and not mapped, so [[vmfault]] allocates it, zeroes it
+          and maps it `R W U`. Its first byte is `'\0'`, which ends the string.
+      - text: open returns -1, because walkaddr returns 0 for the second page and copyinstr gives up.
+        why: |
+          You may have thought walkaddr's 0 is final. Every copy routine gives [[vmfault]] one
+          chance before failing, precisely so that lazy memory works in system calls.
+      - text: The kernel takes a page fault inside copyinstr and usertrap allocates the page.
+        why: |
+          You may have thought the kernel touches user memory through the MMU. It never does:
+          it reads through the direct map after translating in software, so there is no fault.
+          copyinstr calls vmfault itself.
+      - text: The kernel panics, because the string crosses into memory that has no physical page.
+        why: |
+          You may have imagined the kernel following the string blindly. copyinstr translates
+          each page before reading it; a missing page produces vmfault or -1, never a fault.
+    explain: |
+      A lazy page is created by whoever touches it first: [[usertrap]] for the program,
+      the copy routine for the kernel. A system call must not fail just because the program had
+      not yet used memory it owns ([[tour:6]], [[tour:26]]).
+
+  - id: uptr-16
+    level: 3
+    type: choice
+    q: |
+      [[fetchaddr]] tests `addr >= p->sz || addr + sizeof(uint64) > p->sz`. With
+      `p->sz = 0x4000`, which `addr` would pass the *second* test, even though it is outside the
+      process, so that only the first test rejects it?
+    code: kernel/syscall.c:10-21@15-16
+    options:
+      - text: "`0xfffffffffffffffc`"
+        correct: true
+        why: |
+          `addr + 8` wraps around 2^64 to 4, and 4 is not greater than `0x4000`. Only
+          `addr >= p->sz` catches it, which is why the comment says both tests are needed.
+      - text: "`0x3ffc`"
+        why: |
+          This one is caught by the *second* test, not the first: `0x3ffc` is below `p->sz`, but
+          `0x3ffc + 8 = 0x4004` runs past the end. It is the case the second test exists for.
+      - text: "`0x4000`"
+        why: |
+          Both tests reject it: `0x4000 >= p->sz`, and `0x4008 > p->sz`. The second test does
+          not let it through.
+      - text: "`0x3ff8`"
+        why: |
+          This address is legitimate: its 8 bytes end exactly at `0x4000`, so both tests pass and
+          the value is fetched. It is inside the process.
+    explain: |
+      User numbers are adversarial, so even arithmetic on them must be checked for overflow.
+      (Here [[copyin]] would refuse the wrapped address anyway, since walkaddr and vmfault reject
+      it, but fetchaddr does not rely on that.) See [[tour:6]].
+
+  - id: uptr-17
+    level: 2
+    type: line
+    q: |
+      A program passes [[copyout]] a buffer in heap memory it grew with lazy `sbrk` and has never
+      touched. Click the line that makes the copy succeed anyway.
+    code: kernel/vm.c:341-377
+    answer: 357
+    lines:
+      355: |
+        You may have thought walkaddr creates missing pages. It only looks them up, and returns 0
+        for a lazy page that has no PTE yet.
+      364: |
+        This is the write-permission test. It runs only after a physical page exists; it cannot
+        create one.
+      352: |
+        The MAXVA test only rejects addresses; it creates nothing.
+      370: |
+        memmove does the copy, but it needs `pa0`, which for a lazy page only exists after the
+        call on line 357.
+    why_wrong: Find the call that allocates a page when walkaddr has returned 0.
+    explain: |
+      Line 357 calls [[vmfault]], which allocates and maps a zeroed page when the address is below
+      `p->sz` and not already mapped. The same fallback appears in [[copyin]] and
+      [[copyinstr]] ([[tour:28]]).
+
+  - id: uptr-18
+    level: 3
+    type: multi
+    q: |
+      A program calls `read(fd, buf, 2048)` on a regular file at offset 0 whose size is at
+      least 2048. `buf` is exactly 1024 bytes below `p->sz` (which is page-aligned), on a page the
+      program has already used. Which statements are true?
+    code: kernel/fs.c:509-534
+    options:
+      - text: The first 1024 bytes of the file end up in buf.
+        correct: true
+        why: The first block's copy targets `buf`..`buf+1023`, all on a mapped user page, so [[either_copyout]] succeeds.
+      - text: read returns -1.
+        correct: true
+        why: The second block's copy targets `p->sz` and beyond; [[copyout]] fails, [[readi]] sets `tot = -1`, and [[fileread]] returns it.
+      - text: The file offset f->off stays 0.
+        correct: true
+        why: fileread advances `f->off` only when readi returns a positive count ([[kernel/file.c:122]]).
+      - text: read returns 1024, the bytes that were copied before the failure.
+        why: |
+          You may have expected a partial count, as [[pipewrite]] returns. readi does not
+          return what it managed: on a failed copy it sets `tot = -1` and breaks, discarding the
+          count.
+      - text: The kernel panics, because the copy runs past the end of the process.
+        why: |
+          You may have thought the overrun reaches memory. copyout translates each page first;
+          at `p->sz` both walkaddr and vmfault refuse, and the copy returns -1.
+    explain: |
+      readi copies one block at a time, and each [[either_copyout]] can fail on its own. A
+      failure anywhere makes the whole read return -1, even though earlier bytes already reached
+      the user ([[kernel/fs.c:526]], [[tour:28]]).
+
+  - id: uptr-19
+    level: 2
+    type: tf
+    q: |
+      True or false: [[walkaddr]]'s test `if (va >= MAXVA) return 0;` is redundant, because
+      [[vmfault]] would refuse such an address anyway (it is above `p->sz`).
+    code: kernel/vm.c:118-139@127-128
+    answer: false
+    why_tf: |
+      You may have looked only at the final result (-1). The test matters because of what would
+      happen *before* vmfault is ever reached.
+    reasons:
+      - text: walkaddr next calls walk, and walk panics on va >= MAXVA; the test must come first so a user-chosen address can never panic the kernel.
+        correct: true
+        why: |
+          [[walk]] begins with `if (va >= MAXVA) panic("walk")`. vmfault would only run after
+          walkaddr returned, which it never would.
+      - text: Addresses at or above MAXVA are valid user addresses, and the test makes walkaddr translate them correctly.
+        why: |
+          MAXVA is the first address beyond what xv6's page tables cover. Nothing is mapped there;
+          the test rejects, it does not translate.
+      - text: vmfault does not look at p->sz, so it would allocate a page at such an address.
+        why: |
+          It does check: `if (va >= psz) return 0` is its first line. The problem is that
+          execution would never get there.
+    explain: |
+      "No user argument may panic the kernel" is the rule. walkaddr turns an out-of-range address
+      into an ordinary "not mapped" result before [[walk]] can see it ([[tour:6]]).
+
+  - id: uptr-20
+    level: 1
+    type: choice
+    q: |
+      When [[copyin]] translates a user address, which page table does it walk?
+    options:
+      - text: The process's own page table, passed in as the pagetable argument (p->pagetable).
+        correct: true
+        why: |
+          Callers pass `p->pagetable` explicitly, and [[walkaddr]] walks it in software. The
+          hardware's current table is not involved.
+      - text: The table in satp, which the hart is currently using.
+        why: |
+          You may have assumed translation is always the MMU's job. In the kernel, `satp` holds the
+          *kernel* page table, where user addresses mean nothing useful.
+      - text: None; in the kernel, user addresses are already physical addresses.
+        why: |
+          You may have thought user addresses equal physical ones. User virtual addresses start at
+          0 in every process and map to scattered physical pages.
+      - text: A combined table that maps both kernel and user memory.
+        why: |
+          You may be thinking of kernels that map user memory into the kernel's address space.
+          xv6 keeps them separate: every process has its own table, and the kernel has one.
+    explain: |
+      The copy routines take the page table as a parameter so that they can work on any process's
+      memory. [[kexec]] uses that to fill a *new* page table before it is installed
+      ([[kernel/exec.c:106]], [[tour:28]]).
+
+  - id: uptr-21
+    level: 1
+    type: choice
+    q: |
+      [[walkaddr]] returns a *physical* address `pa0`, and [[copyin]] then calls
+      `memmove(dst, (void *)(pa0 + (srcva - va0)), n)` while the hart uses the kernel page
+      table. Why does using a physical address as a pointer work?
+    code: kernel/vm.c:382-405@398
+    options:
+      - text: The kernel page table maps all of RAM at virtual address = physical address, so pa0 is also a valid kernel virtual address.
+        correct: true
+        why: |
+          That is the [[g:direct-map]]: `KERNBASE` to `PHYSTOP` is mapped one-to-one in the kernel
+          table. Every user page lives in that range.
+      - text: copyin turns paging off for the duration of the memmove.
+        why: |
+          You may have thought physical addresses need paging off. xv6 never writes `satp`
+          during a copy; paging stays on the whole time.
+      - text: pa0 is really a user virtual address, which the kernel table also maps.
+        why: |
+          You may have mixed up the two. walkaddr returns `PTE2PA(*pte)`, a physical address. The
+          kernel table does not map user virtual addresses at all.
+      - text: The kernel switches satp to the user page table just for the memmove.
+        why: |
+          xv6 does not do that. And even if it did, S-mode accesses to `PTE_U` pages fault while
+          `sstatus.SUM` is 0, which it always is in xv6.
+    explain: |
+      Translate in software, then read through the direct map: that is how the kernel reaches any
+      user page without changing `satp` ([[tour:28]], [[g:direct-map]]).
+
+  - id: uptr-22
+    level: 2
+    type: choice
+    q: |
+      A buggy program passes `0x2f00`, inside its stack guard page, as the buffer for `fstat`.
+      In [[copyout]], walkaddr returns 0, so [[vmfault]] gets its chance. The address is below
+      `p->sz`. Why doesn't vmfault give the program a fresh page there?
+    code: kernel/vm.c:454-491@466-468
+    options:
+      - text: ismapped finds that a valid PTE already exists there (V set, U clear), so vmfault treats the page as forbidden, not lazy.
+        correct: true
+        why: |
+          A lazy page has no valid PTE yet. The guard page does: [[uvmclear]] only cleared its
+          `PTE_U`. "Valid but refused by walkaddr" means "not yours", so vmfault returns 0.
+      - text: 0x2f00 is not below p->sz; the guard page sits above the process's size.
+        why: |
+          You may have pictured the guard page outside the process. It sits between data and
+          stack, well inside `p->sz` ([[kernel/exec.c:91]]); that is why the size test alone is not
+          enough.
+      - text: vmfault allocates only for reads (read == 1), and copyout passes 0.
+        why: |
+          You may have read meaning into the `read` parameter. vmfault never uses it; copyout's
+          lazy pages are allocated like any other.
+      - text: kalloc refuses to hand out pages below the user stack.
+        why: |
+          kalloc knows nothing about user addresses; it returns any free physical page. The
+          refusal happens in vmfault, before kalloc would be called.
+    explain: |
+      vmfault's two refusals are `va >= psz` (not the process's memory) and [[ismapped]] (already
+      mapped, so not lazy). The guard page fails the second, and copyout returns -1
+      ([[tour:28]], [[g:guard-page]]).
+
+  - id: uptr-23
+    level: 2
+    type: bits
+    q: |
+      In one run, gdb shows the leaf PTE for `cat`'s guard page at `0x2000` as `0x21fc7407`.
+      Decode it.
+    value: "0x21fc7407"
+    fields:
+      - label: PTE_V (bit 0)
+        options: ["1", "0"]
+        answer: "1"
+        why: "The low byte is 0x07 = 0b0000_0111: bit 0 is set. The page really is mapped."
+      - label: PTE_W (bit 2)
+        options: ["1", "0"]
+        answer: "1"
+        why: "0x07 has bits 0, 1 and 2 set: V, R and W. exec allocated the guard page with PTE_W like the stack."
+      - label: PTE_U (bit 4)
+        options: ["1", "0"]
+        answer: "0"
+        why: "Bit 4 (value 0x10) is clear: uvmclear removed it. That is what makes it a guard page."
+      - label: Physical page (PTE2PA)
+        options: ["0x87f1d000", "0x21fc7000", "0x21fc7407000", "0x87f1c000"]
+        answer: "0x87f1d000"
+        why: "PTE2PA shifts right by 10 to drop the flags, then left by 12: (0x21fc7407 >> 10) << 12 = 0x87f1d000. Using the PTE's upper bits directly gives a wrong address."
+      - label: Does walkaddr return a physical address for 0x2000?
+        options: ["no, it returns 0", "yes"]
+        answer: "no, it returns 0"
+        why: "walkaddr returns 0 when PTE_U is clear (vm.c:135), even though PTE_V is set."
+    explain: |
+      `0x407` = bit 10 (part of the physical page number) plus `V R W`. With `PTE_U` clear,
+      user code faults on it and [[walkaddr]] refuses it, so the copy routines treat it as
+      forbidden memory ([[tour:6]], [[g:pte]]).
+
+  - id: uptr-24
+    level: 2
+    type: choice
+    q: |
+      [[sys_open]] copies its path into `char path[MAXPATH]` on the kernel stack, but
+      [[sys_exec]] copies each argument string into a whole page from [[kalloc]]. Why the
+      difference?
+    code: kernel/sysfile.c:458-486@481-485
+    options:
+      - text: Each argument may be up to a page long and there may be 31 of them, far more than the one-page kernel stack can hold.
+        correct: true
+        why: |
+          fetchstr is called with a `PGSIZE` limit. The kernel stack is a single 4096-byte page
+          with a guard page below; even one such string would overflow it.
+      - text: kexec frees the process's old memory, which would destroy strings kept on the kernel stack.
+        why: |
+          You may have thought the kernel stack is part of the user memory exec replaces. It is
+          not: kexec frees the old *user* page table and pages, and the kernel stack survives exec.
+      - text: The kalloc pages are mapped into the new program's address space as its argv.
+        why: |
+          You may have thought the pages are handed over. kexec copies the strings onto the new
+          user stack with [[copyout]], and sys_exec frees the pages afterwards.
+      - text: copyinstr can only write to page-aligned destinations.
+        why: |
+          It writes anywhere: sys_open's `path` is at an arbitrary stack address. The choice is
+          about size, not alignment.
+    explain: |
+      Kernel stacks are small, so large or numerous buffers come from kalloc. Every exit path of
+      sys_exec frees those pages, so a failing exec leaks nothing ([[tour:6]],
+      [[concept:stacks#kernel]]).
+
+  - id: uptr-25
+    level: 3
+    type: choice
+    q: |
+      A program whose file descriptor 1 is the console calls
+      `write(1, (char *)0x80000000, 8)`. What does `write` return?
+    code: kernel/console.c:62-79
+    options:
+      - text: "0"
+        correct: true
+        why: |
+          [[consolewrite]]'s first [[either_copyin]] fails (copyin finds no user page there and
+          vmfault refuses, since the address is above `p->sz`), so the loop breaks with `i = 0`,
+          and consolewrite returns the 0 bytes it wrote.
+      - text: "-1"
+        why: |
+          You may have generalized from regular files, where [[filewrite]] turns a short write
+          into -1. For a device, filewrite returns whatever the driver returns, and consolewrite
+          returns its count of bytes written.
+      - text: "8, after printing 8 bytes of kernel code"
+        why: |
+          You may have thought the kernel reads `0x80000000` in its own address space, where it
+          is kernel code. The copy routines translate through the *user* page table, where that
+          address is unmapped.
+      - text: Nothing; the kernel panics.
+        why: |
+          A bad user pointer never reaches the MMU in the kernel: walkaddr and vmfault reject it
+          in software, and the failure is an ordinary return value.
+    explain: |
+      Every path rejects the pointer the same way, but each caller reports it differently: a
+      regular file gives -1, a pipe -1 (no byte written), and the console 0 bytes written. That is
+      why [[user:copyin]] in usertests accepts -1 or 0 for the console ([[tour:6]]).

@@ -1,0 +1,1754 @@
+published: true
+title: CPU time accounting and a time command
+area: The system-call and trap path
+stars: 2
+branch: ext/04-cputime
+prerequisites: {tours: [5, 11, 13, 21, 43, 45, 50], concepts: [stacks, locks]}
+summary: |
+  You teach the kernel to keep, for every process, how much time it spent running in user
+  mode and how much in the kernel, and you add a `time` command:
+
+  ```text
+  $ time cputest spin 1000
+  real 1.955
+  user 1.950
+  sys  0.003
+  ```
+
+  Measuring time sounds simple until you ask the questions this lab is built on. Which clock
+  do you use when every [[g:hart]] takes its own timer interrupt but only one of them counts
+  `ticks`? Exactly where does a process stop being "in user mode": at the `ecall`, or at the
+  first line of C? What happens to its clock while it sleeps, while it waits for a hart, and
+  on the hart it lands on afterwards? Whose time is an interrupt that arrives on behalf of
+  some other process? Who may read a dying process's numbers, and under which lock? You
+  answer each one, then measure the answers on three harts: the clock you chose against the
+  one you rejected.
+learn:
+  - "Every point at which a running process crosses between user mode, the kernel and not running at all, and which C function is the first or last to run on each side of each crossing."
+  - "What the timer interrupt in this tree really is (which harts take it, how often, and who counts `ticks`), and what that means for any statistic built on it."
+  - "What `time` CSR access each privilege mode has in this tree, and how to find the clock's rate from the machine itself rather than from a comment."
+  - "Which lock, if any, per-process counters need, whether a process can race with itself, and when a parent may safely read a dead child's fields."
+  - "What a process's own kernel time includes and excludes: spinning, sleeping, interrupts for other processes, the scheduler's work."
+  - "How much a system call's round trip costs on QEMU, and how much of it happens outside the C code."
+spec: |
+  **The accounting.** Every process has a user time and a system (kernel) time. User time
+  grows while the process runs in user mode; system time grows while the kernel runs on the
+  process's behalf (system calls, faults, interrupts taken while it runs). Neither grows
+  while the process is not running: asleep, waiting for a hart, or a zombie. A new process
+  starts at zero.
+
+  **Children.** When a process reaps a child with `wait`, the child's user and system time,
+  plus the totals of the child's own reaped children, are added to the parent's *children*
+  totals. Children that have not been reaped do not count.
+
+  **The system call.** `int cputime(struct cputime *ct)` fills in, in microseconds:
+
+  ```c
+  struct cputime {
+    uint64 real;   // time since boot
+    uint64 utime;  // user time of the calling process
+    uint64 stime;  // kernel time of the calling process
+    uint64 cutime; // user time of reaped children
+    uint64 cstime; // kernel time of reaped children
+  };
+  ```
+
+  It returns 0, or -1 if `ct` is not a valid address. The struct lives in a new header,
+  `kernel/cputime.h`, that user programs include. Successive calls must never see `stime`
+  go down.
+
+  **The command.** `time command args...` runs the command and prints, on standard error,
+  the real time it took and the user and system time of the command (including anything the
+  command itself reaped), in seconds with three decimals, like `time -p` on Unix:
+
+  ```text
+  $ time cputest sys 100
+  real 1.458
+  user 1.036
+  sys  0.420
+  ```
+
+  **The test.** `cputest` prints OK or FAIL for ten checks, each of which it measures itself
+  (nothing is left to the eye): a CPU-bound loop is mostly user time; system calls add
+  system time; `pause(5)` takes between 0.3 and 1.5 s of real time (which checks the units)
+  and adds almost no CPU time; a child's time is not counted before `wait` and is counted
+  after; a new process starts at almost zero, even in a reused process slot; a grandchild's
+  time arrives through its parent; three processes spinning on three harts use more CPU
+  time than real time; and four processes calling `cputime()` for 2 s never see their
+  system time go backwards. It also provides workloads for `time`: `cputest spin N`,
+  `cputest par N` (three spinners at once), `cputest sys N` and `cputest sleep N`.
+
+  ```text
+  $ cputest
+  cputest: spin: real 300 ms, user 290 ms, sys 9 ms
+  cputest: a CPU-bound loop is mostly user time: OK
+  [...]
+  cputest: 3 spinning children: real 521 ms, user 1440 ms, sys 59 ms
+  cputest: on 3 harts, 3 spinners use more CPU time than real time: OK
+  cputest: 4 processes calling cputime() for 2 s: sys went backwards 0 times
+  cputest: kernel time never goes backwards: OK
+  cputest: all 10 checks OK
+  ```
+
+  The three-spinner check assumes three harts (`make qemu` uses `CPUS := 3`).
+
+  **Constraints.** `usertests -q` must still print `ALL TESTS PASSED` on three harts. Keep the
+  system-call path cheap. Do not change existing system call
+  numbers.
+think:
+  - title: Which clock?
+    q: |
+      Before writing anything, decide how the kernel will know how long a process ran. This
+      tree has two clocks you could build on: the timer interrupt, and the `time` CSR that
+      the timer is programmed from. For each, find out: how often does it tick, on which
+      harts, who can read it, and what would "charge this process" look like? Then pick one.
+    hints:
+      - |
+        Read [[clockintr]] and the two places that call `yield` when `which_dev == 2`:
+        [[usertrap]] ([[kernel/trap.c:85]]) and [[kerneltrap]] ([[kernel/trap.c:157]]). Then
+        read [[timerinit]] in [[kernel/start.c]] and `r_time` in [[kernel/riscv.h:301]].
+      - |
+        Every hart programs its own `stimecmp` 1,000,000 ticks of `time` ahead, so every hart
+        takes a timer interrupt about every 0.1 s, but only hart 0 increments `ticks`
+        ([[kernel/trap.c:169]]). `start` sets bit 1 (TM) of `mcounteren`
+        ([[kernel/start.c:62]]), which is what lets supervisor mode read `time`. Nothing in
+        the tree sets `scounteren`, the register that would let user mode read it.
+      - |
+        Either count timer interrupts per process, on every hart, by the mode each one
+        interrupted (one sample per 0.1 s per hart), or read `time` each time a process
+        changes between user mode, the kernel and not running, and add the differences to
+        two counters.
+    answer: |
+      **Sampling the timer interrupt** is the classic Unix approach: at each timer
+      interrupt, charge one period (0.1 s here) to whichever process the interrupt found
+      running, as user or system time depending on the mode it interrupted.
+
+      - It has to happen on **every** hart. If you hang it on `ticks` (only hart 0
+        increments it) you see one hart in three. Three processes spinning on three harts for
+        3 s were charged 2.5 to 2.8 s instead of about 8.7 s by the hart-0 ledger in the
+        Measure section (clinic 1 shows the same mistake made for real).
+      - Its resolution is 0.1 s. `echo hi` runs for a few milliseconds (`real 0.003` and
+        `real 0.004` in clinic 3's runs), so it would be charged 0 or 100 ms.
+      - It is statistical, and the sample is not taken at a random moment: an interrupt that
+        becomes pending while interrupts are off waits for the next moment they are on. The
+        Measure section shows that this skews the user/system split of a system-call-heavy
+        program.
+
+      **Reading the `time` CSR at every transition** is exact to one tick (100 ns at
+      QEMU's 10 MHz) and costs one `csrr` per transition. Supervisor mode may read it here
+      because `start` set `mcounteren.TM`. All harts read the same clock: the RISC-V
+      unprivileged specification requires the real-time clocks of all harts to be
+      synchronized to within one tick. The per-process accounting will not even need that,
+      as you will see: every stretch turns out to start and end on the same hart. `real`,
+      which `time` compares across a `fork` and a `wait` that may run on different harts,
+      does need it.
+
+      The reference uses the CSR. The rest of the lab is about *where* to read it, which is
+      the hard part.
+    checks:
+      - id: lab04-01
+        level: 1
+        type: number
+        q: |
+          [[clockintr]] asks for the next timer interrupt 1,000,000 ticks of `time` after it
+          handles one, and `time` counts at 10 MHz in QEMU's `virt` machine. About how many
+          timer interrupts does *each hart* take per second?
+        answer: 10
+        wrong:
+          1: |
+            You may have read 1,000,000 as one second (a microsecond counter). The comment on
+            [[kernel/trap.c:177]] says "about a tenth of a second": the counter runs at
+            10 MHz, so 1,000,000 ticks is 0.1 s.
+          30: |
+            You may have added up the three harts. The question asks per hart: each one
+            programs its own `stimecmp` and takes its own interrupts.
+          100: |
+            You may have remembered a different kernel's tick rate (100 Hz is common). In this
+            tree it follows from the constant in [[clockintr]] and the 10 MHz timebase.
+        why_wrong: |
+          Divide the clock rate by the interval: 10,000,000 ticks per second / 1,000,000
+          ticks per interrupt.
+        explain: |
+          Every hart writes its own `stimecmp` in [[clockintr]] ([[kernel/trap.c:179]]), so
+          each hart gets an interrupt every 0.1 s, slightly more than 0.1 s in practice because
+          the next deadline is counted from when the handler runs. Only hart 0 also
+          increments `ticks`. See [[tour:11]] and [[g:sstc]].
+      - id: lab04-02
+        level: 2
+        type: choice
+        q: |
+          A learner charges 0.1 s of user or system time to `myproc()` right next to
+          `ticks++` in [[clockintr]], inside the `if (cpuid() == 0)` block. Three processes
+          spin in user mode for 3 s, one on each hart. About how much user time is charged
+          to the three of them together?
+        options:
+          - text: About 3 s
+            correct: true
+            why: |
+              Only hart 0 runs that block, so only the process on hart 0 is ever charged: 30
+              samples of 0.1 s. The hart-0 ledger in the Measure section charged 2.5 to 2.8 s
+              where the precise count was about 8.7 s.
+          - text: About 9 s
+            why: |
+              You may have thought every timer interrupt passes through that block. Every hart
+              takes interrupts and calls [[clockintr]], but the `cpuid() == 0` test skips the
+              block on harts 1 and 2.
+          - text: About 1 s
+            why: |
+              You may have divided twice: once for the three harts and once for the three
+              processes. The process on hart 0 still gets a sample every 0.1 s for 3 s.
+          - text: 0, because a timer interrupt never arrives in user mode
+            why: |
+              You may have thought timer interrupts are only taken in the kernel. With
+              `SPIE` set by [[prepare_return]], interrupts are on in user mode and the timer
+              traps straight into [[usertrap]].
+        explain: |
+          `ticks` is a global clock kept by one hart; it says nothing about what the other
+          harts are doing. Any per-process statistic must be collected on the hart the
+          process runs on. See clinic 1 for the recorded symptom.
+  - title: Where does the process cross between user mode and the kernel?
+    q: |
+      With the `time` CSR, each process needs a timestamp for "the current stretch began at",
+      and at each crossing you add the elapsed time to user or system time and start a new
+      stretch. Name the points where a process goes from user mode into the kernel and back,
+      in the order a system call meets them. Where is the first C code after the trap, and
+      the last C code before the return? What runs in between, and whose time will it be?
+    hints:
+      - |
+        Follow [[tour:5]] or [[tour:43]]: `ecall`, [[uservec]], and back out through
+        [[userret]] and `sret`. Interrupts and faults from user mode enter by the same door.
+        A brand-new process reaches user mode for the first time by a different road: find
+        it.
+      - |
+        The trampoline has no free registers until it has saved them, and it runs with the
+        user page table for half its length. The first C code after a trap from user mode
+        and the last C code before a return are both in `trap.c`; the new process's first
+        return comes from another C function that calls the same preparation code.
+      - |
+        Which two C functions bracket every visit to the kernel from user mode, and does a
+        new process's first return pass through the second one? Whatever runs outside that
+        bracket lands on the user side.
+    answer: |
+      - **User to kernel:** `ecall` (or an interrupt or fault) enters [[uservec]], which
+        saves the registers, loads the kernel stack and page table, and jumps to
+        [[usertrap]]. The first useful moment in C is right after `p = myproc()`
+        ([[kernel/trap.c:49]]): add `time - tstamp` to user time and restart the stretch.
+        Interrupts are still off there, which matters later.
+      - **Kernel to user:** [[prepare_return]] is the last C function before the return.
+        [[usertrap]] calls it, then returns the user `satp` to `uservec`'s `jalr`, which falls
+        through into [[userret]]. A forked child's first return comes from [[forkret]],
+        which also calls `prepare_return` ([[kernel/proc.c:539]]). So the end of
+        `prepare_return` covers both: add `time - tstamp` to system time and restart.
+      - **In between** run the trampoline halves: `uservec` from the trap to the `jalr`, and
+        `userret` from the return to `sret`, including two `satp` writes, four
+        `sfence.vma` and a `fence.i` per round trip. With the charges in C, all of that is
+        user time. On real hardware these are a few dozen instructions. On QEMU they are not
+        cheap, and the Measure section shows that for a loop of `getpid` calls most of the
+        "user" time is spent there.
+
+      Reading `time` inside the trampoline would put the boundary at the real mode switch
+      (the `uservec` code has a scratch register once it has saved the user's). It is a
+      good stretch goal; the reference keeps the change to C.
+    checks:
+      - id: lab04-03
+        level: 2
+        type: order
+        q: |
+          Put the events of one `getpid()` round trip in order, in the reference design.
+        items:
+          - "ecall: the hart traps into supervisor mode"
+          - "uservec saves the registers and installs the kernel page table"
+          - "usertrap adds the stretch since tstamp to user time"
+          - "syscall runs sys_getpid"
+          - "prepare_return adds the stretch since tstamp to system time"
+          - "userret installs the user page table"
+          - "sret: back in user mode"
+        why_wrong: |
+          You may have put a charge where no C code runs. The two charges sit in the first
+          and last C code of the trip; everything in the trampoline is outside them, so it
+          lands in user time.
+        explain: |
+          The C code is a window inside the trap: [[usertrap]] opens it, [[prepare_return]]
+          closes it, and the assembly on either side ([[uservec]], [[userret]]) stays outside.
+          The Measure section shows how big that outside part is on QEMU. See [[tour:43]].
+      - id: lab04-04
+        level: 2
+        type: tf
+        q: |
+          True or false: with the kernel-to-user charge at the end of [[prepare_return]], a
+          forked child's first trip to user mode is also charged, even though the child never
+          passes through [[usertrap]] on its way out of `fork`.
+        answer: true
+        why_tf: |
+          You may have thought every return to user mode goes through [[usertrap]]. A forked
+          child starts in [[forkret]], which builds the return itself.
+        reasons:
+          - text: "True: forkret calls prepare_return before jumping to userret."
+            correct: true
+            why: That is [[kernel/proc.c:539]]. Whatever prepare_return does, every return to user mode does it.
+          - text: "True: the child does pass through usertrap, as a copy of the parent's call."
+            why: You may have thought the child resumes the parent's system call. It never made one; it starts on an empty kernel stack in forkret ([[tour:20]]).
+          - text: "False: kfork charges the child instead."
+            why: You may have thought the parent prepares everything. kfork runs as the parent and finishes before the child ever runs.
+          - text: "False: the scheduler returns the child to user mode directly."
+            why: You may have thought swtch can land in user mode. swtch only switches kernel contexts; the child's context.ra is forkret, set by allocproc.
+        explain: |
+          Two roads lead to user mode, one through [[usertrap]] and one through [[forkret]],
+          and both go through [[prepare_return]]. Putting the charge there covers both. Keep
+          the second road in mind for the next question.
+  - title: What happens to the clock while the process is not running?
+    q: |
+      With only the two charges from the previous question, follow `pause(5)`: the process
+      enters the kernel, sleeps about half a second while other processes run or the harts
+      sit idle, then returns. What would be added to its system time? Where must the clock
+      stop and restart instead? Is there a process for which your restart point never runs?
+    hints:
+      - |
+        Read [[yield]], [[sleep]] and [[kexit]]. What do they all call to give up the hart?
+        Then read what [[allocproc]] puts in a new process's `context.ra`.
+      - |
+        A process stops running at exactly one point, just before `swtch`, holding its own
+        `p->lock` with interrupts off, and it resumes right after `swtch` returns, perhaps
+        on another hart. Ask which hart reads the clock at each end of each stretch. A new
+        process's first `swtch` does not return there.
+      - |
+        Find the one function every `yield`, `sleep` and `exit` passes through, and the one
+        place a new process first runs. What must happen on each side of the switch?
+    answer: |
+      Without a stop, the whole half second (including the time other processes ran and the
+      idle `wfi` of empty harts) is added as system time when `pause` returns: clinic 2
+      recorded `pause(5): real 470 ms, user 0 ms, sys 470 ms`.
+
+      Every way of giving up the hart (`yield`, `sleep`, `kexit`) goes through [[sched]], so
+      [[sched]] is the one place to stop the clock: add `time - tstamp` to system time before
+      `swtch`, and set `tstamp = time` after `swtch` returns. The time in between, on the
+      scheduler stack, in other processes or in `wfi`, is charged to nobody. So is the
+      kernel work done there: the `swtch` itself, the scheduler's scan, interrupts taken in
+      the scheduler loop. The CPU times of all processes therefore add up to less than
+      harts × real time, even on a fully busy machine.
+
+      A new process never returns from `sched`: [[allocproc]] set its `context.ra` to
+      [[forkret]], so its first `swtch` lands there. If `forkret` does not set `tstamp`,
+      the first stretch is measured from whatever `tstamp` holds, 0 for a cleared slot: the
+      whole time since boot becomes system time (clinic 3).
+
+      What this design counts as the process's system time:
+
+      | the process is... | counted? |
+      |---|---|
+      | running kernel code for itself | yes |
+      | spinning in `acquire` for a spinlock | yes, it is running |
+      | asleep waiting for a sleep-lock, a disk read, a child | no |
+      | RUNNABLE, waiting for a hart | no |
+      | handling an interrupt that arrived while it ran | yes (next question) |
+    checks:
+      - id: lab04-05
+        level: 2
+        type: multi
+        q: |
+          In the reference design, which of these add to a process's system time?
+        options:
+          - text: Spinning in acquire while another hart holds the spinlock
+            correct: true
+            why: The process is running on a hart the whole time; spinning is kernel code executing on its behalf.
+          - text: Sleeping in acquiresleep while another process holds the sleep-lock
+            why: |
+              You may have thought waiting for a lock is always CPU time. A sleep-lock sleeps:
+              [[sleep]] calls [[sched]], which stops the clock.
+          - text: Running kexit's file closing and iput
+            correct: true
+            why: kexit runs as the process, in the kernel, until its final sched.
+          - text: Being RUNNABLE while all three harts run other processes
+            why: |
+              You may have thought a process's clock runs from fork to exit. It stops in
+              [[sched]] and restarts only when a hart switches back to it.
+          - text: The scheduler's scan of proc[] after the process yields
+            why: |
+              You may have thought the time until the next process starts belongs to the one
+              that just left. The clock stopped before `swtch`; the scheduler loop runs on the
+              hart's own stack and is charged to nobody.
+        explain: |
+          The clock runs exactly while the process occupies a hart: from the `swtch` that
+          resumes it to the `swtch` that leaves it. Whatever runs on the hart in between,
+          spinning included, is its time; nothing that happens while it is switched out is.
+          See [[tour:13]] for the switch and [[tour:16]] for sleeping.
+      - id: lab04-06
+        level: 3
+        type: number
+        q: |
+          A learner forgets the line in [[forkret]]. [[freeproc]] had cleared `tstamp` to 0.
+          A new child's first [[prepare_return]] reads `time` = 23,000,000. How many
+          **milliseconds** of system time is the child charged for that first stretch?
+        answer: 2300
+        wrong:
+          23000: |
+            You may have treated the ticks as microseconds. `time` counts at 10 MHz: 10 ticks
+            per microsecond, so 23,000,000 ticks is 2,300,000 µs.
+          2300000: |
+            That is the right amount in microseconds. The question asks for milliseconds.
+          0: |
+            You may have thought a zero timestamp means "no time yet". The charge is `time -
+            tstamp`, and with `tstamp` 0 that is the whole time since boot.
+        why_wrong: |
+          The charge is `time - tstamp` = 23,000,000 - 0 ticks. Convert at 10,000 ticks per
+          millisecond.
+        explain: |
+          A zero `tstamp` means "the stretch began at boot". Clinic 3 recorded exactly this:
+          `time echo hi` printed `real 0.004` and `sys  4.966`, the time since boot at that
+          moment.
+  - title: Whose time is an interrupt?
+    q: |
+      Process A is in user mode on hart 1 when hart 1 takes a disk interrupt that completes
+      process B's read. Later, A is in a system call when hart 1's timer fires. With your
+      design so far, who is charged for each handler, and as what? Is that fair? What would it
+      take to do better?
+    hints:
+      - |
+        Read [[devintr]], [[virtio_disk_intr]] and [[kerneltrap]]. Does any of them know
+        which process the interrupt is for? Which process is current on the hart while they
+        run?
+      - |
+        An interrupt runs on whatever is current: the interrupted process's kernel stack and
+        its `struct proc`. Your accounting only knows "the process on this hart is in the
+        kernel".
+      - |
+        The interrupted process pays, always as system time: from user mode because the trap
+        ends its user stretch, from the kernel because the stretch was system time anyway.
+    answer: |
+      The interrupted process pays, as system time, in both cases:
+
+      - From user mode, the disk interrupt enters through [[uservec]] and [[usertrap]] like a
+        system call, so the user stretch ends at the trap, and [[devintr]] and
+        [[virtio_disk_intr]] run in A's system time. B, who gets the data, pays nothing for
+        the interrupt.
+      - In the kernel, [[kerneltrap]] runs on A's kernel stack on top of whatever A was doing
+        ([[tour:44]]), still inside A's system-time stretch. If it is a timer interrupt, A
+        then yields: the clock stops in [[sched]], and it restarts when A next runs, perhaps
+        elsewhere. The recorded gdb run caught exactly this: pid 4 was interrupted inside
+        `exec` on hart 2, yielded from [[kerneltrap]], and resumed on hart 0 186 µs later.
+
+      This is what Unix kernels traditionally do, and it is fair on average: interrupts land
+      on whoever is running. Doing better needs separate bookkeeping for interrupt time (read
+      the clock at the start and end of [[devintr]] and keep it per hart), so that `sys`
+      means "work for this process" rather than "time spent in the kernel while it ran".
+    checks:
+      - id: lab04-07
+        level: 2
+        type: choice
+        q: |
+          `cat` is in user mode on hart 2 when hart 2 takes the disk interrupt that completes
+          `sh`'s read. In the reference design, the time spent in [[virtio_disk_intr]] is
+          charged to:
+        options:
+          - text: cat's system time
+            correct: true
+            why: The trap ended cat's user stretch in usertrap; the handler runs as part of cat's kernel stretch until prepare_return.
+          - text: cat's user time
+            why: |
+              You may have thought an interrupt in user mode stays "in user mode". It is a trap:
+              the hart enters the kernel through [[uservec]], and [[usertrap]] charges the user
+              stretch first.
+          - text: sh's system time
+            why: |
+              You may have thought the kernel knows whom the interrupt is for. [[virtio_disk_intr]]
+              only marks the buffer done and wakes the sleeper; the accounting only sees the
+              process current on the hart.
+          - text: Nobody, because interrupt handlers do not belong to a process
+            why: |
+              You may have thought interrupts run outside any process. Here the handler runs
+              on cat's kernel stack, inside cat's stretch. Only an interrupt taken in the
+              scheduler loop (no current process) is charged to nobody.
+        explain: |
+          The accounting knows only which process is current on the hart, and an interrupt
+          runs inside the current process's stretch. See [[tour:9]] and [[tour:44]].
+  - title: Which lock protects the counters?
+    q: |
+      List every place that writes `utime`, `stime` and `tstamp`, and every place that reads
+      them, including the parent that will collect them and the system call that reports
+      them. For each, which process is it running as, and are interrupts on? Then decide:
+      does any of it need `p->lock`, or another lock, or something else?
+    hints:
+      - |
+        Read the comments that divide `struct proc` ([[kernel/proc.h:85]] and
+        [[kernel/proc.h:95]]). Lab 1's `tracemask` made the same argument. Then mark each
+        place: [[usertrap]]'s first lines, the end of [[prepare_return]], [[sched]],
+        [[forkret]], the parent collecting a dead child, and the system call.
+      - |
+        Every writer runs as the process itself. But one of them, [[sched]], can run in the
+        middle of the process's own system call: a timer interrupt, [[kerneltrap]],
+        [[yield]]. And the parent reads a child's counters only after the child has run
+        for the last time.
+      - |
+        Which writer can run in the middle of a reader on the same hart, and what single
+        change to the hart's state would stop it? For the parent, which lock does it
+        already hold while it looks at a zombie?
+    answer: |
+      | where | runs as | interrupts | needs |
+      |---|---|---|---|
+      | [[usertrap]] entry, end of [[prepare_return]] | the process | off | nothing |
+      | [[sched]] | the process, holding its `p->lock` | off | nothing, and it must not take `p->lock` again (clinic 4) |
+      | [[forkret]] | the new process, holding the `p->lock` the scheduler took | off | nothing |
+      | the system call reading its own running clock | the process | **on** | interrupts off for the read (clinic 5) |
+      | the parent reading a ZOMBIE child in [[kwait]] | the parent | off | the child's `p->lock`, already held |
+
+      The fields go in the private section of `struct proc`, for the reason `tracemask` did in
+      lab 1: one process, one thread, one hart at a time.
+
+      **The parent.** A child's last charge happens in [[sched]] called from [[kexit]], which
+      holds the child's `p->lock` from [[kernel/proc.c:355]] through the switch; the
+      scheduler releases it ([[kernel/proc.c:463]]). [[kwait]] reads the counters after
+      `acquire(&pp->lock)` ([[kernel/proc.c:384]]) and only if the state is ZOMBIE, so the
+      release/acquire pair orders the child's last store before the parent's load. No new
+      lock is needed: the right one is already held.
+
+      **The race with itself.** The system call that reports the times wants
+      `stime + (time - tstamp)`, including the current stretch. Interrupts are on during a
+      system call. If a timer interrupt lands between reading `time` and reading `tstamp`
+      and the process yields, [[sched]] adds the stretch to `stime` and moves `tstamp`
+      forward. The pair read afterwards is inconsistent, and the result is short by the
+      time the process spent switched out. The "other thread" is the same process on the
+      same stack, so mutual exclusion between harts is not what is needed. Turning
+      interrupts off for the three reads (`push_off`/`pop_off`) is. Taking `p->lock`
+      would happen to fix it too, but only because `acquire` calls `push_off`: the
+      interrupts being off is what excludes the other party, so the honest tool is
+      `push_off` itself. It is an easy bug to write, and
+      clinic 5 shows it.
+    checks:
+      - id: lab04-08
+        level: 3
+        type: tf
+        q: |
+          True or false: because only the process itself ever writes its `stime` and
+          `tstamp`, a system call can compute `stime + (time - tstamp)` with interrupts on.
+        answer: false
+        why_tf: |
+          You may have equated "one writer" with "no race". The one writer can interrupt
+          itself.
+        reasons:
+          - text: "False: a timer interrupt can make the process yield between the reads, and sched, running as the same process, changes both fields."
+            correct: true
+            why: That is the race clinic 5 recorded. Interrupts off for the reads closes it.
+          - text: "False: another hart's scheduler updates the fields while the process runs."
+            why: You may have thought the scheduler charges processes. In this design only the process itself writes them while it lives, in usertrap, prepare_return, sched and forkret; freeproc clears them once it is gone.
+          - text: "True: 64-bit loads are atomic, so each value is read whole."
+            why: You may have thought atomicity of each load is enough. Each load is whole; the problem is that two loads see different moments, before and after sched ran.
+          - text: "True: system calls run with interrupts off."
+            why: You may have missed intr_on in usertrap ([[kernel/trap.c:66]]). Interrupts are on for the whole system call.
+        explain: |
+          "Private to the process" rules out other harts, not interrupts on the same hart. An
+          interrupt that leads to [[yield]] runs [[sched]] in the middle of your C statement.
+          See [[concept:locks#invariant]] for why interrupts off is the tool that excludes
+          your own hart.
+      - id: lab04-09
+        level: 2
+        type: state
+        q: |
+          A child has called `exit`. [[kexit]] has called [[sched]], which is about to add the
+          final stretch to `stime`. Fill in the machine state of the hart running it.
+        state: {mode: S, stack: kernel, satp: kernel, sie: "off", noff: "1", intena: "1"}
+        why:
+          mode: The process is in a system call (exit), in supervisor mode.
+          stack: You may have thought sched runs on the scheduler stack. It runs on the process's own kernel stack until swtch switches stacks.
+          satp: Kernel C code always runs with the kernel page table.
+          sie: You may have thought interrupts are on during exit. kexit holds the process's p->lock, and holding a spinlock means interrupts are off; sched panics if they are on.
+          noff: You may have counted wait_lock. kexit releases wait_lock (proc.c:360) before calling sched, which insists on exactly one held spinlock.
+          intena: You may have expected 0. The first acquire in this system call happened with interrupts on (after usertrap's intr_on), so intena recorded 1. The gdb run showed noff 1 and intena 1 here.
+        why_wrong: |
+          Ask which stack, which page table, and which locks [[kexit]] holds when it calls
+          [[sched]].
+        explain: |
+          The final charge runs with the child's `p->lock` held, interrupts off, on its own
+          kernel stack: that is why the parent, which must take the same lock, is guaranteed
+          to see it. See [[tour:21]] and [[concept:locks#sched-intena]].
+  - title: How does the parent get its child's time?
+    q: |
+      `time` must report the CPU time of a command that, by the time `time` asks, has exited.
+      Where are the child's counters still readable, by whom, and until when? Should a
+      grandchild's time count too? Then design the system call `time` will use.
+    hints:
+      - |
+        Follow a child from [[kexit]] until its slot is freed. Which function is the last
+        to see the slot's contents, and what does it already copy out to the parent?
+      - |
+        After the slot is cleared it is UNUSED and the next `fork` may take it. A process's
+        reaped children are part of the work it did, the way a shell's commands are part of
+        a shell script's work.
+      - |
+        At which point of reaping is the child certain to be reaped exactly once, while its
+        slot still holds its numbers? What new fields would the parent need to keep them,
+        and what would one system call have to return so `time` can compute differences?
+    answer: |
+      The counters live in the zombie's `struct proc` until [[kwait]] calls [[freeproc]].
+      [[kwait]] is the only code that sees the zombie, it holds the zombie's lock, and it
+      runs as the parent, so it can add to the *parent's* fields without a lock:
+
+      ```c
+      p->cutime += pp->utime + pp->cutime;
+      p->cstime += pp->stime + pp->cstime;
+      ```
+
+      Put it after the exit status `copyout` succeeds. If the `copyout` fails, `kwait`
+      returns -1 and leaves the zombie in place, to be reaped (and counted) by a later call.
+      Adding before it would count the child twice. Including `pp->cutime` makes the totals
+      recursive, so `time sh` counts the commands that shell ran, as Unix does.
+
+      The interface follows Unix `times()`: one call, `cputime(&ct)`, that copies out
+      `{real, utime, stime, cutime, cstime}`. `time` reads it before `fork` and after
+      `wait` and prints the differences. A `waitx(&status, &utime, &stime)` that returns
+      one child's times as it reaps it would work as well. The totals generalise better: a
+      parent that waits for many children can still ask "how much did all of that cost".
+    checks:
+      - id: lab04-10
+        level: 2
+        type: line
+        q: |
+          Here is [[kwait]] in the original tree. Click a line right before which the two
+          additions to `cutime` and `cstime` can go.
+        code: kernel/proc.c:384-402
+        answer: [397, 398]
+        lines:
+          389: |
+            You may have wanted to count the child as soon as it is found. But the `copyout`
+            below can still fail, and then `kwait` returns -1 and leaves the zombie to be
+            reaped again later: it would be counted twice.
+          387: |
+            Before the ZOMBIE test the child may still be running, and its counters are not
+            final. They are final only once it is a zombie and its lock is held.
+          399: |
+            You may have thought the order does not matter. [[freeproc]] has just cleared the
+            counters, so you would add zeros.
+          401: |
+            After the releases the slot is UNUSED and cleared, and another hart may already
+            be reusing it for a new process.
+        why_wrong: |
+          The additions need a zombie whose exit status has been delivered (so it will not be
+          reaped twice) and whose slot has not been cleared yet.
+        explain: |
+          Between the successful `copyout` and [[freeproc]], the parent holds the zombie's
+          lock, the counters are final, and the child is certain to be reaped exactly once.
+          Lines 397 and 398 both qualify; the reference puts the additions before 397.
+      - id: lab04-11
+        level: 3
+        type: choice
+        q: |
+          You run `time sh`, type `cputest spin 500` to that inner shell (it takes about 1 s
+          of user time), then Ctrl-D. What does `time` print as `user`?
+        options:
+          - text: About 1 s, because the inner shell reaped cputest and its totals include it
+            correct: true
+            why: |
+              cputest's time went into the inner sh's `cutime` when sh waited for it; when
+              `time` reaped sh, it added `sh->utime + sh->cutime`.
+          - text: Almost 0, because cputest is not a child of time
+            why: |
+              You may have thought only direct children count. The totals are recursive: a
+              child's reaped children travel up with it.
+          - text: Almost 0, because the inner shell was mostly asleep waiting for input
+            why: |
+              You may have looked only at the shell's own time. Its own user time is small,
+              but its children total holds cputest's.
+          - text: It depends on whether cputest exited before sh
+            why: |
+              You may have worried about the order of exits. sh waits for cputest before
+              reading the next command, so cputest is always reaped first.
+        explain: |
+          Adding `pp->cutime` as well as `pp->utime` makes the totals follow the process tree:
+          whoever reaps a process inherits everything that process had reaped. See [[tour:21]]
+          for `wait`.
+  - title: What units cross the boundary, and where does real time come from?
+    q: |
+      The counters hold ticks of the `time` CSR. What should the system call hand back:
+      ticks, or something else? How will `time` know how much real time passed? And how fast
+      does the clock tick? Find out from the machine, not from a comment.
+    hints:
+      - |
+        Ask QEMU: `qemu-system-riscv64 -machine virt,dumpdtb=virt.dtb` writes the device tree
+        it gives the guest; `dtc -I dtb -O dts virt.dtb` shows it. Look under `cpus`. Then
+        try `rdtime` in a user program.
+      - |
+        The rate is a property of the machine; user programs should not have to know it.
+        User mode cannot read `time` here (hint 2 of the first question), and `uptime()`
+        counts hart 0's 0.1 s ticks.
+      - |
+        Where is a conversion cheapest: at every transition, or once per question? Which
+        unit can a user program use without knowing the machine, and where will `time`
+        get "now" in that unit?
+    answer: |
+      QEMU's device tree says `timebase-frequency = <0x989680>`: 10,000,000 Hz, 10 ticks per
+      microsecond. The reference names it `TIMEBASE` in `param.h` and converts with one
+      division per value in the system call. The fast paths (`usertrap`, `prepare_return`,
+      `sched`) only subtract and add.
+
+      User mode cannot read the clock itself. A test program executing `rdtime a1` was
+      killed with `usertrap(): unexpected scause 0x2 pid=3` / `sepc=0x14 stval=0xc01025f3`,
+      an illegal instruction, because `scounteren.TM` is 0. So `cputime()` returns the
+      current time too, in microseconds, and `time` subtracts.
+
+      Microseconds in a `uint64` last 584,000 years. The conversion's danger is the order of
+      operations: `t * 1000000 / TIMEBASE` overflows once `t` passes 2^64 / 10^6 ticks, about
+      21 days of uptime. `t / (TIMEBASE / 1000000)` cannot overflow, and is exact while the
+      rate is a whole number of MHz. If you forget the conversion, every number is 10 times
+      too large, and only a check against an independent clock catches it (clinic 6).
+    checks:
+      - id: lab04-12
+        level: 1
+        type: number
+        q: |
+          QEMU's device tree says `timebase-frequency = <0x989680>`. How many ticks of `time`
+          are there in one microsecond?
+        answer: 10
+        wrong:
+          1: |
+            You may have assumed the counter counts microseconds. 0x989680 is 10,000,000
+            per second, so 10 per microsecond.
+          1000: |
+            You may have divided by 10,000 instead of 1,000,000. One microsecond is a
+            millionth of a second.
+          100: |
+            You may have misread the hex: 0x989680 is 10,000,000, not 100,000,000.
+        why_wrong: |
+          Convert 0x989680 to decimal (10,000,000) and divide by 1,000,000.
+        explain: |
+          The device tree is how a RISC-V machine tells its software the clock rate. xv6
+          never reads it; it hard-codes the interval in [[clockintr]], whose comment says
+          1,000,000 ticks is "about a tenth of a second". See [[g:csr-time]].
+      - id: lab04-13
+        level: 2
+        type: choice
+        q: |
+          A user program in this tree executes `rdtime a1`. What happens?
+        options:
+          - text: "The hart traps with an illegal-instruction exception and usertrap kills the process"
+            correct: true
+            why: |
+              `scounteren` is 0, so U-mode access to `time` is illegal. The recorded run
+              printed `usertrap(): unexpected scause 0x2 pid=3`.
+          - text: a1 gets the current time, because start.c set mcounteren
+            why: |
+              You may have thought `mcounteren` alone is enough for every mode. It lets
+              supervisor mode read `time`; user access also needs `scounteren.TM`, which no
+              code here sets.
+          - text: a1 gets 0
+            why: |
+              You may have thought a disallowed CSR read returns 0. It raises an exception
+              instead.
+          - text: The kernel panics
+            why: |
+              You may have thought any unexpected exception is fatal to the kernel. An
+              exception from user mode reaches [[usertrap]], which kills only the process.
+        explain: |
+          Counter access is delegated one level at a time: M-mode's `mcounteren` lets S-mode
+          read `time`, and S-mode's `scounteren` would let U-mode read it. See
+          [[g:csr-mcounteren]] and [[tour:10]].
+build: |
+  **Start from the frozen commit**, in your own clone of xv6:
+
+  ```sh
+  git checkout -b my-cputime 06aad25
+  ```
+
+  Work in this order; every step builds and boots.
+
+  1. **The fields.** `tstamp`, `utime`, `stime`, `cutime`, `cstime` (all `uint64`) in the
+     private part of `struct proc`; clear them in [[freeproc]]. Nothing changes yet.
+  2. **The trap boundary.** Charge user time at the top of [[usertrap]] (after `p =
+     myproc()`) and system time at the end of [[prepare_return]]. Still nothing to see: no
+     one reads the counters.
+  3. **The switch.** Stop the clock in [[sched]] before `swtch`, restart it after; start it
+     in [[forkret]].
+  4. **Children.** The two additions in [[kwait]].
+  5. **The system call.** `kernel/cputime.h`, `TIMEBASE`, the five registration points from
+     lab 1 (`syscall.h`, `syscall.c` twice, `usys.pl`, `user.h`), and `sys_cputime` with its
+     interrupts-off read. Test with a tiny program that spins, calls `cputime` and prints.
+  6. **`time`**, then **`cputest`**, then `usertests -q`, then `cputest` again.
+
+  **Debugging.** Run QEMU on three harts. Print, don't guess: a temporary `printk` of `pid`,
+  `utime` and `stime` in [[kexit]] shows each process's final numbers. In [[g:gdb]] the
+  `time` CSR is readable as `$time`, so `p $time - cpus[$_thread - 1].proc->tstamp` is the
+  current stretch of the process on the selected hart (gdb's thread N is hart N-1).
+  If you set a breakpoint on a line that only calls `r_time()`, gdb may answer "No compiled
+  code for line 504": the inlined `rdtime` is attributed to `riscv.h`. Break on the
+  instruction instead (`grep rdtime kernel/kernel.asm`, then `break *0x...`). Signs to read:
+
+  - system time about equal to real time for a sleeper: the clock was not stopped at the
+    switch (clinic 2);
+  - system time of seconds for a program that ran for milliseconds: a stretch started at 0
+    (clinic 3);
+  - `panic: acquire` right after boot: a lock taken twice (clinic 4);
+  - every time 10 times too large compared with a stopwatch: units (clinic 6).
+clinic:
+  - bug: Sampled the timer interrupt on hart 0 only
+    change: |
+      Instead of reading `time` at the transitions, the learner charges one timer period to
+      the running process next to `ticks++` in [[clockintr]]. The four transition charges
+      are removed, and the system call reports `stime` without a running stretch:
+
+      ```diff
+           ticks++;
+           wakeup(&ticks);
+           release(&tickslock);
+      +
+      +    // charge one timer period to the running process.
+      +    struct proc *p = myproc();
+      +    if (p) {
+      +      if (r_sstatus() & SSTATUS_SPP)
+      +        p->stime += 1000000;
+      +      else
+      +        p->utime += 1000000;
+      +    }
+         }
+      ```
+    symptom: |
+      $ cputest
+      cputest: spin: real 300 ms, user 0 ms, sys 0 ms
+      cputest: a CPU-bound loop is mostly user time: FAIL
+      cputest: 20000 getpids: real 459 ms, user 0 ms, sys 0 ms
+      cputest: system calls add kernel time: FAIL
+      [...]
+      cputest: 3 spinning children: real 522 ms, user 400 ms, sys 0 ms
+      cputest: on 3 harts, 3 spinners use more CPU time than real time: FAIL
+      cputest: 4 processes calling cputime() for 2 s: sys went backwards 0 times
+      cputest: kernel time never goes backwards: OK
+      cputest: 3 FAILED
+      $ time cputest par 1000
+      real 2.571
+      user 2.400
+      sys  0.000
+      $ time cputest spin 2000
+      real 5.035
+      user 4.500
+      sys  0.000
+      $ time cputest spin 2000
+      real 4.732
+      user 4.700
+      sys  0.000
+      $ time cputest spin 2000
+      real 4.542
+      user 4.500
+      sys  0.000
+    why: |
+      The block runs only when `cpuid() == 0` ([[kernel/trap.c:169]]), so only the process
+      on hart 0 is ever charged. Harts 1 and 2 take their own timer interrupts and call
+      [[clockintr]] too, but skip the block.
+
+      - `cputest`'s first spin ran on another hart for its whole 300 ms: user 0. The three
+        spinning children, one per hart, got 400 ms between them where the reference
+        records about 1,440.
+      - `time cputest par 1000` reported 2.4 s of user time. The reference reported 6.018 s
+        for the same workload (Verify).
+      - A single spinner is charged correctly only while it happens to run on hart 0, and a
+        process tends to stay on the hart that last ran it. In these three runs it mostly
+        did; in `cputest`'s first check it never did.
+
+      Every number is a multiple of 0.1 s: the sample's weight. The `sys` check of the
+      getpid loop failed too, because the 459 ms loop ran on another hart. Even on every
+      hart, sampling would charge a command of a few milliseconds 0 or 100 ms. That is why
+      the reference reads the clock.
+  - bug: Forgot to stop the clock at the switch
+    change: |
+      The transitions in [[usertrap]] and [[prepare_return]] are charged and [[forkret]]
+      starts the clock, but [[sched]] is unchanged:
+
+      ```diff
+      -  // stop this process's clock while it is not running.
+      -  p->stime += r_time() - p->tstamp;
+      -
+         intena = mycpu()->intena;
+         swtch(&p->context, &mycpu()->context);
+         mycpu()->intena = intena;
+      -
+      -  // running again, perhaps on another hart: restart the clock.
+      -  p->tstamp = r_time();
+       }
+      ```
+    symptom: |
+      $ cputest
+      [...]
+      cputest: pause(5): real 470 ms, user 0 ms, sys 470 ms
+      cputest: pause(5) takes about half a second of real time: OK
+      cputest: sleeping adds almost no CPU time: FAIL
+      [...]
+      cputest: 1 FAILED
+      $ time cputest sleep 10
+      real 0.950
+      user 0.000
+      sys  0.947
+      $ time cputest par 1000
+      real 2.923
+      user 8.463
+      sys  2.931
+    why: |
+      `pause` enters the kernel (the user stretch is charged in [[usertrap]]), sleeps in
+      [[sleep]] → [[sched]], and comes back about 0.47 s later. Nothing touched `tstamp` in
+      between, so [[prepare_return]] adds the whole 0.47 s, other processes' running time
+      and the harts' idle `wfi` included, to the sleeper's system time.
+
+      The same thing explains `sys  2.931` for `cputest par`: the parent process sleeps in
+      `wait` for 2.9 s while its three children spin, and all of that becomes its system
+      time, which `time` then sees through the children totals. Notice what the three
+      spinners did *not* get: they ran the whole time and yielded to themselves at timer
+      interrupts, so they gained almost nothing.
+  - bug: Forgot that a new process starts in forkret
+    change: |
+      [[sched]] stops and restarts the clock, but [[forkret]] does not start it:
+
+      ```diff
+         struct proc *p = myproc();
+
+      -  // a new process starts running here, not in sched():
+      -  // start its clock.
+      -  p->tstamp = r_time();
+      -
+         // Still holding p->lock from scheduler.
+         release(&p->lock);
+      ```
+    symptom: |
+      $ cputest
+      [...]
+      cputest: child said user 193 ms, sys 1750 ms; parent got user 193 ms, sys 1751 ms
+      cputest: wait adds the child's time: OK
+      cputest: new child: user 67 us, sys 1967660 us
+      cputest: a new process starts with almost no CPU time: FAIL
+      cputest: a grandchild's time arrives through its parent: OK
+      cputest: 3 spinning children: real 526 ms, user 1444 ms, sys 6682 ms
+      [...]
+      cputest: 1 FAILED
+      $ time echo hi
+      hi
+      real 0.004
+      user 0.000
+      sys  4.966
+      $ time echo hi
+      hi
+      real 0.003
+      user 0.000
+      sys  5.465
+    why: |
+      A new process's first `swtch` lands in [[forkret]] (its `context.ra`, set by
+      [[allocproc]]), not after the `swtch` in [[sched]], so the restart there never runs
+      for it. Its `tstamp` is whatever [[freeproc]] left: 0. The first [[prepare_return]]
+      then charges `time - 0`, the time since the machine started, as system time.
+
+      Each new process gets the uptime at its first return: 1.97 s for the `new child`
+      check, about 2.2 s for each of the three spinners (6,682 ms together), 4.966 s and
+      then 5.465 s for the two `echo`s, half a second apart. The tell-tale is system time
+      larger than real time for a single process. `cputest` notices only because it checks
+      a fresh child directly; the checks that compare a child's own report with what the
+      parent received still pass, since both carry the same wrong number.
+  - bug: Protected the counters with p->lock
+    change: |
+      A learner decides that fields in `struct proc` need `p->lock` and routes every update
+      through one helper, called from [[usertrap]], [[prepare_return]] and [[sched]]:
+
+      ```c
+      void
+      charge(struct proc *p, uint64 *t)
+      {
+        acquire(&p->lock);
+        uint64 now = r_time();
+        if (t)
+          *t += now - p->tstamp;
+        p->tstamp = now;
+        release(&p->lock);
+      }
+      ```
+
+      In [[sched]]: `charge(p, &p->stime);` before `swtch` and `charge(p, 0);` after it.
+    symptom: |
+      xv6 kernel is booting
+
+      hart 2 starting
+      hart 1 starting
+      panic: acquire
+
+      (a second boot of the same kernel, under gdb with a breakpoint on panic:)
+      Thread 2 hit Breakpoint 1, panic (s=s@entry=0x80007048 "acquire") at kernel/printk.c:139
+      [...]
+        Id   Target Id                    Frame
+        1    Thread 1.1 (CPU#0 [halted ]) s_sstatus (x=2) at kernel/riscv.h:67
+      * 2    Thread 1.2 (CPU#1 [running]) panic (s=s@entry=0x80007048 "acquire") at kernel/printk.c:139
+        3    Thread 1.3 (CPU#2 [running]) 0x0000000080000c0a in acquire (lk=lk@entry=0x8000fdd0 <proc>) at kernel/spinlock.c:37
+      #0  panic (s=s@entry=0x80007048 "acquire") at kernel/printk.c:139
+      #1  0x0000000080000c28 in acquire (lk=lk@entry=0x8000fdd0 <proc>) at kernel/spinlock.c:26
+      #2  0x0000000080001e5a in charge (p=p@entry=0x8000fdd0 <proc>, t=t@entry=0x8000ff48 <proc+376>) at kernel/proc.c:517
+      #3  0x0000000080001ed6 in sched () at kernel/proc.c:503
+      #4  0x0000000080001fde in sleep () at kernel/proc.c:599
+      #5  0x0000000080005bf4 in virtio_disk_rw (b=b@entry=0x80016200 <bcache+24>, write=write@entry=0) at kernel/virtio_disk.c:290
+      #6  0x0000000080002db4 in bread (dev=dev@entry=1, blockno=blockno@entry=1) at kernel/bio.c:98
+      #7  0x00000000800036cc in readsb (dev=1, sb=0x8001e8a8 <sb>) at kernel/fs.c:35
+      #8  fsinit (dev=dev@entry=1) at kernel/fs.c:44
+      #9  0x000000008000196e in forkret () at kernel/proc.c:558
+      [...]
+      $1 = 2
+      $2 = 2
+      $3 = '\000' <repeats 15 times>
+      $4 = 1
+      $5 = {locked = 1, name = 0x80007178 "proc", cpu = 0x8000fa50 <cpus+128>}
+    why: |
+      ([[g:gdb]] commands, in order: `info threads`, `bt`, `p $_thread`,
+      `p cpus[$_thread - 1].noff`, `p ...proc->name`, `p ...proc->pid`, `p ...proc->lock`.)
+
+      [[sched]] is entered holding the process's own `p->lock`: it checks that
+      ([[kernel/proc.c:485]]). `charge` then calls `acquire` on the same lock. [[acquire]]
+      sees that this hart already holds it and panics ([[kernel/spinlock.c:25]]): a spinlock
+      cannot be taken twice, and if it did not panic it would spin forever, waiting for
+      itself. It happens at the very first `sched` after boot: pid 1 (no name yet, it has
+      not exec'd `/init`) sleeping in [[fsinit]]'s first disk read, on hart 1. `noff` is 2:
+      `sched`'s lock plus the `push_off` in the failed `acquire`. Hart 2 is spinning in
+      `acquire` on the same lock (`proc[0]`, which hart 1 will never release), and hart 0
+      is halted, waiting in `wfi`.
+
+      The helper would have worked in [[usertrap]] and [[prepare_return]], at the price of
+      a lock on every system call. But it protects nothing, because only the process writes
+      these fields. The lock that does matter is the child's, held by [[kwait]], and that
+      one is already held.
+  - bug: Read the running clock with interrupts on
+    change: |
+      This version of the system call reads `time` first, and `stime` and `tstamp` later,
+      all with interrupts on:
+
+      ```diff
+         struct proc *p = myproc();
+      +  uint64 now = r_time();
+         uint64 tpus = TIMEBASE / 1000000; // ticks per microsecond
+
+         argaddr(0, &addr);
+      -
+      -  // the clock is running: include this system call so far. a timer
+      -  // interrupt here could yield, and sched() would change stime and
+      -  // tstamp between our reads; so read them with interrupts off.
+      -  push_off();
+      -  uint64 now = r_time();
+      -  ct.stime = (p->stime + (now - p->tstamp)) / tpus;
+      -  pop_off();
+      -
+         ct.real = now / tpus;
+         ct.utime = p->utime / tpus;
+      +  // the clock is running: include this system call so far.
+      +  ct.stime = (p->stime + (now - p->tstamp)) / tpus;
+      ```
+    symptom: |
+      $ cputest
+      [...]
+      cputest: 4 processes calling cputime() for 2 s: sys went backwards 5 times
+      cputest: kernel time never goes backwards: FAIL
+      cputest: 1 FAILED
+      $ cputest
+      [...]
+      cputest: 4 processes calling cputime() for 2 s: sys went backwards 0 times
+      cputest: kernel time never goes backwards: OK
+      cputest: all 10 checks OK
+      $ cputest
+      [...]
+      cputest: 4 processes calling cputime() for 2 s: sys went backwards 2 times
+      cputest: kernel time never goes backwards: FAIL
+      cputest: 1 FAILED
+    why: |
+      Interrupts are on in a system call ([[usertrap]] turned them on). Suppose the timer
+      fires after `now = r_time()` and the process yields. [[sched]] adds `t_stop - tstamp`
+      to `stime` and, when the process runs again, sets `tstamp = t_resume`. Back in the
+      system call, `stime + (now - tstamp)` now equals the correct value minus
+      `t_resume - t_stop`: the time it spent switched out. The `uint64` subtraction wraps,
+      and the addition wraps back. The reported `stime` drops below the previous call's, by
+      anything from microseconds (another process's very short run) to a whole 0.1 s time
+      slice. A scratch program with four processes calling `cputime()` in a loop for 10 s
+      recorded, among others, `mono 7: sys went from 850595 to 850591 us` and
+      `mono 5: sys went from 2860715 to 2860614 us`, and a drop of a whole time slice,
+      from 1569844 to 1469732 us (that line is reassembled: two processes' output
+      interleaved on the console). If the gap ever exceeded the process's whole
+      system time, the sum would wrap to a number near 2^64.
+
+      The window is a few instructions long, so the bug needs many calls and more
+      processes than harts. `cputest`'s eighth check makes both happen, and caught it in
+      two of these three runs. "Only the process writes these fields" is true. But [[sched]]
+      runs as the process *in the middle of its own system call*, on the same hart. What
+      excludes it is `push_off()` around the three reads: with interrupts off, no timer
+      interrupt can come between them ([[concept:locks#invariant]]). An `acquire` would
+      also work, but only because it calls `push_off` first.
+  - bug: Returned raw ticks as microseconds
+    change: |
+      The learner assumes the `time` CSR counts microseconds:
+
+      ```diff
+      -  uint64 tpus = TIMEBASE / 1000000; // ticks per microsecond
+      +  uint64 tpus = 1; // the time CSR counts microseconds (it does not)
+      ```
+    symptom: |
+      $ cputest
+      cputest: spin: real 302 ms, user 292 ms, sys 9 ms
+      cputest: a CPU-bound loop is mostly user time: OK
+      cputest: 20000 getpids: real 4282 ms, user 3147 ms, sys 1133 ms
+      cputest: system calls add kernel time: OK
+      cputest: pause(5): real 4136 ms, user 0 ms, sys 3 ms
+      cputest: pause(5) takes about half a second of real time: FAIL
+      [...]
+      cputest: 3 spinning children: real 1286 ms, user 1448 ms, sys 51 ms
+      cputest: on 3 harts, 3 spinners use more CPU time than real time: FAIL
+      [...]
+      cputest: 2 FAILED
+      $ time cputest sleep 10
+      real 9.752
+      user 0.002
+      sys  0.023
+    why: |
+      Every value is 10 times too large, and every *ratio* is still right, so most checks
+      pass. The spin check passes because it compares user time with real time, both
+      inflated. The only check that compares with an independent clock catches it:
+      `pause(5)` waits five of hart 0's ticks (about 0.5 s), and the "real" time came out
+      as 4.1 s. `time cputest sleep 10` (one second) printed `real 9.752`.
+
+      The three-spinner check failed for a less obvious reason. `spinfor(500)` stops when
+      the "real" time has advanced by 500 "ms", which is really 50 ms. Forking and waiting
+      for three processes costs about the same, so the CPU-to-real ratio fell to 1.1.
+
+      The defence is the one in the reference: keep the rate in one named constant, taken
+      from the device tree (`timebase-frequency = <0x989680>`), and test against a
+      clock you did not derive from it.
+reveal:
+  - title: Five counters in the private part of struct proc
+    commit: 1
+    file: kernel/proc.h
+    lines: 81-112
+    focus: 104-111
+    diff: true
+    state:
+      hart: 2
+      mode: S
+      proc: time (pid 3)
+      intr: "off"
+      satp: kernel
+      locks: []
+      stack: [usertrap]
+      sp: kernel
+      irq: 0
+    note: |
+      The story for this tour: on a fresh boot with three harts you type `time cputest spin
+      200`. The shell forks pid 3, which execs `time`; `time` forks pid 4, which execs
+      `cputest`, spins for about 0.36 s and exits. The run was recorded under [[g:gdb]] with
+      breakpoints at every new line, so harts, pids, lock states and `time` values below
+      come from it (the breakpoints slow the run, so absolute durations are inflated). It
+      printed `real 0.380`, `user 0.360`, `sys  0.015`. The state shown here is the first
+      time these fields are used, two steps from now.
+
+      Five `uint64`s, all in ticks of the `time` CSR: `tstamp`, when the current stretch of
+      running began, and four sums. They sit with `sz`, `ofile` and `name` in the section
+      "private to the process, so p->lock need not be held" ([[kernel/proc.h:95]]). While it
+      lives, only the process itself writes them, from the code it runs in the kernel;
+      [[freeproc]] clears them once it is gone (next step). The parent reads a dead
+      child's counters, but only under the child's `p->lock`, which it holds
+      at that moment anyway (step 11).
+
+      `uint64` because the clock is 64 bits wide and counts 10,000,000 a second: a 32-bit
+      counter would wrap after seven minutes.
+  - title: freeproc gives the next process a clean slate
+    commit: 1
+    file: kernel/proc.c
+    lines: 152-176
+    focus: 170-174
+    diff: true
+    state:
+      hart: 2
+      mode: S
+      proc: time (pid 3)
+      intr: "off"
+      satp: kernel
+      locks: [wait_lock, "cputest's p->lock (pid 4)"]
+      stack: [usertrap, syscall, sys_wait, kwait, freeproc]
+      sp: kernel
+      irq: {noff: 2, intena: 1}
+    note: |
+      Jump to the end of the story: `time` (pid 3) is reaping `cputest` (pid 4) in [[kwait]],
+      which holds `wait_lock` and the child's `p->lock` (`noff` 2; `intena` 1 because the
+      first acquire happened inside a system call with interrupts on). The gdb run stopped
+      here on hart 2.
+
+      `freeproc` returns the slot to UNUSED, and the five new lines zero the counters. This
+      matters more than the similar line in lab 1, because `fork` never writes these fields.
+      A child starts with whatever the slot holds. A kernel without these five lines (a
+      separate experiment) showed it: `cputest` reported
+      `new child: user 194152 us, sys 7106 us` for a process that had run for microseconds,
+      exactly the previous occupant's time. Three runs of `time cputest spin 100` in a row
+      printed `user 1.970`, `user 2.202` and `user 2.439` for about 0.2 s of real time each,
+      as the same slot kept accumulating.
+    others: |
+      A scheduler on hart 0 or 1 that reaches this slot in its scan spins on the same
+      `p->lock` until `kwait` releases it, then finds UNUSED and moves on. The next `fork`,
+      on any hart, can take the slot as soon as the lock is free, which is why the counters
+      must be clean before then.
+  - title: The first C after a trap ends the user stretch
+    commit: 2
+    file: kernel/trap.c
+    lines: 37-73
+    focus: 49-54
+    diff: true
+    state:
+      hart: 2
+      mode: S
+      proc: time (pid 3)
+      intr: "off"
+      satp: kernel
+      locks: []
+      stack: [usertrap]
+      sp: {"on": kernel, detail: "pid 3's kernel stack, empty until this trap"}
+      irq: 0
+    note: |
+      `time` has just executed the `ecall` in its `cputime` stub (`sepc` `0x4f2`) and
+      [[uservec]] has brought it here. As soon as [[usertrap]] knows the process (line 49)
+      it reads the clock: everything since `tstamp` was user time. In the gdb run `now` was
+      5,191,317 and `tstamp` 5,190,271, so 1,046 ticks (104.6 µs) went to `utime`: the
+      time from `exec`'s return to this first system call.
+
+      Interrupts are still off: the trap turned them off, and line 71 turns them back on
+      only for system calls. No timer can interrupt these three lines. The same holds
+      wherever the counters are written; the one place that reads them with interrupts on
+      is step 14's problem.
+
+      Every trap from user mode comes through here: system calls, device and timer
+      interrupts, page faults. So every one of them ends the user stretch, which settles the
+      question "whose time is an interrupt?". The interrupted process pays, as system time.
+    others: |
+      Harts 0 and 1 may be running other processes through these very lines, with their own
+      `p`. Same code, different `struct proc`, no shared counter, no lock.
+  - title: The last C before the return ends the kernel stretch
+    commit: 2
+    file: kernel/trap.c
+    lines: 100-143
+    focus: 135-142
+    diff: true
+    state:
+      hart: 2
+      mode: S
+      proc: time (pid 3)
+      intr: "off"
+      satp: kernel
+      locks: []
+      stack: [usertrap, prepare_return]
+      sp: kernel
+      irq: 0
+    note: |
+      The system call is done. [[prepare_return]] turned interrupts off at line 113 and set
+      up `stvec`, the trapframe, `sstatus` and `sepc`. Its last act now is to add the kernel
+      stretch to `stime` and start a new user stretch. In the gdb run this was the return
+      from that first `cputime` call: `now` 5,193,745, `tstamp` 5,191,317, so 2,428 ticks
+      of system time, inflated by the breakpoint stop inside the call.
+
+      [[prepare_return]] is called from two places: [[usertrap]], and [[forkret]] for a
+      process's very first return. So one charge here covers both roads to user mode. What
+      it does not cover is what follows. [[usertrap]] returns the user `satp` to
+      `uservec`'s `jalr` ([[kernel/trampoline.S:98]]), which falls into [[userret]]. All of
+      that is now counted as user time. The next step looks at how much that is.
+  - title: Between the C code and the mode switch
+    commit: 2
+    file: kernel/trampoline.S
+    lines: 94-118
+    focus: 100-110
+    state:
+      hart: 2
+      mode: S
+      proc: time (pid 3)
+      intr: "off"
+      satp: kernel
+      locks: []
+      stack: [userret]
+      sp: {"on": kernel, detail: "pid 3's kernel stack, empty again: usertrap's frame was popped when it returned"}
+      irq: 0
+    note: |
+      This file did not change, and that is the point. Between the charge at the end of
+      [[prepare_return]] and the `sret` that really enters user mode, the hart still
+      returns through [[usertrap]] and then runs `fence.i` (line 107), `sfence.vma` (110), `csrw satp` (111), another `sfence.vma`, 31
+      loads and `sret`. On the way in, `uservec` ran 31 stores, two `sfence.vma` and a
+      `csrw satp` before [[usertrap]]'s first line. The reference charges all of it as user
+      time.
+
+      How much is that? A scratch copy of the kernel also read `time` in the trampoline
+      itself (right after `uservec` saves the registers, and right after `userret` switches
+      `satp`) and kept a second ledger with the boundary there. For a loop of `getpid`
+      calls, 3 s of real time:
+
+      | boundary | user | sys |
+      |---|---|---|
+      | in C (the reference) | 2.16 s | 0.85 s |
+      | in the trampoline | 0.22 s | 2.79 s |
+
+      On QEMU about two thirds of a system call's time is spent in these few dozen
+      instructions. A likely explanation, not measured instruction by instruction: QEMU emulates
+      the TLB in software, and changing `satp` and fencing are expensive for it; real
+      hardware has different proportions. For a program that mostly
+      computes the difference is small (the spinner: 2.89 to 2.90 s against 2.73 to 2.77 s
+      of user time).
+      Moving the boundary into the trampoline is one of the stretch goals.
+  - title: sched stops the clock before the switch
+    commit: 3
+    file: kernel/proc.c
+    lines: 477-508
+    focus: 499-500
+    diff: true
+    state:
+      hart: 2
+      mode: S
+      proc: time (pid 3)
+      intr: "off"
+      satp: kernel
+      locks: ["time's p->lock (pid 3)"]
+      stack: [usertrap, syscall, sys_wait, kwait, sleep, sched]
+      sp: kernel
+      irq: {noff: 1, intena: 1}
+    note: |
+      `time` has forked `cputest` and called `wait`. [[kwait]] found no zombie, and
+      [[sleep]] took `time`'s own `p->lock`, set SLEEPING and called [[sched]]. Every way a
+      process gives up a hart ([[yield]], [[sleep]], [[kexit]]) comes through here, holding
+      exactly its own `p->lock` with interrupts off (the checks on lines 490-497 insist on
+      both). So this is the one place to stop the clock: line 500 adds the kernel stretch up
+      to the switch. In the gdb run, `time` was 5,198,020 and `tstamp` 5,197,263, so 757
+      ticks were added.
+
+      From the `swtch` on line 503 until the process comes back, nothing is charged to it:
+      not the scheduler's scan, not other processes, not an idle hart's `wfi`. Without
+      these lines that whole interval would be added at the next charge (clinic 2:
+      `pause(5)` came out as `sys 470 ms`).
+
+      Writing `stime` needs no extra lock, and taking one here would be fatal: this hart
+      already holds `p->lock`, and acquiring it again panics (clinic 4).
+    others: |
+      Right after this `swtch`, hart 2's scheduler releases pid 3's lock and goes on with
+      its scan. It finds `cputest`, still pid 4 in `time`'s image, RUNNABLE, and switches to
+      it: the gdb run's next stop on hart 2 was pid 4 in [[forkret]] at `time` 5,198,418,
+      398 ticks later. Those 39.8 µs belong to neither process.
+  - title: Running again, perhaps on another hart
+    commit: 3
+    file: kernel/proc.c
+    lines: 477-519
+    focus: 504-507
+    state:
+      hart: 0
+      mode: S
+      proc: time (pid 4)
+      intr: "off"
+      satp: kernel
+      locks: ["pid 4's p->lock (taken by hart 0's scheduler)"]
+      stack: [usertrap, syscall, sys_exec, kexec, kernelvec, kerneltrap, yield, sched]
+      sp: {"on": kernel, switched: "`ld sp, 8(a1)` in [[swtch]] ([[kernel/swtch.S:26]])", detail: "pid 4's kernel stack, with a kernelvec frame in the middle"}
+      irq: {noff: 1, intena: 0}
+    note: |
+      `swtch` has returned, on a different hart. In the gdb run pid 4 (still called `time`,
+      because `exec` renames a process only when it succeeds) was inside `exec` on hart 2
+      when hart 2's timer fired. [[kerneltrap]] called [[yield]], and [[sched]] stopped the
+      clock (gdb read `time` = 5,293,746 at the breakpoint just before the `rdtime`). The
+      process switched out, and hart 0's scheduler picked it up. Line 507 restarts the clock
+      (gdb read 5,295,602 at that breakpoint). The 1,856 ticks in between, with pid 4
+      RUNNABLE and not running, are charged to nobody.
+
+      The kernel never subtracts these two numbers: it closed the stretch on hart 2 and
+      opens a new one on hart 0, so every stretch is measured on one hart. The 1,856-tick
+      figure means something only because the harts' clocks are synchronized; the
+      accounting itself would not need that. The `intena` restored by line 504 is 0,
+      the value [[sched]] saved: this process gave up the hart from inside an interrupt
+      handler, where interrupts were off ([[concept:locks#sched-intena]]). (gdb could not
+      unwind past `kernelvec`; the earlier stops of this run place pid 4 inside `kexec`,
+      reading the program from disk.)
+
+      The interrupt itself, and the `yield` up to line 500, were inside pid 4's kernel
+      stretch: they are its system time, although the timer interrupt was not "for" it any
+      more than for anyone else.
+  - title: A timer interrupt from user mode
+    commit: 3
+    file: kernel/trap.c
+    lines: 84-100
+    focus: 89-91
+    state:
+      hart: 2
+      mode: S
+      proc: cputest (pid 4)
+      intr: "off"
+      satp: kernel
+      locks: []
+      stack: [usertrap]
+      sp: kernel
+      irq: 0
+    note: |
+      Now `cputest` is spinning in user mode, and the timer fires on its hart. The trap
+      ended the user stretch at the top of [[usertrap]] (step 3); [[devintr]] and
+      [[clockintr]] ran in a new kernel stretch; now [[yield]] will go through [[sched]],
+      which stops the clock, and restart it when the scheduler picks `cputest` again.
+
+      With three harts and nothing else to run, that happens at once. In the gdb run
+      `cputest` resumed from such a yield on hart 2 at `time` 6,296,818, with `utime` at
+      942,834 ticks. An earlier recorded run of the same command caught two of these
+      yields, 0.1 s apart. Both stopped and resumed on hart 0, 0.2 ms later. A spinner is
+      preempted every 0.1 s, but it loses only the scheduler's scan.
+      Interrupts are off here (they are turned on in [[usertrap]] only for system calls),
+      so the `acquire` in [[yield]] records `intena` 0.
+
+      Compare the sampling design from the first question. It would charge this whole
+      0.1 s period at this moment, to whatever mode the interrupt found.
+  - title: A new process starts its clock in forkret
+    commit: 3
+    file: kernel/proc.c
+    lines: 521-560
+    focus: 530-532
+    diff: true
+    state:
+      hart: 2
+      mode: S
+      proc: time (pid 4)
+      intr: "off"
+      satp: kernel
+      locks: ["pid 4's p->lock (from the scheduler)"]
+      stack: [forkret]
+      sp: {"on": kernel, switched: "`ld sp, 8(a1)` in [[swtch]] ([[kernel/swtch.S:26]])", detail: "pid 4's fresh, empty kernel stack"}
+      irq: {noff: 1, intena: 0}
+    note: |
+      pid 4's first `swtch` landed here, not after the `swtch` in [[sched]]: [[allocproc]]
+      set `context.ra` to [[forkret]] ([[kernel/proc.c:146]]). The gdb run stopped on this
+      line with `tstamp` 0, as [[freeproc]] left it, and `time` 5,198,418. Line 532 starts
+      the clock there.
+
+      Without it, the first charge, in the [[prepare_return]] this function calls (line
+      554), would be `time - 0`: the time since boot (clinic 3 printed `sys  4.966` for
+      `echo hi`). With it, that first charge was 227 ticks (22.7 µs): `forkret` and the
+      return preparation.
+
+      The process still holds the `p->lock` its scheduler acquired, taken with interrupts
+      off, so `intena` is 0 and the release on line 535 leaves them off. Setting `tstamp`
+      before or after that release makes no difference: no one else touches it.
+  - title: The zombie's last charge
+    commit: 3
+    file: kernel/proc.c
+    lines: 327-370
+    focus: 367-368
+    state:
+      hart: 2
+      mode: S
+      proc: cputest (pid 4)
+      intr: "off"
+      satp: kernel
+      locks: ["cputest's p->lock (pid 4)"]
+      stack: [usertrap, syscall, sys_exit, kexit, sched]
+      sp: kernel
+      irq: {noff: 1, intena: 1}
+    note: |
+      [[kexit]] did not change, but it now ends with a charge. It took the process's
+      `p->lock` on line 360, set ZOMBIE, released `wait_lock` (line 365) and calls
+      [[sched]], which adds the final kernel stretch, the time spent closing files and in
+      `kexit` itself, before switching away for ever. A second gdb run (another boot, same
+      command, which printed `real 0.435`) stopped in [[sched]] for this zombie on hart 2:
+      `noff` 1, `intena` 1, `stime` 153,287 ticks before the addition, with 7,016 ticks
+      since `tstamp`.
+
+      The lock is the whole point. It is held from line 360 through the charge and the
+      switch, and released by hart 2's scheduler after `swtch` returns there. Any parent
+      that wants to read these counters must acquire it first, so it cannot read them before
+      this last addition. In that second run the parent read `stime` 160,720, a little more
+      than 153,287 + 7,016, because the clock ran on between the breakpoint and the `rdtime`.
+  - title: wait passes the child's time to the parent
+    commit: 4
+    file: kernel/proc.c
+    lines: 374-428
+    focus: 402-405
+    diff: true
+    state:
+      hart: 2
+      mode: S
+      proc: time (pid 3)
+      intr: "off"
+      satp: kernel
+      locks: [wait_lock, "cputest's p->lock (pid 4)"]
+      stack: [usertrap, syscall, sys_wait, kwait]
+      sp: kernel
+      irq: {noff: 2, intena: 1}
+    note: |
+      Back to the first run. `time` (pid 3) woke up in [[kwait]], found its child a ZOMBIE
+      under the child's lock (line 389), and copied out the exit status. Now it adds the
+      child's counters, and the child's own children totals, to its own `cutime` and
+      `cstime`. In the gdb run the child had `utime` 3,600,731 and `stime` 158,327 ticks:
+      `time` printed them as `user 0.360` and `sys  0.015`.
+
+      Why exactly here:
+
+      - after the `copyout` succeeded: if it fails, `kwait` returns -1 and leaves the zombie
+        to be reaped later, and counting now would count it twice;
+      - before [[freeproc]] (line 407), which zeroes the counters;
+      - under `pp->lock`, which orders this read after the child's last charge (previous
+        step).
+
+      The parent's own fields need no lock: `p` is the process running this code.
+    others: |
+      The two locks keep every other hart out of this slot: a scheduler scanning `proc[]`
+      spins on `pp->lock`, and an exiting process that wants to hand children to `init`
+      waits for `wait_lock`. Neither cares about the counters, but both locks are already
+      held for the zombie's sake, so the counters come for free.
+  - title: One struct crosses the boundary
+    commit: 5
+    file: kernel/cputime.h
+    lines: 1-8
+    diff: true
+    state:
+      hart: 2
+      mode: U
+      proc: time (pid 3)
+      intr: "on"
+      satp: user
+      locks: []
+      stack: [main]
+      sp: user
+    note: |
+      The system call copies out one struct, defined in a header that both the kernel and
+      user programs include, as `kernel/stat.h` is for `fstat`. All five values are
+      microseconds: the kernel converts, so user programs need not know the clock's rate.
+
+      `real` is there because user mode cannot read the clock itself. A test program that
+      executed `rdtime` was killed: `usertrap(): unexpected scause 0x2 pid=3`, an illegal
+      instruction, because `scounteren` is 0. `uptime()` would give only hart 0's 0.1 s
+      ticks.
+
+      The commit also does the registration from lab 1: `SYS_cputime` 23 in `syscall.h`, the
+      `extern` and table entry in `syscall.c`, `entry("cputime")` in `usys.pl`, and
+      `int cputime(struct cputime *);` (with `struct cputime;` declared) in `user.h`.
+  - title: The clock's rate, from the machine
+    commit: 5
+    file: kernel/param.h
+    lines: 1-15
+    focus: 15
+    diff: true
+    state:
+      hart: 2
+      mode: S
+      proc: time (pid 3)
+      intr: "off"
+      satp: kernel
+      locks: []
+      stack: [usertrap, syscall, sys_cputime]
+      sp: kernel
+      irq: {noff: 1, intena: 1, note: "the level is sys_cputime's own push_off (next step)"}
+    note: |
+      10,000,000 is QEMU's number, not xv6's: the `virt` machine's device tree says
+      `timebase-frequency = <0x989680>` (dumped with `-machine virt,dumpdtb=` and `dtc`).
+      xv6 never reads the device tree. The only other place that depends on the rate is
+      [[clockintr]], whose comment calls 1,000,000 "about a tenth of a second". Naming the
+      rate once means the conversion has one place to be right (clinic 6 got it wrong:
+      every number came out 10 times too large).
+  - title: Reading the running clock with interrupts off
+    commit: 5
+    file: kernel/sysproc.c
+    lines: 115-142
+    focus: 127-133
+    diff: true
+    state:
+      hart: 2
+      mode: S
+      proc: time (pid 3)
+      intr: "off"
+      satp: kernel
+      locks: []
+      stack: [usertrap, syscall, sys_cputime]
+      sp: kernel
+      irq: {noff: 1, intena: 1, note: "the level is the push_off on line 130; intena 1 because interrupts were on in the system call"}
+    note: |
+      `stime` alone would leave out the current stretch: the time since this system call
+      began. So the call computes `stime + (time - tstamp)`. In the gdb run, at line 131,
+      `tstamp` was 5,191,317 (the trap, step 3) and `time` 5,192,249.
+
+      This is the one place that reads the counters with interrupts on, and the reason for
+      [[push_off]]. A timer interrupt between the clock read and the field reads could
+      [[yield]], and [[sched]], running as this same process, would add to `stime` and move
+      `tstamp`. The result would come out short by the time spent switched out. The writer
+      is this process on this hart, so what excludes it is turning interrupts off on this
+      hart for three loads (an `acquire` would do the same only because it calls
+      `push_off`). gdb showed `noff` 1 and SIE 0 at this line. Clinic 5 is
+      the version without it: `cputest` saw `stime` go backwards.
+
+      `utime`, `cutime` and `cstime` need no such care. Only [[usertrap]]'s entry and
+      [[kwait]] change them, and the process is in neither right now. Each division by
+      `tpus` (10) turns ticks into microseconds. [[copyout]] checks the user address, as
+      for `fstat`.
+  - title: time reads the totals before and after
+    commit: 6
+    file: user/time.c
+    lines: 1-47
+    focus: 28-45
+    diff: true
+    state:
+      hart: 2
+      mode: U
+      proc: time (pid 3)
+      intr: "on"
+      satp: user
+      locks: []
+      stack: [main]
+      sp: user
+    note: |
+      `time` asks for the totals before `fork` and after `wait` and prints the differences.
+      After the `wait`, the child (and anything it reaped) is in `time`'s own children
+      totals. Subtracting the "before" values is not strictly needed for a fresh `time`
+      process, whose totals start at 0, but it keeps the program correct anywhere. `real` is
+      the difference of two readings of the same clock.
+
+      In the gdb run the system calls were `cputime` (trap at `0x4f2`), `fork` (`0x442`),
+      `wait` (`0x452`), and `cputime` again, all on hart 2; the child exec'd from `0x482`.
+
+      `show` prints whole milliseconds as seconds with three decimals by hand, because the
+      user `printf` has no field widths or zero padding.
+  - title: The test measures what a program can see
+    commit: 7
+    file: user/cputest.c
+    lines: 214-251
+    focus: 231-245
+    diff: true
+    state:
+      mode: U
+      proc: cputest
+      intr: "on"
+      satp: user
+      locks: []
+      stack: [main]
+      sp: user
+    note: |
+      Each of the ten checks compares numbers the program obtains itself. Nothing is left
+      to the eye, so the last line may say `all 10 checks OK`. Two of them guard against
+      mistakes that look plausible in a review.
+
+      - **Check 7** (lines 214-229): three children spin for 0.5 s each on three harts, and
+        their total user time must be at least 1.5 times the real time. Sampling on hart 0
+        only (clinic 1) gave `user 400 ms` for `real 522 ms`.
+      - **Check 8** (lines 231-245): four processes, one more than there are harts, call
+        `cputime()` as fast as they can for 2 s and count the times `stime` went down. More
+        processes than harts means timer interrupts make them yield in the middle of system
+        calls, which is exactly the race of the previous step. The count comes back as the
+        exit status. Clinic 5's kernel failed it in two of three runs. A race this narrow can
+        slip through one run, so the check says what it measured, not that the code is
+        race-free.
+
+      Check 3 compares with hart 0's `ticks` through `pause(5)`, the one clock the
+      accounting did not produce, which is what catches a units mistake (clinic 6).
+verify: |
+  On the branch, three harts, with `cputest` before and after `usertests` (one boot):
+
+  ```text
+  $ cputest
+  cputest: spin: real 300 ms, user 290 ms, sys 9 ms
+  cputest: a CPU-bound loop is mostly user time: OK
+  cputest: 20000 getpids: real 342 ms, user 244 ms, sys 97 ms
+  cputest: system calls add kernel time: OK
+  cputest: pause(5): real 429 ms, user 0 ms, sys 0 ms
+  cputest: pause(5) takes about half a second of real time: OK
+  cputest: sleeping adds almost no CPU time: OK
+  cputest: a child's time is not counted before wait: OK
+  cputest: child said user 192 ms, sys 7 ms; parent got user 192 ms, sys 8 ms
+  cputest: wait adds the child's time: OK
+  cputest: new child: user 112 us, sys 9 us
+  cputest: a new process starts with almost no CPU time: OK
+  cputest: a grandchild's time arrives through its parent: OK
+  cputest: 3 spinning children: real 521 ms, user 1440 ms, sys 59 ms
+  cputest: on 3 harts, 3 spinners use more CPU time than real time: OK
+  cputest: 4 processes calling cputime() for 2 s: sys went backwards 0 times
+  cputest: kernel time never goes backwards: OK
+  cputest: all 10 checks OK
+  $ usertests -q
+  usertests starting
+  [...]
+  ALL TESTS PASSED
+  $ cputest
+  [...]
+  cputest: 3 spinning children: real 538 ms, user 1449 ms, sys 52 ms
+  cputest: on 3 harts, 3 spinners use more CPU time than real time: OK
+  cputest: 4 processes calling cputime() for 2 s: sys went backwards 0 times
+  cputest: kernel time never goes backwards: OK
+  cputest: all 10 checks OK
+  $ time cputest spin 1000
+  real 1.955
+  user 1.950
+  sys  0.003
+  $ time cputest par 1000
+  real 2.053
+  user 6.018
+  sys  0.006
+  $ time cputest sys 100
+  real 1.458
+  user 1.036
+  sys  0.420
+  $ time cputest sleep 10
+  real 0.982
+  user 0.000
+  sys  0.002
+  ```
+
+  The "child said / parent got" line shows the child's own last reading and what the parent
+  received through `wait`. The extra millisecond of system time is what the child did
+  after its last reading: two `write`s to the pipe and its `exit`. The new child, in a
+  reused slot, starts at 112 µs. `time cputest par 1000` charges three spinners 2.9 times
+  the real time, and a sleeper gets almost nothing. Every commit builds on its own, and
+  `usertests -q` passes at the branch head.
+measure: |
+  **Precise against sampled, by measurement.** A scratch copy of the reference kernel kept
+  four ledgers side by side for every process: the reference (the clock read in C, at the
+  transitions); the clock read inside the trampoline instead (right after `uservec` saves the
+  registers, right after `userret` switches `satp`); one 0.1 s sample per timer interrupt on
+  *every* hart, by the mode it interrupted; and the same sampling on hart 0 only. A small
+  program ran each workload for 3 s of real time on three harts (seconds, one boot):
+
+  | workload | real | in C: user / sys | in trampoline: user / sys | sampled, all harts | sampled, hart 0 only |
+  |---|---|---|---|---|---|
+  | spin, 3 runs | 3.000 | 2.89-2.90 / 0.10-0.11 | 2.73-2.77 / 0.23-0.27 | 2.6-2.9 / 0.1-0.4 | 2.6-2.8 / 0.1-0.4 |
+  | getpid loop, 3 runs | 3.009-3.012 | 2.16-2.17 / 0.83-0.85 | 0.22 / 2.79 | 0.7-1.1 / 1.9-2.3 | 0.7-1.1 / 1.9-2.1 |
+  | `pause(30)`, 2 runs | 2.930, 2.969 | 0.000 / 0.001 | 0.000 / 0.001 | 0 / 0 | 0 / 0 |
+  | 3 spinners (sum), 3 runs | 3.073-3.074 | 8.64-8.68 / 0.32-0.36 | 8.19-8.24 / 0.76-0.80 | 8.1-8.5 / 0.3-0.7 | 2.5-2.8 / 0.2-0.5 |
+
+  What it shows:
+
+  - **Hart 0 sees one hart in three.** For three spinners, sampling on hart 0 charged 2.5 to
+    2.8 s against 8.6 to 8.7 s. For a single process, it depends on where the process runs.
+    In this boot the single spinners happened to stay on hart 0. Clinic 1's runs show the
+    other case, `user 0 ms` for 300 ms of spinning.
+  - **Sampling is coarse.** Every sampled number is a multiple of 0.1 s, and the spinner's
+    sampled `sys` swings between 0.1 and 0.4 s from run to run, where the precise ledger
+    says 0.10 to 0.11.
+  - **Sampling is biased for system-call-heavy code.** The trampoline ledger, the truest
+    of the four, says the `getpid` loop spends about 93% of its time in the kernel; sampling
+    said 63 to 77%. The scratch kernel also counted the user-mode samples whose `sepc` was
+    exactly the address the process had just returned to. In the three `getpid` runs that
+    was **every** user-mode sample (11 of 11, 7 of 7, 9 of 9). A likely explanation (the counts
+    are recorded, the mechanism is reasoned): a timer that fires while [[prepare_return]]
+    and [[userret]] run with interrupts off is held pending until `sret`, taken before
+    the first user instruction, and recorded as user time. QEMU delivers interrupts only
+    between translated blocks, which may be why no user sample landed anywhere else.
+  - **Where the boundary sits matters on QEMU.** With the clock read in C, the `getpid`
+    loop is "72% user"; with it read at the real mode switch, 7%. The difference is the
+    trampoline (step 5). For computing programs the two user times agree within about 6%.
+  - **Sleeping costs nothing** in every ledger, as it should.
+
+  **CPU time against real time.** `time cputest par 1000` printed `real 2.053`,
+  `user 6.018`: three harts, almost three seconds of CPU per second. Three boots of
+  `time usertests -q` (the first on a build that differed only in `sys_cputime`'s
+  interrupts-on read; the other two on the final branch, measured while the computer was
+  busy with other work; your times will differ) printed:
+
+  ```text
+  real 69.387             real 382.520            real 190.911
+  user 11.640             user 9.664              user 9.810
+  sys  40.088             sys  31.647             sys  30.889
+  ```
+
+  Real time varied more than fivefold. CPU time (user plus sys) varied much less: 51.7,
+  41.3 and 40.7 s, about three quarters of it kernel time. `usertests` spends most of its
+  real time not running at all (waiting for the disk, for its children, in `pause`), and
+  how long those waits take depends on what else the computer is doing. On QEMU even CPU
+  time is not clean when the computer is busy, because the guest's clock keeps running
+  while the host deschedules a vCPU thread. That is why `time` prints both, and why CPU time on an
+  emulator is only an approximation.
+further: |
+  - **Move the boundary into the trampoline.** Read `time` in [[uservec]] after the registers
+    are saved and in [[userret]] after `satp` is switched, store both in spare trapframe
+    slots, and charge from them. The Measure section shows what changes. Teaches what each
+    trampoline instruction is for and which registers are free where.
+  - **Account interrupts separately.** Read the clock at the start and end of [[devintr]]
+    and keep interrupt time per hart, so that `sys` means work done for the process.
+    Teaches how much of the kernel's time is not on behalf of anyone in particular.
+  - **`waitx` or `getrusage`.** Return one child's times as it is reaped, or the caller's own
+    and its children's separately, as Unix does. Teaches how much interface design
+    hides in the choice of where totals live.
+  - **A `top`.** Let a process read *other* processes' CPU time. Now the fields are no
+    longer private to their owner: the reader needs `p->lock` and a consistent snapshot of
+    a running process (lab 3 does the snapshot). Teaches why the private section exists.
+  - **Schedule by CPU time.** Use `utime + stime` to favour processes that have used little
+    CPU (lab 8's stride scheduler is one way). Teaches why accurate accounting matters
+    beyond reporting.

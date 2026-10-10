@@ -1,0 +1,2039 @@
+published: true
+title: Demand-paged exec
+area: Memory
+stars: 4
+branch: ext/12-demand-exec
+prerequisites: {tours: [10, 17, 22, 26, 28, 33, 36], concepts: [stacks, locks]}
+summary: |
+  In this tree [[kexec]] reads a whole program into memory before the program runs its first
+  instruction. For each loadable segment of the [[g:elf]] file it allocates every page and
+  fills it with [[readi]] ([[loadseg]]). `usertests` is 16 pages; `echo` is 2, and the second,
+  its bss, is never touched when you type `echo hi`. In this lab exec only *records* where
+  each segment lives in the file, keeps the file, and lets the program start with no text and
+  no data at all. Each page is read from the file the first time something touches it.
+
+  The idea is old (it is how Unix has run programs since the late 1970s), and it touches more
+  of the kernel than you might expect. Who notices the first touch of a page, and what does
+  that have to do with the lazy heap this tree already has? Reading a file means locking an
+  inode and waiting for the disk, from inside a fault handler: where can such a fault happen,
+  and what does the kernel hold at that moment? What happens when a program reads its *own*
+  file into a page of itself that is not there yet? What keeps the file alive while it runs,
+  and what does a running program see when someone deletes, truncates or rewrites it? The
+  think section asks these questions in the order a designer meets them.
+
+  The reference solution is eleven small commits. With it, `dexectest lazy` loads 8 of the 25
+  pages of its image, and each page it touches later costs exactly one page of memory.
+learn:
+  - "How an instruction fetch from a page that is not mapped reaches the kernel, and how a new kind of page fault has to share [[usertrap]] and [[vmfault]] with the lazy heap this tree already has."
+  - "What a freshly loaded page must contain, byte by byte, and which PTE bits it gets, so that the program cannot tell it was loaded late."
+  - "What a fault handler may do when it has to wait for the disk: which locks are held and what the interrupt state is on each path that can reach it, and what the rule \"never sleep holding a spinlock\" means for the kernel's own copies into user memory."
+  - "What can go wrong when a system call that already holds locks touches a page that is not there yet, and how to rule it out by construction instead of detecting it."
+  - "Why a running program needs a counted reference to its file, why dropping that reference needs a transaction, and what a running program sees when its file is removed, truncated or rewritten."
+  - "What a trap handler can lose when it sleeps, and why a test that counts free pages has to change its idea of what is free."
+spec: |
+  **Behaviour.** `exec` reads the ELF header and the program headers, checks them at least as
+  strictly as before (a segment that could not have been loaded must still make `exec` fail),
+  and records each loadable segment: where it starts in memory, its size in memory, where its
+  bytes are in the file, how many bytes the file supplies, and its permissions. It maps no
+  page of text or data. The stack and the argument strings are still built by `exec`, as
+  before. When the program, or the kernel on its behalf, first touches a page of a segment,
+  that one page is allocated, filled from the file (bytes the file does not supply are zero),
+  and mapped with the segment's permissions. A page outside every segment and outside the
+  heap is still a fatal fault.
+
+  Every way of touching memory must work: instruction fetches, loads, stores, and the
+  kernel's own copies for system calls (`read` into a buffer, `write` from one, `wait(&status)`,
+  `exec`'s argument strings, path names).
+
+  **The file.** A running program keeps its file alive. If the file is unlinked while the
+  program runs, the program keeps running, and the file's inode and blocks are freed when the
+  last process running it exits or calls `exec`. If the file is truncated, a page that is not
+  loaded yet cannot be read, and the process is killed when it needs that page. If the file
+  is rewritten, pages loaded after the change come from the new contents. (The think section
+  discusses why this lab allows that.)
+
+  **What must not change.**
+
+  - Text stays read-only and executable, data writable and not executable: a store to text
+    must still kill the process (`usertests nowrite`), and `read` into text must still fail
+    (`usertests copyout`).
+  - The lazy heap (`sbrklazy`) keeps working, and memory obtained after `sbrk(-n)` is zero.
+  - No kernel panic or hang, whatever the program does with its own file, and whatever program
+    headers a crafted ELF file contains.
+  - **`usertests -q` must print `ALL TESTS PASSED` on 3 harts.** A small change to `usertests`
+    turns out to be needed; the think section finds which, and why.
+
+  **The test program**, `dexectest`, prints one line per check (`dexectest NAME` runs one):
+
+  ```text
+  $ dexectest
+  dexectest: lazy: touching 2 data pages took 2 free pages
+  dexectest: lazy: OK
+  dexectest: fork: OK
+  dexectest: locked: OK
+  dexectest: selfread: OK
+  dexectest: unlink: OK
+  usertrap(): unexpected scause 0xd pid=7
+              sepc=0xd52 stval=0xd000
+  dexectest: truncate: OK
+  dexectest: modify: OK
+  dexectest: shrink: OK
+  dexectest: content: OK
+  dexectest: ALL OK
+  ```
+
+  The program carries a 16-page initialized array, `big[]`, so it has data pages that come
+  from the file; each check touches its own pages of it first.
+
+  - **lazy**: count free pages, touch two untouched pages of `big[]`, count again: exactly 2
+    pages must be gone, and both pages must hold the file's values.
+  - **fork**: a child forked before page 3 was touched reads it; so does the parent.
+  - **locked**: `write` to a pipe from an untouched page, `read` from the pipe into another,
+    and `wait(&status)` with `status` in a third: each must work.
+  - **selfread**: `read` the program's own file into an untouched data page (must succeed and
+    show `\x7fELF`), and into a page of read-only data (must fail).
+  - **unlink**, **truncate**, **modify**: a copy of the program, started as a helper, has its
+    file unlinked (it must finish normally), truncated to nothing (it must be killed: the
+    `usertrap()` lines above are that kill, expected), or overwritten in one place (it must
+    see the new value).
+  - **shrink**: a child gives back memory below the end of its image with `sbrk` and takes the
+    addresses back with `sbrklazy`: they must read as zero.
+  - **content**: every byte of the text equals the file, the rest of its last page is zero,
+    and a bss array is all zeros.
+think:
+  - title: What must exec remember, and for how long?
+    q: |
+      Today [[kexec]] loads every segment with [[loadseg]] and then lets go of the file
+      ([[kernel/exec.c:79]]). If a page is to be read only when it is first touched,
+      possibly minutes later, what must the kernel keep, and where? What guarantees that the
+      file is still there, and still the same file, when that moment comes? Which other
+      events in a process's life have to know about what you keep?
+    hints:
+      - "Read [[kexec]]'s loop ([[kernel/exec.c:60]]-[[kernel/exec.c:78]]) and [[loadseg]], and list every value they use to fill one page. Then read [[iput]] ([[kernel/fs.c:349]]) and [[iget]] ([[kernel/fs.c:249]]): what happens to an in-memory inode whose reference count drops to 0?"
+      - "An inode with `ref` 0 stays in the table only until [[iget]] needs a slot ([[kernel/fs.c:263]]); then the same `struct inode` describes another file. A pointer to an inode is only safe while you hold a counted reference. And whatever a process keeps must follow it through [[kfork]], [[kexit]] and the next exec, the way `p->cwd` does."
+      - "A small per-process table with one entry per loadable segment, plus one counted inode reference, kept like the current directory: taken in exec, duplicated in fork, dropped in exit and in the next exec."
+    answer: |
+      For each loadable segment the kernel needs exactly what [[loadseg]] and [[uvmalloc]]
+      used: the virtual address where it starts (`vaddr`), its size in memory (`memsz`, which
+      says where the segment ends), the offset of its bytes in the file (`off`), how many of
+      them the file supplies (`filesz`; the rest is zero, the [[g:bss]]), and its permissions
+      (`flags`, turned into PTE bits by [[flags2perm]]). The reference puts these in a
+      `struct seg` array in `struct proc`, `p->seg[NSEG]` with `NSEG` 4, plus `p->nseg`.
+
+      It also needs the file. A pointer alone is not enough: [[kexec]] used to drop its
+      reference with `iunlockput`, and an inode with no references can be recycled by the
+      next [[iget]] for a different file. Then a later fault would read *another file's*
+      blocks into the program's text. So the process keeps a counted reference, `p->exe`.
+      The cheapest one is the reference [[namei]] already gave [[kexec]]: keep it instead of
+      dropping it.
+
+      That reference has the lifetime of the image, not of the system call:
+
+      - [[kfork]]: the child runs the same program, and the pages its parent never touched are
+        not mapped in the child either ([[uvmcopy]] skips unmapped pages,
+        [[kernel/vm.c:309]]). It needs its own copy of the table and its own reference
+        (`idup`), exactly like `p->cwd` ([[kernel/proc.c:288]]).
+      - the next exec replaces the image: drop the old reference, take the new one.
+      - [[kexit]]: drop it.
+
+      Dropping is an [[iput]], and [[iput]] can free the inode and its blocks when this was
+      the last reference to a file that has been unlinked meanwhile. Freeing writes to the
+      disk, so every such [[iput]] must run inside a [[g:transaction]], between [[begin_op]]
+      and [[end_op]]. [[kexit]] already has one for `p->cwd` ([[kernel/proc.c:342]]); in
+      [[kexec]], the reference keeps the transaction open until the new image is committed,
+      and drops the old program's reference inside it.
+    checks:
+      - id: lab12-01
+        level: 1
+        type: multi
+        q: |
+          A page of a segment will be filled at fault time instead of in [[kexec]]. Which values
+          from the segment's [[g:program-header]] must be kept so that the fault can build the
+          page exactly as [[kexec]] would have?
+        code: kernel/exec.c:60-78
+        options:
+          - text: "ph.vaddr, where the segment starts in memory"
+            correct: true
+            why: "The fault gives a virtual address; the kernel must find the segment that contains it and the offset within it."
+          - text: "ph.off, where the segment's bytes are in the file"
+            correct: true
+            why: "The page's bytes are read from `off` plus the offset of the page within the segment."
+          - text: "ph.filesz, how many bytes come from the file"
+            correct: true
+            why: "Bytes past `filesz` are not in the file; they must be zero."
+          - text: "ph.memsz, the segment's size in memory"
+            correct: true
+            why: "It says where the segment ends, so that an address past its end is not mistaken for part of it."
+          - text: "ph.flags, the segment's permissions"
+            correct: true
+            why: "Text must be mapped executable and read-only, data writable."
+          - text: "elf.entry, the program's entry point"
+            why: |
+              You may have thought the entry point matters to loading. [[kexec]] uses it once,
+              to set the first `epc` ([[kernel/exec.c:136]]); a page fault never needs it.
+        explain: |
+          [[loadseg]] uses `vaddr`, `off` and `filesz`; [[uvmalloc]], called right before it,
+          uses `memsz` and the permissions from `flags`. Those five values describe one
+          segment completely. The reference stores them in `struct seg`.
+      - id: lab12-02
+        level: 2
+        type: tf
+        q: |
+          True or false: with the running program's reference kept in `p->exe`, `rm` of the
+          program's file (while it runs) frees the file's data blocks at once.
+        answer: false
+        why_tf: |
+          You may have thought `rm` frees a file. It only removes a name: [[sys_unlink]]
+          decrements `nlink`. The blocks are freed by the [[iput]] that drops the *last*
+          reference to an inode with `nlink` 0 ([[kernel/fs.c:357]]).
+        reasons:
+          - text: "The blocks are freed only when the last reference goes, which is the exit (or exec) of the last process running the program."
+            correct: true
+            why: "Right. Until then the process can keep loading pages from the unlinked file."
+          - text: "Unlinking a running program fails in xv6, as it does on some Unix systems."
+            why: |
+              You may be thinking of `ETXTBSY`, which some systems return when a running
+              program is *written*. xv6 has no such check, and unlinking is allowed everywhere.
+          - text: "The blocks are freed, but the process keeps its pages, so nothing is lost."
+            why: |
+              With demand paging the process does *not* have all its pages; the ones it has not
+              touched are still only in the file. Freeing the blocks would lose them.
+        explain: |
+          A name and a reference are different things. `dexectest unlink` checks this: the
+          helper keeps running from the unlinked file, and the file disappears when it exits.
+  - title: Which fault, and whose fault is it?
+    q: |
+      With nothing mapped, the very first instruction of a new program cannot be fetched.
+      What does the hart report, and does [[usertrap]] handle it today? This tree already
+      fills some missing pages on demand: [[vmfault]] gives the lazy heap fresh zero pages
+      ([[kernel/trap.c:71]]). Now a missing page below `p->sz` can be a page of the program,
+      a lazy heap page, or something that should never be touched. How does the kernel tell
+      them apart?
+    hints:
+      - "Look at the condition in [[usertrap]]'s page-fault branch ([[kernel/trap.c:71]]) and at the RISC-V exception codes in `scause`: 12, 13 and 15. Then look at where [[kexec]] puts the stack ([[kernel/exec.c:89]]-[[kernel/exec.c:97]]) and where `sbrk` grows the heap."
+      - "The layout is fixed by exec: the segments from address 0 up to the end of the last segment, then the guard page and the stack (both mapped by exec), then the heap. An unmapped page below the end of the last segment can only be program; above it, only heap."
+      - "Let the same branch handle all three fault codes, and give [[vmfault]] one more comparison: below the end of the image, fill the page from the file; above it, as before."
+    answer: |
+      The first fetch raises an **instruction page fault**, `scause` 12. [[usertrap]] today
+      sends only 13 (load) and 15 (store) to [[vmfault]]; 12 falls into the `else` branch,
+      which kills the process. Since the first program is `init`, the kernel then panics with
+      `init exiting` (clinic 1). Add 12 to the condition and treat it as a read.
+
+      The three kinds of missing page are separated by address alone, because [[kexec]] lays
+      out every address space the same way:
+
+      | address | what it is | who maps it |
+      |---|---|---|
+      | below the end of the last segment, inside a segment | program text or data | fault: read from the file |
+      | below the end, between two segments | a hole | nobody: fatal |
+      | guard page and stack | the stack | [[kexec]], eagerly |
+      | above the stack, below `p->sz` | the lazy heap | fault: zero page ([[vmfault]]) |
+
+      So [[vmfault]] keeps its checks (below `p->sz`, not mapped) and asks one more question
+      before allocating a zero page: is the page below the end of the image? The reference
+      computes that end from the last recorded segment (`imgend`) and sends such pages to a
+      new function, `loadpage`. Nothing changes for the heap.
+
+      One more caller is easy to miss: the kernel's own copies. [[copyin]], [[copyout]] and
+      [[copyinstr]] call [[vmfault]] for a missing page ([[kernel/vm.c:357]]), and they run
+      with the process's page table in hand, so a system call can be the first to touch a page
+      of the program. In the recorded boot, the data page of `init`'s image was first touched
+      by the kernel: `init`'s child (pid 2, about to become the shell) called `exec("sh",
+      argv)`, and [[sys_exec]] fetched the global `argv` array with [[copyin]].
+    checks:
+      - id: lab12-03
+        level: 1
+        type: match
+        q: |
+          Match each `scause` value that can reach [[usertrap]] from user mode with what
+          happened.
+        pairs:
+          - left: "12"
+            right: "an instruction fetch from a page the hart may not execute from"
+            why: "12 is the instruction page fault: the very first fetch of a demand-paged program raises it."
+          - left: "13"
+            right: "a load from a page the hart may not read"
+            why: "13 is the load page fault, the one a read of a lazy heap page raises."
+          - left: "15"
+            right: "a store or atomic operation to a page the hart may not write"
+            why: "15 is the store/AMO page fault: a write to a lazy page, or to read-only text."
+          - left: "8"
+            right: "an ecall from user mode, a system call"
+            why: "8 is not a fault at all; [[usertrap]] handles it first ([[kernel/trap.c:54]])."
+        explain: |
+          The access type decides the code: fetch 12, load 13, store 15. All three can now mean
+          "a page of the program that is not loaded yet". See [[tour:10]] for how [[usertrap]]
+          reads `scause` and [[g:trap-cause]] for the full list.
+      - id: lab12-04
+        level: 2
+        type: choice
+        q: |
+          You have made [[kexec]] map nothing and taught [[vmfault]] to load program pages,
+          but left [[usertrap]]'s condition as `scause == 15 || scause == 13`. You boot. What
+          do you see?
+        code: kernel/trap.c:69-79
+        options:
+          - text: "usertrap(): unexpected scause 0xc pid=1, then panic: init exiting"
+            correct: true
+            why: |
+              `init`'s first instruction fetch faults with 12, the `else` branch kills it,
+              and [[kexit]] panics because `init` may not exit.
+          - text: "init: starting sh, and then the shell dies at its first instruction"
+            why: |
+              You may have thought only later programs are affected. `init` is loaded by
+              [[kexec]] too ([[forkret]] calls it), so it is the first to fault.
+          - text: "A hang: the fault is retried forever."
+            why: |
+              That would happen if the handler returned success without mapping the page. Here
+              no handler accepts the fault, so [[usertrap]] kills the process.
+          - text: "usertrap(): unexpected scause 0xd pid=1, because the fetch is a load"
+            why: |
+              You may have thought a fetch counts as a read. RISC-V reports fetches
+              separately, with code 12; that is exactly why the condition needs it.
+        explain: |
+          Clinic 1 is this run, verbatim: `sepc=0xbc stval=0xbc`, `init`'s entry point. A
+          fetch fault reports the address of the instruction in both registers.
+  - title: What goes into the page?
+    q: |
+      A page of a segment is about to be loaded. Which of its 4096 bytes come from the file,
+      and from where in the file? Which must be zero? Take two real cases: `sh`'s data segment
+      starts at `0x2000` with `filesz` `0x10` and `memsz` `0x98`; in the original tree,
+      `usertests`' text ends at `0x8739`, in the middle of page `0x8000`. And which PTE bits does each page get?
+    hints:
+      - "[[loadseg]] reads `min(PGSIZE, filesz - i)` bytes into a page that [[uvmalloc]] has already zeroed ([[kernel/vm.c:233]]). And [[kalloc]] does not return a zeroed page: it fills it with junk ([[kernel/kalloc.c:80]])."
+      - "The page must look exactly as eager exec would have made it: the file's bytes for the part of the page below `filesz`, zeros for everything else, including the part of the last page past `memsz`, which the program can still read. And the bits: `PTE_R | PTE_U` plus what [[flags2perm]] gives."
+      - "Allocate, zero the whole page, read the file's part into the front of it, map it."
+    answer: |
+      For a page at offset `o` into a segment (`o` = page address minus `vaddr`):
+
+      - if `o < filesz`, the first `min(4096, filesz - o)` bytes come from the file, starting
+        at file offset `off + o`;
+      - every other byte is zero: the rest of a page that the file only partly fills, a page
+        entirely past `filesz` (pure bss), and the tail of the last page past `memsz`.
+
+      For `sh`'s data page `0x2000`: 16 bytes from the file (two initialized pointers,
+      `symbols` and `whitespace`), then zeros, including `freep` at `0x2010`, which [[malloc]]
+      tests for 0 the first time it runs. For `usertests`' last text page in the original
+      tree: `0x739` bytes from the file, then zeros, the same as eager exec gave.
+
+      The order matters. Zero the page first, then read: zeroing after the read wipes out the
+      file's bytes (clinic 2: `init` executes zeros and dies with an illegal instruction), and
+      not zeroing at all leaves [[kalloc]]'s `0x05` junk in the bss (clinic 3: every command
+      the shell forks dies in [[malloc]] at `freep = 0x0505050505050505`).
+
+      The PTE gets `PTE_R | PTE_U` plus [[flags2perm]] of the segment's flags: `X` for text,
+      `W` for data. gdb read the PTE of `init`'s first text page right after it was mapped:
+      `0x21fd541b`, flags `0x1b` = `V|R|X|U`; a data page of `dexectest`: `0x21fc8c17`,
+      flags `0x17` = `V|R|W|U`. A store to text therefore still faults, and since the page is
+      now mapped, [[vmfault]] refuses it and the process dies, as `usertests nowrite` expects.
+
+      A page that lies entirely past `filesz` needs no file at all: zero it and map it. In the
+      recorded runs, `dexectest`'s bss page `0x16000` was loaded that way, without touching
+      the inode.
+    checks:
+      - id: lab12-05
+        level: 2
+        type: number
+        q: |
+          `usertests`' data segment: `vaddr` `0x9000`, `off` `0xa000`, `filesz` `0x4d0`,
+          `memsz` `0x6d08`. When page `0x9000` is loaded, how many bytes are read from the file?
+        answer: 1232
+        accept: ["0x4d0"]
+        wrong:
+          4096: |
+            You may have thought a page is always read whole. The file supplies only `filesz`
+            bytes of this segment; reading 4096 would copy whatever follows the segment in the
+            file into the bss.
+          0: |
+            You may have thought data pages are bss. Only the part past `filesz` is; this page
+            starts with the segment's 1232 bytes of initialized data.
+          27912: |
+            You may have used `memsz` (`0x6d08`). That is the size in memory, which includes
+            the bss; and no single page can take more than 4096 bytes anyway.
+        why_wrong: "The page is at offset 0 of the segment; the file supplies min(4096, filesz - 0) bytes."
+        explain: |
+          `min(0x1000, 0x4d0 - 0)` = `0x4d0` = 1232 bytes, read from file offset `0xa000`. The
+          remaining 2864 bytes of the page are bss and must be zeroed; pages `0xa000` to
+          `0xf000` are all bss and need no read at all.
+      - id: lab12-06
+        level: 2
+        type: bits
+        q: |
+          gdb read this PTE right after the reference mapped `init`'s page `0x0`. Decode it.
+        value: "0x21fd541b"
+        fields:
+          - label: "V (bit 0)"
+            options: ["0", "1"]
+            answer: "1"
+            why: "0x1b = 1 1011 in binary: bit 0 is set, the mapping is valid."
+          - label: "W (bit 2)"
+            options: ["0", "1"]
+            answer: "0"
+            why: "Bit 2 (0x4) is clear in 0x1b: text is not writable, so a store to it still faults and kills the process."
+          - label: "X (bit 3)"
+            options: ["0", "1"]
+            answer: "1"
+            why: "0x8 is set: the hart may fetch instructions from this page. Without it the retried fetch would fault again."
+          - label: "U (bit 4)"
+            options: ["0", "1"]
+            answer: "1"
+            why: "0x10 is set: user mode may use the page."
+          - label: "A (bit 6)"
+            options: ["0", "1"]
+            answer: "0"
+            why: "0x40 is clear. You may have expected A to be set, but this value was read before `init` returned to user mode; nothing had used the mapping yet."
+        explain: |
+          `0x1b` = `V` (1) + `R` (2) + `X` (8) + `U` (0x10): [[flags2perm]] gave `PTE_X` for
+          the text segment and `loadpage` added `PTE_R | PTE_U`. `0x21fd541b >> 10` =
+          `0x87f55`, the physical page `0x87f55000` that [[kalloc]] returned. See [[g:pte]].
+  - title: Where does a load run, and what may it do there?
+    q: |
+      Loading a page now locks the executable's inode ([[ilock]], a [[g:sleeplock]]) and
+      calls [[readi]], which calls [[bread]], which may wait for the disk. Find every path
+      that can reach the load. On each, are interrupts on or off, and which locks does the
+      thread hold at that moment? Which paths break a rule of this kernel, what would happen,
+      and what will you do about it?
+    hints:
+      - "Start from every caller of [[vmfault]]: [[usertrap]]'s fault branch ([[kernel/trap.c:71]]; does it ever reach `intr_on` at [[kernel/trap.c:66]]?) and [[copyout]]/[[copyin]]/[[copyinstr]]. For the copy functions, list their callers, and for each caller what it holds at the call."
+      - "[[sched]] panics with `sched locks` if a process gives up the CPU holding any spinlock besides its own `p->lock` ([[kernel/proc.c:488]]). Interrupts being off is fine: sched wants them off. Whether a load sleeps depends on the buffer cache, so a wrong path may work for a long time and then panic."
+      - "Make sure a copy made under a lock never needs a load: before a system call takes its locks, load the program pages of its user buffer. Ask yourself who could unmap such a page again before the copy happens."
+    answer: |
+      The paths, with the state observed by gdb on the reference branch:
+
+      | path | interrupts | locks held when the load starts | may it sleep? |
+      |---|---|---|---|
+      | [[usertrap]] → [[vmfault]] (a fault from user code) | off | none | yes |
+      | system call → [[copyinstr]] in [[argstr]] (e.g. [[sys_open]]) | on | none | yes |
+      | [[sys_mkdir]], [[sys_mknod]], [[sys_chdir]]: [[argstr]] after [[begin_op]] | on | none (a transaction is not a lock) | yes |
+      | [[piperead]] / [[pipewrite]] → [[copyout]]/[[copyin]] | off | `pi->lock` | **no** |
+      | [[consoleread]] → [[copyout]] | off | `cons.lock` | **no** |
+      | [[kwait]] → [[copyout]] of the status | off | `wait_lock`, the child's `p->lock` | **no** |
+      | [[fileread]]/[[filewrite]] → [[readi]]/[[writei]] → copy | on | the file's inode lock and a buffer's lock (sleep-locks) | see the next question |
+
+      A sleep from a page fault is legal even though interrupts are off: [[sleep]] takes
+      `p->lock`, [[sched]] checks that `noff` is exactly 1 and that interrupts are off, and the
+      scheduler on this hart turns them back on. gdb saw the first load of the system do it:
+      `init`'s text page needed three disk reads, and `init` slept three times inside
+      [[virtio_disk_rw]] with `noff` 1, `intena` 0 (gdb stopped three times in the disk
+      driver's wait loop), and came back on another hart in between.
+
+      The three spinlock paths are bugs waiting for a cache miss. [[piperead]] and
+      [[pipewrite]] hold `pi->lock` (noff 1) while they copy; if the copy loads a page and
+      [[bread]] has to wait for the disk, [[sched]] sees noff 2 and panics. Clinic 6 shows
+      exactly that, with `dexectest locked` (there, the pipe write). If the blocks happen to be cached, nothing sleeps and nothing
+      happens, which is why such a bug can survive testing.
+
+      The fix used here: **load first, then lock.** [[sys_read]], [[sys_write]] and
+      [[sys_wait]] call a new function, `uvmprefault`, before they take any lock. It walks the
+      pages of the user buffer that lie below the end of the image and loads the missing ones.
+      A loaded page stays loaded for the rest of the system call: only this process could unmap
+      it (with `sbrk`, `exec` or `exit`), and it is busy in this system call; xv6 processes have
+      one thread. So the copy, later, under the lock, finds every program page present. Lazy
+      heap pages need nothing: allocating one takes only [[kalloc]]'s spinlock and never
+      sleeps, as before.
+
+      Alternatives, and why not: loading in a kernel thread (xv6 has none), making the copies
+      fail under a lock (a `read` from a pipe into a global buffer would fail at random), or
+      copying through a bounce buffer outside the lock in every driver (many changes; the
+      prefault is one rule in three places).
+    checks:
+      - id: lab12-07
+        level: 2
+        type: state
+        q: |
+          `sh` takes an instruction page fault on its first text page. The load reads a block
+          that is not in the buffer cache, so [[virtio_disk_rw]] has queued the request and is
+          about to sleep, inside its own critical section ([[kernel/virtio_disk.c:288]]). Fill in
+          the hart's state at that line.
+        code: kernel/virtio_disk.c:280-295@288
+        state:
+          mode: S
+          stack: kernel
+          satp: kernel
+          sie: "off"
+          noff: 1
+          intena: 0
+        why:
+          noff: |
+            One spinlock is held: `disk.vdisk_lock`, taken by [[virtio_disk_rw]]. The
+            inode's sleep-lock and the buffer's sleep-lock are not counted in noff.
+          intena: |
+            intena records SIE before the outermost push_off. This is a page fault, and
+            [[usertrap]] never turned interrupts on, so the acquire saw SIE 0. (A load
+            reached from a system call shows intena 1.)
+          sie: |
+            A spinlock is held, so interrupts are off; and on the fault path they were off
+            before anything was acquired.
+          stack: |
+            A fault runs on the process's kernel stack: `usertrap → vmfault → loadpage →
+            readi → bread → virtio_disk_rw`.
+          satp: |
+            [[uservec]] switched to the kernel page table before [[usertrap]] ran.
+        why_wrong: Follow the fault through uservec (kernel page table, kernel stack, SIE off) into usertrap, which does not call intr_on for a fault, and count the spinlocks held at the line.
+        explain: |
+          gdb recorded exactly this on the reference branch: `sh` (pid 2) at
+          [[kernel/virtio_disk.c:288]], noff 1, intena 0, SIE 0, four times for its first text
+          page, twice on hart 0, once on hart 1, once more on hart 0, and it finished the load
+          on hart 2. Then [[virtio_disk_rw]] releases `vdisk_lock` itself (line 289) and calls
+          [[sleep]], which takes no argument in this tree and acquires `p->lock`, so [[sched]]
+          sees noff 1 and is satisfied.
+      - id: lab12-08
+        level: 2
+        type: choice
+        q: |
+          The prefault is missing from [[sys_read]]. `dexectest locked` reads from a pipe into
+          a data page that is not loaded yet. Its blocks are not in the buffer cache. What
+          happens?
+        options:
+          - text: "panic: sched locks"
+            correct: true
+            why: |
+              [[piperead]] holds `pi->lock`; the copy loads the page; [[bread]] waits for the
+              disk; [[sleep]] adds `p->lock`; [[sched]] sees noff 2 and panics.
+          - text: "The read works, a little slower."
+            why: |
+              It would, if the blocks were cached: nothing would sleep. Here they are not, and
+              a sleep under a spinlock is fatal.
+          - text: "The read returns -1."
+            why: |
+              You may have thought [[copyout]] refuses pages that need loading. Without the
+              prefault it calls [[vmfault]], which loads.
+          - text: "panic: acquire, because ilock takes a lock already held"
+            why: |
+              The inode is not locked by anyone here; [[ilock]] succeeds. The problem is the
+              sleep that follows, not a second acquire.
+        explain: |
+          Clinic 6 shows the same failure one copy earlier, in the pipe *write* that `locked`
+          now makes first (all prefaults removed there): `pipewrite → copyin → vmfault →
+          loadpage → readi → bread → virtio_disk_rw → sleep → sched`, `noff` 2. The other two
+          harts spin in [[acquire]] on the panicking process's `p->lock`. The read path is the
+          same chain with [[piperead]] and [[copyout]], which was recorded too, with the
+          read as the check's first copy.
+  - title: A program reads its own file
+    q: |
+      A program opens its own executable and calls `read(fd, buf, 4096)`, where `buf` is in a
+      data page it has not touched yet. Follow the call through [[fileread]] and [[readi]] in
+      a kernel that loads pages inside [[copyout]] and has no prefault. Which locks does the
+      process hold when the copy needs the page, and what does the load then try to take?
+      What about two programs, each reading the other's file?
+    hints:
+      - "[[fileread]] locks the file's inode ([[kernel/file.c:121]]) and [[readi]] holds a buffer while it copies the block out ([[kernel/fs.c:524]]-[[kernel/fs.c:526]]). Which inode is the file here, and which inode does the load lock?"
+      - "[[acquiresleep]] ([[kernel/sleeplock.c:22]]) does not check *who* holds the lock: a process that asks for a sleep-lock it already holds sleeps until it releases it, that is, forever, with no panic and no message."
+      - "The rule from the previous question covers this too: no load may start while the system call holds a lock of any kind, sleep-locks included. The same call, made earlier, removes the problem."
+    answer: |
+      [[fileread]] holds the inode lock of the file being read, which here is the program's own
+      file, and [[readi]] holds the lock of the buffer it is copying from. The copy reaches
+      [[vmfault]], the load calls [[ilock]] on `p->exe`, the very same inode, and
+      [[acquiresleep]] waits for the lock to be released, by itself. The process sleeps
+      forever. Nothing panics, `kill` cannot help (it makes the process runnable, and
+      [[acquiresleep]] goes back to sleep), and anyone else who needs that file waits behind it.
+      If the inode lock were somehow skipped, the buffer lock would deadlock only when the
+      block being copied from is the block the load needs (a read into the page that holds that
+      very part of the file). In `selfread` they differ: the copy holds the block at file offset
+      0, and the load of `0xc000` needs file offset `0x6000 + 0x7000` = `0xd000`. Clinic 6 shows
+      the hang and the sleeping process's stack.
+
+      Two programs that read each other's files deadlock the same way, in a cycle: process A
+      reads B's program file, so it holds that inode's lock, and its copy needs a page of A's
+      own program, so it waits for A's file's lock; process B does the mirror image. Each holds
+      what the other needs, an ABBA deadlock between two sleep-locks. A run on a kernel
+      without the prefault, with two copies of one program (`abA`, `abB`), each reading the
+      other's file into its own untouched data, hung in the first round;
+      gdb showed `abA` (pid 4) sleeping on inode 28's lock, held by pid 5, and `abB` (pid 5)
+      sleeping on inode 29's lock, held by pid 4. On the reference branch the same program ran
+      10 rounds without trouble.
+
+      The prefault from the previous question removes every case at once: [[sys_read]] loads
+      the buffer's program pages before [[fileread]] takes any lock, so the copy never loads.
+      That is why the reference calls it from the system-call layer and not inside the pipe
+      or console code: it is the last point before *any* lock, spinlock or sleep-lock.
+      Detecting the self-deadlock instead (a check in [[acquiresleep]] for `lk->pid ==
+      myproc()->pid`) would only turn a hang into a panic; the `read` is legitimate and must
+      work.
+
+      (Linux meets the same problem when `write()` copies from a buffer that is memory-mapped
+      from the file being written, and solves it the same way: fault the user pages in before
+      taking the locks, then copy.)
+    checks:
+      - id: lab12-09
+        level: 2
+        type: choice
+        q: |
+          Without the prefault, `dexectest selfread` reads its own file into a data page it has
+          not touched. What does the console show?
+        options:
+          - text: "Nothing more: dexectest never finishes, and the prompt never comes back."
+            correct: true
+            why: |
+              The process sleeps in [[acquiresleep]] on its own inode lock, forever. The harts
+              are idle in the scheduler.
+          - text: "panic: acquire"
+            why: |
+              That panic is for spinlocks ([[holding]]). A sleep-lock records a pid, and
+              [[acquiresleep]] never checks it; it sleeps.
+          - text: "panic: sched locks"
+            why: |
+              You may be thinking of the pipe case. Here no spinlock is held when the process
+              sleeps: [[acquiresleep]] releases `lk->lk` before [[sleep]].
+          - text: "dexectest: selfread: FAIL, because read returns -1"
+            why: |
+              Nothing makes the copy fail: the load is attempted and blocks.
+        explain: |
+          A hang is the worst kind of failure: no message, and a test runner that only checks
+          output waits forever. gdb, attached to the hung kernel, found `dexectest` SLEEPING with
+          `chan` equal to the address of its own executable's inode lock, whose `pid` field was
+          the process's own pid.
+      - id: lab12-10
+        level: 3
+        type: tf
+        q: |
+          True or false: after [[sys_read]] has loaded the buffer's program pages, one of them
+          could be unmapped again before [[fileread]] copies into it, so the copy still needs
+          the load path as a fallback.
+        answer: false
+        why_tf: |
+          You may be thinking of a multithreaded kernel, where another thread of the process
+          could unmap memory meanwhile. In xv6 a process has one thread, and that thread is
+          inside this system call.
+        reasons:
+          - text: "Only the process itself can unmap its pages (sbrk, exec, exit), and it is busy in this system call."
+            correct: true
+            why: "Right. Nothing pages memory out in xv6 either, so a loaded page stays loaded until the process itself changes its address space."
+          - text: "Interrupts are off during the copy, so nothing can run."
+            why: |
+              Interrupts off only affects this hart; the other harts keep running. The argument
+              is about who *could* unmap the page, not about who runs.
+          - text: "The page is locked in memory by the prefault."
+            why: |
+              There is no page locking in xv6. The guarantee is structural: no other code
+              unmaps another process's pages.
+        explain: |
+          The prefault is sound only because of that structure. With threads (lab 9) or
+          swapping (lab 16) it would need help: a page could vanish between the prefault and the
+          copy, and the copy would have to fail or retry instead of loading under the lock.
+  - title: The file changes under a running program
+    q: |
+      The program's file is unlinked while it runs. Or truncated. Or rewritten. What happens
+      in each case, with the design so far, and what should happen? And look again at
+      [[kexit]] dropping `p->exe`: what is special about that particular [[iput]]?
+    hints:
+      - "[[sys_unlink]] only lowers `nlink`. [[iput]] frees the inode's blocks when the last reference goes and `nlink` is 0 ([[kernel/fs.c:357]]-[[kernel/fs.c:377]]); [[itrunc]] writes to the disk. [[log_write]] refuses to run outside a transaction ([[kernel/log.c:231]])."
+      - "[[readi]] returns fewer bytes than asked when the file is shorter ([[kernel/fs.c:510]]). Nothing in xv6 stops anyone from opening a running program's file for writing."
+      - "A short read means the page cannot be built: fail the load and let the fault kill the process. Rewrites are visible; decide that it is acceptable for this lab, and say so. And keep every `iput` of `p->exe` inside `begin_op`/`end_op`."
+    answer: |
+      **Unlinked**: the process holds a reference, so [[iput]] does not free anything until
+      that reference goes. Pages keep loading from the unlinked file. When the last process
+      running it exits, its [[iput]] in [[kexit]] is the last one, the inode has `nlink` 0, and
+      [[iput]] truncates and frees it: [[itrunc]] → [[bfree]] → [[log_write]]. That is the
+      special case: the only time the [[iput]] of `p->exe` writes to the disk, and the reason it must
+      be inside the transaction. Outside one, [[log_write]] panics with `log_write outside of
+      trans` (clinic 5). A bug that only shows when a running program's file was deleted is
+      invisible to `usertests`.
+
+      **Truncated** (`open` with `O_TRUNC`): the next load of a page that is not loaded yet asks
+      [[readi]] for bytes the file no longer has and gets fewer. The page cannot be built, so
+      `loadpage` frees it and fails, [[vmfault]] returns 0, and [[usertrap]] kills the process.
+      (A system call that needed that page fails instead.) Truncation never makes a process read
+      *another* file's data: the blocks were freed through the inode, so the inode no longer
+      points at them. `dexectest truncate` checks the kill.
+
+      **Rewritten**: pages already loaded keep their old contents, pages loaded later come from
+      the new contents. A program can end up running a mix of two versions. The reference
+      accepts this and documents it; `dexectest modify` checks that a running helper sees a
+      value written into its file after it started. Real systems close the hole by refusing to
+      open a running program's file for writing (`ETXTBSY`), or by giving each executable
+      mapping a private copy of a page when the file changes; both are stretch goals.
+
+      Two checks move into [[kexec]], because [[uvmalloc]] and [[loadseg]] used to make them
+      without saying so. The original kernel noticed a truncated or corrupt program when
+      [[loadseg]]'s [[readi]] came up short, and `exec` failed; the reference checks, while the
+      inode is locked, that the file is long enough to hold every segment's bytes
+      (`ph.off + ph.filesz <= ip->size`). And the original kernel could never accept a segment
+      that ends absurdly high: [[uvmalloc]] ran out of memory long before, and `exec` returned
+      -1. Without that implicit limit a crafted ELF whose data segment ends past `MAXVA` makes
+      the stack setup panic in [[walk]], and one whose segment ends just below the trampoline
+      makes it panic with `mappages: remap`. The reference refuses any segment that ends above `TRAPFRAME -
+      (USERSTACK + 1) * PGSIZE`, which leaves room for the guard page and the stack. One
+      difference remains, by design: a segment with a huge bss that does fit (4 GiB, say) now
+      execs, since nothing is allocated until it is touched; the original kernel refused it for
+      lack of memory.
+    checks:
+      - id: lab12-11
+        level: 2
+        type: choice
+        q: |
+          A kernel has every other part of this lab right, but [[kexit]] drops `p->exe` after
+          [[end_op]] instead of before it. When does it go wrong?
+        options:
+          - text: "Only when the exiting process holds the last reference to a program file that was unlinked while it ran: panic: log_write outside of trans."
+            correct: true
+            why: |
+              Only that [[iput]] frees blocks, and freeing them calls [[log_write]], which
+              checks that a transaction is open.
+          - text: "At every exit, with panic: log_write outside of trans."
+            why: |
+              You may have thought every [[iput]] writes. An [[iput]] that only lowers `ref`
+              writes nothing; most exits drop a reference that others still hold, or that has
+              `nlink` > 0.
+          - text: "Never: iput takes care of its own transaction."
+            why: |
+              It does not; the comment above it says every caller must be inside a
+              transaction ([[kernel/fs.c:347]]).
+          - text: "At the next boot: the file system is corrupt because the free was not logged."
+            why: |
+              The kernel does not get that far: [[log_write]] checks `log.outstanding` and
+              panics at once.
+        explain: |
+          Clinic 5 is this kernel: `usertests -q` passed, then `dexectest unlink` panicked in
+          `kexit → iput → itrunc → bfree → log_write`.
+      - id: lab12-12
+        level: 2
+        type: match
+        q: |
+          A helper program is running from file `dxcopy` and has not yet touched page 7 of
+          its data. Match what happens to the file with what the helper sees when it then
+          touches page 7, on the reference branch.
+        pairs:
+          - left: "dxcopy is unlinked"
+            right: "page 7 loads normally; the file disappears when the helper exits"
+            why: "The helper's reference keeps the inode and its blocks alive."
+          - left: "dxcopy is truncated to 0 bytes"
+            right: "the helper is killed (unexpected scause 0xd)"
+            why: "readi returns 0 bytes, the load fails, and the load fault is fatal."
+          - left: "a new value is written into page 7's bytes in dxcopy"
+            right: "the helper reads the new value"
+            why: "The page is read from the file as it is at fault time."
+          - left: "the same three, on the original kernel"
+            right: "the helper sees the old contents and runs normally"
+            why: "The original kernel read every page at exec, before any change."
+        explain: |
+          `dexectest unlink`, `truncate` and `modify` run these three cases; on the original
+          kernel `truncate` and `modify` report FAIL because nothing changes for the helper.
+  - title: What else has to learn about the new state?
+    q: |
+      Three more places see the new state of a process. [[kfork]]: a child of a demand-paged
+      process. [[growproc]] with a negative size: `sbrk(-n)` below the end of the image, then
+      `sbrklazy(n)` to take the addresses back. And [[usertrap]] itself, which reads `scause`,
+      `sepc` and `stval` several times: is that still safe now that the fault handler can
+      sleep?
+    hints:
+      - "[[uvmcopy]] copies mapped pages only ([[kernel/vm.c:309]]). [[growproc]] ([[kernel/proc.c:249]]-[[kernel/proc.c:251]]) unmaps pages but knows nothing about segments. [[usertrap]] calls `r_scause()` and `r_stval()` in its condition and again in its error message ([[kernel/trap.c:71]]-[[kernel/trap.c:77]])."
+      - "CSRs belong to the hart, not to the process. While a process sleeps, its hart runs other code and takes other traps; and the process may wake on another hart."
+      - "Fork copies the table and takes a reference. Shrinking cuts the table at the new size. usertrap reads the trap registers once, into locals, before anything can sleep."
+    answer: |
+      **fork.** Pages the parent loaded are copied by [[uvmcopy]] like any other page; pages it
+      never touched are unmapped in the child too, so the child loads them itself, from the same
+      file through its own reference (first question). `dexectest fork` checks a page that
+      neither had touched.
+
+      **sbrk(-n) below the image.** [[uvmdealloc]] frees the pages, but the segment table still
+      covers those addresses. If the process grows again lazily and touches one of them,
+      [[vmfault]] would load the *program's* bytes there, where the original kernel gives a zero
+      page. The reference adds `segtrim`, called from [[growproc]]: it cuts each segment at the
+      new size (rounded up to a page, as [[uvmdealloc]] does) and drops segments entirely above
+      it, so the end of the image moves down with the process. Only a program that gives back
+      its own stack can get there; `dexectest shrink` does it in a child that, from then on,
+      calls only system-call stubs, which use no stack.
+
+      **The trap registers.** Before this lab nothing between [[usertrap]]'s first `r_scause()`
+      and its error message could sleep, so reading the CSRs again was harmless. Now [[vmfault]]
+      can sleep in the load, and while the process sleeps, its hart takes other traps: gdb saw
+      `scause` read `0x8000000000000009` (a supervisor external interrupt, the disk) right after
+      `init`'s first load returned, where it had read 12 before. A load that then *fails*, after
+      sleeping, would be reported with some other trap's cause and address, possibly from
+      another hart. The reference reads `scause` and `stval` once, into locals, at the top of
+      [[usertrap]], and prints the saved `epc` instead of `sepc`. (`epc` was already saved,
+      [[kernel/trap.c:52]], which is why returning to user mode was never affected.)
+    checks:
+      - id: lab12-13
+        level: 3
+        type: choice
+        q: |
+          `init` (pid 1) takes its first instruction page fault on hart 1, with `scause` 12 and
+          `stval` `0xbc`. The load reads three blocks from the disk, and `init` waits for each.
+          Right after the read, back on hart 1, what did gdb read from the `scause` CSR?
+        options:
+          - text: "0x8000000000000009, a supervisor external interrupt"
+            correct: true
+            why: |
+              The disk's completion interrupts were taken while `init` slept, on whatever hart
+              they arrived at; the CSR holds the last trap taken on this hart.
+          - text: "12, because the CSR belongs to the process"
+            why: |
+              You may have thought CSRs are saved and restored with the process, like the
+              registers in the trapframe or the context. `scause` is never saved by [[swtch]] or
+              the trampoline; it belongs to the hart.
+          - text: "12, because interrupts are off in the fault handler"
+            why: |
+              They are off on this hart while the handler runs, but [[sleep]] gives the hart to
+              the scheduler, which turns them on.
+          - text: "0, because the hart was idle"
+            why: |
+              An idle hart in the scheduler still takes interrupts, and each one writes `scause`.
+        explain: |
+          That is why [[usertrap]] now copies `scause` and `stval` into locals before calling
+          [[vmfault]]. The process even finished the load on a different hart from the one
+          that took the fault in some runs (`sh`: hart 0, then 1, then 0, then 2).
+      - id: lab12-14
+        level: 2
+        type: tf
+        q: |
+          True or false: a child forked before its parent touched page 3 of `big[]` gets page
+          3 from its parent when it touches it.
+        answer: false
+        why_tf: |
+          You may have thought fork shares unloaded pages. [[uvmcopy]] copies only mapped
+          pages; page 3 is unmapped in both, and the child loads it from the file.
+        reasons:
+          - text: "The child loads it from the file through its own reference to the executable."
+            correct: true
+            why: "Right: that is why fork must duplicate the reference and copy the segment table."
+          - text: "The parent is asked to load it and share it."
+            why: |
+              Nothing in xv6 shares pages between processes (that is lab 11's copy-on-write,
+              not this branch).
+          - text: "The child gets a zero page from the lazy heap code."
+            why: |
+              That would be a bug: the child's segment table says page 3 belongs to the
+              program, so [[vmfault]] loads it.
+        explain: |
+          Each process loads its own copy of a page it needs. In the measured run of
+          `usertests` without its warm-up, the 16 pages of its image were loaded 136 times over
+          all its processes: forks inherit only what the parent had loaded.
+  - title: How do you know it works, and what does usertests think?
+    q: |
+      `usertests` counts the free pages before its tests and after, and fails if pages were
+      lost ([[user/usertests.c:3476]], [[user/usertests.c:3500]]). What will it report on the
+      demand-paged kernel, and is it right? And how can a test program show, from user space,
+      that a page is loaded only when touched?
+    hints:
+      - "Between the two counts the usertests process itself keeps running code and reading data it never touched before: the functions of later tests, the test table, strings."
+      - "On this kernel, touching a page of your own image for the first time allocates a page, which is then no longer free. That is not a leak."
+      - "Load the whole image before the first count, so the two counts compare the same thing. And measure with the same counter: count, touch two pages, count."
+    answer: |
+      It reports a leak that is not one. A run of the branch without the fix ended with
+      `FAILED -- lost some free pages 32467 (out of 32470)`: three pages of `usertests` itself
+      were loaded during the tests. The check compares "free" before and after, and on this
+      kernel "free" also shrinks when a program grows into its own image.
+
+      The reference keeps the check and changes what it measures: a new function, `touchimage`,
+      reads one byte of every page from address 0 up to the linker's `end` before the first
+      count, so the whole image is loaded and both counts see the same program. On the original
+      kernel it changes nothing. This is the only change to `usertests`.
+
+      The same counter makes the lab's own measurement. `dexectest lazy` counts free pages
+      (after one warm-up count, which allocates page-table pages for the heap once), touches two
+      untouched pages of `big[]`, and counts again: exactly 2 on this branch, 0 on the original
+      kernel, which had loaded them at exec.
+    checks:
+      - id: lab12-15
+        level: 1
+        type: number
+        q: |
+          On the reference branch, `dexectest lazy` counts free pages, reads one int from each of
+          two untouched pages of `big[]`, and counts again. How many free pages did the two
+          reads cost?
+        answer: 2
+        wrong:
+          0: |
+            That is the original kernel, which had loaded every page of `big[]` at exec.
+          8: |
+            You may have counted disk blocks (4 per page). The cost in memory is one page per
+            page touched; the blocks go through the buffer cache, which has a fixed size.
+          1: |
+            You may have thought the second page comes for free with the first. Each page is
+            loaded separately, when it is first touched.
+        why_wrong: "One page of memory is allocated for each page of the image that is touched for the first time."
+        explain: |
+          The recorded run printed `dexectest: lazy: touching 2 data pages took 2 free pages`.
+          No page-table page is needed: both pages lie in the first 2 MiB of the address space,
+          under the level-0 page table that already maps the stack, which exec built.
+build: |
+  **Start.**
+
+  ```text
+  git checkout -b my-12 06aad25
+  ```
+
+  Add the test program first: copy the spec's list of checks into `user/dexectest.c` and add
+  `$U/_dexectest\` to `UPROGS` in the `Makefile`. On the unmodified kernel `lazy`, `truncate`
+  and `modify` print `FAIL` (it loads everything at exec, so nothing that happens later can
+  matter) and the rest print `OK`: that is the test working.
+
+  **Milestones, in an order that keeps the system bootable after each one.** Until the
+  switch in milestone 7, exec still loads everything, so every new piece can be tested by the
+  existing suite before it carries any weight.
+
+  1. **Keep the file.** `p->exe` in `struct proc`; [[kexec]] keeps [[namei]]'s reference and
+     drops the old program's inside its transaction; [[kfork]] duplicates it; [[kexit]] drops
+     it inside the transaction it already has. Test: `usertests -q`.
+  2. **Record the segments.** A small table in `struct proc`, filled by [[kexec]], copied by
+     [[kfork]]. Test: it boots.
+  3. **The loader.** A function that, given a process and a page address, finds the segment,
+     allocates and zeroes a page, reads the file's part of it with [[readi]] under [[ilock]],
+     and maps it. Nothing calls it yet. Test: it compiles.
+  4. **Route faults to it.** In [[vmfault]], before the zero-page code: below the end of the
+     image, call the loader. Then make [[usertrap]] read `scause` and `stval` once, into
+     locals, and accept `scause` 12 as well. Test: `usertests -q` (no program page is ever
+     missing yet, so nothing changes).
+  5. **Load before locking.** A function that loads the program pages of a user range, called
+     from [[sys_read]], [[sys_write]] and [[sys_wait]] before they take any lock. Test:
+     `usertests -q`.
+  6. **Fix `usertests`' leak check** so that it loads its own image before the first count.
+  7. **Flip the switch.** [[kexec]] stops calling [[uvmalloc]] and [[loadseg]] for segments and
+     checks that the file holds each segment's bytes instead. Test: `dexectest`, then
+     `usertests -q`, then `dexectest` again.
+  8. **sbrk below the image.** Cut the segment table in [[growproc]] when the process shrinks.
+     Test: `dexectest shrink`.
+
+  **Debugging advice.** For the first faults of the system (`init`'s), start QEMU halted with
+  `make qemu-gdb` (it adds `-S` and a gdb port of its own, which it writes into `.gdbinit`),
+  run `${TOOLPREFIX}gdb kernel/kernel` in another terminal, and set breakpoints before the
+  first `continue`; for later events, continue and interrupt with Ctrl-C when you need to.
+  `TOOLPREFIX` is your RISC-V toolchain's prefix, the same one xv6's Makefile detects
+  (`riscv64-unknown-elf-`, `riscv64-linux-gnu-` or `riscv64-elf-`); set it with `export
+  TOOLPREFIX=riscv64-unknown-elf-` or whichever you have. On Debian/Ubuntu/WSL,
+  `gdb-multiarch` also works as the debugger. `${TOOLPREFIX}readelf -l user/_NAME` shows a
+  program's segments.
+
+  - A panic at boot right after `hart 2 starting` means `init` died: look at the `usertrap()`
+    line. `scause` 0xc is a fetch nobody handled; 0x2 at `sepc` = the entry point means the
+    page was mapped but its bytes are wrong.
+  - Print every load while you build it: `printk("load %s %d va %p\n", p->name, p->pid, va)`.
+    The first lines of a boot should be `init` loading `0x0`, then `init`'s child loading
+    `0x1000` inside `exec`.
+  - A hang with idle harts: attach gdb, list `proc[]` with their `state` and `chan`, and
+    compare a SLEEPING process's `chan` with the addresses of inode and buffer locks. To see
+    a sleeping process's kernel stack, set `$sp`, `$s0` and `$pc` from its `p->context`
+    (`sp`, `s0`, `ra`) on a halted hart, run `bt`, and put the registers back.
+  - `panic: sched locks`: break on `panic` and run `bt`; look for a lock-holding function
+    (`piperead`, `consoleread`, `kwait`) above `copyout`/`copyin` and a disk wait below.
+clinic:
+  - bug: usertrap does not handle instruction page faults
+    change: |
+      Everything else is in place, but the fault branch in [[usertrap]] still accepts only
+      loads and stores:
+
+      ```diff
+      -  } else if ((scause == 15 || scause == 13 || scause == 12) &&
+      +  } else if ((scause == 15 || scause == 13) &&
+                    vmfault(p->pagetable, p->sz, stval, (scause == 15) ? 0 : 1) != 0) {
+      ```
+    symptom: |
+      xv6 kernel is booting
+
+      hart 2 starting
+      hart 1 starting
+      usertrap(): unexpected scause 0xc pid=1
+                  sepc=0xbc stval=0xbc
+      panic: init exiting
+    why: |
+      The first process runs [[kexec]] from [[forkret]] and returns to user mode at `init`'s
+      entry point, `0xbc` (`${TOOLPREFIX}readelf -h user/_init`). Nothing is mapped there any more, so the
+      hart cannot fetch the instruction and raises an instruction page fault: `scause` 12, with
+      the address in both `sepc` and `stval`. Loads and stores into unloaded pages (string
+      constants, data) go through the existing branch and would work; but the very first thing
+      every program does is fetch an instruction.
+
+      Neither branch accepts cause 12, so the `else` branch prints the message and kills the
+      process. The process is `init`, and [[kexit]] refuses to let it go: `panic: init
+      exiting`. The machine never reaches the shell. On the original kernel this branch did not
+      need 12: exec mapped every text page, so a fetch could only fault on an address outside
+      the program, and killing was right.
+  - bug: The page is zeroed after the file data is read
+    change: |
+      The `memset` moves below the read, as if zeroing were a final cleanup:
+
+      ```diff
+         if ((mem = kalloc()) == 0)
+           return 0;
+      -  memset(mem, 0, PGSIZE);
+         off = va - s->va;
+         if (off < s->filesz) {
+           [...]
+           iunlock(p->exe);
+         }
+      +  memset(mem, 0, PGSIZE);
+         if (mappages(p->pagetable, va, PGSIZE, (uint64)mem,
+      ```
+    symptom: |
+      xv6 kernel is booting
+
+      hart 2 starting
+      hart 1 starting
+      usertrap(): unexpected scause 0x2 pid=1
+                  sepc=0xbc stval=0x0
+      panic: init exiting
+    why: |
+      Every load now reads the file correctly and then wipes the page: every page of every
+      program is all zeros. `init`'s first fetch at `0xbc` faults, the handler loads page 0,
+      and the retried fetch finds the bytes `00 00`. In RISC-V an all-zero 16-bit instruction
+      is defined to be illegal (so that running into zeroed memory stops at once), so the hart
+      raises an illegal-instruction exception, `scause` 2, with `stval` 0. [[usertrap]] kills
+      `init` and the kernel panics as in clinic 1, but with a
+      different cause: this time the page *was* mapped.
+
+      The rule is that zeroing provides the background and the file overwrites part of it, so
+      the zeroing must come first. The next clinic is the opposite mistake.
+  - bug: The page is not zeroed at all
+    change: |
+      The `memset` is gone: [[readi]] fills the part of the page the file supplies, and the
+      rest keeps whatever [[kalloc]] left there.
+
+      ```diff
+         if ((mem = kalloc()) == 0)
+           return 0;
+      -  // zero first: what the file does not supply (the bss, the end
+      -  // of the last page) must read as 0, not as kalloc's junk.
+      -  memset(mem, 0, PGSIZE);
+         off = va - s->va;
+      ```
+    symptom: |
+      xv6 kernel is booting
+
+      hart 1 starting
+      hart 2 starting
+      init: starting sh
+      $ echo hi
+      usertrap(): unexpected scause 0xd pid=3
+                  sepc=0x11b4 stval=0x505050505050505
+      $ dexectest
+      usertrap(): unexpected scause 0xd pid=4
+                  sepc=0x11b4 stval=0x505050505050505
+      $ usertests -q
+      usertrap(): unexpected scause 0xd pid=5
+                  sepc=0x11b4 stval=0x505050505050505
+      $
+    why: |
+      [[kalloc]] does not return zeroed pages; it fills every page with the byte `0x05`
+      ([[kernel/kalloc.c:80]]) precisely so that code which forgets to initialize memory fails
+      visibly. Text pages are almost full of file data, and `init` and the shell start and
+      print their prompts. The damage is in the [[g:bss]].
+
+      `sh`'s data page `0x2000` holds 16 bytes from the file (`symbols` and `whitespace`) and
+      then the bss, which begins with `freep` at `0x2010`, the head of [[malloc]]'s free list.
+      It must start as 0. Here it is `0x0505050505050505`. The parent shell never calls
+      [[malloc]], so it survives; but for every command line it forks a child that parses the
+      line, and the parser allocates. [[malloc]] sees `freep` is not 0, follows it, and the load
+      `ld a5,0(a0)` at `0x11b4` faults on address `0x0505050505050505`, cause 13. Every command
+      dies in the shell's child before it reaches `exec`, which is why `echo`, `dexectest` and
+      `usertests` all fail at the same `sepc`, with pids 3, 4 and 5.
+
+      A program whose bss happened to be used only after being written would have run fine.
+      The original kernel never had this problem because [[uvmalloc]] zeroed every page before
+      [[loadseg]] read into it ([[kernel/vm.c:233]]).
+  - bug: fork shares the executable without taking a reference
+    change: |
+      [[kfork]] copies the pointer, as if the child could borrow the parent's reference:
+
+      ```diff
+         np->cwd = idup(p->cwd);
+      -  np->exe = idup(p->exe); // the child runs the same program
+      +  np->exe = p->exe;
+      ```
+    symptom: |
+      xv6 kernel is booting
+
+      hart 1 starting
+      hart 2 starting
+      init: starting sh
+      $ echo hi
+      hi
+      $ ls
+      .              1 1 1024
+      [...]
+      dexectest      2 23 147072
+      console        3 24 0
+      $ dexectest
+      dexectest: lazy: touching 2 data pages took 2 free pages
+      dexectest: lazy: OK
+      panic: ilock
+
+      # another boot of the same kernel, `dexectest fork` alone, gdb breakpoint on panic:
+      #0  panic (s=s@entry=0x80007468 "ilock") at kernel/printk.c:139
+      #1  0x000000008000336a in ilock (ip=<optimized out>) at kernel/fs.c:301
+      #2  0x0000000080004d42 in loadpage (p=p@entry=0x800101e0 <proc+1072>, va=va@entry=36864) at kernel/exec.c:232
+      #3  0x0000000080001554 in vmfault (pagetable=0x87f25000, psz=<optimized out>, va=va@entry=36864, read=read@entry=1) at kernel/vm.c:473
+      #4  0x000000008000279e in usertrap () at kernel/trap.c:77
+      #5  0x0000003ffffff09c in ?? ()
+      $1 = 3
+      $2 = "dexectest\000\000\000\000\000\000"
+      $3 = {dev = 1, inum = 23, ref = 0, lock = {locked = 0, lk = {locked = 0, name = 0x80007568 "sleep lock", cpu = 0x0}, name = 0x80007448 "inode", pid = 0}, valid = 1, type = 2, major = 0, minor = 0, nlink = 1, size = 147072, addrs = {1007, 1008, 1009, 1010, 1011, 1012, 1013, 1014, 1015, 1016, 1017, 1018, 1019}}
+
+      # a third boot: usertests -q
+      [...]
+      ALL TESTS PASSED
+    why: |
+      Each [[iput]] must match a reference that was taken. With this change two processes
+      drop a reference that was counted once. In `dexectest fork`, `dexectest` (pid 3) holds
+      the only reference to its file, from [[namei]] in its exec: `ref` 1. Its child shares the
+      pointer, reads page 3 of `big[]`, and exits; [[kexit]]'s [[iput]] brings `ref` to 0. The
+      parent then touches page 3 itself (`va` 36864 = `0x9000`): `loadpage` calls [[ilock]],
+      which refuses an inode with no references ([[kernel/fs.c:300]]): `panic: ilock`. gdb shows
+      the parent's `p->exe` with `ref = 0`, still valid, still inode 23.
+
+      The panic is the lucky outcome. An inode with `ref` 0 is a free slot for [[iget]]
+      ([[kernel/fs.c:263]]). Had any file been opened between the child's exit and the parent's
+      fault, that slot could have been given to another file, with `ref` 1; [[ilock]] would have
+      been satisfied, and `loadpage` would have read *that* file's blocks into the program's
+      memory: garbage code or data, and no message at all. (Reasoned from the code; not seen in
+      these runs.)
+
+      `echo hi` and `ls` worked, and `usertests -q` passed on a third boot. The reference count
+      went wrong there too (the shell's own count dropped to 0 at the first command, when the
+      child's exec dropped a reference it had never taken), but nobody needed the inode again:
+      the shell had already loaded the few pages it uses, and `usertests` loads its whole image
+      before its first test (the `touchimage` change). A missing reference is invisible until
+      someone loads a page through it.
+
+      A second variant, kexec storing `p->exe = ip` but still dropping [[namei]]'s reference
+      with `iunlockput`, fails at once: the first load in the system, `init`'s page 0, finds
+      `ref` 0, and the console shows `panic: ilock` right after `hart 1 starting`.
+  - bug: exit drops the executable outside the transaction
+    change: |
+      [[kexit]] closes the transaction first and drops `p->exe` afterwards:
+
+      ```diff
+         begin_op();
+         iput(p->cwd);
+      -  iput(p->exe); // may free an unlinked program: needs the transaction
+         end_op();
+      +  iput(p->exe);
+         p->cwd = 0;
+      ```
+    symptom: |
+      xv6 kernel is booting
+
+      hart 1 starting
+      hart 2 starting
+      init: starting sh
+      $ usertests -q
+      usertests starting
+      test copyin: OK
+      [...]
+      test unlinkcwd: OK
+      ALL TESTS PASSED
+      $ dexectest unlink
+      panic: log_write outside of trans
+
+      # another boot, `dexectest unlink`, gdb breakpoint on panic:
+      #0  panic (s=s@entry=0x80007548 "log_write outside of trans") at kernel/printk.c:139
+      #1  0x0000000080003fe4 in log_write (b=b@entry=0x8001c960 <bcache+17816>) at kernel/log.c:232
+      #2  0x0000000080002ee2 in bfree (dev=<optimized out>, b=<optimized out>) at kernel/fs.c:105
+      #3  0x0000000080003452 in itrunc (ip=ip@entry=0x80020d68 <itable+704>) at kernel/fs.c:472
+      #4  0x000000008000352a in iput (ip=0x80020d68 <itable+704>) at kernel/fs.c:365
+      #5  0x0000000080002182 in kexit (status=0) at kernel/proc.c:349
+      #6  0x0000000080002a20 in sys_exit () at kernel/sysproc.c:15
+      #7  0x00000000800029dc in syscall () at kernel/syscall.c:146
+      #8  0x0000000080002762 in usertrap () at kernel/trap.c:73
+      #9  0x0000003ffffff09c in ?? ()
+      $1 = 1
+      $2 = 1
+      $3 = 4
+      $4 = "dxcopy\000\000t\000\000\000\000\000\000"
+    why: |
+      All of `usertests` passes: no test in it deletes a program while the program runs. Almost
+      every [[iput]] only lowers a reference count and writes nothing, and for those the missing
+      transaction does not matter.
+
+      `dexectest unlink` starts a copy of itself as a helper from the file `dxcopy`, unlinks
+      `dxcopy` while the helper runs, then lets it finish. The helper (pid 4, `dxcopy`) holds the
+      last reference to an inode whose `nlink` is now 0. Its [[kexit]]'s [[iput]] therefore frees
+      the file: [[itrunc]] gives each data block back with [[bfree]], which clears the block's bit
+      in the free bitmap and records the change with [[log_write]]. [[log_write]] checks that the
+      caller is inside a transaction (`log.outstanding < 1`, [[kernel/log.c:231]]) and panics.
+      gdb shows the chain and `noff` 1: `log.lock`, taken by [[log_write]] right before the check.
+
+      Without that check the bitmap block would be changed outside the log, and a crash in the
+      next moments could leave the bitmap and the inode disagreeing. The rule "every [[iput]]
+      inside a transaction" ([[kernel/fs.c:347]]) exists for this one case, which a test suite
+      that never deletes a running program will never exercise.
+  - bug: read() copies into an unloaded page while holding locks
+    change: |
+      There is no prefault: [[sys_read]], [[sys_write]] and [[sys_wait]] go straight to the
+      code that copies, and the copy loads a missing page wherever it happens to be:
+
+      ```diff
+         if (argfd(0, 0, &f) < 0)
+           return -1;
+      -  // load the buffer's program pages now: fileread holds locks
+      -  // while it copies, and loading a page needs to sleep.
+      -  if (n > 0 && uvmprefault(myproc(), p, n) < 0)
+      -    return -1;
+         return fileread(f, p, n);
+      ```
+
+      (and the same three lines in [[sys_write]], one in [[sys_wait]].)
+    symptom: |
+      xv6 kernel is booting
+
+      hart 2 starting
+      hart 1 starting
+      init: starting sh
+      $ dexectest locked
+      panic: sched locks
+
+      # gdb breakpoint on panic, same boot:
+      #0  panic (s=s@entry=0x800071a8 "sched locks") at kernel/printk.c:139
+      #1  0x0000000080001fb2 in sched () at kernel/proc.c:494
+      #2  0x0000000080002052 in sleep () at kernel/proc.c:575
+      #3  0x0000000080005d24 in virtio_disk_rw (b=b@entry=0x8001e7c8 <bcache+25600>, write=write@entry=0) at kernel/virtio_disk.c:290
+      #4  0x0000000080002d54 in bread (dev=1, blockno=1068) at kernel/bio.c:98
+      #5  0x0000000080003788 in readi (ip=0x80020ce0 <itable+568>, user_dst=user_dst@entry=0, dst=dst@entry=2280865792, off=61440, n=n@entry=4096) at kernel/fs.c:524
+      #6  0x0000000080004d56 in loadpage (p=p@entry=0x800101e0 <proc+1072>, va=va@entry=57344) at kernel/exec.c:235
+      #7  0x0000000080001554 in vmfault (pagetable=pagetable@entry=0x87f25000, psz=psz@entry=110592, va=va@entry=57344, read=read@entry=1) at kernel/vm.c:473
+      #8  0x00000000800016a8 in copyin (pagetable=0x87f25000, psz=110592, dst=dst@entry=0x3fffff9ebf "", srcva=srcva@entry=57344, len=len@entry=1) at kernel/vm.c:391
+      #9  0x0000000080004758 in pipewrite (pi=0x87f44000, addr=57344, n=8) at kernel/pipe.c:96
+      #10 0x0000000080004498 in filewrite (f=0x80022700 <ftable+104>, addr=57344, n=8) at kernel/file.c:143
+      #11 0x000000008000508a in sys_write () at kernel/sysfile.c:97
+      #12 0x00000000800029dc in syscall () at kernel/syscall.c:146
+      #13 0x0000000080002762 in usertrap () at kernel/trap.c:73
+      #14 0x0000003ffffff09c in ?? ()
+      $1 = 2
+      $2 = 1
+      $3 = 3
+      $4 = "dexectest\000\000\000\000\000\000"
+        Id   Target Id                    Frame
+        1    Thread 1.1 (CPU#0 [running]) acquire (lk=lk@entry=0x800101e0 <proc+1072>) at kernel/spinlock.c:37
+        2    Thread 1.2 (CPU#1 [running]) acquire (lk=lk@entry=0x800101e0 <proc+1072>) at kernel/spinlock.c:37
+      * 3    Thread 1.3 (CPU#2 [running]) panic (s=s@entry=0x800071a8 "sched locks") at kernel/printk.c:139
+
+      # another boot: `dexectest selfread`, which never returns
+      $ dexectest selfread
+      # (nothing more; after a while gdb was attached to the hung kernel)
+        Id   Target Id                    Frame
+      * 1    Thread 1.1 (CPU#0 [halted ]) s_sstatus (x=2) at kernel/riscv.h:67
+        2    Thread 1.2 (CPU#1 [halted ]) s_sstatus (x=2) at kernel/riscv.h:67
+        3    Thread 1.3 (CPU#2 [halted ]) s_sstatus (x=2) at kernel/riscv.h:67
+      [...]
+      proc[0] pid 1 SLEEPING init chan 0x8000fdb0 <proc>
+      proc[1] pid 2 SLEEPING sh chan 0x8000ffc8 <proc+536>
+      proc[2] pid 3 SLEEPING dexectest chan 0x80020cf0 <itable+584>
+        exe inum 23 ref 2 lock.locked 1 lock.pid 3 &exe->lock 0x80020cf0 <itable+584>
+      [...]
+        kernel stack of pid 3 (from p->context):
+      #0  r_tp () at kernel/riscv.h:344
+      #1  cpuid () at kernel/proc.c:67
+      #2  mycpu () at kernel/proc.c:76
+      #3  sched () at kernel/proc.c:502
+      #4  0x0000000080002052 in sleep () at kernel/proc.c:575
+      #5  0x00000000800040ce in acquiresleep (lk=lk@entry=0x80020cf0 <itable+584>) at kernel/sleeplock.c:28
+      #6  0x0000000080003336 in ilock (ip=0x80020ce0 <itable+568>) at kernel/fs.c:303
+      #7  0x0000000080004d42 in loadpage (p=p@entry=0x800101e0 <proc+1072>, va=va@entry=49152) at kernel/exec.c:234
+      #8  0x0000000080001554 in vmfault (pagetable=0x87f25000, pagetable@entry=0x1, psz=psz@entry=0, va=va@entry=49152, read=read@entry=0) at kernel/vm.c:473
+      #9  0x00000000800015e2 in copyout (pagetable=0x1, psz=0, dstva=dstva@entry=49152, src=src@entry=0x800199f0 <bcache+5672> "\177ELF\002\001\001", len=len@entry=1024) at kernel/vm.c:357
+      #10 0x00000000800023c0 in either_copyout (user_dst=user_dst@entry=1, dst=dst@entry=49152, src=src@entry=0x800199f0 <bcache+5672>, len=len@entry=1024) at kernel/proc.c:657
+      #11 0x000000008000375a in readi (ip=0x80020ce0 <itable+568>, user_dst=user_dst@entry=1, dst=dst@entry=49152, off=0, n=n@entry=4096) at kernel/fs.c:526
+      #12 0x00000000800043b0 in fileread (f=0x800226d8 <ftable+64>, addr=49152, n=4096) at kernel/file.c:122
+      #13 0x0000000080005042 in sys_read () at kernel/sysfile.c:81
+      #14 0x00000000800029dc in syscall () at kernel/syscall.c:146
+      #15 0x0000000080002762 in usertrap () at kernel/trap.c:73
+      #16 0x0000003ffffff09c in ?? ()
+    why: |
+      Two different failures from one missing rule, "load before you lock".
+
+      **`dexectest locked`: a sleep under a spinlock.** The parent's first copy is a `write` into
+      a pipe from page 8 of `big[]` (`va` 57344 = `0xe000`), which it has never touched.
+      [[pipewrite]] holds `pi->lock` and copies byte by byte with [[copyin]]
+      ([[kernel/pipe.c:96]]). The first byte finds the page missing, [[vmfault]] calls
+      `loadpage`, [[readi]] needs block 1068 (file offset `0xf000`), which is not in the buffer
+      cache, and [[virtio_disk_rw]] goes to [[sleep]]. [[sleep]] takes `p->lock`; [[sched]]
+      counts noff 2 (`pi->lock` and `p->lock`) and panics. The other two harts are stuck in
+      [[acquire]] on `proc+1072`, this process's `p->lock`, which the panicking hart will never
+      release. Had the block been in the cache, nothing would have slept and the write would
+      have worked: a bug that depends on the cache. The `read` from the pipe and the `wait`
+      that follow in the same check would fail the same way ([[piperead]] holds `pi->lock`,
+      [[kwait]] holds two spinlocks); a kernel with only [[sys_write]]'s prefault removed also
+      printed `panic: sched locks` for this check.
+
+      **`dexectest selfread`: a process waiting for itself.** `dexectest` reads its own file
+      into page 6 of `big[]` (`va` 49152 = `0xc000`). [[fileread]] locks inode 23, the program's
+      own file, and [[readi]] copies the first block with [[either_copyout]], holding that
+      block's buffer (its first bytes, `\177ELF`, are visible in `src`). The copy needs the
+      page; `loadpage` calls [[ilock]] on `p->exe`, the same inode 23, and [[acquiresleep]]
+      sleeps until the holder lets go. The holder is pid 3 itself: `lock.pid 3`, and the
+      process's `chan` is the address of that lock. It will sleep forever. No panic, no message;
+      the harts sit idle in the scheduler and the shell never prints another prompt.
+
+      (In both backtraces some argument values of `vmfault` and `copyout` are stale registers
+      in this optimized build, for example `pagetable=0x1`; the addresses and line numbers are
+      what matter. The selfread stack was reconstructed by setting a halted hart's `sp`, `s0`
+      and `pc` from the sleeping process's saved context, which is why its top frames are
+      `sched` and `mycpu`.)
+
+      Both are fixed by the same three call sites: [[sys_read]], [[sys_write]] and
+      [[sys_wait]] load the program pages of the user buffer before any lock is taken.
+reveal:
+  - title: exec keeps the file it read
+    commit: 1
+    file: kernel/exec.c
+    lines: 120-156
+    focus: 131-139
+    diff: true
+    state:
+      hart: 2
+      mode: S
+      proc: echo (pid 3)
+      intr: "on"
+      satp: kernel
+      locks: ["echo's inode lock (sleep-lock)"]
+      irq: 0
+      stack: [usertrap, syscall, sys_exec, kexec]
+      sp: {"on": kernel, detail: "pid 3's kernel stack, `sp` = `0x3fffff9b30`"}
+    note: |
+      The story of this tour, recorded with gdb on the branch, three harts (the recording
+      predates one bound check in [[kexec]] and one pipe write in `dexectest`, so kernel
+      addresses in `exec.c` differ from the branch's by a few bytes): the
+      machine boots, `init` and the shell load their pages as they run, you type `echo hi`, and
+      the shell's child (pid 3) calls `exec("echo")`. Later steps follow `dexectest` reading its
+      own file, and a helper whose file is deleted while it runs.
+
+      Commit 1 changes what [[kexec]] does with the inode [[namei]] gave it. The original kernel
+      dropped it as soon as the segments were read (`iunlockput`, then `end_op`). Now the image
+      will be read *later*, so the process keeps that reference in `p->exe` (a new field in
+      `struct proc`). Keeping the one [[namei]] already counted costs nothing: no [[idup]], no
+      extra lock.
+
+      Two things moved to make this possible. The inode stays locked, and the transaction open,
+      until the image is committed (the comment at line 79): the commit is where the new
+      reference replaces the old one, and the old one must be dropped inside a transaction. The
+      error path is unchanged: every `goto bad` still happens with `ip` locked and the
+      transaction open, exactly what `bad:` (line 148) undoes.
+
+      At the focus lines gdb saw pid 3 on hart 2 holding the inode lock of `echo` (inode 4,
+      `lock.pid` 3), and `log.outstanding` = 1: this exec's transaction. The old image's file,
+      the shell's (inode 13), had `ref` 2: the shell's reference and this child's.
+    others: |
+      The shell (pid 2) is asleep in `wait`. Another hart could be loading a page of `sh`
+      for another process at this moment; that would lock inode 13, not 4, and nothing here
+      waits for it.
+  - title: Dropping the old program, inside the transaction
+    commit: 1
+    file: kernel/exec.c
+    lines: 131-156
+    focus: 140-143
+    state:
+      hart: 2
+      mode: S
+      proc: echo (pid 3)
+      intr: "on"
+      satp: kernel
+      locks: []
+      irq: 0
+      stack: [usertrap, syscall, sys_exec, kexec]
+      sp: {"on": kernel}
+    note: |
+      [[iunlock]] first, then [[iput]] of the old program's file, then [[end_op]]. The order
+      inside is deliberate:
+
+      - [[iput]] can free the inode and its blocks, when this was the last reference to a file
+        that has been unlinked meanwhile. Freeing writes the free bitmap and the inode through
+        the log, so it must happen before [[end_op]].
+      - The new inode is unlocked before the old one is dropped. If they are the same file (a
+        shell that execs `sh`), [[iput]] would only lower `ref` from 2 to 1; but holding one
+        inode's sleep-lock while [[iput]] might take another's is an ordering this code never
+        needs.
+
+      Here the old file is `sh`, `ref` 2 → 1: nothing is written. Only an unlinked program
+      makes this [[iput]] write; the last step of the tour shows one doing it. `oldexe` is 0
+      only once: for `init`'s exec from [[forkret]], the first process has no program yet.
+    others: |
+      Other harts may be in transactions of their own; [[begin_op]] lets several run at once
+      and commits them together ([[tour:31]]). This exec's transaction writes nothing at all,
+      unless the [[iput]] frees a file.
+  - title: The child inherits the file, exit lets it go
+    commit: 1
+    file: kernel/proc.c
+    lines: 284-300
+    focus: 288-289
+    diff: true
+    state:
+      hart: any
+      mode: S
+      proc: sh (pid 2)
+      intr: "off"
+      satp: kernel
+      locks: ["np->lock (the child's)"]
+      irq: {noff: 1, intena: 1}
+      stack: [usertrap, syscall, sys_fork, kfork]
+      sp: {"on": kernel}
+    note: |
+      [[kfork]] treats the program file like the current directory: the child gets its own
+      counted reference with [[idup]]. The child needs it because it shares nothing with its
+      parent's address space but copies: pages the parent loaded are copied by [[uvmcopy]],
+      pages it never touched are missing in the child too, and the child will load them itself,
+      from the file, through `p->exe`.
+
+      [[kfork]] still holds the child's `np->lock` here (since [[allocproc]], until line 295):
+      noff 1, intena 1 (a system call, so interrupts were on before the first acquire). Inside
+      [[idup]], `itable.lock` makes it noff 2 for a few instructions: the edge `p->lock` →
+      `itable.lock` that `p->cwd` already created ([[concept:locks#order]]). (This state is
+      reasoned from the code; no breakpoint was set here.)
+
+      In [[kexit]] (below in the same file, lines 343-348) the reference is dropped next to
+      `p->cwd`, inside the [[begin_op]]/[[end_op]] that was already there. Clinic 4 removes
+      the [[idup]] and gets `panic: ilock`; clinic 5 moves the [[iput]] out of the transaction
+      and gets `panic: log_write outside of trans`.
+  - title: exit drops the reference inside its transaction
+    commit: 1
+    file: kernel/proc.c
+    lines: 326-352
+    focus: 343-348
+    diff: true
+    state:
+      hart: 2
+      mode: S
+      proc: echo (pid 3)
+      intr: "on"
+      satp: kernel
+      locks: []
+      irq: 0
+      stack: [usertrap, syscall, sys_exit, kexit]
+      sp: {"on": kernel, detail: "`sp` = `0x3fffff9f60`"}
+    note: |
+      `echo` has printed `hi` and exits. gdb stopped at line 345 on hart 2: `p->exe` is inode 4
+      with `ref` 1 and `nlink` 1, and `log.outstanding` is 1, the transaction begun at line 343.
+      This [[iput]] makes `ref` 0 and writes nothing, since the file still has its name. The
+      in-memory inode stays in the table, valid, until [[iget]] needs the slot for another file.
+
+      Setting `p->exe = 0` matters for the same reason as `p->cwd = 0`: the zombie keeps its
+      `struct proc` until the parent's `wait`, and no stale pointer should survive in it.
+
+      Nothing else in exit changes. The process's pages, loaded or not, are freed by
+      [[freeproc]] in the parent's [[kwait]], as before: [[uvmunmap]] skips pages that were
+      never mapped ([[kernel/vm.c:205]]), so an image with holes in it frees cleanly.
+  - title: A record per segment
+    commit: 2
+    file: kernel/proc.h
+    lines: 79-116
+    focus: 81-88
+    diff: true
+    state:
+      hart: any
+      proc: "(a definition: used by exec, fork and the fault path)"
+      locks: []
+    note: |
+      `struct seg` holds the five values the think section listed: where the segment starts in
+      memory, how big it is there, where its bytes are in the file, how many bytes the file has,
+      and the PTE permissions ([[flags2perm]]'s result, so `PTE_X` and/or `PTE_W`). `struct proc`
+      gets `seg[NSEG]`, kept in address order, and `nseg`. `NSEG` is 4 (`param.h`); every
+      program in this tree has 2 loadable segments (`forktest`, linked differently, has 1).
+
+      The comment block in `struct proc` says the fields below it are "private to the process,
+      so p->lock need not be held". The new ones belong there: only the process itself reads
+      them (in its faults and system calls), and they change only in its own `exec` or `sbrk`,
+      or in [[kfork]] before the child can run. That is also why the fault path can read them
+      without any lock.
+  - title: exec records each segment
+    commit: 2
+    file: kernel/exec.c
+    lines: 61-91
+    focus: 73-88
+    diff: true
+    state:
+      hart: 2
+      mode: S
+      proc: echo (pid 3)
+      intr: "on"
+      satp: kernel
+      locks: ["echo's inode lock (sleep-lock)"]
+      irq: 0
+      stack: [usertrap, syscall, sys_exec, kexec]
+      sp: {"on": kernel}
+    note: |
+      Each segment is still loaded as before, and now also recorded in a local `seg[]`, copied
+      into the process at the commit with the other parts of the new image. A failed exec
+      leaves the old table untouched, like the old page table.
+
+      One new check: a segment must start at or above the end of the previous one, and there may
+      be at most `NSEG` of them. The original kernel accepted overlapping segments without
+      noticing ([[uvmalloc]] mapped only the pages above the previous end, and [[loadseg]] wrote
+      into whatever was mapped); with demand paging a page must belong to exactly one segment, or
+      the fault would not know which bytes to read. No program in this
+      tree has overlapping segments: `${TOOLPREFIX}readelf -l` shows text at `0x0` and data at the next page
+      boundary (the linker script aligns `.data` to `0x1000`).
+
+      [[kfork]] copies the table along with the reference (in `proc.c`). Nothing reads it yet.
+  - title: "loadpage: find the segment, zero the page"
+    commit: 3
+    file: kernel/exec.c
+    lines: 197-254
+    focus: 224-235
+    diff: true
+    state:
+      hart: 1
+      mode: S
+      proc: init (pid 1)
+      intr: "off"
+      satp: kernel
+      locks: []
+      irq: 0
+      stack: [usertrap, vmfault, loadpage]
+      sp: {"on": kernel, detail: "`sp` = `0x3fffffdf50`, pid 1's kernel stack at `0x3fffffd000`"}
+    note: |
+      The loader, `loadpage(p, va)`, for one page-aligned address below the end of the image
+      (`imgend`, defined above it, computes that end from the last segment). First the segment that
+      contains the page; if there is none, `va` is in a hole between segments and the fault is
+      not this function's to fix. Then a page from [[kalloc]], zeroed *before* anything else.
+      [[kalloc]] fills pages with `0x05` ([[kernel/kalloc.c:80]]), and whatever the file does not
+      supply (the bss, the tail of a segment's last page) must read as 0. Clinics 2 and 3 get
+      this order wrong in both directions.
+
+      The state is from the finished branch: the very first page load of the boot. `init`
+      (pid 1) returned to user mode at its entry point `0xbc` with nothing mapped, the fetch
+      faulted (`scause` 12), and here, on hart 1, `loadpage` handles `va` 0. As in every page
+      fault, interrupts are off: [[usertrap]] calls `intr_on` only for system calls
+      ([[kernel/trap.c:66]]). No lock is held yet.
+
+      ```text
+      init's kernel stack, during the load
+        top ─► usertrap
+               vmfault
+               loadpage
+               readi → bread → virtio_disk_rw → sleep (next step)
+      ```
+  - title: "loadpage: read the file's part, under the inode lock"
+    commit: 3
+    file: kernel/exec.c
+    lines: 216-254
+    focus: 236-247
+    state:
+      hart: 1
+      mode: S
+      proc: init (pid 1)
+      intr: "off"
+      satp: kernel
+      locks: ["init's inode lock (sleep-lock)"]
+      irq: 0
+      stack: [usertrap, vmfault, loadpage]
+      sp: {"on": kernel}
+    note: |
+      If the page holds any of the file's bytes (`off < filesz`), [[readi]] copies
+      `min(4096, filesz - off)` of them into the front of the page, from file offset `s->off +
+      off`, with the inode locked: [[ilock]] is a sleep-lock, and [[readi]] may wait for the
+      disk in [[bread]]. A short read means the file is now shorter than the program (someone
+      truncated it): the page cannot be built, it is freed, and the function returns 0. Then
+      [[mappages]] with `PTE_R | PTE_U` plus the segment's bits. A page entirely past `filesz`
+      skips the read and never touches the inode.
+
+      `init`'s page 0: `filesz` is `0xa01`, so 2561 bytes, three 1024-byte blocks. gdb stopped
+      at line 241 with the lock held by pid 1, then three times in [[virtio_disk_rw]]'s wait
+      loop: on hart 1, on hart 1, on hart 0, each time with noff 1 (`disk.vdisk_lock`) and
+      intena 0. Back at line 246 the process was on hart 1. Sleeping here is legal although
+      interrupts are off: [[sleep]] takes `p->lock`, [[sched]] finds noff 1 and interrupts off,
+      as it requires, and the scheduler on this hart turns them on while `init` waits.
+
+      The PTE this produced, read by gdb before `init` went back to user mode: `0x21fd541b`,
+      flags `0x1b` = `V|R|X|U`.
+    others: |
+      While `init` sleeps in the disk wait, its hart runs the scheduler, which has nothing
+      else to run this early. When the disk interrupt arrives (at whichever hart the PLIC
+      gives it to), [[virtio_disk_intr]] calls [[wakeup]], and the next free hart picks `init`
+      up: here hart 0 for the third block, then hart 1 again.
+
+      | time | hart 0 | hart 1 |
+      |---|---|---|
+      | 1 | scheduler loop | `init`: fault, `loadpage`, [[readi]], block 1 queued, [[sleep]] |
+      | 2 | | disk interrupt: [[wakeup]]; `init` runs again, block 2 |
+      | 3 | disk interrupt or scheduler: `init` resumes here, block 3 | scheduler loop |
+      | 4 | | `init` resumes here: [[iunlock]], [[mappages]] |
+
+      (Reconstructed from the four gdb stops, which recorded the hart at each one; which hart
+      took each interrupt was not recorded.)
+  - title: "vmfault: below the image, the page comes from the file"
+    commit: 4
+    file: kernel/vm.c
+    lines: 454-483
+    focus: 471-473
+    diff: true
+    state:
+      hart: 1
+      mode: S
+      proc: init (pid 2)
+      intr: "on"
+      satp: kernel
+      locks: []
+      irq: 0
+      stack: [usertrap, syscall, sys_exec, fetchaddr, copyin, vmfault]
+      sp: {"on": kernel, detail: "pid 2's kernel stack"}
+    note: |
+      One comparison, placed after the two checks that were already there (below `p->sz`, not
+      mapped) and before the zero-page code: a missing page below the end of the image belongs to
+      the program, and `loadpage` builds it. Above it, the lazy heap, unchanged. The test
+      `pagetable == p->pagetable` keeps [[kexec]]'s copies into a *new* page table (the stack,
+      which is mapped anyway) away from the current process's segments.
+
+      Because [[copyin]], [[copyout]] and [[copyinstr]] call [[vmfault]] for missing pages, a
+      system call can be the first to touch a page of the program. gdb caught exactly that during
+      boot: `init` forked, and its child (pid 2, still named `init`) called `exec("sh", argv)`.
+      [[sys_exec]] fetched `argv`, a global array in `init`'s data page `0x1000`, with
+      [[copyin]], and that page was loaded through here with interrupts on (a system call) and no
+      locks. The load started on hart 1, waited once for the disk, and finished on hart 0. It is
+      a page the child then threw away when exec replaced the image.
+    others: |
+      `init` (pid 1) is asleep in `wait`. The page was loaded into pid 2's page table only:
+      after [[kfork]] each process loads its own copy of a page it did not have at fork time.
+  - title: Read the trap registers before anything can sleep
+    commit: 5
+    file: kernel/trap.c
+    lines: 37-96
+    focus: 51-57
+    diff: true
+    state:
+      hart: 1
+      mode: S
+      proc: init (pid 1)
+      intr: "off"
+      satp: kernel
+      locks: []
+      irq: 0
+      stack: [usertrap]
+      sp:
+        "on": kernel
+        switched: "`ld sp, 8(a0)` in [[uservec]] ([[kernel/trampoline.S:76]]), after the instruction page fault"
+        detail: "was empty; now holds `usertrap`'s frame"
+    note: |
+      [[usertrap]] read `scause`, `sepc` and `stval` from the CSRs again and again: to pick a
+      branch, as [[vmfault]]'s argument, and in the error message. That was safe while nothing in
+      between could sleep. Now [[vmfault]] can sleep in `loadpage`, and the CSRs belong to the
+      *hart*: while the process sleeps, the hart runs the scheduler and takes other traps, and
+      the process may wake up on another hart altogether.
+
+      gdb saw it: at the top of this fault `scause` was 12 and `stval` `0xbc`; after `init`'s
+      read had finished, the same hart's `scause` read `0x8000000000000009`, a supervisor
+      external interrupt (the disk), and `stval` 0. Had the load failed after sleeping, the old
+      code would have printed that interrupt's cause and address instead of the fault's.
+
+      So [[usertrap]] copies `scause` and `stval` into locals at once, and the error message
+      prints `p->trapframe->epc`, the `sepc` saved at line 52. Returning to user mode was
+      never affected: [[prepare_return]] writes `sepc` from the trapframe, not from the CSR.
+
+      This step's state: the start of `init`'s first fault, hart 1, on the kernel stack that
+      [[uservec]] switched to, which held nothing until [[usertrap]]'s frame. Interrupts are off
+      and stay off on this path.
+  - title: The instruction page fault joins the branch
+    commit: 6
+    file: kernel/trap.c
+    lines: 49-96
+    focus: 74-79
+    diff: true
+    state:
+      hart: 1
+      mode: S
+      proc: init (pid 1)
+      intr: "off"
+      satp: kernel
+      locks: []
+      irq: 0
+      stack: [usertrap]
+      sp: {"on": kernel, detail: "`sp` = `0x3fffffdfd0` when [[vmfault]] was entered"}
+    note: |
+      `scause` 12 now goes to [[vmfault]] with 13 and 15, as a read. Until this lab no fetch
+      could hit a missing page of the program, because exec had mapped all the text; from the
+      switch on, the first instruction of every program faults here. gdb recorded [[vmfault]]
+      entered from here with `va` `0xbc`, `psz` `0x4000` and `read` 1: `init`'s entry point,
+      its two image pages plus guard and stack.
+
+      [[devintr]] is still asked first: a timer or device interrupt has a `scause` with the top
+      bit set, never 12, 13 or 15, so the order does not matter for correctness.
+
+      Retrying needs nothing special: `epc` was not advanced (only the system-call branch adds
+      4), so [[userret]] returns to the same instruction, which now finds its page. The bytes
+      were written through the kernel's direct map, and [[userret]] executes `fence.i`
+      ([[kernel/trampoline.S:107]]) before every return to user mode, so the hart fetches the new
+      instructions and not anything stale.
+  - title: "uvmprefault: load before you lock"
+    commit: 7
+    file: kernel/vm.c
+    lines: 484-507
+    focus: 495-505
+    diff: true
+    state:
+      hart: 2
+      mode: S
+      proc: dexectest (pid 4)
+      intr: "on"
+      satp: kernel
+      locks: []
+      irq: 0
+      stack: [usertrap, syscall, sys_read, uvmprefault]
+      sp: {"on": kernel, detail: "`sp` = `0x3fffff9f40`"}
+    note: |
+      Scene 2: `dexectest selfread`. The program opens its own file and calls `read(fd, dst,
+      4096)` with `dst` at `0xc000`, page 6 of `big[]`, which it has never touched.
+
+      `uvmprefault(p, va, n)` walks the pages of `[va, va+n)` that lie below the end of the
+      image and loads every one that is not mapped, through [[vmfault]]. Pages above the image
+      are left alone: a lazy heap page costs only [[kalloc]], which takes a spinlock and never
+      sleeps, so a copy under a lock may allocate it as before. If a program page cannot be
+      loaded, the system call fails with -1, before it has touched anything.
+
+      gdb stopped here on hart 2 with `a` = `0xc000`, interrupts on, nothing held: the load
+      that follows may sleep on the disk and on the inode lock, and it did (`loadpage` began on
+      hart 2 and finished on hart 0). It was the same inode the read is about to lock, and that
+      is fine now, because the read has not locked it yet.
+  - title: read and write call it first
+    commit: 7
+    file: kernel/sysfile.c
+    lines: 68-102
+    focus: 77-83
+    diff: true
+    state:
+      hart: 2
+      mode: S
+      proc: dexectest (pid 4)
+      intr: "on"
+      satp: kernel
+      locks: []
+      irq: 0
+      stack: [usertrap, syscall, sys_read]
+      sp: {"on": kernel}
+    note: |
+      [[sys_read]] and [[sys_write]] call `uvmprefault` after decoding their arguments and before
+      [[fileread]]/[[filewrite]], the last moment at which the system call holds no lock. What
+      each kind of file holds while it copies:
+
+      | file | locks held during the copy | without the prefault |
+      |---|---|---|
+      | pipe ([[piperead]], [[pipewrite]]) | `pi->lock` (spinlock) | sleep under a spinlock: `panic: sched locks` |
+      | console ([[consoleread]]) | `cons.lock` (spinlock) | the same |
+      | inode ([[fileread]] → [[readi]]) | the inode's lock and a buffer's lock (sleep-locks) | self-deadlock if the file is the program |
+      | inode ([[filewrite]] → [[writei]]) | a transaction, the inode's lock, a buffer's lock | the same |
+
+      After the prefault, `dexectest selfread` goes on into [[fileread]], which locks inode 23,
+      the program's own file, and [[readi]] copies four blocks into page 6, which is now mapped:
+      no load, no second [[ilock]]. The test then reads 16 bytes into `ro`, a page of read-only
+      data in the text segment. The prefault loads that page (text is legal to load), and
+      [[copyout]] refuses it because its PTE has no `PTE_W` ([[kernel/vm.c:364]]): `read`
+      returns -1, as `usertests copyout` demands for text.
+
+      The page stays mapped between the prefault and the copy because nothing but this process
+      could unmap it, and this process is busy here.
+  - title: wait copies under two spinlocks
+    commit: 7
+    file: kernel/sysproc.c
+    lines: 30-40
+    focus: 35-39
+    diff: true
+    state:
+      hart: 2
+      mode: S
+      proc: dexectest (pid 5)
+      intr: "on"
+      satp: kernel
+      locks: []
+      irq: 0
+      stack: [usertrap, syscall, sys_wait, uvmprefault]
+      sp: {"on": kernel, detail: "`sp` = `0x3fffff9f50`"}
+    note: |
+      [[kwait]] copies the child's exit status into `*addr` while it holds `wait_lock` and the
+      child's `p->lock` ([[kernel/proc.c:376]], [[kernel/proc.c:384]]-[[kernel/proc.c:391]]):
+      noff 2. A load there would be a sleep with noff 3 at [[sched]]. So [[sys_wait]] loads the
+      status's page first, if it is a program page.
+
+      `dexectest locked` (pid 5) does exactly that: `wait(&big[PAGE(5)])`, a status variable in
+      an untouched data page. gdb stopped in `uvmprefault` from [[sys_wait]] with `a` =
+      `0xb000` on hart 2, interrupts on, no locks; the page was loaded and the load finished on
+      the same hart. A moment earlier the same process had read from a pipe into page 4
+      (`0xa000`) the same way, through [[sys_read]]'s prefault, and its child (pid 6) had exited.
+    others: |
+      The child (pid 6) is a zombie by now, its `xstate` 7. Another hart may be running the
+      shell or idle. Nobody else can touch `dexectest`'s page table, so the page that
+      `uvmprefault` loads is still there when [[kwait]], under its two spinlocks, writes 7 into
+      it.
+  - title: usertests loads itself before it counts
+    commit: 8
+    file: user/usertests.c
+    lines: 3455-3500
+    focus: 3471-3491
+    diff: true
+    state:
+      hart: any
+      mode: U
+      proc: usertests
+      intr: "on"
+      satp: user
+      locks: []
+      stack: [main, drivetests, touchimage]
+      sp: {"on": user}
+    note: |
+      [[user:drivetests]] counts free pages with [[user:countfree]] before the tests and after,
+      and reports lost pages if the second count is lower. On a demand-paged kernel the
+      `usertests` process itself loads pages of its own image during the tests (code of later
+      tests, the test table, strings), and those pages are no longer free. A run of the branch
+      without this commit printed `FAILED -- lost some free pages 32467 (out of 32470)`: three
+      pages of `usertests` were "lost" into `usertests`.
+
+      `touchimage` reads one byte of every page from address 0 up to the linker's `end` (text,
+      data and bss), through a `volatile` pointer so the compiler cannot drop the reads. After it,
+      the whole image is loaded, both counts see the same program, and the leak check means what
+      it meant before. On the original kernel every page is already there and it changes
+      nothing. In this build the loop is three instructions (`lbu`, `add`, `bltu`) starting at
+      address 0.
+  - title: The switch
+    commit: 9
+    file: kernel/exec.c
+    lines: 56-94
+    focus: 62-81
+    diff: true
+    state:
+      hart: 0
+      mode: S
+      proc: dexectest (pid 4)
+      intr: "on"
+      satp: kernel
+      locks: ["dexectest's inode lock (sleep-lock)"]
+      irq: 0
+      stack: [usertrap, syscall, sys_exec, kexec]
+      sp: {"on": kernel, detail: "`sp` = `0x3fffff9b30`"}
+    note: |
+      [[uvmalloc]] and [[loadseg]] are gone from the loop; [[loadseg]] is deleted. The loop now
+      only checks and records, and `sz` becomes the end of the last segment, so the guard page
+      and the stack land at the next page boundary exactly as before. Everything else in
+      [[kexec]], the stack, the argument strings, the commit, is unchanged.
+
+      Two checks are new, because [[uvmalloc]] and [[loadseg]] used to make them implicitly.
+      Line 77: the segment must end low enough to leave room for the guard page and the stack
+      below `TRAPFRAME`. The original kernel could not get past [[uvmalloc]] with a segment that
+      ends near `MAXVA` (it ran out of memory and `exec` returned -1); without this line, a
+      crafted ELF made the stack setup panic (`panic: walk` for a segment ending past `MAXVA`,
+      `panic: mappages: remap` for one ending at the trampoline). Line 79: the file must be long enough to
+      hold every segment's bytes, as [[loadseg]]'s [[readi]] used to check; without it such a
+      program would start and die at its first fault in the missing part. `ip->size` is valid
+      because the inode is locked, which is why `exec.c` now includes `fs.h` and `file.h`.
+
+      gdb saw `dexectest`'s exec commit on hart 0 with its inode (23, `ref` 1) locked by pid 4
+      and the transaction open. After it, the process ran with nothing mapped but the stack and
+      the trampoline. Its first fault was an instruction fetch at `0xd34`, its entry point.
+  - title: sbrk below the image
+    commit: 10
+    file: kernel/exec.c
+    lines: 184-202
+    focus: 191-201
+    diff: true
+    state:
+      hart: any
+      mode: S
+      proc: dexectest (a child in `shrink`)
+      intr: "on"
+      satp: kernel
+      locks: []
+      irq: 0
+      stack: [usertrap, syscall, sys_sbrk, growproc, segtrim]
+      sp: {"on": kernel}
+    note: |
+      [[growproc]] calls `segtrim(p, sz)` after [[uvmdealloc]] when the process shrinks. Each
+      segment is cut at the new size, rounded up to a page as [[uvmdealloc]] rounds it, and
+      segments entirely above it are dropped. The end of the image moves down with the
+      process, so if it grows again (`sbrklazy`) and touches those addresses, [[vmfault]] gives
+      it zero pages, as the original kernel does, instead of the program's bytes.
+
+      Only a process that gives back its own stack can get here, since the stack lies above the
+      image. `dexectest shrink` does it in a child: `sys_sbrk(-n, SBRK_EAGER)` down to page 8
+      of `big[]`, `sys_sbrk(n, SBRK_LAZY)` back up, then `exit(big[PAGE(9)])`. Between the two
+      calls it uses only registers (we checked the compiled code: the raw system-call stubs
+      need no stack). It exits with 0 on this branch. A copy of the branch with the `segtrim`
+      call removed printed `dexectest: shrink: FAIL`: the child's exit status was not 0.
+      (Reasoned: page 9 came back from the file, whose first int there is 1009, instead of as
+      zeros; the status itself was not printed.)
+
+      (The state is reasoned, not recorded: `segtrim` runs in the shrinking child's [[sys_sbrk]]
+      with interrupts on and no locks.)
+  - title: The test the original kernel fails
+    commit: 11
+    file: user/dexectest.c
+    lines: 14-40
+    focus: 18-30
+    diff: true
+    state:
+      hart: any
+      mode: U
+      proc: dexectest
+      intr: "on"
+      satp: user
+      locks: []
+      stack: [main, lazytest]
+      sp: {"on": user}
+    note: |
+      `big[]` is 16 pages of initialized data, written with GCC's range [[g:designated-initializer]]:
+      every int `0x5a5a5a5a`, except the first of each page, which is 1000 plus the page number.
+      Because it is initialized, it is in the file (`.data`, `filesz` `0x11000`), and every page
+      has a value that only the right file offset can supply: a load from the wrong place shows.
+      Each check touches its own pages first, so each one exercises a real load.
+
+      `lazytest` counts free pages twice around two reads of untouched pages: this branch prints
+      `touching 2 data pages took 2 free pages`; the original kernel took 0, because it had
+      loaded them at exec, and the check fails there. `truncate` and `modify` fail there as well:
+      the helper's pages were all in memory before its file changed. The other checks pass on
+      both kernels, which is the point of them: they describe behaviour that must not change,
+      and each guards one mistake from this lab. `fork` panicked on clinic 4's kernel, `locked`
+      and `selfread` on clinic 6's (`locked` also with only [[sys_write]]'s prefault removed: its
+      first copy is a pipe write from an untouched page), `unlink` on clinic 5's, and `shrink`
+      failed without `segtrim`; `content` checks the bytes of every loaded page directly.
+  - title: The last process lets go of a deleted program
+    commit: 11
+    file: kernel/proc.c
+    lines: 330-352
+    focus: 346-349
+    state:
+      hart: 0
+      mode: S
+      proc: dxcopy (pid 8)
+      intr: "on"
+      satp: kernel
+      locks: []
+      irq: 0
+      stack: [usertrap, syscall, sys_exit, kexit]
+      sp: {"on": kernel, detail: "`sp` = `0x3fffff7f60`"}
+    note: |
+      Scene 3: `dexectest unlink`. A copy of the program, `dxcopy`, runs as a helper (pid 8),
+      and its parent unlinks `dxcopy` while it runs. The helper then touches pages 7 to 15 of
+      `big[]`; gdb saw nine loads, `0xd000` to `0x15000`, each one reading the unlinked file
+      through `p->exe`, each one on whichever hart the process was on when the disk answered.
+
+      Then the helper exits. At line 348 gdb found `p->exe` = inode 25 with `ref` 1 and `nlink`
+      0, and `log.outstanding` 1: this is the [[iput]] that frees the file. It went on into
+      [[itrunc]] ([[kernel/fs.c:365]]), still inside the transaction, which [[end_op]] then
+      commits. That is the one case in which dropping `p->exe` writes to the disk, and the reason
+      for the transaction (clinic 5 takes it away).
+
+      What the branch cost, in the end: 11 commits, about 180 added lines of kernel code, one new
+      rule ("load before you lock") in three system calls, and one change to `usertests`. What
+      it bought: an image costs only the pages it uses (8 of 25 for `dexectest lazy`, 1 of 2 for
+      `echo`), and a program starts without reading itself first. What it exposed: a fault
+      handler that sleeps, and the locks every path into it holds.
+    others: |
+      The parent, `dexectest` (pid 7), is asleep in `wait` for this helper. Other harts may be
+      inside transactions of their own at this moment; this one is committed together with
+      them when the last of them calls [[end_op]] ([[tour:31]]).
+verify: |
+  On the branch (`ext/12-demand-exec`, 11 commits), built with the project toolchain and run on
+  3 harts (`-smp 3 -m 128M`), one boot:
+
+  ```text
+  $ dexectest
+  dexectest: lazy: touching 2 data pages took 2 free pages
+  dexectest: lazy: OK
+  dexectest: fork: OK
+  dexectest: locked: OK
+  dexectest: selfread: OK
+  dexectest: unlink: OK
+  usertrap(): unexpected scause 0xd pid=7
+              sepc=0xd52 stval=0xd000
+  dexectest: truncate: OK
+  dexectest: modify: OK
+  dexectest: shrink: OK
+  dexectest: content: OK
+  dexectest: ALL OK
+  $ usertests -q
+  usertests starting
+  test copyin: OK
+  test copyout: OK
+  [...]
+  test nowrite: usertrap(): unexpected scause 0xf pid=6571
+  [...]
+  test unlinkcwd: OK
+  ALL TESTS PASSED
+  $ dexectest
+  dexectest: lazy: touching 2 data pages took 2 free pages
+  dexectest: lazy: OK
+  dexectest: fork: OK
+  dexectest: locked: OK
+  dexectest: selfread: OK
+  dexectest: unlink: OK
+  usertrap(): unexpected scause 0xd pid=6660
+              sepc=0xd52 stval=0xd000
+  dexectest: truncate: OK
+  dexectest: modify: OK
+  dexectest: shrink: OK
+  dexectest: content: OK
+  dexectest: ALL OK
+  ```
+
+  The `usertrap()` lines are the expected kills. In `dexectest truncate` the helper touches page
+  7 of `big[]` (`stval=0xd000`) after its file was truncated, and the test checks that its exit
+  status is -1; in `usertests nowrite` a child stores to text. `usertests -q` passing shows
+  that what the original kernel did still works: `copyout` into text still fails (the page is
+  mapped without `PTE_W` and [[copyout]] refuses it), stores to text still kill, the stack guard
+  still faults, the lazy heap still works, and no page is lost.
+
+  Every commit builds with `make kernel/kernel fs.img`, and `usertests -q` printed `ALL TESTS
+  PASSED` on 3 harts at each of the 11 commits.
+
+  Crafted ELF files (copies of `echo` with patched program headers) on the same
+  branch: a data segment ending past `MAXVA`, one ending where the stack would cover the
+  trampoline, and a text segment longer than the file all make `exec` return -1, as on the
+  original kernel, with no panic. A 4 GiB bss segment execs (`exec-succeeded`), where the
+  original kernel refused it for lack of memory: nothing is allocated until it is touched.
+
+  The same `dexectest` on the original kernel: `lazy: touching 2 data pages took 0 free pages`,
+  `lazy: FAIL`, `truncate: FAIL`, `modify: FAIL`, all other checks `OK`.
+measure: |
+  (These counts were made with a `dexectest` whose `locked` check had no pipe write yet; the
+  kernel's loading code is the same.)
+
+  **Pages loaded against the size of the image.** A scratch copy of the branch counted, per
+  program file, the execs, the pages of the image, and the pages loaded (and which ones); a
+  scratch copy of the original kernel counted the pages its exec allocated for segments. Both
+  printed the counters on Ctrl-P (instrumentation not on the branch). Same commands, one boot
+  each, except the `dexectest lazy` row, which comes from a separate boot of the counting
+  branch:
+
+  | program (image pages) | event | original kernel: pages loaded | demand paging: pages loaded |
+  |---|---|---|---|
+  | `init` (2) | boot | 2 | 2 |
+  | `sh` (3) | boot and three command lines | 3 | 3 |
+  | `echo` (2) | `echo hi` | 2 | 1 (its bss page is never touched) |
+  | `ls`, `cat`, `grep`, `wc` (2 each) | `ls`, `cat README \| grep the \| wc` | 8 | 8 |
+  | `dexectest` (25) | `dexectest lazy` alone | 25 | 8 (text pages 0, 1, 2 and 4, data page `0x5000`, `big[]` pages 1 and 2, one bss page) |
+  | `dexectest` (25) | full `dexectest` | 25 | 26 (all 25, one of them twice: page 3 of `big[]`, which the `fork` check makes both the child and the parent load) |
+  | `dxcopy` helpers (25) | 3 runs inside `dexectest` | 75 | 22 (13 different pages) |
+  | `echo` (2) | in `usertests -q` | 4 (2 execs; one of them, `bigargtest`'s, then fails) | 1 (1 exec succeeds) |
+  | `usertests` (16) | `usertests -q` | 16 | 16 (the `touchimage` warm-up) |
+
+  The small programs touch almost everything they have, and demand paging saves little there:
+  a 2-page program cannot save more than a page. The gain grows with the part of a program a
+  run does not need: the helpers in `dexectest` used 22 of 75 pages. Notice also the failed
+  exec: the original kernel read `echo` twice for `bigargtest`, whose exec is built to fail
+  when it copies the arguments; the demand-paged kernel read nothing for it.
+
+  **How much of `usertests` is ever touched?** All of it. With the `touchimage` warm-up removed
+  (and its leak check failing, as expected: `lost some free pages 32466 (out of 32469)`), the
+  16 pages of `usertests` (9 text, 7 data and bss) were loaded 136 times across all its
+  processes, and every one of the 16 at least once. A test suite runs every test; that is
+  what it is for. The 136 loads are the price of forking before touching: a child inherits
+  only the pages its parent had loaded, and loads the rest again from the file (through the
+  buffer cache), each child for itself.
+
+  **One page per touch.** `dexectest lazy`: `touching 2 data pages took 2 free pages` on this
+  branch, `0` on the original kernel.
+
+  **Where loads happen.** In the gdb runs of the finished branch (boot, `echo hi`, `dexectest
+  selfread`, `locked`, `unlink`, `truncate`), loads came from page faults with interrupts off
+  and from three system-call paths with interrupts on: [[sys_exec]]'s [[copyin]] of `argv`,
+  [[sys_open]]'s [[copyinstr]] of a path (the shell opening `console`: the string is in
+  `sh`'s second text page), and the prefaults of [[sys_read]] and [[sys_wait]]. Every load
+  that read a block not in the cache slept, and processes regularly finished a load on a
+  different hart from the one that started it.
+further: |
+  - **Make the latent bug fail every time.** A sleep under a spinlock only panics when the load
+    misses the buffer cache. A check at the top of `loadpage`, `panic` if this hart's `noff` is
+    not 0 (read with interrupts off, so the hart cannot change under you), turns clinic 6's
+    pipe case into a panic on every run. Why does it not catch the self-deadlock, and what
+    would you need to catch that (a per-process count of held sleep-locks)?
+  - **Text busy.** Refuse to open a running program's file for writing (and refuse to exec a
+    file open for writing), as Unix does with `ETXTBSY`. You will need a count of executing
+    processes per inode that [[kfork]] can update without sleeping, and you will meet the
+    question of which lock protects it.
+  - **Share text pages between processes.** Every process loads its own copy of a text page,
+    even when ten processes run the same program. Keep loaded pages in a per-inode cache and map
+    the same physical page read-only into each process: a first page cache, and the reason
+    real kernels count references to pages (lab 11).
+  - **Fault-around.** Load the neighbours of a faulting page too, if they are cheap (already in
+    the buffer cache). Measure faults and disk reads per program before and after.
+  - **Drop clean pages under memory pressure.** A text page that was never written can be
+    unmapped and freed when memory runs out, and loaded again from the file on the next touch:
+    no swap space needed. What must the kernel know about a page to decide it may do that?
+    (Lab 16 builds on this.)
+  - **mmap.** The segment table is a special case of a list of file-backed mappings. Generalize
+    it into `mmap` and `munmap` of any file (lab 15).

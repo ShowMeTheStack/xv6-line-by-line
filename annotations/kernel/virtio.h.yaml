@@ -1,0 +1,249 @@
+summary: |
+  Constants and structure layouts that [[kernel/virtio_disk.c]] needs to talk to QEMU's
+  [[g:virtio]] disk. Nothing here is code; every number and every field comes from the
+  virtio specification (version 1.1 is linked in the comment), and the driver is only
+  correct if they match it exactly.
+
+  The file has three parts:
+
+  1. the **MMIO registers**: offsets of the device's control registers, which appear at
+     physical address [[VIRTIO0]] (`0x10001000`) through [[g:mmio]];
+  2. the **[[g:virtqueue]]** structures: the descriptor table and the two rings that the
+     driver and the device share in RAM;
+  3. the **block-device request** format: the header that says "read" or "write" and which
+     sector.
+
+  **Read next:** [[kernel/virtio_disk.c]], which uses all of these.
+
+blocks:
+  - lines: 1-8
+    title: Where these definitions come from
+    note: |
+      The comment says the definitions cover both the MMIO interface (registers) and the
+      descriptors (shared memory), and names the specification they follow. "Only tested
+      with qemu" matters: a real virtio device might offer features or behave in ways this
+      minimal driver does not handle.
+
+  - lines: 10-33
+    title: The device's control registers
+    note: |
+      A virtio-over-MMIO device exposes a block of 32-bit registers. The driver reaches
+      register `r` at address `VIRTIO0 + r` (see the [[R]] macro in
+      [[kernel/virtio_disk.c]]). Each `#define` is an offset into that block, and they match
+      the "MMIO Device Register Layout" table of the virtio 1.1 spec (section 4.2.2).
+
+      The registers fall into groups:
+
+      - **identification** (`0x000`–`0x00c`): checked once at boot to make sure a virtio
+        disk is really there;
+      - **feature negotiation** (`0x010`, `0x020`): the device offers optional features, the
+        driver says which it accepts;
+      - **queue setup** (`0x030`–`0x044`, `0x080`–`0x0a4`): select a [[g:virtqueue]], set
+        its size, give the device the physical addresses of its three parts, mark it ready;
+      - **runtime** (`0x050`–`0x070`): "I have new requests" (notify), "why did you
+        interrupt me" (interrupt status and acknowledge), and the device status.
+
+      Several registers are write-only or read-only, as the comments note: a read of a
+      write-only register does not return what was written.
+
+      The `// clang-format off` and `on` lines are instructions to a source-code formatter,
+      telling it to leave the aligned columns alone. The compiler ignores them.
+
+  - lines: 35-39
+    title: Device status bits
+    note: |
+      The status register ([[VIRTIO_MMIO_STATUS]]) records how far the driver has got in
+      initializing the device. The driver sets these bits one by one, in the order the
+      spec's "Device Initialization" section (3.1.1) prescribes, and
+      [[virtio_disk_init]] follows that order:
+
+      - `ACKNOWLEDGE` (1): the driver has noticed the device;
+      - `DRIVER` (2): the driver knows how to drive it;
+      - `FEATURES_OK` (8): feature negotiation is finished;
+      - `DRIVER_OK` (4): the driver is ready, the device may start working.
+
+      The numeric order (1, 2, 4, 8) is not the order of use: `FEATURES_OK` (8) is set
+      before `DRIVER_OK` (4). The spec defines two more bits, `FAILED` (128) and
+      `DEVICE_NEEDS_RESET` (64), which xv6 does not use.
+
+  - lines: 41-49
+    title: Optional features xv6 refuses
+    note: |
+      A virtio device advertises optional features as bits in a 32-bit word (more words
+      exist; see the note on line 17). Each number here is a *bit position*, so a feature
+      is tested with `1 << VIRTIO_BLK_F_RO` and so on. [[virtio_disk_init]] clears these
+      bits from what the device offers, so the device must behave in the basic way:
+
+      - `RO` (5): the disk is read-only. xv6 needs to write, and it never checks whether
+        the device is read-only.
+      - `SCSI` (7), `FLUSH` (9), `CONFIG_WCE` (11), `MQ` (12): extra commands (SCSI,
+        FLUSH), a switchable write cache (CONFIG_WCE) and multiple request queues (MQ),
+        none of which xv6 uses.
+      - `ANY_LAYOUT` (27), `INDIRECT_DESC` (28), `EVENT_IDX` (29): generic virtqueue
+        features. The last two would change how the rings defined below are used. For
+        example, `EVENT_IDX` gives meaning to a 16-bit field at the end of each ring
+        (`used_event`, `avail_event`); without it the device ignores those fields.
+
+      The bit numbers match the virtio spec: RO, FLUSH and CONFIG_WCE are in section 5.2.3
+      of version 1.1, SCSI in 5.2.3.1 (legacy feature bits), and MQ was added in version
+      1.2 (also 5.2.3); INDIRECT_DESC and EVENT_IDX are in section 6, and ANY_LAYOUT in 6.3
+      (legacy reserved feature bits). Version 1.1 names bits 28 and 29
+      `VIRTIO_F_RING_INDIRECT_DESC` and `VIRTIO_F_RING_EVENT_IDX`.
+
+  - lines: 51-53
+    title: The size of the queue
+    note: |
+      The driver's [[g:virtqueue]] has 8 descriptors and 8 ring slots. Every disk request
+      uses 3 descriptors, so at most 2 requests can be in flight at once (2 × 3 = 6; the
+      remaining 2 are not enough for a third).
+
+      The spec requires a split virtqueue's size to be a power of two. xv6 also relies on
+      that: ring positions are computed as `idx % NUM`, where `idx` is a 16-bit counter that
+      wraps from 65535 to 0. Because 65536 is a multiple of 8, the position sequence stays
+      continuous across the wrap (…, 6, 7, 0, 1, …).
+
+  - lines: 55-63
+    title: One descriptor
+    note: |
+      A descriptor tells the device about one buffer in memory: where it is, how long it is,
+      and whether the device should read it or write it. Descriptors can be linked into a
+      chain through `next`, and a chain describes one request. The table of [[NUM]]
+      descriptors lives in a page that [[virtio_disk_init]] allocates.
+
+      The layout is fixed by the spec: 8 + 4 + 2 + 2 = 16 bytes, with no padding, in the
+      same order. The device reads these bytes directly from RAM ([[g:dma]]), so a
+      different order or size would make it misread every request.
+
+  - lines: 65-71
+    title: The available ring (driver to device)
+    note: |
+      The driver lists the requests it wants processed here. It writes the number of the
+      *first* descriptor of a chain into `ring[idx % NUM]` and then increments `idx`. The
+      device remembers how far it has read and processes every entry up to `idx`.
+
+      `idx` is never reduced modulo `NUM`; it counts all requests ever submitted and wraps
+      only at 65536 (it is a `uint16`). See [[kernel/virtio_disk.c:275]].
+
+  - lines: 73-84
+    title: The used ring (device to driver)
+    note: |
+      The mirror image of the available ring. When the device finishes a request, it
+      writes the request's first descriptor number into `ring[idx % NUM].id` and increments
+      `idx`. The driver keeps its own count of how many entries it has handled
+      ([[disk]]`.used_idx`) and processes entries until it catches up with `idx`
+      ([[virtio_disk_intr]]).
+
+      `len` is the number of bytes the device wrote into the request's buffers. xv6 does
+      not look at it.
+
+  - lines: 86-90
+    title: Request types
+    note: |
+      The two block-device operations xv6 uses. "In" and "out" are from the driver's point
+      of view: `IN` (0) brings data *in* from the disk (a read), `OUT` (1) sends data *out*
+      to it (a write). The values come from section 5.2.6 of the spec.
+
+  - lines: 92-99
+    title: The request header
+    note: |
+      Every block request starts with this 16-byte header, the first of the three buffers
+      in the chain built by [[virtio_disk_rw]]. The second buffer is the data and the third
+      is a single status byte that the device writes (0 means success).
+
+      `sector` counts 512-byte sectors, always, regardless of the file system's block size.
+      Since an xv6 [[g:block]] is 1024 bytes, the driver passes `blockno * 2`.
+
+lines:
+  13: |
+    Reads as `0x74726976`, which is the ASCII bytes "virt" stored little-endian. A device
+    that returns anything else is not a virtio MMIO device.
+  14: |
+    `2` means the modern (virtio 1.x) MMIO interface; `1` would be the older "legacy"
+    interface, whose queue-setup registers are different. The Makefile passes
+    `-global virtio-mmio.force-legacy=false` so that QEMU presents version 2.
+  15: |
+    What kind of virtio device this is. In the spec's numbering, 1 is a network card and 2
+    a block device (disk).
+  16: |
+    Who made the device: `0x554d4551` is "QEMU" in ASCII, little-endian.
+  17: |
+    The features the device offers, 32 bits at a time. The spec has a companion register,
+    `DeviceFeaturesSel` at `0x014`, that selects which group of 32 bits this register shows;
+    xv6 never writes it and so only ever sees bits 0–31.
+  18: |
+    Where the driver writes the features it accepts (again bits 0–31 only; the select
+    register at `0x024` is not used).
+  19: |
+    A device can have several virtqueues. Writing a queue number here makes the
+    queue-setup registers that follow refer to that queue. xv6 uses only queue 0.
+  20: |
+    The largest number of descriptors the device supports for the selected queue. Reads 0
+    if the queue does not exist.
+  21: |
+    The number of descriptors the driver chose ([[NUM]]), at most the maximum above.
+  22: |
+    Writing 1 tells the device it may start using the selected queue. Reading it returns
+    the last value written, which lets the driver check that the queue is not already in
+    use.
+  23: |
+    The "doorbell". Writing a queue number here tells the device there are new entries in
+    that queue's available ring.
+  24: |
+    Why the device interrupted: bit 0 means it added entries to a used ring, bit 1 means
+    its configuration changed.
+  25: |
+    The driver writes the bits it has handled here; this clears the device's interrupt
+    request.
+  26: |
+    The status register. Reading returns the status bits (lines 36–39); writing a non-zero
+    value sets them; writing 0 resets the device.
+  27: |
+    The physical address of the descriptor table, split into a low and a high 32-bit
+    half (line 28) because the registers are 32 bits wide.
+  29: |
+    The spec calls this register pair `QueueDriverLow`/`High`: the physical address of the
+    "driver area", which is the *available* ring. xv6's name `DRIVER_DESC` is misleading;
+    nothing about it is a descriptor.
+  31: |
+    The spec's `QueueDeviceLow`/`High`: the physical address of the "device area", the
+    *used* ring. Again, the `DESC` in xv6's name does not mean descriptors.
+  57: |
+    Physical address of the buffer. The device uses it directly, without page tables.
+  58: |
+    Length of the buffer in bytes.
+  59: |
+    A combination of the `VRING_DESC_F_*` bits defined just below.
+  60: |
+    Index of the next descriptor in the chain; only meaningful if the `NEXT` flag is set.
+  62: |
+    "The chain continues at `next`." Set on every descriptor of a chain except the last.
+  63: |
+    "The device writes into this buffer." Without it, the buffer is read-only for the
+    device. A disk read sets it on the data buffer; a disk write does not.
+  67: |
+    Bit 0 of this field, if set, would ask the device not to interrupt when it finishes
+    requests. xv6 leaves it 0 because it relies on the interrupt.
+  68: |
+    Count of entries the driver has added. The source comment's wording is loose: the
+    next entry goes in `ring[idx % NUM]`, not `ring[idx]`.
+  69: |
+    The ring itself: descriptor numbers of the first descriptor of each submitted chain.
+  70: |
+    The spec calls this field `used_event`. The device reads it only when `EVENT_IDX` was
+    negotiated, which xv6 refuses, so here it is padding.
+  76: |
+    The first descriptor of the finished chain. xv6 uses it to find the request's entry in
+    [[disk]]`.info`. Requests can finish in a different order than they were submitted.
+  82: |
+    Count of entries the device has added; the next goes in `ring[idx % NUM]`. The spec's
+    used ring also ends with a 16-bit `avail_event` field (70 bytes for 8 entries, not 68).
+    xv6 leaves it out of this struct, which is safe because the device writes
+    `avail_event` only when `EVENT_IDX` was negotiated, and the ring has a whole page to
+    itself.
+  96: |
+    [[VIRTIO_BLK_T_IN]] or [[VIRTIO_BLK_T_OUT]].
+  97: |
+    Must be zero; the spec reserves it.
+  98: |
+    The first 512-byte sector to read or write. 64 bits wide, so 8-byte aligned after the
+    two 32-bit fields: the struct is exactly 16 bytes with no padding.

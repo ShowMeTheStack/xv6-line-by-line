@@ -1,0 +1,788 @@
+title: Lock order and deadlock
+summary: How two locks taken in opposite orders freeze three harts, the one written rule (wait_lock before any p->lock), and the releases, refusals and reference counts that keep every other path in xv6 in a consistent order.
+questions:
+  - id: lockord-01
+    level: 1
+    type: choice
+    q: |
+      Hart 1 holds spinlock A and calls `acquire(&B)`. At the same moment hart 2 holds B and
+      calls `acquire(&A)`. Nothing else holds A or B. What happens in this kernel?
+    code: kernel/spinlock.c:21-42@37-38
+    options:
+      - text: Both harts spin on line 37 forever with interrupts off, and no message is printed.
+        correct: true
+        why: |
+          Each swap returns 1 because the other hart holds the lock, and neither holder can
+          reach its `release`. Interrupts are off on both (from `push_off`), so not even a timer
+          interrupt can move either hart somewhere else.
+      - text: "The kernel panics with `acquire`, because `holding()` notices the problem."
+        why: |
+          You may have thought [[holding]] detects any deadlock. It only asks "does *this hart*
+          already hold `lk`?". Hart 1 does not hold B and hart 2 does not hold A, so both checks
+          pass and both harts go on to spin.
+      - text: The next timer interrupt preempts one of the harts, which releases its lock, and both continue.
+        why: |
+          You may have thought a timer can interrupt a spinning hart. [[acquire]] called
+          [[push_off]] on line 24, so SIE is off while it spins. And even if a timer did fire,
+          [[yield]] would not release lock A or B for it.
+      - text: The swap gives the lock to whichever hart asked first, so one of them gets B and the other gets A, and both continue.
+        why: |
+          You may have confused "atomic" with "fair". The swap decides who gets a *free* lock.
+          Here neither lock ever becomes free, because each holder is stuck waiting for the other
+          lock.
+    explain: |
+      This is a [[g:deadlock]]: a cycle of harts, each holding a lock the next one wants.
+      A spinlock waiter spins with interrupts off, so the stuck harts do nothing else ever
+      again, and other harts that later need A or B join them. xv6 prevents this by design,
+      not by detection: every path takes locks in one order ([[g:lock-order]],
+      [[tour:18]], [[concept:locks#order]]).
+
+  - id: lockord-02
+    level: 1
+    type: choice
+    q: |
+      Two processes deadlock on two **sleep-locks** (each holds one inode lock and waits for
+      the other's). Compared with a deadlock on two spinlocks, what does the rest of the
+      machine see?
+    options:
+      - text: The two processes never run again, but the harts are free, so other processes keep running until they need one of those inodes.
+        correct: true
+        why: |
+          A sleep-lock waiter calls [[sleep]] and gives up its hart. Nothing is spinning, so
+          the scheduler keeps running other work; only the processes in the cycle, and anyone who
+          later waits for the same locks, are stuck.
+      - text: Exactly the same as with spinlocks, all three harts stop with interrupts off.
+        why: |
+          You may have thought every lock waits by spinning. [[acquiresleep]] holds its inner
+          spinlock only for a few instructions and then sleeps; the waiting process is
+          `SLEEPING`, not spinning, and its hart goes back to the scheduler.
+      - text: "The kernel panics with `sched locks`, because a process went to sleep holding a lock."
+        why: |
+          You may have thought [[sched]] counts sleep-locks. `noff` counts only spinlocks
+          (push_off levels). Sleeping while holding a sleep-lock is allowed and happens all the
+          time, for example across a disk read.
+      - text: "[[acquiresleep]] notices that the owner is asleep and returns an error to the system call."
+        why: |
+          You may have expected a timeout or error path. `acquiresleep` returns nothing and has
+          no timeout; it loops until `locked` is 0.
+    explain: |
+      Both kinds of lock can deadlock; they fail differently. Spinlock waiters burn their
+      harts with interrupts off, so a spinlock deadlock freezes the machine. Sleep-lock waiters
+      sleep, so a sleep-lock deadlock freezes only processes, quietly. xv6 uses the same
+      ordering discipline for both ([[tour:18]], [[concept:locks#sleep-locks]]).
+
+  - id: lockord-03
+    level: 1
+    type: multi
+    q: |
+      Which of these mistakes does xv6 turn into a **panic** at run time?
+    options:
+      - text: A hart calls `acquire` on a spinlock it already holds.
+        correct: true
+        why: "[[acquire]] checks [[holding]] on line 25 and panics with `acquire` ([[kernel/spinlock.c:26]])."
+      - text: A process calls `sched` while holding a spinlock other than its own `p->lock`.
+        correct: true
+        why: "[[sched]] requires `noff == 1` and panics with `sched locks` otherwise ([[kernel/proc.c:487-488]])."
+      - text: Hart 1 holds A and wants B while hart 2 holds B and wants A.
+        why: |
+          You may have assumed the kernel tracks lock order. Nothing does: each hart passes its
+          own `holding()` check and spins. The machine freezes silently.
+      - text: A process calls `ilock` on an inode whose sleep-lock it already holds.
+        why: |
+          You may have expected the spinlock's self-check here too. [[acquiresleep]] never
+          compares `lk->pid` with the caller; it sees `locked == 1` and sleeps, waiting for
+          itself forever.
+      - text: A process takes two inode locks child first, then parent, while another takes them parent first.
+        why: |
+          You may have thought the file system checks the parent-before-child rule. It is a
+          convention kept by the code ([[sys_unlink]], [[create]], [[namex]]); breaking it
+          deadlocks without a message.
+    explain: |
+      xv6's checks catch misuse by **one** hart or one thread: re-acquiring a held spinlock
+      and switching away with extra spinlocks. A cycle between two harts or two processes is
+      invisible to every check; the only defence is taking locks in a consistent order
+      ([[concept:locks#panics]], [[concept:locks#rules]]).
+
+  - id: lockord-04
+    level: 1
+    type: choice
+    q: |
+      [[kexit]] and [[kwait]] each need `wait_lock` and some `p->lock` at the same time. Read
+      the comment. Which nesting does this kernel use?
+    code: kernel/proc.c:23-27
+    options:
+      - text: "Hold `wait_lock`, then acquire the `p->lock`."
+        correct: true
+        why: |
+          That is what "must be acquired before any p->lock" means, and it is what
+          [[kexit]] (lines 347, 355) and [[kwait]] (lines 376, 384) do.
+      - text: "Hold the `p->lock`, then acquire `wait_lock`."
+        why: |
+          You may have thought "the more specific lock first". This is exactly the order the
+          comment forbids; [[kfork]] goes out of its way (line 294) to avoid it.
+      - text: Either order is fine, as long as the locks are released in the reverse order.
+        why: |
+          You may have thought release order prevents deadlock. Only the order in which a
+          path *waits* matters; two paths acquiring in opposite orders can deadlock however
+          they release.
+      - text: The two are never held together; the comment means "release wait_lock first".
+        why: |
+          You may have read "before" as "instead of". They are held together on purpose:
+          [[kexit]] holds both while it becomes a `ZOMBIE`, and [[kwait]] holds both while it
+          inspects a child.
+    explain: |
+      `wait_lock` protects every `p->parent`; a `p->lock` protects one process's state.
+      Exit and wait need both, and both take `wait_lock` first. This comment is the only place
+      xv6 writes a lock order down ([[tour:18]], [[concept:locks#lock-wait_lock]]).
+
+  - id: lockord-05
+    level: 1
+    type: multi
+    q: |
+      A **leaf** lock is one that no code acquires anything else while holding (so it can
+      never be part of a cycle). Which of these are leaves in this kernel?
+    options:
+      - text: "`kmem.lock`"
+        correct: true
+        why: "[[kalloc]] and [[kfree]] hold it only to update the free list; they call nothing that takes a lock."
+      - text: "`bcache.lock`"
+        correct: true
+        why: |
+          [[bget]] releases it before `acquiresleep`, [[brelse]] takes it only after
+          `releasesleep`, and [[bpin]]/[[bunpin]] only change `refcnt` under it.
+      - text: "`pid_lock`"
+        correct: true
+        why: "[[allocpid]] holds it for two lines that read and bump `nextpid`."
+      - text: "`wait_lock`"
+        why: |
+          You may have thought of it as a top-level, simple lock. It is near the top of the
+          order: [[kexit]] holds it while [[wakeup]] takes every `p->lock`, and [[kwait]] holds
+          it while taking a child's `p->lock`.
+      - text: "`log.lock`"
+        why: |
+          You may have thought the log lock only guards counters. [[log_write]] calls [[bpin]]
+          (`bcache.lock`) under it, and [[end_op]] calls [[wakeup]] (`p->lock`) under it.
+    explain: |
+      A cycle needs every lock in it to be held while its holder waits for the next. A leaf
+      is never held while waiting for anything else, so it can be taken under any other lock
+      without risk. `ftable.lock` and `pr.lock` are leaves too, and `itable.lock` is one
+      except inside [[iput]] ([[tour:18]], [[concept:locks#order]]).
+
+  - id: lockord-06
+    level: 1
+    type: tf
+    q: |
+      True or false: [[kexit]] acquires `wait_lock` (line 347) and then its own `p->lock`
+      (line 355), but releases `wait_lock` first (line 360). Releasing in that order breaks
+      the lock-ordering discipline and could deadlock.
+    code: kernel/proc.c:347-363
+    answer: false
+    why_tf: |
+      You may have learned "release in reverse order of acquiring" as a deadlock rule. It is a
+      tidy habit, not a requirement: deadlock comes only from the order in which a path
+      *waits*, and `release` never waits.
+    reasons:
+      - text: Releasing never waits for anything, so the order of releases cannot close a cycle; only the order of acquires matters.
+        correct: true
+        why: |
+          A deadlock needs each member of a cycle to be stuck *waiting*. `release` stores 0 and
+          returns; it cannot be part of a wait.
+      - text: It is safe only because interrupts are off while both locks are held.
+        why: |
+          You may have mixed up two rules. Interrupts off protects against this hart's own
+          handlers; it does nothing about the order in which two harts wait.
+      - text: It would deadlock, but sched never returns here, so it does not matter.
+        why: |
+          You may have thought the missing return hides the bug. Line 360 runs before
+          [[sched]], and other harts keep running; the release order is simply harmless.
+    explain: |
+      Line 360 drops `wait_lock` so that [[sched]] sees exactly one spinlock (`noff == 1`),
+      while the kept `p->lock` stops the parent from freeing the child until the scheduler
+      has taken it off its kernel stack ([[concept:locks#unusual]]).
+
+  - id: lockord-07
+    level: 1
+    type: choice
+    q: |
+      [[bget]] finds the cached block on line 66. Why does it release `bcache.lock` (line 68)
+      *before* waiting for the buffer's sleep-lock (line 69)?
+    code: kernel/bio.c:57-88@66-70
+    options:
+      - text: Waiting for the buffer may mean sleeping, and a process must not sleep (or make other harts spin) while holding a spinlock.
+        correct: true
+        why: |
+          If another process holds the buffer, perhaps during a disk read, `acquiresleep`
+          sleeps. With `bcache.lock` still held, [[sched]] would panic `sched locks`, and every
+          other hart calling `bget` or `brelse` would spin with interrupts off meanwhile.
+      - text: Because `acquiresleep` itself acquires `bcache.lock`, which would panic as a double acquire.
+        why: |
+          You may have guessed that the sleep-lock uses the cache's lock. It uses its own inner
+          spinlock, `b->lock.lk`, which is a different lock.
+      - text: To let other harts recycle this buffer for a different block while this process waits.
+        why: |
+          This is backwards. Line 67 raised `refcnt` *before* the release precisely so that the
+          buffer cannot be recycled in the gap: [[bget]] only recycles buffers with
+          `refcnt == 0`.
+      - text: It does not matter; the order of lines 68 and 69 could be swapped safely.
+        why: |
+          You may have thought both are short operations. Line 69 can wait for milliseconds
+          (a disk read by the holder), and waiting under a spinlock is exactly what the lock
+          rules forbid.
+    explain: |
+      The rule is "sleep-locks outside, spinlocks inside": you may take a spinlock while
+      holding a sleep-lock, but never wait for a sleep-lock while holding a spinlock. `bget`
+      keeps the buffer valid across the gap with `refcnt` instead of the lock
+      ([[concept:locks#unusual]], [[tour:18]]).
+
+  - id: lockord-08
+    level: 1
+    type: number
+    q: |
+      [[kexit]] calls `wakeup(p->parent)` on line 353 while holding `wait_lock`. How many
+      different `p->lock` spinlocks does that single [[wakeup]] call acquire (one after
+      another)?
+    code: kernel/proc.c:574-595
+    answer: 64
+    wrong:
+      1: |
+        You may have thought `wakeup` goes straight to the parent. It does not know who is
+        waiting on the channel until it looks, so it takes every slot's lock to check `p->chan`.
+      3: |
+        You may have counted harts. `wakeup` walks the process table, not the CPUs: one lock
+        per `struct proc`.
+      8: |
+        You may have used `NCPU` (8). The loop runs over `proc[NPROC]`, and `NPROC` is 64.
+    why_wrong: Look at the loop bounds on line 580 and the value of NPROC in kernel/param.h.
+    explain: |
+      `wakeup` takes all 64 `p->lock`s in turn (`NPROC`, [[kernel/param.h:1]]), including
+      slots that are `UNUSED` or half-built. That is why anyone holding a `p->lock` must
+      never wait for `wait_lock` (or for any lock held around a `wakeup`): the waker would
+      eventually reach that very `p->lock` ([[tour:18]]).
+
+  - id: lockord-09
+    level: 2
+    type: line
+    q: |
+      [[allocproc]] returned `np` with `np->lock` held. Click the line that keeps [[kfork]]
+      from holding a `p->lock` while it waits for `wait_lock`.
+    code: kernel/proc.c:284-305
+    answer: 294
+    lines:
+      296: |
+        This is the acquire that must not happen under `np->lock`. What makes it safe is the
+        line that lets `np->lock` go before it.
+      300: |
+        This retakes `np->lock` *after* `wait_lock` has been released on line 298, so it
+        nests nothing. The protective step is earlier.
+      302: |
+        This is the normal end of the critical section that marks the child `RUNNABLE`. By
+        then `wait_lock` is long gone.
+      288: |
+        [[idup]] takes `itable.lock` under `np->lock`, a legal nesting (`itable.lock` sits
+        below `p->lock` in the order). It has nothing to do with `wait_lock`.
+    why_wrong: Find where kfork lets go of the child's lock before touching the family tree.
+    explain: |
+      Line 294 releases `np->lock`, so line 296 asks for `wait_lock` holding no `p->lock`.
+      Holding it would create the edge `p->lock → wait_lock`, the reverse of the rule on
+      [[kernel/proc.c:26]], and deadlock against a [[kexit]] whose [[wakeup]] reaches this
+      child's slot ([[tour:18]], [[tour:52]]).
+
+  - id: lockord-10
+    level: 2
+    type: choice
+    q: |
+      Between line 294 and line 300, [[kfork]] holds no lock on the new child at all. Why is
+      that safe?
+    code: kernel/proc.c:284-305@292-300
+    options:
+      - text: "The child is still in state `USED`: no scheduler runs it (it picks only `RUNNABLE`) and no `wait` reaps it (it is not a `ZOMBIE`)."
+        correct: true
+        why: |
+          [[allocproc]] set `USED` on line 126. Every other piece of code that looks at the slot
+          under its lock finds a state that tells it to leave the slot alone, until line 301
+          makes it `RUNNABLE`.
+      - text: Because interrupts stay off between line 294 and line 300.
+        why: |
+          You may have thought a release leaves interrupts off. `release(&np->lock)` is the
+          outermost lock here, so its `pop_off` turns interrupts back on (this is a system call,
+          intena 1). And interrupts on this hart say nothing about other harts.
+      - text: Because `wait_lock` protects the child's state while `np->lock` is not held.
+        why: |
+          You may have thought `wait_lock` covers everything about a process. It protects only
+          `p->parent`; a process's `state` is protected by its `p->lock`.
+      - text: Because no other hart can see a new process until `np->parent` is set.
+        why: |
+          You may have thought the slot is invisible. Every [[scheduler]] pass and every
+          [[wakeup]] scan all 64 slots, this one included; they just find nothing to do.
+    explain: |
+      Releasing and re-acquiring is safe when the state you leave behind is one that every
+      other lock holder treats as "not mine". Here `USED` plays that role, and it lets
+      [[kfork]] obey `wait_lock` before `p->lock` ([[concept:locks#unusual]]).
+
+  - id: lockord-11
+    level: 2
+    type: order
+    q: |
+      Put the steps of [[kexit]] (from line 347 on) in the order they happen.
+    code: kernel/proc.c:342-365
+    items:
+      - text: "`acquire(&wait_lock)`"
+        why: "`wait_lock` is the outermost lock of exit; everything that touches `p->parent` comes after it."
+      - text: "`reparent(p)`: hand any children to `init`"
+        why: "Reparenting reads and writes `pp->parent`, so it needs `wait_lock`, but no `p->lock`."
+      - text: "`wakeup(p->parent)`"
+        why: "The wakeup must come before the process takes its own `p->lock`, because `wakeup` takes every `p->lock`, its own included."
+      - text: "`acquire(&p->lock)`"
+        why: "Only after the wakeup is done does exit take its own lock, still under `wait_lock`."
+      - text: "`p->state = ZOMBIE` (with `xstate`)"
+        why: "The state change is made under both locks, so a parent scanning under `wait_lock` sees either a live child or a finished zombie."
+      - text: "`release(&wait_lock)`, then `sched()`"
+        why: "`wait_lock` must go before `sched`, which allows exactly one spinlock: the process's own `p->lock`."
+    why_wrong: For each step ask which lock it needs and whether it could take a lock this process already holds.
+    explain: |
+      `wait_lock` first, then the family-tree work and the wakeup, then the process's own
+      `p->lock`, then `ZOMBIE`, then drop `wait_lock` so that `noff` is 1 for [[sched]].
+      The `wakeup` must precede line 355 or [[acquire]] would panic ([[tour:18]],
+      [[concept:locks#holding]]).
+
+  - id: lockord-12
+    level: 2
+    type: choice
+    q: |
+      Suppose someone moved `acquire(&p->lock)` (line 355) up to just before
+      `wakeup(p->parent)` (line 353), so the exiting process holds its own lock during the
+      wakeup. What happens?
+    code: kernel/proc.c:347-363
+    options:
+      - text: "`panic: acquire`, as soon as [[wakeup]]'s loop reaches the exiting process's own slot."
+        correct: true
+        why: |
+          [[wakeup]] takes every `p->lock` in turn, including this process's. [[holding]]
+          sees the lock held by this hart and [[acquire]] panics instead of spinning forever.
+      - text: A silent two-hart deadlock with the parent.
+        why: |
+          You may have thought of a cycle between two processes. The first problem is closer to
+          home: one hart asking for a lock it already holds, which the `holding()` check
+          catches every time.
+      - text: Nothing changes, since `wakeup` skips the calling process.
+        why: |
+          You may have assumed `wakeup` skips `myproc()`. Its loop has no such test: it
+          acquires every slot's lock from `proc[0]` to `proc[63]`.
+      - text: "`panic: sched locks`, because two spinlocks are held when `sched` runs."
+        why: |
+          You may have looked ahead to [[sched]]. The kernel never gets that far: the panic
+          happens inside `wakeup`, before line 363.
+    explain: |
+      Rule: never call [[wakeup]] while holding your own `p->lock`. [[kexit]] obeys it by
+      waking the parent first and taking its own lock second ([[concept:locks#holding]],
+      [[concept:locks#rules]]).
+
+  - id: lockord-13
+    level: 2
+    type: line
+    q: |
+      [[sys_unlink]] holds the parent directory `dp` locked and may then lock the entry `ip`
+      inside it. Click the line that stops it from ever locking a *parent while holding its
+      child*.
+    code: kernel/sysfile.c:212-233
+    answer: 221
+    lines:
+      218: |
+        This takes the first lock, on `dp`. It is the step that would become dangerous
+        if the name could point back up; it does not prevent anything itself.
+      224: |
+        [[dirlookup]] finds the entry but does not lock it. The check that rules out a bad
+        name must come before this lookup.
+      226: |
+        This is the second acquisition, the one that would go wrong for `..`. The protection
+        is the refusal that keeps the code from reaching it.
+      230: |
+        This refuses to remove a non-empty directory, a file-system rule. It runs after both
+        locks are already held.
+    why_wrong: Look for the test on the name that runs before any second lock is taken.
+    explain: |
+      For a final name of `..`, `ip` would be `dp`'s parent, so line 226 would lock a parent
+      while holding its child, the reverse of the order every other path uses; for `.`, it would
+      be `dp` itself and the process would wait for its own sleep-lock. Line 221 refuses both
+      before any lookup ([[tour:18]]).
+
+  - id: lockord-14
+    level: 2
+    type: choice
+    q: |
+      In [[create]], when the name already exists, line 281 unlocks the parent `dp` *before*
+      line 282 locks the existing `ip`. Which input would hang the process if the two lines
+      were swapped (lock `ip` while still holding `dp`)?
+    code: kernel/sysfile.c:258-292@280-286
+    options:
+      - text: "`open(\"a/.\", O_CREATE)`: `dirlookup` returns `a` itself, so the process would wait for a sleep-lock it already holds."
+        correct: true
+        why: |
+          With `name = "."`, `ip == dp`. [[ilock]] calls [[acquiresleep]], which sees `locked`
+          and sleeps. Nobody else can ever release it: the owner is the sleeper.
+      - text: "`open(\"a/new\", O_CREATE)` for a name that does not exist yet."
+        why: |
+          You may have mixed up the two paths. A new name goes past line 280 to [[ialloc]] and
+          line 294, where locking the brand-new child under its parent is the normal, safe
+          order.
+      - text: "`open(\"a/f\", O_CREATE)` where `f` is an ordinary existing file in `a`."
+        why: |
+          You may have thought any nesting is dangerous. Holding `a` and then locking `f`
+          follows the parent-before-child order; it would not hang on its own.
+      - text: None; the kernel would panic `acquire` and recover.
+        why: |
+          You may have expected the spinlock's self-check. Inode locks are sleep-locks, and
+          [[acquiresleep]] has no "already held by me" check. It hangs silently.
+    explain: |
+      User-supplied names can point anywhere, including at the directory itself (`.`) or its
+      parent (`..`). Releasing the parent first makes both harmless here, because nothing is
+      held when the second lock is taken ([[tour:18]], [[concept:locks#sleep-locks]]).
+
+  - id: lockord-15
+    level: 2
+    type: state
+    q: |
+      `cat` called `exit(0)` (a system call). [[kexit]] has just executed line 360,
+      `release(&wait_lock)`, and is about to call [[sched]] on line 363. What is the state of
+      its hart?
+    code: kernel/proc.c:347-364@360-363
+    state:
+      mode: S
+      stack: kernel
+      satp: kernel
+      sie: off
+      noff: 1
+      intena: 1
+    why:
+      noff: |
+        Line 355 took the process's own `p->lock` (noff 2 with `wait_lock`), and line 360
+        dropped `wait_lock`. One spinlock is left, exactly what [[sched]] demands.
+      sie: |
+        You may have thought releasing `wait_lock` turns interrupts back on. It is not the
+        outermost lock any more: `p->lock` is still held, so `pop_off` only decrements noff.
+      intena: |
+        intena was recorded when noff went 0 → 1 at line 347. In an `exit` system call,
+        [[usertrap]] had turned interrupts on, so it recorded 1. (A `kexit` reached from
+        `usertrap` line 58, before `intr_on`, or from line 82 after a device interrupt or
+        page fault, would record 0; this one came from `sys_exit`.)
+      stack: |
+        `kexit` runs in the process's own kernel thread on its kernel stack; `sched` moves to
+        the scheduler stack only inside [[swtch]].
+    why_wrong: Count the spinlocks still held after line 360 and remember where intena was recorded.
+    explain: |
+      Supervisor mode, `cat`'s kernel stack, kernel page table, one spinlock held (its own
+      `p->lock`), so SIE off and noff 1; intena 1 from the system call. [[sched]]'s checks
+      on lines 485–492 all pass ([[concept:locks#sched-intena]], [[tour:18]]).
+
+  - id: lockord-16
+    level: 2
+    type: order
+    q: |
+      `rm x` decrements `x`'s link count and [[iupdate]] writes the inode through the log.
+      Put the waits and locks of this path in the order they are taken (outermost first).
+      When the inode's block is new to this transaction, [[log_write]] calls [[bpin]], and at
+      that moment all five are in effect at once.
+    items:
+      - text: "[[begin_op]]: room in the log (`outstanding` incremented)"
+        why: "Every file-system operation starts its transaction before it locks any inode."
+      - text: "`x`'s inode sleep-lock ([[ilock]])"
+        why: "The inode is locked inside the transaction; sleep-locks go outside spinlocks."
+      - text: The inode block's buffer sleep-lock ([[bread]] in `iupdate`)
+        why: "`iupdate` reads the block holding the on-disk inode while the inode itself is locked: inode before buffer."
+      - text: "`log.lock` ([[log_write]])"
+        why: "`log_write` records the block under `log.lock` while the caller still holds the buffer."
+      - text: "`bcache.lock` ([[bpin]])"
+        why: "`bpin` pins the buffer under `bcache.lock`, a leaf, while `log.lock` is held."
+    why_wrong: Long waits go outside short ones; spinlocks come last, and the leaf is the very last.
+    explain: |
+      `begin_op` → inode sleep-lock → buffer sleep-lock → `log.lock` → `bcache.lock`. Each step
+      only takes something "below" what it holds, and `bcache.lock` is a leaf. (`begin_op`
+      is not a lock, but it can wait, so it is ordered like one.) See [[tour:18]] and
+      [[kernel/log.c:224-244]].
+
+  - id: lockord-17
+    level: 2
+    type: match
+    q: |
+      Each place below avoids a deadlock in a different way. Match each one with its technique.
+    pairs:
+      - left: "[[kfork]], line 294 (`release(&np->lock)`)"
+        right: release a lock first, so the next acquire follows the global order
+        why: "It lets go of the child's `p->lock` so that `wait_lock` is never requested under a `p->lock`."
+      - left: "[[sys_unlink]], line 221"
+        right: refuse an input that would force the wrong order
+        why: "It rejects `.` and `..` as the final name before any second inode lock is taken."
+      - left: "[[bget]], line 68"
+        right: never wait for a sleep-lock while holding a spinlock
+        why: "It drops `bcache.lock` before `acquiresleep`, keeping the buffer alive with `refcnt` instead."
+      - left: "[[namex]], line 720"
+        right: hold only one lock of the kind at a time
+        why: "It unlocks the current directory before the next loop iteration locks the next, so `..` can never lock a parent under a child."
+      - left: "[[iput]], line 362"
+        right: break the order only where a reference count proves nobody else can hold the lock
+        why: "With `ref == 1`, the `acquiresleep` under `itable.lock` finds the lock free and never waits."
+    explain: |
+      xv6 has no deadlock detector. Its discipline is a handful of habits: release before
+      acquiring, refuse dangerous names, never wait under a spinlock, hold one lock at a time
+      where the order is unknown, and justify every exception ([[tour:18]],
+      [[concept:locks#unusual]]).
+
+  - id: lockord-18
+    level: 2
+    type: choice
+    q: |
+      [[namex]] locks a directory, looks up the next name, and then (line 720) **unlocks** it
+      before the next iteration locks the entry it found. Why not keep the directory locked
+      while locking the next one?
+    code: kernel/fs.c:691-728@716-721
+    options:
+      - text: "Because a path can go up: for `..`, holding the current directory while locking the next would lock a parent under its child, and `.` would lock the same inode twice."
+        correct: true
+        why: |
+          Going down, "hold current, lock next" would follow parent-before-child. But `..`
+          reverses it, which can deadlock against a process walking down, and `.` makes the
+          process wait for its own sleep-lock.
+      - text: Because [[dirlookup]] already locks the next inode.
+        why: |
+          You may have thought `dirlookup` returns a locked inode. It returns one from
+          [[iget]], referenced but *not* locked; the lock is taken later by [[ilock]].
+      - text: Because holding two inode sleep-locks at once is never allowed in xv6.
+        why: |
+          You may have over-generalised the rule. [[sys_unlink]] and [[create]] do hold two,
+          parent first. The problem in `namex` is that it cannot know the next name is a child.
+      - text: To keep `noff` at 1 so that `sched` does not panic if the lookup sleeps.
+        why: |
+          You may have thought inode locks count in `noff`. They are sleep-locks; holding them
+          adds nothing to `noff`, and sleeping while holding them is allowed.
+    explain: |
+      The reference from [[iget]] keeps the next inode valid in memory without a lock, so
+      `namex` can drop one lock before taking the next. The comment at
+      [[kernel/fs.c:158-162]] says the iget/ilock split "helps avoid deadlock" in exactly this
+      walk ([[tour:18]]).
+
+  - id: lockord-19
+    level: 2
+    type: tf
+    q: |
+      True or false: if a process calls [[ilock]] on an inode whose lock it already holds,
+      xv6 panics, just as [[acquire]] does for a spinlock.
+    code: kernel/sleeplock.c:21-34
+    answer: false
+    why_tf: |
+      You may have assumed sleep-locks have the same self-check as spinlocks. `acquiresleep`
+      has none, even though it records the owner's pid.
+    reasons:
+      - text: "[[acquiresleep]] never compares `lk->pid` with the caller; it sees `locked == 1`, registers on the lock and sleeps, waiting for itself forever."
+        correct: true
+        why: |
+          Only [[holdingsleep]] compares the pid, and only [[iunlock]], [[brelse]] and
+          [[bwrite]] call it. That is why the code that might lock the same inode twice
+          (`.` in unlink, create and namex) is written to avoid it.
+      - text: It panics with `acquire` because the inner spinlock `lk->lk` is already held.
+        why: |
+          You may have thought the inner spinlock stays held. `lk->lk` is released at the end
+          of every `acquiresleep` (line 33), so the second call takes it without trouble.
+      - text: It does not panic because it returns immediately; sleep-locks are re-entrant.
+        why: |
+          You may have thought of re-entrant (recursive) locks. xv6 has none: the second call
+          loops on `while (lk->locked)` and sleeps.
+    explain: |
+      A spinlock self-deadlock becomes `panic: acquire`; a sleep-lock self-deadlock is one
+      process asleep forever, silently. The rule "never lock an inode you might already
+      hold" has no safety net ([[tour:18]], [[concept:locks#sleep-locks]]).
+
+  - id: lockord-20
+    level: 3
+    type: multi
+    q: |
+      In this kernel, which of these locks are ever acquired **while the acquiring hart holds a
+      `p->lock`**?
+    options:
+      - text: "`pid_lock`"
+        correct: true
+        why: "[[allocproc]] calls [[allocpid]] on line 125 holding the new slot's `p->lock`."
+      - text: "`ftable.lock`"
+        correct: true
+        why: "[[kfork]] calls [[filedup]] for each open file (line 287) while it still holds `np->lock`."
+      - text: "`itable.lock`"
+        correct: true
+        why: "[[kfork]]'s [[idup]] (line 288) under `np->lock`, and once per boot [[userinit]]'s `namei(\"/\")` under the first process's lock."
+      - text: "`wait_lock`"
+        why: |
+          You may have thought [[kfork]] sets `np->parent` while holding `np->lock`. It
+          deliberately releases it first (line 294); `wait_lock` is always taken *before* any
+          `p->lock`.
+      - text: "`pi->lock`"
+        why: |
+          You may have reversed the pipe's nesting. [[pipewrite]] holds `pi->lock` and *then*
+          takes `p->lock` (in [[wakeup]], [[killed]], [[sleep_prepare]]); never the other way.
+      - text: "`tickslock`"
+        why: |
+          You may have thought of [[clockintr]]. It holds `tickslock` and then takes `p->lock`
+          through `wakeup(&ticks)`: condition lock outside, `p->lock` inside.
+    explain: |
+      `p->lock` is almost at the bottom of the order. Only four locks are taken under it:
+      `pid_lock`, `kmem.lock`, `ftable.lock` and `itable.lock`, and only for a slot being
+      built ([[allocproc]], [[kfork]], [[userinit]]) or, for `kmem.lock`, a zombie being freed
+      ([[kwait]]'s [[freeproc]]) or [[kwait]]'s `copyout` of the exit status reaching a lazily
+      allocated page ([[vmfault]] → [[kalloc]]). Every condition lock sits above it ([[concept:locks#lock-proc]],
+      [[tour:51]]).
+
+  - id: lockord-21
+    level: 3
+    type: number
+    q: |
+      Suppose [[bget]]'s lines 68 and 69 were swapped, so it calls `acquiresleep(&b->lock)`
+      while still holding `bcache.lock`, and the buffer is held by another process. Inside
+      [[acquiresleep]], the process reaches [[sleep]] and then [[sched]]. What is
+      `mycpu()->noff` when `sched` checks it on line 487?
+    code: kernel/sleeplock.c:21-34@25-29
+    answer: 2
+    wrong:
+      1: |
+        You may have forgotten `bcache.lock`. It is still held, so it is one push_off level;
+        [[sleep]]'s `acquire(&p->lock)` adds a second.
+      3: |
+        You may have counted the sleep-lock's inner spinlock `lk->lk`. [[acquiresleep]]
+        releases it on line 27 before calling `sleep()` on line 28, so it no longer counts.
+      0: |
+        You may have thought noff counts only locks held across the switch by design. It
+        counts every spinlock this hart holds right now: `bcache.lock` and `p->lock`.
+    why_wrong: List the spinlocks this hart holds at the moment sched runs; sleep-locks do not count.
+    explain: |
+      `bcache.lock` (1) + the process's own `p->lock` taken in [[sleep]] (2). `sched` demands
+      exactly 1 and panics `sched locks`. That panic is the kernel catching "sleeping while
+      holding a spinlock", the very mistake line 68 avoids ([[kernel/proc.c:487-488]],
+      [[concept:locks#panics]]).
+
+  - id: lockord-22
+    level: 3
+    type: number
+    q: |
+      `rm` drops the last reference to an unlinked inode, so [[iput]] calls
+      `acquiresleep(&ip->lock)` on line 362 while holding `itable.lock`. Inside
+      [[acquiresleep]], at line 32 the call to [[myproc]] runs its own `push_off`. What is
+      `noff` at that moment (inside `myproc`, before its `pop_off`)?
+    code: kernel/sleeplock.c:21-34@31-33
+    answer: 3
+    wrong:
+      2: |
+        You may have forgotten the `push_off` inside [[myproc]] itself. `itable.lock` (1) and
+        `lk->lk` (2) are held, and `myproc()` adds one more level until its `pop_off`.
+      4: |
+        You may have counted the sleep-lock `ip->lock` as a level. Sleep-locks add nothing to
+        noff; only its inner spinlock `lk->lk` does, and that is already counted.
+      1: |
+        You may have thought `acquiresleep` releases `itable.lock`. That happens only on
+        line 363, after `acquiresleep` returns.
+    why_wrong: Count itable.lock, the sleep-lock's inner spinlock, and any push_off still outstanding.
+    explain: |
+      `itable.lock` → `lk->lk` → `myproc()`'s push_off: noff 3, one of the three deepest
+      nestings measured in this kernel ([[concept:locks#nesting]]). It is safe only because
+      `ref == 1` means the sleep-lock is free and this `acquiresleep` never sleeps; if it did,
+      [[sched]] would panic `sched locks` ([[tour:18]]).
+
+  - id: lockord-23
+    level: 3
+    type: choice
+    q: |
+      Imagine [[filewrite]] called [[ilock]] *before* [[begin_op]]. The log already holds
+      15 blocks from this group (`LOGBLOCKS` is 30, `MAXOPBLOCKS` 10), and `rm x` on another
+      hart is inside its own transaction (`outstanding` 1) and about to lock `x`. The writer
+      locks `x`, then calls `begin_op`. What happens?
+    code: kernel/log.c:127-150@138-143
+    options:
+      - text: "Both processes sleep forever: the writer waits in `begin_op` for a commit that needs `rm`'s `end_op`, and `rm` waits for `x`'s lock, which the writer holds."
+        correct: true
+        why: |
+          15 + (1 + 1) × 10 = 35 > 30, so line 138 makes the writer sleep until a commit. The
+          commit needs `outstanding` to reach 0, which needs `rm` to finish, which needs the
+          inode the writer holds. The cycle mixes a lock with a condition.
+      - text: "`panic: sched locks`, because the writer sleeps in `begin_op` holding an inode lock."
+        why: |
+          You may have thought inode locks count in `noff`. They are sleep-locks; `begin_op`
+          releases `log.lock` before `sleep()`, so `sched` sees only `p->lock` and is happy.
+      - text: All three harts freeze with interrupts off.
+        why: |
+          You may have imagined spinlocks. Both waits here are sleeps, so the harts stay free;
+          the two processes, and later every file-system operation that queues behind them in
+          `begin_op`, stop quietly.
+      - text: No deadlock; `begin_op` lets the writer in because it already holds the inode.
+        why: |
+          You may have expected `begin_op` to know which locks you hold. It only counts log
+          space: it compares `log.lh.n + (log.outstanding + 1) * MAXOPBLOCKS` with
+          `LOGBLOCKS`.
+    explain: |
+      Anything that can make you wait belongs in the lock order, not just locks. Every path
+      that writes calls `begin_op` before taking any inode lock (read-only paths such as
+      [[fileread]] and [[filestat]] lock inodes without a transaction and never call
+      `begin_op` while holding one), so no operation waits for log space while holding
+      something a running operation needs ([[tour:18]], [[tour:51]]).
+
+  - id: lockord-24
+    level: 3
+    type: choice
+    q: |
+      A modified kernel deletes [[kfork]]'s lines 294 and 300, so it takes `wait_lock` while
+      holding the half-built child's `np->lock`. Under a fork/exit stress test it froze. The
+      other hart in the cycle never names that child's lock in its code. Which code took the
+      child's lock on the other side?
+    code: kernel/proc.c:284-305@292-300
+    options:
+      - text: "[[wakeup]], called by an exiting process's [[kexit]] while it held `wait_lock`: it acquires every slot's `p->lock`, including the half-built child's."
+        correct: true
+        why: |
+          `kexit` holds `wait_lock` and calls `wakeup(p->parent)`, which walks all 64 slots.
+          When it reaches the child's slot it spins on `np->lock`, while `kfork` spins on
+          `wait_lock`: a two-hart cycle.
+      - text: "[[kwait]], scanning for the new child as one of its children."
+        why: |
+          You may have thought the parent's `wait` looks at the child. `kwait` takes a
+          `p->lock` only when `pp->parent == p`, and the child's `parent` is not set yet:
+          that is exactly what `kfork` is waiting to do.
+      - text: The [[scheduler]] on another hart, which wants to run the new child.
+        why: |
+          You may have thought the scheduler holds `wait_lock`. It holds nothing else while it
+          takes a `p->lock`, so it can only wait, never close a cycle; and the child is `USED`,
+          not `RUNNABLE`.
+      - text: "[[reparent]], which locks each child before changing its parent."
+        why: |
+          You may have thought `reparent` takes `p->lock`. It changes `pp->parent` under
+          `wait_lock` alone; it takes `p->lock`s only inside its `wakeup(initproc)` call.
+    explain: |
+      [[wakeup]] does not know who is waiting until it looks, so it takes every `p->lock`.
+      That makes "any `p->lock` held, then `wait_lock` requested" deadly against every
+      `wakeup` run under `wait_lock`. The experiment froze within the first dozen forks in four
+      runs out of four ([[tour:52]], [[tour:18]]).
+
+  - id: lockord-25
+    level: 3
+    type: tf
+    q: |
+      True or false: if you draw a graph of lock *classes* (an edge A → B whenever some path
+      holds a lock of class A while acquiring one of class B), this kernel's graph has no
+      cycle.
+    answer: false
+    why_tf: |
+      You may have concluded "no deadlock, so no cycle". The class graph does contain a cycle;
+      it is the *instances* that can never close it.
+    reasons:
+      - text: "`p->lock` → `itable.lock` ([[kfork]]'s [[idup]]) → an inode's `lk->lk` ([[iput]]'s `acquiresleep`) → `p->lock` ([[wakeup]] in `releasesleep`); it cannot deadlock because `iput` does this only with `ref == 1`."
+        correct: true
+        why: |
+          With `ref == 1`, no other process holds or is acquiring that inode's lock, so the
+          `lk->lk` in the middle edge is never the one held in the last edge, and
+          `acquiresleep` never sleeps there.
+      - text: "`wait_lock` → `p->lock` → `wait_lock`, closed by [[kfork]]."
+        why: |
+          You may have thought `kfork` holds `np->lock` while taking `wait_lock`. Line 294
+          releases it first, so that edge never exists.
+      - text: "`log.lock` → `bcache.lock` → `log.lock`, closed by [[bget]]."
+        why: |
+          You may have thought `bget` touches the log. `bcache.lock` is a leaf: nothing is
+          acquired while holding it.
+    explain: |
+      A graph of classes over-approximates: it cannot see that the middle edge happens only
+      for an inode nobody else references. The safety argument has to come from the code
+      ([[kernel/fs.c:357-362]]), which is why every exception to the order needs one
+      ([[concept:locks#order]], [[tour:51]]).

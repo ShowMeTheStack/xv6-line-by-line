@@ -1,0 +1,793 @@
+summary: |
+  The xv6 [[g:shell]]: the program that prints `$ `, reads what you type, and runs it. It
+  is an ordinary user program with no special powers, and it is one of the best places to
+  see why Unix splits process creation into [[g:fork-exec|`fork` and `exec`]].
+
+  Each command line goes through two stages:
+
+  1. **Parse.** A small [[g:recursive-descent]] parser ([[parsecmd]] down to [[gettoken]])
+     turns the text into a [[g:parse-tree]] of five node kinds: run a program, redirect a
+     descriptor, connect a pipe, run two commands in sequence, run in the background.
+  2. **Run.** [[runcmd]] walks the tree. Every node becomes a few system calls: `fork`,
+     `exec`, `wait`, `close`, `open`, `dup`, `pipe`. [[g:io-redirection|Redirection]] and
+     [[g:shell-pipeline|pipelines]] both rest on one kernel rule: a new
+     [[g:file-descriptor]] always takes the lowest free number.
+
+  [[main@user/sh.c]] ties them together, and handles the one command the shell must run
+  itself, `cd`.
+
+  **Read before:** [[user/init.c]], which starts the shell. **Read next:**
+  [[kernel/sysfile.c]] and [[kernel/pipe.c]] for the system calls the shell relies on.
+
+blocks:
+  - lines: 1-5
+    title: Headers
+    note: |
+      A user program includes [[user/user.h]] for the system calls and library functions
+      (`fork`, `printf`, `malloc`...), [[kernel/types.h]] for short type names it needs,
+      and [[kernel/fcntl.h]] for the `O_` flags passed to `open` when redirecting.
+
+  - lines: 7-14
+    title: The five kinds of command
+    note: |
+      Every command line becomes a tree built from five kinds of node. The constants name
+      them, and every node's first field holds one of them:
+
+      | Kind | Written | Meaning |
+      |---|---|---|
+      | `EXEC` | `echo hi` | run one program with arguments |
+      | `REDIR` | `cmd > out`, `cmd < in` | run `cmd` with descriptor 0 or 1 replaced by a file |
+      | `PIPE` | `a \| b` | run `a` and `b` with `a`'s output feeding `b`'s input |
+      | `LIST` | `a ; b` | run `a`, wait for it, then run `b` |
+      | `BACK` | `cmd &` | run `cmd` without waiting for it |
+
+      For example, `echo hi | wc > out &` becomes this [[g:parse-tree]]:
+
+      ```
+      BACK
+       └─ PIPE
+           ├─ EXEC   argv = {"echo", "hi"}
+           └─ REDIR  fd 1 ← "out" (write, create, truncate)
+               └─ EXEC   argv = {"wc"}
+      ```
+
+      Read it from the top: "in the background, run a pipe whose left side is `echo hi`
+      and whose right side is `wc` with its output sent to `out`". [[runcmd]] executes the
+      tree in exactly that top-down order.
+
+  - lines: 16-50
+    title: One struct per node kind
+    note: |
+      C has no inheritance, so the shell uses a common C pattern instead. Every node
+      struct starts with the same `int type` field, and [[cmd]] is a struct containing
+      *only* that field. A pointer to any node can be stored as a `struct cmd *`; code that
+      receives one reads `type` (always at offset 0) and then casts the pointer to the real
+      struct. The C standard guarantees there is no padding before a struct's first member,
+      so `type` is at offset 0 in every node (C99 6.7.2.1p13). It does not formally
+      guarantee that a member may be read through a pointer to a different struct type:
+      its "common initial sequence" rule (6.5.2.3p5) covers only structs inside a union.
+      In practice compilers support this widely used pattern.
+
+      The child pointers make the tree: [[redircmd]] and [[backcmd]] wrap one command,
+      [[pipecmd]] and [[listcmd]] combine two.
+
+      Notice that no node holds a copy of any text. `argv`, `file` and their `e`-partners
+      are pointers *into the input line itself*: `argv[i]` points at the first character of
+      a word and `eargv[i]` just past its last character. The words are not yet
+      NUL-terminated while parsing; [[nulterminate]] fixes that at the end (its note
+      explains why it must wait).
+
+  - lines: 52-55
+    title: Forward declarations
+    note: |
+      [[runcmd]] and [[main@user/sh.c]] use these four functions before their definitions.
+      `__attribute__((noreturn))` ([[g:attribute]]) promises the compiler that [[runcmd]]
+      never returns: it always ends in `exec` or `exit`. Without it, recent GCC sees that
+      every path through `runcmd` can call `runcmd` again, reports "infinite recursion
+      detected", and the build fails because xv6 compiles with `-Werror`. The promise also
+      tells *you* something: after a child calls `runcmd`, it never comes back to the next
+      line.
+
+  - lines: 57-73
+    title: "runcmd(): execute one tree node, then exit"
+    note: |
+      [[runcmd]] runs a parse tree, and it always runs in a *child* of the shell:
+      [[main@user/sh.c]] forks before calling it (line [[:172]]). That is why it may freely
+      close descriptors, `exec`, or `exit`: none of it touches the shell process that is
+      waiting for the next command line.
+
+      It switches on the node kind; each `case` below handles one kind, usually by forking
+      more children and calling `runcmd` on the subtrees. A node that does not need a new
+      process (a redirection, the right side of a list) calls `runcmd` on its child in the
+      same process.
+
+      Line 68 is defensive. The parser never produces a null tree: an empty command, such as
+      the empty right side of `echo a;`, becomes an `EXEC` node with no words, handled on
+      line 77. (Blank lines never reach the parser; [[main@user/sh.c]] skips them.) The `default` case would
+      only fire on a corrupted tree.
+
+  - lines: 75-81
+    title: "EXEC: replace this process with the program"
+    note: |
+      The [[g:exec]] system call ([[exec]] → [[kernel:sys_exec]] → [[kernel:kexec]])
+      loads the program named by `argv[0]` into this process and starts it with the whole
+      [[g:argv]] array. If it succeeds, it never returns: the shell code in this process is
+      gone, replaced by `echo` or `wc`. The program inherits this process's descriptors,
+      which earlier nodes (`REDIR`, `PIPE`) may have rearranged.
+
+      xv6 has no `PATH` search. `argv[0]` is used as a path name as typed, relative to the
+      current directory, and all programs live in `/`. So after `cd d`, typing `ls` prints
+      `exec ls failed`; `/ls` still works.
+
+  - lines: 83-91
+    title: "REDIR: swap a descriptor, then run the inner command"
+    note: |
+      This is the whole of [[g:io-redirection]] in xv6, and it depends on one kernel rule:
+      [[kernel:fdalloc]] always hands out the *lowest* unused descriptor number.
+
+      For `wc > out`, `rcmd->fd` is 1. The [[close]] empties slot 1. Slots 0 and 2 are
+      still in use (the shell made sure of it at startup, lines 152–157), so slot 1 is now
+      the lowest free one, and the [[open]] of `out` lands in it. Then `runcmd` continues
+      with the inner command, in the same process, and when that becomes `exec("wc", ...)`
+      the program writes to descriptor 1 as usual, which is now the file.
+
+      Nested redirections are applied outside-in. The parser puts the *last* redirection
+      written on the outside ([[parseredirs]]), so `echo hello > a > b` first points
+      descriptor 1 at `b`, then replaces it with `a`: the text goes to `a`, and `b` is
+      left created but empty. Most Unix shells do the opposite (the last one wins). Tested
+      in QEMU at this commit.
+
+      The `break` on line 91 is unreachable; [[runcmd]] never returns.
+
+  - lines: 93-99
+    title: "LIST: run left, wait, run right"
+    note: |
+      For `a ; b`, the left command runs in a new child because it will end in `exec` or
+      `exit`, and something must survive to run `b` afterwards. [[wait]] blocks until that
+      child exits ([[kernel:kwait]]). The right command then runs in *this* process: nothing
+      needs to happen after it, so a second fork would be wasted.
+
+      The parser builds `a ; b ; c` as `a ; (b ; c)` ([[parseline]]), so a longer list is
+      handled by the same three lines, one level of recursion per `;`.
+
+  - lines: 101-111
+    title: "PIPE: create the pipe and start the writer"
+    note: |
+      [[pipe]] creates a [[g:pipe]] and two new descriptors: `p[0]` is the read end and
+      `p[1]` the write end ([[kernel:sys_pipe]]). Both are inherited by the children
+      forked next, because `fork` copies the descriptor table ([[kernel:kfork]]).
+
+      The first child will run the left command, so it must write into the pipe instead of
+      the console. The same lowest-free-slot trick as redirection does it, with [[dup]]
+      instead of `open`: `close(1)` frees slot 1, and `dup(p[1])` puts a second reference
+      to the write end into the lowest free slot, which is 1. Afterwards the child closes
+      its original `p[0]` and `p[1]`, so that descriptor 1 is its *only* reference to the
+      pipe.
+
+      Then it runs the left command. Since [[runcmd]] never returns, this child never
+      reaches line 112: only the process that called `runcmd(PIPE ...)` continues there.
+
+  - lines: 112-123
+    title: "PIPE: start the reader, then close and wait"
+    note: |
+      The second child mirrors the first: `dup(p[0])` lands in slot 0, so the right
+      command reads from the pipe as its standard input.
+
+      Then the process that owns the `PIPE` node closes both of its own copies. This is
+      the classic pipe lesson. A reader of a pipe gets
+      end-of-file only when *every* reference to the write end has been closed
+      ([[kernel:piperead]] keeps sleeping while `writeopen` is set; it is cleared in
+      [[kernel:pipeclose]], which runs only when the [[g:open-file]]'s
+      [[g:reference-count]] drops to zero in [[kernel:fileclose]]). If this process kept
+      `p[1]`, or the right child kept its own copy, `wc` would wait for more input forever
+      after `echo` finished, and the whole command line would hang. Keeping a stray read end
+      has the opposite hazard: if the reader exits early, a writer with a full buffer would
+      sleep forever instead of getting an error ([[kernel/pipe.c:84]]).
+
+      The two [[wait]] calls collect both children, in whichever order they finish. This
+      process exits only after the whole pipeline is done, so the shell's own `wait`
+      (line [[:174]]) does not return, and the next prompt does not appear, until all the
+      output has been written.
+
+  - lines: 125-129
+    title: "BACK: start the command and do not wait"
+    note: |
+      For `cmd &`, this process forks a child to run `cmd` and then falls through to
+      `exit(0)` at once, without waiting. Its parent, the shell, is waiting for it on line
+      174, so the shell gets control back immediately and prints the next prompt while
+      `cmd` keeps running: a [[g:background-job]].
+
+      The child is now an orphan. When its parent exits, the kernel makes `init` its new
+      parent ([[kernel:reparent]], called from [[kernel:kexit]]), and `init`'s endless
+      `wait` loop ([[user/init.c:39]]) collects it when it finishes. Without that, every
+      background command would stay a [[g:zombie]] in the process table forever.
+
+  - lines: 130-132
+    title: Every node ends by exiting
+    note: |
+      The cases that end without `exec` or a nested `runcmd` (`EXEC` after a failed exec,
+      `PIPE` after its two waits, `BACK` after its fork) fall out of the `switch` here and
+      exit with status 0. `REDIR` and `LIST` always end in a nested `runcmd`, so their
+      `break`s (lines 91 and 99) are never reached. Even a failed `exec` exits with 0; no one reads the status, since every `wait` in
+      this file passes 0 for the status pointer.
+
+  - lines: 134-143
+    title: "getcmd(): prompt and read one line"
+    note: |
+      The prompt goes to descriptor 2 (standard error), not 1, presumably so that it stays
+      out of the shell's standard output. Both are the console normally, so you cannot tell
+      the difference at the keyboard.
+
+      [[gets]] (in [[user/ulib.c]]) reads one byte at a time from descriptor 0 until a
+      newline or carriage return, end of input, or a full buffer, and always NUL-terminates; the [[memset]]
+      before it is therefore extra caution, not necessary. The console delivers input a
+      whole line at a time ([[g:line-editing]]), so `gets` usually gets the whole line you
+      typed, ending in `\n`.
+
+      If the very first `read` returns 0 bytes, `buf[0]` is still 0: that is end of input.
+      On the console, Ctrl-D at the start of a line produces it ([[kernel/console.c:112]]).
+      `getcmd` returns -1 and the shell exits; `init` then starts a fresh one (try it: you
+      see `init: starting sh` again).
+
+  - lines: 145-157
+    title: "main(): make sure descriptors 0, 1 and 2 are open"
+    note: |
+      Redirection and pipes ([[runcmd]]) depend on descriptors 0, 1 and 2 all being open:
+      the lowest-free-slot trick only puts a file in slot 1 if slot 0 is taken. This loop
+      guarantees it. It opens the console repeatedly; each `open` fills the lowest empty
+      slot. As soon as an `open` returns 3 or more, slots 0–2 must all be full, so the
+      extra descriptor is closed and the loop ends.
+
+      Normally `init` has already opened all three ([[user/init.c:19]]) and the shell
+      inherited them, so the first `open` returns 3 and is closed at once.
+
+      `buf` holds one command line. Being `static`, it lives in the program's
+      [[g:bss]] rather than on the stack. The parse tree's string pointers point into it.
+
+  - lines: 159-165
+    title: The main loop, and blank lines
+    note: |
+      Each iteration reads one line with [[getcmd]] and runs it; the loop ends at end of
+      input. Leading spaces and tabs are skipped so that the `cd` test below sees the
+      command name. A line that is empty after that (only the newline left) is ignored
+      without forking.
+
+  - lines: 166-170
+    title: "cd must run in the shell itself"
+    note: |
+      The current directory is part of a process's state (`p->cwd`, set by
+      [[kernel:sys_chdir]] at [[kernel/sysfile.c:454]]). If the shell forked a child to
+      run `cd`, the *child's* directory would change and then vanish when the child
+      exited, and the shell would still be where it was. So `cd` is a *built-in*: the
+      shell calls [[chdir]] in its own process. Every later child then inherits the new
+      directory, because [[kernel:kfork]] copies `cwd`.
+
+      The recognition is crude. It needs exactly `cd` followed by one space at the start
+      of the line; `cd` with no argument falls through to the `else`, tries to run a
+      program named `cd`, and prints `exec cd failed`. Everything after the space,
+      including any extra spaces, is the path: `cd  /` fails with `cannot cd  /`, and
+      `cd d; ls` tries to change to a directory named `d; ls`.
+
+  - lines: 171-178
+    title: Fork, parse and run in the child, wait in the parent
+    note: |
+      This is the [[g:fork-exec]] pattern at its plainest. [[fork1]] creates a child; the
+      child parses the line and runs the tree; the parent waits for that child to exit.
+
+      Parsing happens in the child, after the fork, and that is deliberate. Parse errors
+      call [[panic@user/sh.c]], which exits the current process: here that is the child,
+      so a typo kills only the child and the shell carries on. The parse tree lives in the
+      child's memory ([[malloc]]), which disappears when the child execs or exits, so the
+      shell never has to free it.
+
+      [[wait]] returns when the child exits. For a command ending in `&`, that child exits
+      immediately (the `BACK` case), so the prompt comes back at once.
+
+      `exit(0)` on line 177 is reached only at end of input.
+
+  - lines: 180-185
+    title: "panic(): give up on this process"
+    note: |
+      Print a message to standard error and exit with status 1. Unlike the kernel's
+      [[kernel:panic]], which stops the whole machine, this ends only the process that
+      called it, usually a child running or parsing one command.
+
+  - lines: 187-196
+    title: "fork1(): fork or die"
+    note: |
+      A wrapper so that callers need not check for failure: [[fork]] returns -1 when the
+      process table or memory is full, and the shell has no sensible way to continue, so
+      it panics. When the failing call is the one in [[main@user/sh.c]], the shell itself
+      exits, and `init` starts a new one.
+
+  - lines: 198-264
+    title: "Constructors: allocate and fill one node"
+    note: |
+      One function per node kind. Each allocates the struct on the user [[g:heap]] with
+      [[malloc]], zeroes it with [[memset]], fills in the `type` and the fields passed in,
+      and returns it as a generic `struct cmd *`. The parser calls them as it recognizes
+      each construct.
+
+      Zeroing matters most for [[execcmd]]: its `argv` array starts as all null pointers.
+      (The parser also writes the terminating null explicitly, line 449.)
+
+      None of them checks whether `malloc` returned 0. If memory ran out, `memset` would
+      write to address 0, where the program's read-only code is mapped; the resulting
+      [[g:page-fault]] would make the kernel print a `usertrap(): unexpected scause` line
+      and kill the child. The nodes are never freed either; they do not need to be, since
+      parsing happens in a short-lived child (line 173).
+
+      `//PAGEBREAK!` (lines 198 and 265) is a leftover formatting marker from the
+      printed source listing of the older x86 xv6; it does nothing.
+
+  - lines: 265-269
+    title: Character classes for the tokenizer
+    note: |
+      The tokenizer needs two questions answered about each character: is it whitespace
+      (space, tab, carriage return, newline, vertical tab), and is it one of the shell's
+      seven special symbols? Each answer is a [[strchr]] lookup in one of these strings.
+
+      Because symbols end a word just as whitespace does, `echo hi|wc` needs no spaces
+      around the `|`.
+
+  - lines: 271-282
+    title: "gettoken(): skip spaces, mark the token's start"
+    note: |
+      [[gettoken]] reads one token from the text between `*ps` and `es`, moves `*ps`
+      past it, and returns its kind:
+
+      - `0` for end of input,
+      - the character itself for `| ( ) ; & < >`,
+      - `'+'` for `>>`,
+      - `'a'` for a word (a program name, argument or file name).
+
+      If `q` and `eq` are not null, it also stores where the token's text begins and where
+      it ends (one past the last character). That is how words reach the parse tree
+      without being copied.
+
+      The skip loop stops at the end of the string even without the `s < es` test, because
+      xv6's [[strchr]] never matches the NUL terminator. (Standard C's `strchr` does treat
+      the terminator as part of the string, so that guard matters elsewhere.)
+
+  - lines: 283-306
+    title: Recognize the token
+    note: |
+      At the end of the string (`*s == 0`) nothing is consumed and the return value is 0.
+      A one-character symbol is consumed and returned as itself. `>` gets one extra look
+      ahead so that `>>` becomes a single token, reported as `'+'`.
+
+      Anything else starts a word, which runs until whitespace, a symbol, or the end. The
+      return value becomes `'a'`. Note that a word stops at a symbol even without
+      whitespace: `a>b` is three tokens. There is no quoting, so a word can never contain
+      a space or a symbol.
+
+  - lines: 307-314
+    title: Record the end, skip trailing spaces
+    note: |
+      `eq` gets the position just past the token. Then the trailing whitespace is skipped
+      too, so the next call (or [[peek]]) starts at the next real character.
+
+      Notice that `eq` was stored *before* that skip, so it points at the character that
+      ended the word: a space, a newline, or a symbol such as `|`. [[nulterminate]] will
+      later overwrite exactly that character with a NUL.
+
+  - lines: 316-326
+    title: "peek(): look at the next token without taking it"
+    note: |
+      [[peek]] skips whitespace (this does advance `*ps`, harmlessly) and answers one
+      question: is the next character one of those in `toks`? It does not consume it. The
+      parser uses this one-character lookahead at every decision point: "is there a `|`
+      next? Then this is a pipe."
+
+      The `*s &&` part makes sure the end of the string is never reported as a match. With
+      a standard C `strchr` that check would be essential, since `strchr(toks, 0)` would
+      find the terminator.
+
+  - lines: 328-331
+    title: Parser prototypes
+    note: |
+      The parsing functions call each other recursively ([[parseline]] → [[parsepipe]] →
+      [[parseexec]] → [[parseblock]] → [[parseline]]), so some must be declared before
+      their definitions.
+
+  - lines: 333-348
+    title: "parsecmd(): parse a whole line and check nothing is left"
+    note: |
+      The entry point of the parser. The grammar it implements, one function per rule
+      ([[g:recursive-descent]]):
+
+      ```
+      line  = pipe { "&" } [ ";" line ]          parseline
+      pipe  = exec [ "|" pipe ]                   parsepipe
+      exec  = block | redirs { word redirs }      parseexec
+      block = "(" line ")" redirs                 parseblock
+      redirs = { ("<" | ">" | ">>") word }        parseredirs
+      ```
+
+      `{ }` means "any number of times" and `[ ]` "optional". The rule order gives the
+      precedence: `;` binds loosest, then `&`, then `|`, and redirections bind to a single
+      command. So `a | b > f & ; c` is `LIST(BACK(PIPE(a, REDIR(b))), c)`.
+
+      After [[parseline]] returns, `peek(&s, es, "")` is used only for its side effect of
+      skipping whitespace (an empty `toks` never matches). If anything remains, the line
+      did not fit the grammar. For example `echo x & echo y` stops after the `&`, because
+      `&` ends a `line`, and prints `leftovers: echo y` followed by `syntax`. Finally
+      [[nulterminate]] turns the recorded word ends into real C strings.
+
+  - lines: 350-365
+    title: "parseline(): background and sequence"
+    note: |
+      A line is a pipeline, optionally followed by `&` (each one wraps everything so far in
+      a `BACK` node), optionally followed by `;` and *another whole line*. That recursive
+      call makes lists right-nested: `a ; b ; c` becomes `LIST(a, LIST(b, c))`, which
+      [[runcmd]] handles one `;` per level.
+
+      Each `gettoken(ps, es, 0, 0)` consumes the symbol that `peek` has just seen; the
+      zeros say its text is not needed.
+
+  - lines: 367-378
+    title: "parsepipe(): one command, then maybe | and more"
+    note: |
+      A pipeline is a single command, optionally followed by `|` and another pipeline.
+      Like lists, pipelines nest to the right: `a | b | c` becomes `PIPE(a, PIPE(b, c))`.
+      When it runs, the outer `PIPE` process forks one child for `a` and one for the inner
+      `PIPE`, which forks two more: one process per program, connected by two pipes.
+
+  - lines: 380-403
+    title: "parseredirs(): wrap a command in redirections"
+    note: |
+      While the next token is `<` or `>` (including `>>`), [[parseredirs]] consumes it and
+      then demands a word for the file name; anything else is an error (`echo a >` prints
+      `missing file for redirection`). Each redirection wraps the command built so far in a
+      new `REDIR` node, recording the file name's start and end, the `open` mode, and which
+      descriptor to replace:
+
+      | Written | Mode | Descriptor |
+      |---|---|---|
+      | `< f` | read only | 0 |
+      | `> f` | write, create if missing, truncate | 1 |
+      | `>> f` | write, create if missing | 1 |
+
+      The comment `// >>` suggests appending, but xv6 has no append flag ([[kernel/fcntl.h]]
+      defines no `O_APPEND`) and `open` always starts at offset 0. So `>>` overwrites the
+      start of the file without truncating it. In QEMU, after `echo abcdefgh > f` and
+      `echo xy >> f`, the file contains `xy`, a newline, then `defgh`.
+
+      Because each new node wraps the previous ones, the last redirection written ends up
+      outermost, which is why the first one written wins when two target the same
+      descriptor (see the `REDIR` case of [[runcmd]]).
+
+  - lines: 405-419
+    title: "parseblock(): a parenthesized line"
+    note: |
+      Parentheses group a whole line, `;` and `&` included, into one command, which can
+      then be piped or redirected as a unit. `(echo a; echo b) > g` puts both lines in
+      `g`: the `REDIR` node replaces descriptor 1, and the `LIST` beneath it runs `echo a`
+      in a child, which inherits the new descriptor 1, and `echo b` in the same process,
+      which already has it.
+
+      [[parseexec]] calls this only after seeing `(`, so the first `panic` is a
+      safety check that cannot fire. A missing `)` is a real user error. After the `)`,
+      redirections are allowed, but more words are not: in `(echo a) b` the `b` is left over
+      and [[parsecmd]] reports a syntax error.
+
+  - lines: 421-452
+    title: "parseexec(): a program name and its arguments"
+    note: |
+      A parenthesized block is handed to [[parseblock]]. Otherwise this builds an `EXEC`
+      node and collects words until it sees a token that ends a command (`| ) & ;`) or the
+      end of the line.
+
+      Two variables point at the result. `cmd` always points at the `EXEC` node so that
+      words can be added to its `argv`. `ret` is what will be returned: redirections may
+      wrap the `EXEC` node in `REDIR` nodes, and `ret` points at the outermost wrapper.
+      [[parseredirs]] is called before the first word and after every word, so
+      redirections can appear anywhere: `< README wc` works as well as `wc < README`.
+
+      Each word's start and end go into `argv` and `eargv`. A token that is not a word at
+      this point is a syntax error (for example `echo (x)`). The array has [[MAXARGS]] = 10
+      slots and needs one for the terminating null, so a command can have at most 9 words,
+      program name included; a tenth word prints `too many args`. Finally the null
+      pointer that ends `argv`, which `exec` requires, is stored.
+
+  - lines: 454-499
+    title: "nulterminate(): turn word ends into C strings"
+    note: |
+      While parsing, each word is known only by its start and end pointers into `buf`.
+      `exec` and `open` need NUL-terminated strings, so [[nulterminate]] walks the finished
+      tree and writes a `0` at every recorded end: each `eargv[i]` of an `EXEC` node and
+      the `efile` of a `REDIR` node. The other node kinds only recurse into their children.
+
+      Why not write the NUL in [[gettoken]], as soon as the word's end is known? Because
+      the end of a word is often the very character the parser must read next. In
+      `echo hi|wc` the end of `hi` *is* the `|`; overwriting it right away would make the
+      parser see the end of the line and never build the pipe. Waiting until the whole line
+      is parsed avoids that, and avoids copying any strings.
+
+      For `echo hi | wc > out &` the buffer changes like this (`\0` is the NUL byte):
+
+      ```
+      before:  echo hi | wc > out &\n
+      after:   echo\0hi\0| wc\0> out\0&\n
+      ```
+
+      The `argv` pointers now point at the strings `"echo"`, `"hi"` and `"wc"`, and the
+      redirection's `file` at `"out"`.
+
+lines:
+  8: |
+    `EXEC`: run a program ([[execcmd]]).
+  9: |
+    `REDIR`: run a command with one descriptor replaced by a file ([[redircmd]]).
+  10: |
+    `PIPE`: connect two commands with a [[g:pipe]] ([[pipecmd]]).
+  11: |
+    `LIST`: `a ; b`, run one after the other ([[listcmd]]).
+  12: |
+    `BACK`: `a &`, run without waiting ([[backcmd]]).
+  14: |
+    The size of an `EXEC` node's argument arrays. One slot is needed for the null pointer
+    that ends `argv`, so a command can have at most 9 words.
+  17: |
+    The only field every node is guaranteed to have. Code holding a `struct cmd *` reads
+    this, then casts to the real struct type.
+  22: |
+    Pointers to the start of each word in the input line: `argv[0]` is the program name.
+    Passed directly to `exec`, so it must end with a null pointer.
+  23: |
+    For each word, a pointer just past its last character, where [[nulterminate]] will
+    write the terminating NUL.
+  28: |
+    The command to run once the redirection is in place.
+  29-30: |
+    The file name's start and end in the input line, like `argv` and `eargv`.
+  31: |
+    The flags to pass to `open`: `O_RDONLY` for `<`, `O_WRONLY|O_CREATE|O_TRUNC` for `>`,
+    `O_WRONLY|O_CREATE` for `>>`.
+  32: |
+    Which descriptor to replace: 0 (standard input) for `<`, 1 (standard output) for `>`
+    and `>>`.
+  37-38: |
+    The command whose output feeds the pipe, and the command that reads from it.
+  43-44: |
+    The command to run first, and the command to run after it finishes.
+  49: |
+    The command to run in the background.
+  68-69: |
+    Defensive: the parser never returns a null tree, so this exit should not happen.
+  71: |
+    Dispatch on the node kind stored in the common first field.
+  72-73: |
+    Unknown node kind: a bug in the shell, not a user error.
+  76: |
+    Now that the type is known to be `EXEC`, view the node as the larger struct.
+  77-78: |
+    An empty command (for example the empty right side of `echo a;`) has no program
+    name; there is nothing to run.
+  79: |
+    Replace this process with the program `argv[0]`, passing all the words as its
+    arguments. Returns only on failure.
+  80: |
+    Reached only if `exec` failed, for example because no file has that name. Try
+    `nosuch` at the prompt: `exec nosuch failed`.
+  85: |
+    Free the slot that is about to be replaced: 0 for `<`, 1 for `>`.
+  86-89: |
+    `open` takes the lowest free slot, which is the one just freed. If the file cannot be
+    opened (a missing input file, or a directory opened for writing), report it and give
+    up on this command.
+  90: |
+    Run the wrapped command in this same process, with the new descriptor in place.
+  95-96: |
+    Run the left command in a child, so that this process survives to run the right one.
+  97: |
+    Wait for the left command to finish before starting the right one; that is what `;`
+    means.
+  98: |
+    Run the right command in this process. No fork is needed, since nothing comes after it.
+  103-104: |
+    Create the pipe: `p[0]` becomes the read end, `p[1]` the write end. Failure (no free
+    descriptors or memory) ends this process, not the shell.
+  105: |
+    The first child will run the left command, the writer.
+  106-107: |
+    Make descriptor 1 refer to the pipe's write end: `close(1)` frees slot 1, and `dup`
+    puts its copy in the lowest free slot, which is 1.
+  108-109: |
+    Close the original descriptors. The child keeps only descriptor 1; a leftover `p[0]`
+    or `p[1]` would hold the pipe open for no reason.
+  110: |
+    Run the left command with standard output going into the pipe. Never returns.
+  112: |
+    The second child will run the right command, the reader.
+  113-114: |
+    Make descriptor 0 refer to the pipe's read end, by the same close-then-dup trick.
+  115-116: |
+    Close the originals. Closing `p[1]` here is essential: if the reader kept a write end,
+    its own reads would never see end-of-file.
+  117: |
+    Run the right command with standard input coming from the pipe.
+  119-120: |
+    This process does not use the pipe at all, so it must drop both ends. Its `p[1]` in
+    particular would keep the right command from ever seeing end-of-file.
+  121-122: |
+    Wait for both children: one `wait` per child, in whatever order they exit.
+  127-128: |
+    Run the command in a child, and do not wait for it.
+  131: |
+    The end of every path that did not `exec`. `exit` never returns, which is what makes
+    the `noreturn` promise on line 55 true.
+  137: |
+    Print the prompt on standard error.
+  138: |
+    Clear the buffer, so that `buf[0]` is 0 if nothing is read.
+  139: |
+    Read one line, at most `nbuf - 1` characters plus the terminating NUL.
+  140-141: |
+    Nothing at all was read: end of input. A line containing only a newline is not end of
+    input; it has `buf[0] == '\n'`.
+  148: |
+    One command line of at most 99 characters, the last of which is usually `\n`.
+  152: |
+    Open the console device by its name in the current directory, `/`. `open` returns the
+    lowest free descriptor, or -1 if it fails, which ends the loop.
+  153-156: |
+    A descriptor of 3 or more means 0, 1 and 2 are all taken. This extra one is not needed.
+  160: |
+    Keep going until [[getcmd]] reports end of input.
+  162-163: |
+    Skip leading spaces and tabs.
+  164-165: |
+    A blank line: print a new prompt without forking.
+  166: |
+    Is this the built-in `cd`? Exactly the letters `c`, `d` and a space at the start.
+  168: |
+    Replace the final `\n` with a NUL so that it is not part of the directory name. This
+    assumes the line ends in a newline, which is true unless it filled the whole buffer or
+    the line was ended with Ctrl-D instead of Enter.
+  169-170: |
+    Change the shell's own current directory ([[chdir]]). The path is everything after
+    `cd `.
+  172-173: |
+    In a new child: parse the line into a tree and run it. The child never returns from
+    [[runcmd]].
+  174: |
+    The shell waits for that child; only then does it print the next prompt.
+  177: |
+    End of input: the shell exits, and `init` starts another one.
+  183-184: |
+    Report the problem on standard error and end this process with status 1.
+  192: |
+    Make a child process ([[fork]] → [[kernel:sys_fork]] → [[kernel:kfork]]). Returns
+    the child's [[g:pid]] in the parent, 0 in the child, -1 on failure.
+  193-194: |
+    Failure means the process table or memory is full; give up.
+  206: |
+    Allocate the node on the [[g:heap]]. `sizeof(*cmd)` is the size of the full
+    `execcmd` struct, the two arrays included.
+  207: |
+    Zero every field, so both arrays start as all null pointers.
+  209: |
+    Return it as the generic node type. The `type` field set on the line before is what
+    lets [[runcmd]] recover the real type.
+  213: |
+    Wrap `subcmd` so that it runs with descriptor `fd` replaced by `file`, opened with
+    `mode`.
+  229: |
+    Join two commands with a pipe: `left`'s output goes to `right`'s input.
+  242: |
+    Join two commands so that `left` runs to completion before `right`.
+  255: |
+    Wrap `subcmd` so that it runs in the background.
+  268: |
+    Space, tab, carriage return, newline and vertical tab.
+  269: |
+    The characters that are tokens by themselves: redirection, pipe, background, sequence,
+    and grouping.
+  277: |
+    Start at the current position.
+  278-279: |
+    Skip whitespace before the token.
+  280-281: |
+    Report where the token starts.
+  282: |
+    For a symbol, the return value is the symbol itself; overridden below for `>>` and
+    words.
+  284-285: |
+    End of input: consume nothing, return 0.
+  286-293: |
+    A one-character symbol: consume it.
+  294-300: |
+    `>` or, if another `>` follows, `>>`, which is reported as `'+'` since a token kind
+    must fit in one character.
+  301-305: |
+    A word: consume characters until whitespace, a symbol, or the end of input.
+  307-308: |
+    Report where the token ends: one past its last character.
+  310-311: |
+    Skip whitespace after the token, so the caller is left at the next token.
+  312: |
+    Tell the caller how far it got.
+  313: |
+    The token's kind: 0, a symbol, `'+'`, or `'a'`.
+  322-324: |
+    Skip whitespace and remember the new position, so the following `gettoken` starts at
+    the token.
+  325: |
+    True if there is a next character and it is one of `toks`.
+  339: |
+    `es` marks the end of the text: the NUL at the end of the line.
+  340: |
+    Parse as much of the line as fits the grammar; `s` is advanced past it.
+  341: |
+    Skip trailing whitespace (an empty `toks` list never matches).
+  342-345: |
+    Text remains that the grammar could not place: report it and end this child.
+  346: |
+    Write the NULs that end each word, now that parsing is finished.
+  355: |
+    Parse the pipeline that starts every line.
+  356-359: |
+    Each `&` wraps everything parsed so far in a `BACK` node.
+  360-363: |
+    A `;` joins what came before with the rest of the line, which is parsed recursively as
+    another whole line.
+  372: |
+    Parse one command, with its arguments and redirections.
+  373-376: |
+    A `|` follows: consume it and parse everything after it as another pipeline, the
+    right side.
+  386: |
+    Keep going while the next token is a redirection.
+  387: |
+    Consume the `<`, `>` or `>>` (returned as `'+'`) and remember which it was.
+  388-389: |
+    The next token must be a word, the file name; `q` and `eq` receive its start and end.
+  392: |
+    `< file`: open for reading and put it on descriptor 0.
+  395: |
+    `> file`: open for writing, create it if missing, empty it, and put it on descriptor 1.
+  398: |
+    `>> file`: like `>` but without emptying the file. Without an append mode, writing
+    still starts at offset 0.
+  410-412: |
+    Consume the `(`. [[parseexec]] has already checked it is there.
+  413: |
+    Parse a whole line inside the parentheses: lists, background and pipes are all allowed.
+  414-416: |
+    Demand and consume the matching `)`.
+  417: |
+    Allow redirections that apply to the whole group.
+  429-430: |
+    A `(` starts a group, which has its own rule.
+  432-433: |
+    Make an empty `EXEC` node; `cmd` keeps a typed pointer to it for filling in `argv`.
+  436: |
+    Redirections may come before the program name.
+  437: |
+    Stop at any token that ends a command.
+  438-439: |
+    End of input ends the command too.
+  440-441: |
+    Anything but a word here is out of place.
+  442-444: |
+    Record the word's start and end and count it.
+  445-446: |
+    Leave room for the null that ends `argv`.
+  447: |
+    Redirections may also follow any word.
+  449-450: |
+    End both arrays with a null pointer. `exec` needs `argv` to end this way, and
+    [[nulterminate]] stops at it.
+  465-466: |
+    Nothing to do for a missing subtree.
+  471-472: |
+    Write a NUL just past each word, for every word up to the null that ends `argv`.
+  477-478: |
+    Terminate the inner command's words, then the file name.
+  483-484: |
+    Recurse into both sides of a pipe.
+  489-490: |
+    Recurse into both sides of a list.
+  495: |
+    Recurse into the background command.

@@ -1,0 +1,182 @@
+summary: |
+  The [[g:linker-script]] for every xv6 user program (except `_forktest`, which the Makefile
+  links with command-line options instead, [[Makefile:120]]). It tells the [[g:linker]] how
+  to lay out the program's code and data in its virtual address space. Read it side by
+  side with the kernel's [[kernel/kernel.ld]]; the structure is the same, the differences
+  are instructive:
+
+  | | [[kernel/kernel.ld]] | `user/user.ld` |
+  |---|---|---|
+  | starts at | `0x80000000`, where RAM is | `0`, the bottom of the process's own address space |
+  | entry point | `ENTRY( _entry )` | none; `ld` falls back to the symbol `start` |
+  | special code | the trampoline page | none |
+  | before `.data` | nothing (code end `etext` is page-aligned) | `ALIGN(0x1000)` |
+  | `.eh_frame` | not mentioned | collected after `.rodata` |
+  | `end` symbol | used by [[kernel:kinit]] | defined, but no xv6 program uses it |
+
+  The result for `user/_cat` (from `${TOOLPREFIX}readelf -l user/_cat`; `TOOLPREFIX` is your RISC-V toolchain's prefix; see [[tour:1]]):
+
+  ```
+  0x0000   .text    code               ┐ segment 1: read + execute
+  0x09a8   .rodata  constants, strings ┘
+  0x1000   .data    initialized vars   ┐ segment 2: read + write
+  0x1000   .bss     zeroed vars        ┘ (0x220 bytes)
+  ```
+
+  [[kernel:kexec]] loads each segment at the address the linker chose, then places the
+  stack (and later the [[g:heap]]) above them. See [[g:user-memory-layout]].
+
+  **Read before:** [[kernel/kernel.ld]], [[kernel/exec.c]].
+
+blocks:
+  - lines: 1
+    title: A RISC-V program
+    note: |
+      Marks the output as RISC-V code ([[g:ld-output-arch|OUTPUT_ARCH]]), as in the kernel
+      script.
+
+      There is no `ENTRY` line, unlike [[kernel/kernel.ld:2]]. When neither an `ENTRY`
+      command nor a `-e` option names the [[g:entry-point]], GNU `ld` uses the value of
+      the symbol `start` if it is defined. [[user/ulib.c]] defines exactly that function,
+      [[start]], so it becomes the entry point (`0xf6` in `user/_cat`). A quick test with
+      the build's `${TOOLPREFIX}ld` confirms the rule: it picks `start` and ignores a symbol
+      called `_start`, and with neither it uses the start of `.text`.
+
+  - lines: 3-5
+    title: Start at address 0
+    note: |
+      The location counter ([[g:ld-dot]]) starts at 0, so the program's first byte of
+      code is at virtual address 0.
+
+      The kernel must sit at a physical address where RAM exists. A user program does not
+      care about physical addresses: each process has its own [[g:page-table]], and every
+      program can use the same virtual addresses without conflict. 0 is the natural
+      choice because [[kernel:kexec]] builds the address space from 0 upward. It starts
+      with a size of 0 and calls [[kernel:uvmalloc]] to map every page from the current
+      size up to the end of each segment ([[kernel/exec.c:72]]), so code linked higher up
+      would leave the pages below it mapped, but wasted.
+
+      One consequence: in xv6, address 0 is valid in a user program. Reading through a
+      null pointer does not fail; it reads the program's first instructions. Writing
+      through one is caught, because the code pages are not writable: the store causes a
+      [[g:page-fault]] and the kernel kills the process.
+
+  - lines: 7-9
+    title: "Code: .text"
+    note: |
+      All code from all input files ([[g:text]]). Files are placed in command-line order:
+      the program's own object file first, then [[build:ULIB]] (`ulib.o`, `usys.o`,
+      `printf.o`, `umalloc.o`), as the link command lists them ([[Makefile:107]]). So
+      the program's own functions come first, and [[start]] is somewhere after them.
+      Nothing needs to be at address 0 in particular, because the entry point is recorded
+      in the [[g:elf]] header.
+
+      The kernel script singles out `entry.o` and the trampoline here; a user program has
+      nothing comparable.
+
+  - lines: 11-16
+    title: "Constants: .rodata"
+    note: |
+      Read-only data, right after the code: string literals such as the format strings
+      passed to [[printf]], and `const` tables such as the `digits` array in
+      [[user/printf.c]]. The small-data variant `.srodata` ([[g:small-data]]) is merged
+      in, exactly as in [[kernel/kernel.ld:23]]. Each group starts on a 16-byte boundary
+      ([[g:ld-align]]).
+
+      `.rodata` ends up in the same segment as the code, which the kernel maps readable
+      and executable but not writable, so writing to a string literal is caught.
+
+  - lines: 18-21
+    title: "Unwind tables: .eh_frame"
+    note: |
+      `.eh_frame` holds tables that describe each function's stack frame, used to unwind
+      the stack for C++ exceptions and by some debuggers and crash reporters. Compilers
+      emit it for C only under some settings. The kernel script does not mention it.
+
+      In this build no input file contains it: `${TOOLPREFIX}readelf -S` lists no
+      `.eh_frame` in any `user/_*` program. Listing it here still decides where it would
+      go if a different compiler emitted it: with the read-only data, before the page
+      boundary, rather than wherever `ld`'s default rules for unlisted sections would put
+      it.
+
+  - lines: 23
+    title: Start writable data on a fresh page
+    note: |
+      Round the location counter up to the next multiple of `0x1000` (4096, one
+      [[g:page]]) before `.data` begins. This line is what splits the program into two
+      [[g:program-header|loadable segments]] with different permissions:
+
+      - code and read-only data: read and execute;
+      - `.data` and `.bss`: read and write.
+
+      Permissions are set per page, in each [[g:pte]], so the two kinds of content must
+      not share a page. [[kernel:kexec]] turns each segment's ELF flags into page
+      permissions ([[kernel:flags2perm]]) and also refuses any segment whose address is
+      not a multiple of the page size ([[kernel/exec.c:69]]).
+
+      Without this line, the linker puts everything into a single segment that is
+      readable, writable and executable (tried with the build's `${TOOLPREFIX}ld`, which
+      also warns "has a LOAD segment with RWX permissions"). xv6 would load such a
+      program, but its code would then be writable and its data executable.
+
+      The kernel script has no such line before its `.data`: the kernel's only page
+      boundary is after its code (`ALIGN(0x1000)` before [[kernel:etext]]), and
+      [[kernel:kvmmake]] maps everything from `etext` up read-write, so in the kernel even
+      `.rodata` is writable.
+
+  - lines: 24-29
+    title: "Initialized variables: .data"
+    note: |
+      Global and `static` variables with an initial value ([[g:data]]), including the
+      small-data `.sdata` ([[g:small-data]]). Their initial bytes are stored in the
+      program file and copied into memory by [[kernel:loadseg]]. For `user/_cat` this
+      section is empty; `user/_sh` has 16 bytes here.
+
+  - lines: 31-36
+    title: "Zeroed variables: .bss"
+    note: |
+      Global and `static` variables without an initializer ([[g:bss]]), such as
+      [[base]] and [[freep]] in [[user/umalloc.c]], or `cat`'s 512-byte buffer. The file
+      stores only their size. The program header gives a memory size larger than the
+      file size, and [[kernel:kexec]] provides the difference as zeroed memory: the pages
+      come from [[kernel:uvmalloc]], which clears each new page, and [[kernel:loadseg]]
+      copies only the file's bytes into them. So, unlike the kernel, a user program can
+      rely on its `.bss` starting at zero without anyone clearing it explicitly.
+
+  - lines: 38-39
+    title: Mark the end of the program image
+    note: |
+      [[g:ld-provide|PROVIDE]] defines the symbol `end` as the first address after
+      `.bss`, unless a program defines `end` itself. The kernel uses its `end` to find free
+      memory; no xv6 user program refers to it. The heap does not start here: [[kernel:kexec]]
+      places the stack on the next page boundaries above the image, and `sbrk` extends
+      memory above the stack. Line 39 closes the `SECTIONS` block.
+
+lines:
+  5: |
+    Set the location counter to 0: the first section, `.text`, starts at virtual address
+    0.
+  8: |
+    Put every input file's `.text` and `.text.*` sections here, in link order.
+  12: |
+    Start the small read-only data on a 16-byte boundary.
+  13: |
+    Small read-only data (`.srodata`), merged into `.rodata` as the comment says.
+  14-15: |
+    Then the ordinary read-only data from all files, again 16-byte aligned.
+  19-20: |
+    Collect `.eh_frame` and `.eh_frame.*` sections, if any input has them.
+  23: |
+    Move to the next 4096-byte boundary. In `user/_cat` the read-only part ends at
+    `0xa11`, so `.data` starts at `0x1000`.
+  25-26: |
+    Small initialized data (`.sdata`) first, 16-byte aligned.
+  27-28: |
+    Then the ordinary initialized data.
+  32-33: |
+    Small zero-initialized data (`.sbss`).
+  34-35: |
+    Then ordinary zero-initialized data. It follows `.data` directly; no page boundary is
+    needed because both are writable.
+  38: |
+    Define `end`, the address just past the program's last variable.

@@ -1,0 +1,1636 @@
+published: true
+title: A hashed buffer cache
+area: Concurrency
+stars: 4
+branch: ext/19-bcache-hash
+prerequisites: {tours: [15, 17, 18, 30, 51], concepts: [locks]}
+summary: |
+  In this tree every [[bread]] and [[brelse]], on every [[g:hart|hart]], takes one spinlock:
+  `bcache.lock` ([[kernel/bio.c:26]]). While one hart scans the 30 buffers for a block,
+  every other hart that wants *any* block spins. In this lab you split that lock: the
+  buffers go into a hash table of 13 buckets, each with its own lock, so that harts working
+  on different blocks stop waiting for each other.
+
+  Splitting a lock sounds like a mechanical change. It is not, because the old lock did more
+  than one job. What exactly did it protect, and which of those jobs can be cut into
+  pieces? The cache recycles the least recently used buffer: what does "least recently
+  used" mean once there is no single list? A miss has to find a free buffer that may sit in
+  another bucket and move it: which locks does that take, in which order, while two other
+  harts do the same? What happens when two harts miss on the same block at the same
+  instant? And afterwards, how do you show that the split helped, and where did the waiting
+  go? The think section asks these questions in the order a designer meets them, and the
+  clinic shows what the tempting wrong answers did on real runs.
+
+  The reference solution is five small commits. Measured on three harts with
+  `bcachetest`, the cache's locks made a hart wait about 105 times per run instead of about
+  360, with the same hit rate as before; and the measurement turned up one surprise on the
+  way, which the last commit fixes.
+learn:
+  - "How to find what a lock really protects, by sorting the data it covers into what belongs to one block and what belongs to the whole cache, and how that tells you where the lock can be split."
+  - "How to take two locks of the same kind on three harts without deadlock, and what a deadlock looks like on a running machine when you get it wrong."
+  - "Why \"look up, and insert if missing\" must stay one atomic step after the lock that made it atomic is split, and what goes wrong on disk when it does not."
+  - "What the original rule \"raise `refcnt` before releasing the lock\" protects, and what more it has to protect once buffers can move between buckets."
+  - "How to measure lock contention (failed atomic swaps per lock) and read the result: where the waiting went after the split, and why hashing spreads blocks evenly but not accesses."
+  - "When a shared variable may be read without the lock that protects it, and how to decide."
+spec: |
+  **Behaviour.** The buffer cache keeps its 30 buffers ([[NBUF]]) in 13 buckets. A block can
+  be cached only in bucket `blockno % 13`, and each bucket has its own spinlock.
+
+  - A lookup that finds its block (a hit) takes only that block's bucket lock.
+  - [[brelse]], [[bpin]] and [[bunpin]] take only the lock of the buffer's bucket.
+  - A miss recycles the least recently used buffer that nobody uses (`refcnt == 0`), from
+    whichever bucket it is in, and moves it to the bucket of the new block.
+  - As before, a block is never cached in two buffers at once, and a buffer with `refcnt >
+    0` (held, waited for, or pinned by the log) is never recycled.
+
+  **What must not change.**
+
+  - The interface: [[bread]], [[bwrite]], [[brelse]], [[bpin]], [[bunpin]] and what they
+    mean. Nothing outside `kernel/bio.c` and `kernel/buf.h` changes.
+  - `bread` still returns the buffer locked, and [[bget]] still holds no spinlock when it
+    calls [[acquiresleep]] (sleeping with a spinlock held panics in [[sched]]).
+  - When every buffer is in use, the kernel still panics with `bget: no buffers`.
+  - **`usertests -q` must print `ALL TESTS PASSED` on 3 harts.**
+
+  **The test program**, `bcachetest`, runs four checks, each with three child processes at
+  once (one per hart), and compares every byte it reads with what was written:
+
+  ```text
+  $ bcachetest
+  bcachetest: private files: OK
+  bcachetest: one shared file: OK
+  bcachetest: small files: OK
+  bcachetest: allocating together: OK
+  bcachetest: ALL OK
+  ```
+
+  - **private files**: each child writes its own 40-block file and reads it back, 4 times.
+    40 blocks is more than the 30 buffers, so the cache recycles buffers all the time.
+  - **one shared file**: the three children read the same 40-block file at the same time,
+    8 times each.
+  - **small files**: each child creates, checks and deletes 20 two-block files, 4 times, so
+    the children allocate inodes and blocks at the same time.
+  - **allocating together**: each child appends one block per round to its own file, in its
+    own directory; before each round the parent waits for a clock tick and reads a big file,
+    then releases the three children at once, so all three allocate a block at about the
+    same moment. At the end each child checks every byte of its file. When a block is wrong,
+    the test prints which file and block it found there instead (the first eight bytes of
+    every block name its file and block).
+
+  The test passes on the original kernel too: it is a safety net, not a proof. It cannot see
+  lock contention at all, and a race that it does not happen to hit stays invisible (the
+  clinic shows how often it caught the race it was designed for). Contention is measured
+  separately, with an instrumented kernel (see "Measure").
+think:
+  - title: What does bcache.lock protect, and what could be split?
+    q: |
+      Before changing anything, list what [[bget]], [[brelse]], [[bpin]] and [[bunpin]] read
+      or write while they hold `bcache.lock`. Sort the list into facts about *one* buffer or
+      block, and facts about the cache as a whole. Then commit to an answer: when a hart asks
+      for block 46, which buffers must its lookup examine to be sure that block 46 is not
+      cached already, and which may it safely ignore?
+    hints:
+      - "Read [[bget]] and [[brelse]] ([[kernel/bio.c:57]]-[[kernel/bio.c:137]]) next to the table in [[tour:30]] that says which lock protects which field of [[g:buffer-cache|a buffer]]."
+      - "The cache's main promise is that a block is in at most one buffer. A lookup must see every buffer that *could* hold block 46, and nothing else. A buffer's label (`dev`, `blockno`) changes only when the buffer is recycled for another block."
+      - "Make the place where a buffer lives a function of its block number, so that block *n* can only ever be found in one group of buffers. Give each group its own list and its own lock. Then go through the operations and see which ones still need more than one group."
+    answer: |
+      `bcache.lock` protects four different things:
+
+      | data | about | changed by |
+      |---|---|---|
+      | the LRU list (`prev`, `next`, `head`) | the whole cache | [[brelse]] (moves to the front), [[binit]] |
+      | each buffer's label: `dev`, `blockno`, and `valid` when relabeling | one buffer | the recycling scan in [[bget]] |
+      | each buffer's `refcnt` | one buffer | [[bget]], [[brelse]], [[bpin]], [[bunpin]] |
+      | the answer to "is block *n* cached?" | one block, but potentially every buffer | nobody writes it; it is the scan |
+
+      The last line is why one lock covers all 30 buffers: in the original, a block can be in
+      any buffer, so a lookup must scan them all, and nothing may relabel a buffer during the
+      scan.
+
+      Fix where a block can live and the lookup shrinks. With a hash table
+      of 13 buckets and the rule "a buffer is always in bucket `blockno % 13`", a lookup of
+      block 46 needs only bucket 7, under bucket 7's lock: no other bucket can hold block
+      46. [[brelse]], [[bpin]] and [[bunpin]] touch one buffer's `refcnt`, so they need only
+      that buffer's bucket. Two things remain global: the LRU order (the next question) and
+      recycling, which takes a buffer out of one bucket and puts it into another (the
+      question after that).
+
+      Why 13, a prime? Consecutive block numbers spread evenly over any number of buckets.
+      A prime only protects against access patterns with a stride that shares a factor with
+      the bucket count (with 12 buckets, blocks 0, 4, 8, ... would use only 3 of them). The
+      measurements show a different limit: hashing spreads *blocks* evenly, not *accesses*;
+      see "Measure".
+    checks:
+      - id: lab19-01
+        level: 1
+        type: number
+        q: |
+          With 13 buckets and bucket = `blockno % 13`, which bucket holds the free-block
+          bitmap of this file system, block 46 (`sb.bmapstart`, see [[tour:30]])?
+        answer: 7
+        wrong:
+          3: |
+            You may have computed 46 / 13 = 3 (the quotient). The bucket is the remainder:
+            46 = 3 × 13 + 7.
+          6: |
+            You may have counted buckets from 1. `%` gives 0 to 12, and 46 - 39 = 7.
+        why_wrong: "Compute the remainder of 46 divided by 13: 46 = 3 × 13 + 7."
+        explain: |
+          46 % 13 = 7. In this file system the root directory's inode block (block 33) also
+          hashes to 7, and the root directory's first data block (47) and the inode block for
+          inodes 16 to 31 (34) both hash to 8. Which blocks share a bucket matters for
+          contention, as the measurements show.
+      - id: lab19-02
+        level: 2
+        type: multi
+        q: |
+          After the split, which operations need the lock of only one bucket?
+        options:
+          - text: "bget finding the block already cached (a hit)"
+            correct: true
+            why: "The block can only be in its own bucket, so the lookup and the `refcnt++` need only that bucket's lock."
+          - text: "brelse"
+            correct: true
+            why: "It changes one buffer's `refcnt` (and time stamp), which its bucket's lock protects."
+          - text: "bpin and bunpin"
+            correct: true
+            why: "Like brelse, they change one buffer's `refcnt`."
+          - text: "bget recycling a buffer for a block that is not cached (a miss)"
+            why: |
+              You may have thought a miss only touches the new block's bucket. The free
+              buffer it recycles can be in any bucket, and it has to be taken out of that
+              bucket's list and put into another one: at least two buckets.
+        explain: |
+          Everything that concerns one buffer stays inside one bucket. The only operation that
+          crosses buckets is recycling, which is also the rarest: in the measured `bcachetest`
+          run, about 6% of [[bread]] calls missed
+          (about 7,500 of 120,000).
+  - title: Without one list, what is "least recently used"?
+    q: |
+      The original keeps all buffers on one list ordered by their last release: [[brelse]]
+      moves a buffer to the front, a miss recycles from the back. Could each bucket keep its
+      own list, or could you keep one global list next to the buckets? What would every
+      [[brelse]] then have to lock? Design a way to find the least recently used free buffer
+      that puts nothing global on the release path. What clock will you use, and what does
+      reading it cost?
+    hints:
+      - "Look at which pointers [[brelse]] changes when it moves a buffer to the front ([[kernel/bio.c:128]]-[[kernel/bio.c:133]]), and count how often the order is written versus how often it is read."
+      - "The order is written on every release but read only on a miss, to choose a victim. Make the write cheap and local to one buffer, and let the rare reader do the work. Per-bucket lists only order buffers within a bucket, which says nothing about which bucket holds the oldest one."
+      - "Give each buffer a number saying when it was last released, written under the lock that already protects that buffer, and let the rare miss compare the numbers. For the clock, look at what the kernel already counts ([[kernel/trap.c:10]]), which lock protects it, and how often it changes ([[kernel/trap.c:170]]-[[kernel/trap.c:179]])."
+    answer: |
+      A global list ordered by use is a global lock in disguise: moving a buffer to the front
+      writes `head.next` and the neighbours' links, so every release on every hart would
+      take the list's lock. Per-bucket lists are cheap but only order the buffers within one
+      bucket.
+
+      So the reference turns the list into a number: `lastuse`, the clock value at which the
+      buffer's `refcnt` last dropped to 0, written in [[brelse]] under the bucket lock. A
+      miss scans all 30 buffers and takes the unused one with the smallest stamp. The write
+      is one store into the buffer itself; the cost moves to the miss, which scans 30
+      buffers anyway (the original's recycling scan did too).
+
+      The clock: `ticks`, incremented by [[clockintr]] on hart 0 about every 0.1 s
+      (1,000,000 cycles of the 10 MHz timer), under `tickslock`. Two consequences:
+
+      - It is coarse. Hundreds of buffers can be released within one tick and get the same
+        stamp. The scan breaks ties by position (the lowest bucket first, then the front of
+        that bucket's list), so within a tick the policy is not LRU at all. "Measure" shows
+        that the hit rate still matched the original's on our workloads, and Clinic 4 shows
+        what happens with no stamp at all.
+      - Reading it properly means taking `tickslock`, as [[sys_uptime]] and [[sys_pause]] do.
+        Commit 2 does exactly that. The last question revisits this choice with
+        measurements.
+
+      Alternatives: a global counter incremented on every release is exact, but it is a
+      shared variable written by every hart, the very thing this lab removes; the RISC-V
+      `time` register is fine-grained and needs no lock (see "Further").
+    checks:
+      - id: lab19-03
+        level: 2
+        type: choice
+        q: |
+          A miss finds exactly two unused buffers, A in bucket 9 and B in bucket 2. Both
+          were released during the same clock tick, 41: A first, B a few microseconds later.
+          Every other buffer is in use. Which one does the reference recycle?
+        options:
+          - text: "B, because the scan visits bucket 2 first and replaces its choice only for a strictly smaller stamp"
+            correct: true
+            why: |
+              Equal stamps are a tie. The scan goes from bucket 0 to 12 and keeps the first
+              buffer with the smallest stamp it sees, so B (bucket 2) wins although it was
+              released later.
+          - text: "A, because it was released first"
+            why: |
+              That would be true with an exact clock. Both stamps are 41: the clock cannot see
+              the difference, and the scan breaks the tie by position.
+          - text: "Either one, at random"
+            why: |
+              You may have thought ties are broken unpredictably. The scan order is fixed:
+              buckets 0 to 12, front of each list first, `<` not `<=`.
+          - text: "Neither: the miss panics with bget: no buffers"
+            why: |
+              That needs every buffer to have `refcnt > 0`. A and B are unused, so the miss
+              recycles one of them.
+        explain: |
+          `ticks` advances about 10 times a second ([[kernel/trap.c:179]]), so the stamp
+          orders buffers only across ticks. Within a tick, position decides. The
+          reference's LRU is an approximation; Clinic 4 and "Measure" show how much it
+          matters for hit rates.
+  - title: A miss moves a buffer between buckets. Which locks, in which order?
+    q: |
+      Block 1161 hashes to bucket 4 and is not cached. The only unused buffers are in buckets
+      1 and 3. To move one into bucket 4 you change two lists and the buffer's label while
+      lookups and releases run on the other harts.
+
+      Here is the design most people write first: keep bucket 4 locked from the failed lookup
+      until the insert (so no other hart can cache block 1161 meanwhile), and while holding
+      it, visit the other buckets in index order, locking each one in turn and keeping the
+      lock of the bucket with the best candidate so far.
+
+      At the same moment another hart misses on block 1056, which hashes to bucket 3, using
+      the same code. What can happen? Then: what rule makes holding two bucket locks safe?
+    hints:
+      - "A [[g:deadlock]] needs a cycle of \"holds A, waits for B\" ([[tour:18]], [[concept:locks#order]]). Write down, for each hart, which bucket locks it holds and which one it is spinning for."
+      - "Two locks of the same kind are safe if every path that holds two of them takes them in one global order. \"My own bucket first\" is not a global order: which bucket is \"mine\" depends on the block, and another hart's \"mine\" is one of my \"others\"."
+      - "Make every path that holds two bucket locks take them in one fixed order; ask what that means for the block's own bucket during the search. Then ask what must stay locked so that the free buffer you found is still free when you take it."
+    answer: |
+      The first design deadlocks. Hart 0 holds bucket 4 (its own) and bucket 1 (the best
+      candidate so far) and now wants bucket 3; hart 2 holds bucket 3 (its own) and wants
+      bucket 1. Each spins in [[acquire]] for a lock the other holds, with interrupts off,
+      forever. That is not a thought experiment: Clinic 1 ran this code and gdb found
+      exactly such a cycle within the first `bcachetest`.
+
+      The cure is a global order: bucket locks are taken only in increasing index order. A
+      miss therefore releases its own bucket before it searches. The search visits buckets 0
+      to 12 and holds at most two at a time: the bucket with the best candidate so far (a
+      lower index) and the bucket being examined (a higher index). When it finds a better
+      candidate it releases the old one's bucket. When the scan ends it still holds the lock
+      of the winner's bucket.
+
+      Why keep that lock at all? Because a hit on another hart could find the candidate,
+      raise its `refcnt` and start using it, if the bucket were unlocked between "this one
+      has `refcnt` 0" and "take it out". Holding the lock, the miss unlinks the buffer from
+      its bucket. Now no lookup can find it (it is on no list) and nobody holds it
+      (`refcnt` is 0), so it can be released and the destination bucket locked separately.
+      At no moment does a hart hold two bucket locks out of order.
+
+      Releasing the block's own bucket, though, opens a new hole. That is the next question.
+    checks:
+      - id: lab19-04
+        level: 2
+        type: choice
+        q: |
+          With the first design (own bucket held throughout, others locked in index order,
+          keeping the best candidate's bucket), which pair of misses can deadlock?
+        options:
+          - text: "A miss on a block in bucket 9 that holds bucket 2 as its best candidate and reaches bucket 4, and a miss on a block in bucket 4 that reaches bucket 2"
+            correct: true
+            why: |
+              The first holds 2 and spins on 4; the second holds 4 (its own) and spins on 2.
+              Each one's own bucket lies inside the other's scan, so the two harts take the
+              same pair of locks in opposite orders. This is the cycle gdb found in Clinic 1.
+          - text: "Two misses on blocks in the same bucket"
+            why: |
+              You may have thought sharing a bucket causes the deadlock. The second miss simply
+              spins on the shared bucket until the first is done; one lock cannot form a cycle.
+          - text: "A miss and a hit in another bucket"
+            why: |
+              A hit holds one bucket lock and waits for nothing else while holding it, so it
+              cannot be part of a cycle; at worst the miss waits for it briefly.
+          - text: "None: locking the other buckets in index order prevents deadlock"
+            why: |
+              Index order among the *other* buckets is not enough: each miss also holds its
+              own bucket, which it took first regardless of its index.
+        explain: |
+          A lock order must be global: every path that holds two bucket locks must take them
+          in the same order. "Mine, then the others in index order" is a different order for
+          every block. See [[concept:locks#order]] and Clinic 1.
+      - id: lab19-05
+        level: 2
+        type: tf
+        q: |
+          True or false: in the reference design, a hart may hold two bucket locks at the same
+          time.
+        answer: true
+        why_tf: |
+          You may have thought the fix for the deadlock is to never hold two. The search does
+          hold two: the best candidate's bucket and the one being examined.
+        reasons:
+          - text: "The search keeps the best candidate's bucket locked while it locks the next one, always a lower index before a higher one."
+            correct: true
+            why: |
+              Right. Two locks of one kind are safe when they are always taken in one order;
+              here, increasing index.
+          - text: "It holds the block's own bucket while it searches the others."
+            why: |
+              That is the first design, the one that deadlocks. The reference releases the
+              block's own bucket before it searches.
+          - text: "brelse locks the buffer's old bucket and its new bucket."
+            why: |
+              [[brelse]] locks one bucket. A buffer whose caller still holds it cannot change
+              buckets (question 5).
+        explain: |
+          The reference holds at most two bucket locks, always in increasing index order,
+          and only during the search. The measured lock-order graph shows the edge
+          `bcache.bucket` → `bcache.bucket` coming from that one line (see the reveal).
+  - title: Your bucket was unlocked while you searched. What did another hart do meanwhile?
+    q: |
+      In the design from the last question, the hart that missed on block 46 releases bucket
+      7, searches, and later locks bucket 7 again to insert. [[tour:30]] showed two children
+      asking for block 46 at almost the same moment. Trace two harts missing on block 46 with
+      this design. What can bucket 7 contain afterwards? Why does that matter (think about
+      [[balloc]] and about how the log identifies blocks)? Then: what extra step closes the
+      gap, and which lock must be held for that step to be enough?
+    hints:
+      - "In [[tour:30]], step \"Child B finds A's buffer\": why did child B find A's half-filled buffer, instead of making its own copy of block 46?"
+      - "\"Is block 46 cached?\" and \"insert block 46\" must be one atomic step with respect to every other hart that might insert block 46. Hits never insert. Only misses do."
+      - "Find, or create, a lock that every inserter holds while it checks and inserts, and make the check that matters happen while holding it."
+    answer: |
+      Both harts can miss: each looks in bucket 7 before either has inserted. Each recycles a
+      different buffer, labels it 46 and inserts it. Bucket 7 now holds **two** buffers for
+      block 46, and the cache's main promise is broken. Each hart reads the bitmap into its
+      own copy, and both may pick the same free bit, say block 1141, for their two files.
+      [[log_write]] records blocks by number, so the second change is absorbed into the first
+      entry and only one copy is pinned; at commit, [[write_log]] logs whichever copy
+      [[bread]] finds first. One allocation is lost on disk, two files now point at the same
+      data block, and each overwrites the other's data. Clinic 2 shows exactly this: a file
+      reading back another file's bytes, and on the next run a panic in the disk driver.
+
+      The original was immune because the lookup and the insert happened under one lock.
+      The reference restores that with a second lock, `bcache.evict`, taken by every miss
+      after its failed lookup:
+
+      1. look in the bucket (bucket lock only); on a hit, done;
+      2. release the bucket, take `evict`;
+      3. **look in the bucket again**; on a hit now, another miss cached the block meanwhile:
+         use that buffer;
+      4. search and move a victim (question 3), insert, release `evict`.
+
+      Step 3 is enough because only misses insert, and every miss holds `evict` while it
+      checks and inserts. Between our second look and our insert nobody else can add block
+      46.
+
+      `evict` has a second effect: only the hart holding it ever holds two bucket locks, so
+      even a bucket order mistake could not form a cycle between two misses. The design has
+      two independent guarantees against deadlock. The price is that misses run one at a
+      time; hits, releases and pins do not take `evict` at all. Lock order: `evict` before
+      any bucket lock.
+    checks:
+      - id: lab19-06
+        level: 3
+        type: state
+        q: |
+          Recorded with gdb on the reference branch: a `bcachetest` child (pid 5), on hart 2,
+          missed on block 46 inside `write`. It holds `bcache.evict`, holds bucket 0 (the best
+          candidate so far) and has just acquired bucket 1 in the search loop. Fill in the
+          hart's state at that moment.
+        code: kernel/bio.c:57-88
+        state:
+          mode: S
+          stack: kernel
+          satp: kernel
+          sie: "off"
+          noff: 3
+          intena: 1
+        why:
+          noff: |
+            Three spinlocks are held: `evict`, bucket 0 and bucket 1. Each [[acquire]] pushes
+            one level. gdb read `cpus[2].noff` = 3.
+          intena: |
+            The first of the three was taken in a system call, after [[usertrap]] turned
+            interrupts on ([[kernel/trap.c:66]]), so the outermost push_off saw SIE on.
+          sie: "Any held spinlock means interrupts are off on this hart."
+          stack: "A system call runs on the process's kernel stack: usertrap → syscall → sys_write → … → balloc → bread → bget."
+          satp: "The kernel always runs on the kernel page table."
+        why_wrong: "Count the spinlocks held at that line, and remember where the first one was taken."
+        explain: |
+          noff 3 was the deepest nesting in this kernel before (tour 51: [[kwait]] →
+          [[freeproc]] → [[kfree]]); the search loop now reaches it on every miss that
+          already has a candidate when it locks a later bucket (that is, a candidate before
+          bucket 12). The code excerpt is the original
+          [[bget]] for reference; the reveal shows the new loop.
+      - id: lab19-07
+        level: 3
+        type: choice
+        q: |
+          Why must the second look happen *after* acquiring `bcache.evict`, rather than just
+          before it?
+        options:
+          - text: "Only a hart holding evict can insert, so a look made while holding it stays true until the insert; a look made before could be stale by the time evict is acquired."
+            correct: true
+            why: |
+              Right. Between a look before `acquire(&bcache.evict)` and the moment the lock
+              is granted, another miss (holding `evict`) could insert the block.
+          - text: "Because acquire(&bcache.evict) disables interrupts, and the look must run with interrupts off."
+            why: |
+              The look already runs with interrupts off, under the bucket lock. Interrupts
+              only affect this hart; the danger is another hart.
+          - text: "It does not matter; one look anywhere after the first is enough."
+            why: |
+              A look is only useful if nothing can invalidate it before you act on it. That
+              needs the lock all inserters hold.
+          - text: "Because evict protects each buffer's refcnt."
+            why: |
+              `refcnt` is protected by the bucket lock. `evict` protects the right to insert
+              and to move buffers between buckets.
+        explain: |
+          A check is only as good as the lock held from the check to the action. Here the
+          action is "insert block *n*", and every inserter holds `bcache.evict`.
+  - title: brelse, bpin and bunpin get only a pointer. Which bucket, and can it change?
+    q: |
+      [[brelse]] is called with a buffer pointer `b`. To lock the right bucket it computes
+      `b->blockno % 13`, reading `blockno` *before* it holds any bucket lock. Is that safe?
+      What stops a miss on another hart from relabeling `b`, and so moving it to another
+      bucket, between that read and the `acquire`? Then look at the hit path from the other
+      side: why must `refcnt` be raised before the bucket lock is released, as the original
+      does under `bcache.lock` ([[kernel/bio.c:67]])?
+    hints:
+      - "Which buffers can a miss choose to recycle?"
+      - "The caller of [[brelse]] still holds its reference: `refcnt` is at least 1 until brelse's own decrement, which happens under the bucket lock. [[bpin]] is called by [[log_write]] on a buffer its caller holds; [[bunpin]] by [[install_trans]], which holds the buffer too."
+      - "Find the one field that decides whether a buffer may be relabeled. For each moment in [[brelse]] and in a hit, ask who could change that field, and under which lock."
+    answer: |
+      A miss only recycles a buffer whose `refcnt` is 0, and it checks that under the
+      buffer's bucket lock. While anyone holds a reference, the label (`dev`, `blockno`)
+      cannot change, so neither can the bucket. The caller of [[brelse]] holds a reference
+      until brelse's own decrement, so reading `b->blockno` before the acquire is safe, and
+      the bucket it computes is still right when the lock is granted. After the decrement the
+      buffer may be recycled at any moment, but brelse no longer touches it. The same holds
+      for [[bpin]] (the log's caller holds the buffer) and [[bunpin]] ([[install_trans]]
+      holds the buffer it unpins).
+
+      The hit path relies on the same fact from the other side. The `refcnt++` must happen
+      while the bucket lock is held, before [[acquiresleep]]. If it happened after the
+      release, a miss on another hart could, in that gap, see `refcnt == 0`, unlink the
+      buffer and relabel it for another block; the hit would then lock and use a buffer that
+      no longer holds its block. This is the rule [[tour:30]] explained for the original,
+      unchanged in meaning; Clinic 5 breaks it on purpose.
+
+      So `refcnt > 0` now carries two promises: "nobody will recycle this buffer" (as before)
+      and "this buffer stays in the bucket of its `blockno`" (new).
+    checks:
+      - id: lab19-08
+        level: 2
+        type: order
+        q: |
+          Put the steps of a hit in [[bget]] in the order the reference performs them.
+        items:
+          - text: "acquire the block's bucket lock"
+          - text: "find the buffer with this dev and blockno in the bucket's list"
+          - text: "raise the buffer's refcnt"
+            why: "The increment must come before the release: once the lock is gone, `refcnt` is the only thing that keeps a miss from recycling the buffer."
+          - text: "release the bucket lock"
+            why: "The lock must be released before acquiresleep, which may sleep; sleeping with a spinlock held panics in sched."
+          - text: "acquiresleep on the buffer's sleep-lock"
+        why_wrong: "Think about what must be true at each step: the list can only be searched under the bucket lock, refcnt protects the buffer once the lock is gone, and no spinlock may be held across a possible sleep."
+        explain: |
+          The same five steps as the original's hit ([[kernel/bio.c:62]]-[[kernel/bio.c:70]]),
+          with the bucket lock in place of `bcache.lock`.
+      - id: lab19-09
+        level: 2
+        type: tf
+        q: |
+          True or false: [[brelse]] may read `b->blockno` before taking any bucket lock, and
+          use it to choose which bucket lock to take.
+        answer: true
+        why_tf: |
+          You may have thought every read of a buffer field needs its lock. This one cannot
+          change while the caller holds the buffer.
+        reasons:
+          - text: "The caller still holds a reference (refcnt ≥ 1), and a miss recycles only buffers with refcnt 0, so the label and therefore the bucket cannot change."
+            correct: true
+            why: "Right. The decrement that ends the reference happens under the lock brelse is about to take."
+          - text: "blockno is an aligned 32-bit word, so reading it is atomic."
+            why: |
+              Atomicity gives you *a* value, not the *current* one. The argument has to be
+              that nobody can change it, and that comes from `refcnt`.
+          - text: "Interrupts are off in brelse, so no other hart can relabel the buffer."
+            why: |
+              Interrupts are a per-hart setting, and they are not even off at that point (no
+              spinlock is held yet). Other harts keep running.
+        explain: |
+          A non-zero `refcnt` freezes the label. That is what lets [[brelse]], [[bpin]] and
+          [[bunpin]] find the bucket without a lock.
+  - title: Did it help? Count the waiting, then look at the new hottest lock.
+    q: |
+      How would you show that the split reduced waiting, rather than only believing it? What
+      would you count, and where in the kernel? Suppose you measured after building
+      everything above and found that one lock that never mattered in the original kernel is
+      now the most contended lock on the buffer-cache path. Which lock is it likely to be, and
+      why? Do you really need it?
+    hints:
+      - "Every wait for a spinlock is a run of failed atomic swaps in [[acquire]] ([[kernel/spinlock.c:37]]). Counting them per lock, per hart, needs no lock of its own."
+      - "Any lock that every [[brelse]] on every hart takes is a global lock again, however short its critical section. Ask what would go wrong if the value it protects were read without it: can the value be torn, and does a slightly stale value break anything?"
+      - "Decide whether this read needs a lock at all: what is the worst a stale or concurrent value could do here, and what must you tell the compiler so that it reads the variable exactly once?"
+    answer: |
+      Count failed swaps. The measurement kernel (not on the branch) counts, for every
+      [[acquire]], how many times `amoswap` found the lock taken before it succeeded, per lock
+      and per hart, and prints the totals when you type Ctrl-P. "Contended acquisitions"
+      (those that spun at least once) is the robust number; the total number of spins is
+      dominated by a few long waits when the host deschedules a QEMU thread that holds a lock.
+
+      The surprise after commit 4 is `tickslock` (its name is `time`). Commit 2 made every
+      [[brelse]] take it to read `ticks`; with `bcache.lock` gone, it is the one lock every
+      release on every hart still shares. In three measured `bcachetest` runs it made a hart
+      wait 19, 19 and 0 times on the original kernel, but 145, 153 and 195 times after commit
+      4: about twice as often as all 13 bucket locks together (71, 63 and 78). After commit 5:
+      12, 8 and 11.
+
+      Is it needed? `ticks` is one aligned 32-bit word, written only by [[clockintr]] on hart
+      0. A 32-bit aligned load on RISC-V is single-copy atomic: it returns the old value or
+      the new one, never a mix. The value is used only to choose among buffers that nobody
+      uses; whether a buffer is in use is decided by `refcnt`, under the bucket lock. A stale
+      stamp can only make the LRU choice a little less exact. Commit 5 therefore reads it
+      with `__atomic_load_n(&ticks, __ATOMIC_RELAXED)`, one load that the compiler may not
+      split, repeat or move out of existence, and the contention disappears.
+
+      One honest caveat: the C standard calls an unsynchronized plain write (`ticks++`)
+      together with this atomic read a data race. In this build both compile to a single `sw`
+      and a single `lw`, and Clinic 3 shows that a plain read compiles to the same one
+      instruction; a fully standard program would make the increment atomic too.
+    checks:
+      - id: lab19-10
+        level: 2
+        type: choice
+        q: |
+          In the original kernel, `tickslock` was almost never contended. After commit 4 it
+          was contended between 145 and 195 times per `bcachetest` run (three runs). Why?
+        options:
+          - text: "Every brelse, on every hart, took tickslock to read ticks."
+            correct: true
+            why: |
+              Commit 2 added that, and it did not matter while `bcache.lock` serialized
+              everything anyway. After the split, it is the one lock all releases share.
+          - text: "The timer interrupt fires more often with a hashed cache."
+            why: |
+              The timer interval is fixed ([[kernel/trap.c:179]]). Only hart 0 increments
+              `ticks`, about 10 times a second.
+          - text: "clockintr holds tickslock while it scans the buffer cache."
+            why: |
+              [[clockintr]] only increments `ticks` and wakes sleepers under `tickslock`. It
+              never touches the cache.
+          - text: "The bucket locks are taken inside tickslock."
+            why: |
+              [[brelse]] takes `tickslock` and releases it before it takes the bucket lock;
+              the two are never nested.
+        explain: |
+          Removing one global lock often reveals the next one. The fix here is to ask whether
+          the read needs the lock at all.
+      - id: lab19-11
+        level: 3
+        type: multi
+        q: |
+          Which facts make the lock-free read of `ticks` in [[brelse]] safe in this kernel?
+        options:
+          - text: "ticks is an aligned 32-bit word, so a load returns either the old or the new value, never a mix."
+            correct: true
+            why: "RISC-V aligned word loads are single-copy atomic."
+          - text: "The value is only a hint for choosing among unused buffers; refcnt, under the bucket lock, decides what is in use."
+            correct: true
+            why: "A stale stamp changes which free buffer is recycled, never whether a busy one is."
+          - text: "ticks is declared volatile."
+            why: |
+              It is not: `uint ticks;` ([[kernel/trap.c:10]]). That is why the reference uses
+              an atomic load, which forces exactly one real load.
+          - text: "Interrupts are off on every hart while brelse runs."
+            why: |
+              Interrupts are a per-hart setting; hart 0's timer interrupt can increment
+              `ticks` at any moment while another hart runs [[brelse]].
+          - text: "Only one hart ever writes ticks."
+            correct: true
+            why: "Only hart 0 increments it ([[kernel/trap.c:169]]-[[kernel/trap.c:173]]), under tickslock, so writers never race each other; only the readers skip the lock."
+        explain: |
+          A lock-free read is acceptable when the value cannot be torn, a stale value is
+          harmless, and the writers are still serialized. All three hold for this stamp; none
+          of them would hold for `refcnt`.
+build: |
+  **Start.**
+
+  ```text
+  git checkout -b my-bcache 06aad25
+  ```
+
+  Write your test first (the spec's four checks in `user/bcachetest.c`, and
+  `$U/_bcachetest\` in `UPROGS` in the `Makefile`) and run it on the unmodified kernel: it
+  must print `ALL OK` there. A test that fails before you change anything tests your test.
+
+  **Milestones, in an order that keeps the system working after each one.** Run
+  `bcachetest`, `usertests -q` and `bcachetest` again after every milestone, on 3 harts.
+
+  1. **Time stamps instead of list order**, still under the one `bcache.lock`. Add a
+     `lastuse` field to `struct buf`; [[brelse]] stamps it when `refcnt` reaches 0 and no
+     longer moves the buffer; the recycling scan picks the unused buffer with the smallest
+     stamp. Nothing is concurrent yet that was not before.
+  2. **The hash table, still under one lock.** Replace the list with 13 bucket lists; a
+     buffer always sits in the bucket of its `blockno`, so all 30 start in bucket 0 (their
+     `blockno` is 0). Lookups search one bucket; a miss unlinks its victim from one bucket
+     and links it into another. Still one lock: this milestone tests the data structure
+     alone.
+  3. **A lock per bucket.** Hits, [[brelse]], [[bpin]] and [[bunpin]] take one bucket
+     lock; misses take the eviction lock, look again, and search in increasing bucket
+     order. This is where the bugs live; the clinic below shows the common ones.
+  4. **Measure** (see "Measure") and act on what you find.
+
+  **Debugging advice.** Run with 3 harts (`-smp 3`, the Makefile's default `CPUS`).
+
+  - **A hang with no output** is very likely a deadlock. Start QEMU with `make qemu-gdb`,
+    attach gdb on the port it prints and `continue`; when it hangs, interrupt gdb (Ctrl-C)
+    and type `info threads` and `thread apply all bt`. Two or three harts in [[acquire]] at `kernel/spinlock.c:37` is a spinlock deadlock.
+    Then print every bucket lock's `locked` and `cpu` (the `cpu` pointer minus `&cpus[0]`,
+    divided by `sizeof(struct cpu)`, is the hart) and draw the "holds / wants" graph.
+  - **Duplicates are silent** until two files share a block. While developing, add a
+    temporary check after the insert (with `evict` held, labels cannot change): scan all 30
+    buffers and `printk` if another one has the same `dev` and `blockno`. Remove it before
+    you commit.
+  - **`panic: bget: no buffers`** with plenty of activity usually means a lost `refcnt`
+    update: an increment or decrement done without the bucket lock.
+  - **Races are probabilistic.** One passing run proves little. Run `bcachetest` several
+    times, on several boots; to test a suspicion, widen the window with a short delay loop
+    in a scratch copy (Clinic 2 and 5 do that).
+clinic:
+  - bug: The miss keeps its own bucket locked while it searches the others
+    change: |
+      The first design from think question 3: no `evict` lock and no second look; the
+      block's own bucket `bk` stays locked from the failed lookup to the insert, and the
+      search skips it (it is already held):
+
+      ```diff
+         if ((b = bfind(bk, dev, blockno)) != 0) {
+           ...
+         }
+      -  release(&bk->lock);
+      -
+      -  // Not cached. Only one miss at a time may recycle a buffer.
+      -  acquire(&bcache.evict);
+      -  [... the second look, lines 110-122 ...]
+      +  // Not cached. Keep bk locked, so no other hart can cache the
+      +  // same block meanwhile.
+         ...
+         for (i = 0; i < NBUCKET; i++) {
+      -    acquire(&bcache.bucket[i].lock);
+      +    if (&bcache.bucket[i] != bk)
+      +      acquire(&bcache.bucket[i].lock);
+      ```
+
+      (and the matching releases skip `bk`; `bk` is released after the insert.)
+    symptom: |
+      $ bcachetest
+      [... nothing more: the console stays silent. After 120 s, gdb attached and ran
+       info threads, thread apply all bt, and a Python loop over the bucket locks ...]
+      [...]
+        Id   Target Id                    Frame 
+      * 1    Thread 1.1 (CPU#0 [running]) acquire (lk=lk@entry=0x8001d9f0 <bcache+33272>) at kernel/spinlock.c:37
+        2    Thread 1.2 (CPU#1 [running]) acquire (lk=lk@entry=0x8001d9b0 <bcache+33208>) at kernel/spinlock.c:37
+        3    Thread 1.3 (CPU#2 [running]) acquire (lk=lk@entry=0x8001d9b0 <bcache+33208>) at kernel/spinlock.c:37
+
+      Thread 3 (Thread 1.3 (CPU#2 [running])):
+      #0  acquire (lk=lk@entry=0x8001d9b0 <bcache+33208>) at kernel/spinlock.c:37
+      #1  0x0000000080002cd0 in bget (dev=1, blockno=1109) at kernel/bio.c:117
+      #2  bread (dev=1, blockno=blockno@entry=1109) at kernel/bio.c:160
+      [...]
+
+      Thread 2 (Thread 1.2 (CPU#1 [running])):
+      #0  acquire (lk=lk@entry=0x8001d9b0 <bcache+33208>) at kernel/spinlock.c:37
+      #1  0x0000000080002c06 in bget (dev=1, blockno=2) at kernel/bio.c:98
+      #2  bread (dev=1, blockno=2) at kernel/bio.c:160
+      #3  0x0000000080003ce8 in write_head () at kernel/log.c:107
+      #4  0x0000000080004008 in commit () at kernel/log.c:207
+      [...]
+
+      Thread 1 (Thread 1.1 (CPU#0 [running])):
+      #0  acquire (lk=lk@entry=0x8001d9f0 <bcache+33272>) at kernel/spinlock.c:37
+      #1  0x0000000080002cd0 in bget (dev=1, blockno=1153) at kernel/bio.c:117
+      #2  bread (dev=1, blockno=1153) at kernel/bio.c:160
+      [...]
+      bucket 2 lock: locked=1 held by hart 0
+      bucket 4 lock: locked=1 held by hart 2
+      bucket 9 lock: locked=1 held by hart 0
+      hart 0: proc bcachetest pid 4 noff 3 intena 1
+      hart 1: proc bcachetest pid 5 noff 1 intena 1
+      hart 2: proc bcachetest pid 6 noff 2 intena 1
+    why: |
+      It hung in the very first check of the first run, on two boots out of two. The
+      addresses decode with the layout from the reveal (buckets of 32 bytes from
+      `bcache+33144`): `bcache+33208` is bucket 2 and `bcache+33272` is bucket 4. Line 117
+      of this copy is the `acquire` inside the search loop; line 98 is the first `acquire`
+      of a lookup.
+
+      | hart | process | missed on | own bucket (held) | also holds | spinning for |
+      |---|---|---|---|---|---|
+      | 0 | pid 4, reading `bcp0` | block 1153 | 9 | 2 (best candidate) | 4 |
+      | 2 | pid 6, reading `bcp2` | block 1109 | 4 | | 2 |
+      | 1 | pid 5, committing the log | (block 2, a lookup) | | | 2 |
+
+      Hart 0 holds 2 and waits for 4; hart 2 holds 4 and waits for 2: a cycle of length two.
+      Hart 1 is not part of the cycle; it waits behind it for bucket 2 (block 2 is the log
+      header), and since it is in [[commit]], every other process's `end_op` would wait for
+      it in turn. `noff` confirms it: [[acquire]] pushes before it spins, so noff counts the
+      lock being waited for too: 2 held + 1 = 3 on hart 0, 1 + 1 = 2 on hart 2, 0 + 1 = 1 on
+      hart 1.
+
+      Why the whole machine is silent: a hart spinning in `acquire` has interrupts off, so
+      it takes no timer interrupt, never yields, and never runs anything else. All three
+      harts are spinning; the console, the shell and every process are stopped for good.
+      Nothing panics, because nothing in xv6 detects a deadlock (lab 21 adds a checker).
+
+      The cause is the order. Each hart's search visits buckets in index order, but each
+      also holds its own bucket from the start, whatever its index. Hart 2's own bucket (4)
+      is in the middle of hart 0's scan, and hart 0's best candidate (2) is in the middle of
+      hart 2's scan. Releasing the own bucket before the search, as the reference does,
+      leaves only ordered acquisitions; `evict` makes the cycle impossible a second way.
+  - bug: No second look after taking evict
+    change: |
+      The miss takes `bcache.evict` but goes straight to the search:
+
+      ```diff
+         // Not cached. Only one miss at a time may recycle a buffer.
+         acquire(&bcache.evict);
+
+      -  // Look again: while this hart held no lock, another hart may
+      -  // have missed on the same block and cached it. Only a miss adds
+      -  // a block to a bucket, so while evict is held, the answer stays
+      -  // true.
+      -  acquire(&bk->lock);
+      -  if ((b = bfind(bk, dev, blockno)) != 0) {
+      -    b->refcnt++;
+      -    release(&bk->lock);
+      -    release(&bcache.evict);
+      -    acquiresleep(&b->lock);
+      -    return b;
+      -  }
+      -  release(&bk->lock);
+      ```
+
+      We also built a copy with the window widened (a 20,000-iteration delay loop between
+      the failed lookup and `acquire(&bcache.evict)`), and one with a detector: after each
+      insert, with `evict` held, it scans all 30 buffers and prints `DUP` if another buffer
+      carries the same block number.
+    symptom: |
+      # without the delay: three boots, each meant to run bcachetest three times and
+      # usertests -q once; boots 1 and 2 passed everything, boot 3 went wrong:
+      [... boot 3, first run: bcachetest: ALL OK ...]
+      $ bcachetest
+      bcachetest: private files: OK
+      bcachetest: one shared file: OK
+      bcachetest: small files: OK
+      bcachetest: f: block 35 should be (1, 35) but is (0, 35)
+      bcachetest: allocating together: FAIL
+      bcachetest: SOME TESTS FAILED
+      $ bcachetest
+      panic: virtio_disk_intr status
+
+      # with the delay and the detector (another boot):
+      $ bcachetest
+      bcachetest: private files: OK
+      bcachetest: one shared file: OK
+      bcachetest: small files: OK
+      DUP block 46: buffers 19 and 5 (refcnt 1 valid 0)
+      DUP block 46: buffers 27 and 28 (refcnt 1 valid 0)
+      DUP block 46: buffers 27 and 11 (refcnt 1 valid 0)
+      DUP block 46: buffers 28 and 27 (refcnt 1 valid 0)
+      [... two children's error lines, interleaved character by character ...]
+      bcachetest: f: block 44 should be (1, 44) but is (0, 44)
+      bcachetest: allocating together: FAIL
+      bcachetest: SOME TESTS FAILED
+    why: |
+      Honest summary first: without the delay this bug is rare. On 3 boots, 7 runs of
+      `bcachetest` and 2 of `usertests -q` passed; only boot 3 went wrong, in its second run,
+      and it panicked in its third. In another set of runs, with a slightly different version
+      of the test and the computer busier with other work, 9 runs caught it twice. With the delay, the first run
+      on each of 2 boots failed. (Their second runs failed too, but only because the first
+      run's failing children had left their directories behind, so `mkdir` failed and nothing
+      was checked; the branch's `bcachetest` removes such leftovers at startup.) The detector shows
+      what happens: every duplicate was block 46, the free-block bitmap, and both copies
+      were fresh (`valid 0`, `refcnt 1`): two harts had missed on block 46, both found it
+      missing, and both inserted a buffer for it.
+
+      The chain from there to the symptom:
+
+      1. Children 0 and 1 each [[balloc]] from *their own copy* of the bitmap. Both find the
+         same first free bit, both set it, and both get the same block for their files.
+      2. [[log_write]] records blocks by number: the second bitmap change is absorbed into the
+         first entry, and only the first copy is pinned. At commit, [[write_log]] logs
+         whichever copy [[bread]] finds first in bucket 7. One of the two allocations never
+         reaches the disk.
+      3. Two files now point at one data block. Child 1 writes its block 35 into it, child 0
+         overwrites it with its own block 35. When child 1 reads its file back, the block's
+         first eight bytes say "file 0, block 35": `should be (1, 35) but is (0, 35)`.
+
+      The panic on the next run is reasoned, not traced. When blocks are shared, a block
+      that one file uses as its indirect block can be another file's data block; [[bmap]]
+      then reads "block numbers" that are really test data, the disk is asked for a block far
+      beyond its end, the device reports an error, and [[virtio_disk_intr]] panics on the
+      non-zero status.
+
+      Three lessons. A missing re-check after a lock is dropped and retaken is invisible in
+      most runs. The damage appears far from the cause: in user data, then in the disk
+      driver. And widening the window, plus a detector that checks the invariant directly,
+      turns a once-in-a-while failure into a near-certain one. One more lesson about tests:
+      a test that leaves state behind after failing can make every later run fail without
+      checking anything, which is a false claim of its own.
+  - bug: "Not a bug: reading the clock with a plain load and no lock"
+    change: |
+      In commit 5's [[brelse]], a plain read instead of the atomic one (and still no
+      `tickslock`), the way most people first write it:
+
+      ```diff
+      -  now = __atomic_load_n(&ticks, __ATOMIC_RELAXED);
+      +  now = ticks;
+      ```
+    symptom: |
+      $ bcachetest
+      bcachetest: private files: OK
+      bcachetest: one shared file: OK
+      bcachetest: small files: OK
+      bcachetest: allocating together: OK
+      bcachetest: ALL OK
+      $ usertests -q
+      usertests starting
+      [...]
+      ALL TESTS PASSED
+      $ bcachetest
+      [...]
+      bcachetest: ALL OK
+
+      # objdump -d of brelse in three builds (tabs expanded):
+      # commit 4, ticks read under tickslock:
+          80002e5c:   d8dfd0ef                jal     80000be8 <acquire>
+          80002e60:   00005997                auipc   s3,0x5
+          80002e64:   a309a983                lw      s3,-1488(s3) # 80007890 <ticks>
+          80002e68:   00013517                auipc   a0,0x13
+      [...]
+          80002e70:   e01fd0ef                jal     80000c70 <release>
+      # commit 5, the atomic load:
+          80002e54:   00005797                auipc   a5,0x5
+          80002e58:   a3c78793                addi    a5,a5,-1476 # 80007890 <ticks>
+          80002e5c:   0007a983                lw      s3,0(a5)
+      # this change, a plain load:
+          80002e54:   00005997                auipc   s3,0x5
+          80002e58:   a3c9a983                lw      s3,-1476(s3) # 80007890 <ticks>
+    why: |
+      This entry is not a bug report: nothing happened, and nothing was expected to. It is
+      here because "is this a bug?" deserves an honest answer rather than a reflex, and the
+      answer is "not in this kernel".
+
+      In this build all three versions load `ticks` with exactly one 32-bit `lw`; the only
+      difference is the lock around it (commit 4) and how the address is formed. On RISC-V
+      an aligned 32-bit load is single-copy atomic, so the value read is always one that
+      [[clockintr]] actually stored. And as think question 6 argues, any value of `ticks` is
+      an acceptable stamp.
+
+      What the plain read gives up is a *promise from the compiler*. `ticks` is not
+      `volatile`, and the C standard treats an unsynchronized plain read that races with a
+      write as undefined behaviour, so a compiler may assume nobody else changes the variable.
+      Here that has no visible consequence, because `now` is read once and used once. It
+      would matter in a loop (`while (ticks == t0)` may be compiled into a loop that never
+      reloads) or if the compiler chose to read the variable twice for two uses. The
+      `__atomic_load_n` costs nothing here (the same `lw`) and states the intent: one real
+      load, no lock, on purpose. That is why the reference uses it. Strictly, the C standard
+      still calls the pair a data race while `ticks++` stays a plain write (think question
+      6); the atomic load relies on GCC's documented `__atomic` semantics, not on the
+      standard alone.
+
+      The lock itself (commit 4) was correct but expensive: it made `tickslock` the most
+      contended lock on the cache path ("Measure").
+  - bug: brelse never updates the time stamp
+    change: |
+      The stamp is never written; every buffer keeps `lastuse` 0 forever:
+
+      ```diff
+         acquire(&bk->lock);
+         b->refcnt--;
+      -  if (b->refcnt == 0) {
+      -    // no one is waiting for it.
+      -    b->lastuse = now;
+      -  }
+         release(&bk->lock);
+      ```
+
+      (With `-Werror` that alone does not build, because `now` is then set but never used;
+      declaring it `uint now __attribute__((unused));` makes it build.)
+    symptom: |
+      # a measurement copy counts bread calls ("gets") and disk reads in bread;
+      # Ctrl-P prints and resets the counters. Boot 1 of 3:
+      $ bcachetest
+      bcachetest: private files: OK
+      bcachetest: one shared file: OK
+      bcachetest: small files: OK
+      bcachetest: allocating together: OK
+      bcachetest: ALL OK
+      [... Ctrl-P ...]
+      BC gets 120617 reads 12483
+      $ usertests -q
+      [...]
+      ALL TESTS PASSED
+      [... Ctrl-P ...]
+      BC gets 203860 reads 18497
+
+      # the same workload on the reference branch, boot 1 of 3:
+      BC gets 116211 reads 7489
+      BC gets 205427 reads 1097
+    why: |
+      Nothing fails: the cache still returns the right data, because correctness never
+      depended on the policy, only on `refcnt` and the bucket locks. What breaks is the cache's
+      first job, saving disk reads. With every stamp equal to 0, the search's tie-breaking
+      decides alone: the victim is always the *first* unused buffer in bucket order, starting
+      at bucket 0. Hot blocks that happen to hash to low buckets, like the log header (block
+      2, bucket 2), are thrown out again and again, while blocks in high buckets stay cached
+      long after anyone wants them. (That explanation is reasoned from the scan order; the
+      measurement counted only totals.)
+
+      Over three boots of each kernel (both passing `bcachetest` and `usertests -q` every
+      time):
+
+      | disk reads | boot + `bcachetest` | `usertests -q` |
+      |---|---|---|
+      | reference branch | 7,489, 7,563, 7,606 | 1,097, 1,115, 1,075 |
+      | this bug | 12,483, 13,050, 12,202 | 18,497, 18,419, 15,418 |
+
+      About 65% more disk reads in `bcachetest` and about 16 times as many in `usertests
+      -q`, for about the same number of [[bread]] calls (116,000 to 122,000 and 201,000 to
+      209,000 per run in both kernels). On QEMU with a RAM-backed disk that costs little time;
+      on a real disk every extra read is a wait of milliseconds.
+
+      A policy bug is invisible to a correctness test. Only a measurement catches it, which
+      is one reason "Measure" counts disk reads as well as lock waits.
+  - bug: refcnt is raised after the bucket lock is released
+    change: |
+      In the hit path, the increment moves one line down, outside the critical section:
+
+      ```diff
+         acquire(&bk->lock);
+         if ((b = bfind(bk, dev, blockno)) != 0) {
+      -    b->refcnt++;
+           release(&bk->lock);
+      +    b->refcnt++;
+           acquiresleep(&b->lock);
+           return b;
+         }
+      ```
+
+      We also built a copy with a 20,000-iteration delay loop between the `release` and the
+      `refcnt++`, and as a control, the reference with the same delay placed *after* a
+      correct `refcnt++` and `release`.
+    symptom: |
+      # as written: 2 boots, each bcachetest twice and usertests -q once: all passed.
+
+      # with the delay (boot 1):
+      $ bcachetest
+      [...]
+      bcachetest: ALL OK
+      $ bcachetest
+      panic: virtio_disk_intr status
+
+      # with the delay (another boot, in a copy with extra checks):
+      $ bcachetest
+      bcachetest: bcp1: block 37 should be (101, 37) but is (1, 37)
+      bcachetest: private files: FAIL
+      bcachetest: one shared file: OK
+      bcachetest: small files: OK
+      bcachetest: allocating together: FAIL
+      bcachetest: SOME TESTS FAILED
+
+      # the control (delay after a correct increment): 2 boots, bcachetest twice each:
+      bcachetest: ALL OK
+
+      # a third copy: the same delay, plus a check right after the
+      # hit's acquiresleep that the buffer still holds the block it looked up:
+      [... earlier runs: ALL OK ...]
+      $ bcachetest
+      bcachetest: private files: OK
+      bcachetest: one shared file: OK
+      bcachetest: small files: OK
+      FC WRONG: hit on 1145 returns buffer labeled 1240
+      panic: virtio_disk_intr status
+    why: |
+      As written, the window is a few instructions wide and we never saw it fail. With the
+      delay, 7 of 7 boots in our runs went wrong (2 of the plain copy, 5 of copies with extra
+      checks): lost file data, `panic: freeing free block`, `panic: log_write outside of
+      trans`, or the disk driver's panic. The control rules out the delay itself: with the
+      increment in the right place, the same delay changed nothing. How often the delay copy
+      fails depends on what else the computer is doing: the third copy failed visibly on 1
+      boot of 3.
+
+      Why the order matters: between the `release` and the `refcnt++`, the buffer looks
+      unused to everyone else.
+
+      - A miss on another hart may pick it as its victim in that gap, relabel it for another
+        block and start reading that block into it. The hit then raises `refcnt` on a buffer
+        that is no longer the block it looked up.
+      - Even when no miss intervenes, `refcnt++` is now a load, an add and a store done without
+        the lock that every other update of `refcnt` holds. A concurrent [[brelse]],
+        [[bpin]] or relabel on another hart can be lost in between, leaving the count one too
+        low or too high. Too low, and a buffer that someone still holds, or that the log still
+        has pinned, can be recycled; too high, and it can never be recycled again.
+
+      The first path was observed. The third copy checked the label right after the
+      hit's [[acquiresleep]] and printed `FC WRONG: hit on 1145 returns buffer labeled 1240`,
+      followed by `panic: virtio_disk_intr status`: a miss had recycled the buffer in the
+      gap, and the hit went on with a buffer holding block 1240 as if it were block 1145. On
+      another boot it printed `FC WRONG: hit on 47 returns buffer labeled 1080` in a run that
+      still ended `ALL OK`: wrong data that no check happened to read. Whether the lost-update
+      path also occurred was not observed. (The other copies had similar checks in [[bread]],
+      but which checks ran on each of their logged boots was not recorded reliably, so their
+      silence is not relied on.)
+
+      The rule from [[tour:30]] stands: whatever makes a buffer "wanted" must be recorded
+      under the same lock that the recycler checks, before that lock is released.
+reveal:
+  - title: A test that makes three harts miss on one block
+    commit: 1
+    file: user/bcachetest.c
+    lines: 165-218
+    focus: 186-211
+    diff: true
+    state:
+      hart: any
+      mode: U
+      proc: bcachetest (pid 3) and three children
+      intr: "on"
+      satp: user
+      locks: []
+      stack: [main, together]
+      sp: {"on": user}
+    note: |
+      The story of this tour: `bcachetest 1` (pid 3) recorded on the finished branch with gdb
+      attached, in its first check, where its children pids 4, 5 and 6 create and fill the
+      files `bcp0`, `bcp1` and `bcp2`. Most states below come from that run; where a step's
+      state is reasoned from the code instead, it says so.
+
+      Commit 1 is the test alone, and it passes on the original kernel. Three of its four
+      checks are plain stress: big private files, one shared file, many small files, every
+      byte compared. The fourth, shown here, is aimed at the one race this lab can create:
+      two harts missing on the *same* block at the same moment.
+
+      That is harder to provoke than it sounds. Most blocks are only ever read under one
+      inode's sleep-lock, which serializes the readers before they reach the cache: three
+      readers of one file never miss on its blocks together. The free-block bitmap is
+      different. Every process that grows a file calls [[balloc]], which reads the bitmap
+      while holding only *its own* file's inode lock. So: three children, each appending to
+      its own file in its own directory (its working directory, so that path lookups do not
+      share a directory lock either). Before each round the parent waits for a clock tick and
+      reads a 40-block file, which pushes the bitmap out of the 30-buffer cache; then it
+      writes one byte into each child's pipe, and all three allocate a block at once. In the
+      end each child reads its file back and compares every byte; the first eight bytes of
+      each block name the file and block it belongs to.
+
+      Clinic 2 shows how often this catches the race when the code has it: sometimes. A
+      test that passes is evidence, not proof.
+  - title: A time stamp in every buffer
+    commit: 2
+    file: kernel/buf.h
+    lines: 1-12
+    focus: 7-10
+    diff: true
+    state:
+      hart: any
+      proc: "(a definition)"
+      locks: []
+    note: |
+      The LRU list says "how recently was this buffer used" by its *position*, and keeping
+      positions up to date means touching the global list on every release. Commit 2 says it
+      with a number instead: `lastuse`, the value of `ticks` when the buffer's `refcnt` last
+      dropped to 0.
+
+      This commit still has one lock and one list; it changes only the policy's
+      representation, so that the next commits can break the list apart. The `prev`/`next`
+      links stay for now (commit 3 replaces them with one `next` per bucket).
+  - title: brelse stamps the buffer instead of moving it
+    commit: 2
+    file: kernel/bio.c
+    lines: 117-140
+    focus: 134-138
+    diff: true
+    state:
+      hart: 1
+      mode: S
+      proc: bcachetest (pid 4)
+      intr: "off"
+      satp: kernel
+      locks: ["the directory's ip->lock (sleep-lock)", bcache.lock]
+      irq: {noff: 1, intena: 1}
+      stack: [usertrap, syscall, sys_open, create, dirlookup, readi, brelse]
+      sp: {"on": kernel, detail: "pid 4's kernel stack"}
+    note: |
+      The six lines that moved the buffer to the front of the list are gone; when `refcnt`
+      reaches 0, [[brelse]] stores the time instead. (State reasoned from the code: this
+      commit was not traced, but the recorded run at commit 5 passes through this same
+      `brelse` from the same call, a [[dirlookup]] inside [[create]].)
+
+      Two locks are taken one after the other, never nested: `tickslock` for three lines to
+      read `ticks` ([[kernel/trap.c:10]]), as [[sys_uptime]] does, then `bcache.lock` for the
+      decrement. Reading the clock *before* `bcache.lock` keeps the two locks from ever being
+      held together, so this adds no spinlock-to-spinlock edge. (The caller's sleep-locks, an
+      inode's or a buffer's, are held during `brelse`, so it does add sleep-lock →
+      `tickslock` edges, which cannot form a cycle: nothing holding `tickslock` ever waits
+      for a sleep-lock.)
+
+      The stamp is written only when `refcnt` reaches 0, the moment the buffer becomes a
+      candidate for recycling. A buffer released while the log still pins it keeps its old
+      stamp until the last release after the commit ([[install_trans]] unpins, then
+      [[brelse]] brings it to 0).
+    others: |
+      Every other hart's [[brelse]] takes the same two locks. With `bcache.lock` still
+      global, the extra `tickslock` round trip changes nothing measurable yet. It will after
+      commit 4, when `tickslock` is the only lock left that every release shares.
+  - title: A miss picks the oldest stamp
+    commit: 2
+    file: kernel/bio.c
+    lines: 54-91
+    focus: 74-87
+    diff: true
+    state:
+      hart: 2
+      mode: S
+      proc: bcachetest (pid 5)
+      intr: "off"
+      satp: kernel
+      locks: ["bcp1's ip->lock (sleep-lock)", bcache.lock]
+      irq: {noff: 1, intena: 1}
+      stack: [usertrap, syscall, sys_write, filewrite, writei, bmap, balloc, bread, bget]
+      sp: {"on": kernel}
+    note: |
+      The recycling scan now visits all 30 buffers and keeps the unused one with the
+      smallest stamp, instead of walking backwards from the list's tail and taking the first
+      unused buffer. Same idea, different bookkeeping: the work moves from every release to
+      the rare miss. (State reasoned from the code: a miss in [[balloc]] on the bitmap, as in
+      the traced run later.)
+
+      Two details that matter later:
+
+      - The comparison is `<`, so among equal stamps the first one in scan order wins. With
+        a clock that ticks 10 times a second, ties are common.
+      - Everything still happens under `bcache.lock`: the lookup, the scan and the
+        relabeling are one critical section, which is what keeps a block from being cached
+        twice. The next two commits will break that critical section apart and have to
+        rebuild the guarantee.
+  - title: Thirteen buckets
+    commit: 3
+    file: kernel/bio.c
+    lines: 24-51
+    focus: 45-50
+    diff: true
+    state:
+      hart: 0
+      mode: S
+      proc: none (boot)
+      intr: "off"
+      satp: kernel
+      locks: []
+      irq: 0
+      stack: [main, binit]
+      sp: {"on": boot, detail: "hart 0's slice of `stack0`"}
+    note: |
+      The list becomes a hash table. Bucket `i` holds every buffer whose `blockno % 13` is
+      `i`, linked through `next` (`struct buf` loses `prev` in this commit). That rule is
+      the invariant everything else leans on: **a buffer is always in the bucket of its
+      current `blockno`.**
+
+      [[binit]] puts all 30 buffers into bucket 0, which is right because their `blockno`
+      starts at 0 (`bcache` is a global, zeroed at boot). Over time, recycling moves them
+      where their blocks hash.
+
+      gdb stopped in this loop at boot (in the commit 5 build, whose loop is the same): hart
+      0, no process yet, `noff` 0, on the boot stack, with paging already on. [[main]] calls
+      [[binit]] before the other harts are released, so no lock is needed here.
+
+      Still one lock, `bcache.lock`: this commit changes only the data structure, so a bug
+      here is a list bug, not a race.
+  - title: A miss moves a buffer between buckets
+    commit: 3
+    file: kernel/bio.c
+    lines: 81-128
+    focus: 101-124
+    diff: true
+    state:
+      hart: 2
+      mode: S
+      proc: bcachetest (pid 5)
+      intr: "off"
+      satp: kernel
+      locks: ["bcp1's ip->lock (sleep-lock)", bcache.lock]
+      irq: {noff: 1, intena: 1}
+      stack: [usertrap, syscall, sys_write, filewrite, writei, bmap, balloc, bread, bget]
+      sp: {"on": kernel}
+    note: |
+      A lookup now searches one bucket (line 94 calls `bfind` on bucket
+      `blockno % 13`). A miss still scans every bucket for the oldest unused buffer, then
+      `bunlink`s it from its bucket and pushes it onto the front of the new block's bucket.
+      (State reasoned from the code.)
+
+      Under one lock all of this is atomic, so nothing new can go wrong yet. Read the miss
+      as a list of things that *will* need protection once there are 13 locks:
+
+      1. the failed lookup in bucket `bk`;
+      2. the scan, which reads every bucket's buffers;
+      3. the unlink from the victim's bucket;
+      4. the relabel and the insert into `bk`.
+
+      Steps 1 and 4 involve one bucket, steps 2 and 3 others. That is the whole problem of
+      commit 4.
+  - title: A lock in every bucket, and a lock for misses
+    commit: 4
+    file: kernel/bio.c
+    lines: 25-57
+    focus: 27-49
+    diff: true
+    state:
+      hart: any
+      proc: "(the definitions and their comments)"
+      locks: []
+    note: |
+      Each bucket gets a spinlock, named `bcache.bucket`; `bcache.lock` becomes
+      `bcache.evict`, now held only by misses. The comments state the two rules the rest of
+      the commit follows:
+
+      - A bucket's lock protects its list and the `dev`, `blockno`, `refcnt` and `lastuse` of
+        every buffer on it.
+      - Lock order: `evict` first, then bucket locks in increasing index order.
+
+      In this build `bcache` is at `0x800157f8`: `evict` (24 bytes), the 30 buffers (1,104
+      bytes each, one less pointer than before), then the 13 buckets of 32 bytes from
+      `0x8001d970`. The bucket locks are 32 bytes apart, so several share a 64-byte cache
+      line (see "Further").
+  - title: A hit takes one bucket lock
+    commit: 4
+    file: kernel/bio.c
+    lines: 87-105
+    focus: 99-101
+    diff: true
+    state:
+      hart: 1
+      mode: S
+      proc: bcachetest (pid 4)
+      intr: "off"
+      satp: kernel
+      locks: ["the root directory's ip->lock (sleep-lock)", "bucket 8's lock"]
+      irq: {noff: 1, intena: 1}
+      stack: [usertrap, syscall, sys_open, create, dirlookup, readi, bread, bget]
+      sp: {"on": kernel, detail: "pid 4's kernel stack, `sp` = `0x3fffff7d70`"}
+    note: |
+      Recorded with gdb (in the commit 5 build; `bget` is unchanged since this commit): pid
+      4, creating its file, looks up a name in the root directory. [[dirlookup]] reads block
+      47, the root directory's first data block, which hashes to bucket 8. Buffer 14 holds
+      it with `refcnt` 0: a hit. The hart holds bucket 8's lock and nothing else: noff 1,
+      intena 1 (taken in a system call after [[usertrap]]'s `intr_on`).
+
+      Same five steps as the original hit, with the bucket lock in place of
+      `bcache.lock`: lock, find, `refcnt++`, unlock, [[acquiresleep]]. The order of the
+      middle two is the rule from [[tour:30]]: once the lock is released, only the raised
+      `refcnt` keeps a miss on another hart from recycling this buffer.
+
+      Note the comment on line 97: "Only its own bucket can hold it." That sentence is the
+      reason a hit needs no other lock.
+    others: |
+      While hart 1 holds bucket 8, the other harts can hit, release and pin buffers in the
+      other twelve buckets without waiting. A hart that wants bucket 8 waits: in the
+      measured runs bucket 8 was the busiest by far, because blocks 47 (root directory) and
+      34 (the inode block holding the test's files) both hash there.
+  - title: "A miss: let go, take evict, look again"
+    commit: 4
+    file: kernel/bio.c
+    lines: 97-123
+    focus: 115-116
+    state:
+      hart: 2
+      mode: S
+      proc: bcachetest (pid 5)
+      intr: "off"
+      satp: kernel
+      locks: ["bcp1's ip->lock (sleep-lock)", bcache.evict, "bucket 7's lock"]
+      irq: {noff: 2, intena: 1}
+      stack: [usertrap, syscall, sys_write, filewrite, writei, bmap, balloc, bread, bget]
+      sp: {"on": kernel, detail: "pid 5's kernel stack, `sp` = `0x3fffff5dd0`"}
+    note: |
+      pid 5 appends to its file; [[balloc]] reads block 46, the bitmap, which hashes to
+      bucket 7, and the lookup misses. Line 105 releases bucket 7 **before** anything else:
+      the miss is about to lock other buckets, and holding bucket 7 meanwhile is exactly
+      the out-of-order hold that deadlocked in Clinic 1.
+
+      Then `evict` (line 108), and the second look (lines 114-121). While pid 5 held no lock,
+      another hart could have missed on block 46 too and inserted it; if so, this look finds
+      it and uses it like a hit. Only a hart holding `evict` can insert, so the answer of
+      this look stays true until pid 5 releases `evict`. (The state shown, at line 115, is
+      reasoned from the code: `evict` and bucket 7, noff 2. In our traced runs the second
+      look never found the block; gdb recorded the same depth a few lines later, at the
+      start of the search, with bucket 0 held instead of bucket 7.)
+    others: |
+      The race the second look closes (an illustration, not a recorded run):
+
+      | time | hart 2: pid 5, block 46 | hart 0: pid 6, block 46 |
+      |---|---|---|
+      | 1 | lookup in bucket 7: miss, release | lookup in bucket 7: miss, release |
+      | 2 | takes `evict` | spins on `evict` |
+      | 3 | looks again: still missing; searches, inserts 46, releases `evict` | |
+      | 4 | | takes `evict`, looks again: **found**, `refcnt++`, uses it |
+
+      Without the second look, hart 0 would insert a second buffer for block 46 at time 4
+      (Clinic 2).
+  - title: The search holds at most two buckets, in order
+    commit: 4
+    file: kernel/bio.c
+    lines: 123-149
+    focus: 132-138
+    state:
+      hart: 2
+      mode: S
+      proc: bcachetest (pid 5)
+      intr: "off"
+      satp: kernel
+      locks: ["bcp1's ip->lock (sleep-lock)", bcache.evict, "bucket 0's lock", "bucket 1's lock"]
+      irq: {noff: 3, intena: 1}
+      stack: [usertrap, syscall, sys_write, filewrite, writei, bmap, balloc, bread, bget]
+      sp: {"on": kernel}
+    note: |
+      gdb stopped pid 5 at line 132 with `i` = 1 and `vi` = 0: bucket 0 held because it
+      contains the best candidate so far (buffer 17, holding block 1014, stamp 2), bucket 1
+      just acquired. `cpus[2].noff` = 3, intena 1, SIE 0. That ties the deepest nesting this
+      kernel had before (3, in [[kwait]]; [[tour:51]]), and now it happens on most misses.
+
+      The loop's discipline:
+
+      - buckets are visited in increasing order, so a hart holding bucket `vi` only ever
+        waits for a bucket with a higher index;
+      - at most two bucket locks are held: `vi` and `i`;
+      - a better candidate in bucket `i` makes `i` the new `vi` and releases the old one;
+        otherwise `i` is released at once.
+
+      Holding `vi` is not optional. Without it, a hit on another hart could take the
+      candidate between "its `refcnt` is 0" and the unlink below.
+    others: |
+      What the other harts can do meanwhile: hit, release or pin in any bucket pid 5 does not
+      hold right now (all but two). A second miss spins on `evict` with interrupts off; the
+      measurement shows that such waits are rare (about 30 per run) but each lasts a whole
+      search (see "Measure").
+  - title: Unlink, relabel, insert
+    commit: 4
+    file: kernel/bio.c
+    lines: 145-167
+    focus: 156-162
+    state:
+      hart: 2
+      mode: S
+      proc: bcachetest (pid 5)
+      intr: "off"
+      satp: kernel
+      locks: ["bcp1's ip->lock (sleep-lock)", bcache.evict, "bucket 7's lock"]
+      irq: {noff: 2, intena: 1}
+      stack: [usertrap, syscall, sys_write, filewrite, writei, bmap, balloc, bread, bget]
+      sp: {"on": kernel}
+    note: |
+      The search ended with `vi` = 7: the oldest unused buffer was buffer 13, holding block
+      189 with stamp 1, which happens to live in bucket 7, the destination too (189 % 13 =
+      7). gdb recorded the unlink with `evict` and bucket 7 held (noff 2), then the insert at
+      line 157 with `evict` and bucket 7 again, then line 164 with only `evict` (noff 1) and
+      buffer 13 relabeled: block 46, `refcnt` 1.
+
+      Between line 153 and line 156 the buffer is on no list, and the hart holds no bucket
+      lock at all. That is safe: no lookup can find a buffer that is on no list, nobody
+      holds it (its `refcnt` was 0), and no other miss can run (this hart holds `evict`).
+
+      Line 164 releases `evict` before [[acquiresleep]], for the same reason as
+      `bcache.lock` in the original: acquiresleep may sleep, and [[sched]] panics if a
+      process sleeps holding a spinlock. The raised `refcnt` keeps the buffer safe in the
+      gap.
+  - title: brelse finds the bucket from blockno
+    commit: 4
+    file: kernel/bio.c
+    lines: 193-220
+    focus: 214-219
+    diff: true
+    state:
+      hart: 1
+      mode: S
+      proc: bcachetest (pid 4)
+      intr: "off"
+      satp: kernel
+      locks: ["the root directory's ip->lock (sleep-lock)", "bucket 8's lock"]
+      irq: {noff: 1, intena: 1}
+      stack: [usertrap, syscall, sys_open, create, dirlookup, readi, brelse]
+      sp: {"on": kernel, detail: "`sp` = `0x3fffff7db0`"}
+    note: |
+      [[brelse]] reads `b->blockno` before it holds any bucket lock and uses it to pick the
+      lock. The comment says why that is safe: the caller still holds the buffer (`refcnt` ≥
+      1), and a miss only recycles buffers with `refcnt` 0, so `blockno` and therefore the
+      bucket cannot change before the decrement on line 214.
+
+      Recorded: pid 4 releasing block 47 after the hit two steps back, bucket 8 held, noff
+      1, intena 1 (in the commit 5 build, whose lines here are the same except for the clock
+      read just above).
+
+      In this commit the clock is still read under `tickslock` (lines 206-208). That is what
+      the measurement after this commit caught.
+  - title: bpin under log.lock, and bunpin
+    commit: 4
+    file: kernel/bio.c
+    lines: 220-241
+    focus: 229
+    state:
+      hart: 2
+      mode: S
+      proc: bcachetest (pid 4)
+      intr: "off"
+      satp: kernel
+      locks: ["the root directory's ip->lock (sleep-lock)", "inode block 34's b->lock (sleep-lock)", log.lock, "bucket 8's lock"]
+      irq: {noff: 2, intena: 1}
+      stack: [usertrap, syscall, sys_open, create, ialloc, log_write, bpin]
+      sp: {"on": kernel}
+    note: |
+      [[log_write]] pins a block the first time it joins a transaction, holding `log.lock`.
+      gdb recorded pid 4 (now on hart 2: it had given up the CPU in between and resumed on
+      another hart) pinning block 34, the inode
+      block for its new file, from [[ialloc]]: `log.lock` and bucket 8 held, noff 2, intena 1.
+      The old edge `log.lock` → `bcache.lock` ([[tour:51]], edge 13) becomes `log.lock` →
+      `bcache.bucket`.
+
+      Like [[brelse]], `bpin` computes the bucket from `blockno` without a lock, safe because
+      [[log_write]]'s caller holds the buffer. [[bunpin]] is called by [[install_trans]],
+      which holds the buffer it unpins (it just read it with [[bread]]); gdb recorded pid 6
+      unpinning block 34 there, bucket 8 held, noff 1.
+
+      Is the new edge safe? Nothing holding a bucket lock ever takes `log.lock` (or anything
+      but another bucket, during the search). A bucket lock is a leaf apart from that one
+      ordered bucket-to-bucket step.
+  - title: The clock, read without a lock
+    commit: 5
+    file: kernel/bio.c
+    lines: 193-222
+    focus: 206-210
+    diff: true
+    state:
+      hart: 1
+      mode: S
+      proc: bcachetest (pid 4)
+      intr: "on"
+      satp: kernel
+      locks: ["the root directory's ip->lock (sleep-lock)"]
+      irq: 0
+      stack: [usertrap, syscall, sys_open, create, dirlookup, readi, brelse]
+      sp: {"on": kernel}
+    note: |
+      Commit 5 is one line. After commit 4, `tickslock` was the most contended lock on the
+      cache path, because every [[brelse]] on every hart took it. The stamp only chooses
+      among unused buffers, so a value one tick stale is harmless, and `ticks` is an aligned
+      32-bit word written only by hart 0: a relaxed atomic load is enough. In this build it
+      is `lw s3,0(a5)` at `0x80002e5c`; the increment it races with in [[clockintr]] is
+      `lw`/`addiw`/`sw` at `0x8000253a`-`0x8000253e`, under `tickslock`.
+
+      State at these lines (reasoned): [[releasesleep]] has just dropped its `lk->lk`, no
+      spinlock is held, so noff is 0 and interrupts are back on, as they always are in a
+      system call outside a critical section. The directory's sleep-lock does not count.
+      An interrupt here is harmless: nothing is held.
+    others: |
+      Hart 0's timer interrupt may increment `ticks` at the same moment. The load returns the
+      value before or after, never a mix; either is a fine stamp.
+  - title: The lock graph after the split
+    commit: 5
+    file: kernel/bio.c
+    lines: 25-40
+    focus: 27-40
+    state:
+      hart: any
+      proc: "(the definitions)"
+      locks: []
+    note: |
+      What the lock-order recorder from [[tour:51]] measured on this branch (boot,
+      `bcachetest`, `usertests -q`, on 3 harts), compared with the same workload on the
+      original kernel:
+
+      | edge (A held while B acquired) | original | branch |
+      |---|---|---|
+      | `log.lock` → `bcache.lock` / a bucket ([[bpin]]) | 7,797 | 8,741 |
+      | inode sleep-lock → `bcache.lock` / a bucket | 728,225 | 809,134 |
+      | buffer sleep-lock → `bcache.lock` / a bucket | 61,446 | 82,023 |
+      | `bcache.evict` → a bucket (`bget`, lines 114, 131 and 156) | | 121,905 |
+      | a bucket → a higher bucket (line 131 only) | | 81,822 |
+      | inode / buffer sleep-lock → `bcache.evict` | | 6,259 / 932 |
+
+      (All bucket locks share one name, so the recorder sees "bucket → bucket"; the code
+      guarantees the second index is higher.) The recorder found 41 distinct edges, against
+      37 on the original kernel: the four new ones are the last three rows.
+
+      Every new edge points from `evict` into a bucket, from a bucket into a higher bucket,
+      or from something that already preceded `bcache.lock` into a bucket or into `evict`.
+      No bucket lock is
+      ever held while anything other than a higher bucket is acquired, so no cycle can pass
+      through them.
+
+      The deepest spinlock nesting is still 3, but there is a new path to it: `evict` → bucket
+      → bucket, 81,822 times in the run, every one of them in the search loop.
+verify: |
+  On the branch (`ext/19-bcache-hash`, 5 commits), built with the project toolchain and run
+  on 3 harts (`-smp 3 -m 128M`), one boot:
+
+  ```text
+  $ bcachetest
+  bcachetest: private files: OK
+  bcachetest: one shared file: OK
+  bcachetest: small files: OK
+  bcachetest: allocating together: OK
+  bcachetest: ALL OK
+  $ usertests -q
+  usertests starting
+  test copyin: OK
+  test copyout: OK
+  [...]
+  test kernmem: usertrap(): unexpected scause 0xd pid=6489
+  [...]
+  ALL TESTS PASSED
+  $ bcachetest
+  bcachetest: private files: OK
+  bcachetest: one shared file: OK
+  bcachetest: small files: OK
+  bcachetest: allocating together: OK
+  bcachetest: ALL OK
+  ```
+
+  The `usertrap()` lines are `usertests` checking that bad accesses kill the process, as on
+  the original kernel. The same sequence (`bcachetest`, `usertests -q`, `bcachetest`)
+  passed at every commit of the branch, each built on its own, and the original kernel with
+  only commit 1's test passes it too. Instrumented copies of the head passed the same
+  `bcachetest` and `usertests -q` on the 4 boots used for "Measure" and the lock-order run,
+  and `bcachetest 1` on the 2 boots traced with gdb for the reveal.
+
+  What this demonstrates: the cache still returns the right bytes for every block under
+  heavy concurrent use (every block of every file is compared), `usertests -q` sees no
+  difference, and nothing leaks (`usertests` checks free pages; a leaked `refcnt` would end
+  in `bget: no buffers`). It does not demonstrate the absence of races: Clinic 2 shows the
+  test missing a real race in most runs. The lock-order argument and the measurements below
+  carry that part.
+measure: |
+  **How.** A measurement copy of each kernel (not on the branch) counts, in [[acquire]], how
+  many times `amoswap` found the lock taken before it got it, per lock and per hart, in
+  per-hart tables that need no lock of their own. Ctrl-P prints the totals and resets them.
+  The same copy counts [[bread]] calls and disk reads. Each kernel was booted three times,
+  three harts each, on a computer busy with other work (your numbers will differ). Workload:
+  boot plus one `bcachetest`, then `usertests -q`. "Contended" counts acquisitions that had
+  to spin at least once; total spins are dominated by a few long waits (a holder whose
+  QEMU thread the host paused), so they are given only for comparison within a run.
+
+  **Lock waits during boot + `bcachetest`** (contended acquisitions, three boots):
+
+  | lock | original | commit 4 | branch (commit 5) |
+  |---|---|---|---|
+  | `bcache.lock` | 387, 286, 397 | | |
+  | the 13 bucket locks | | 71, 63, 78 | 75, 84, 70 |
+  | `bcache.evict` | | 22, 33, 33 | 30, 29, 28 |
+  | `tickslock` (`time`) | 19, 19, 0 | 145, 153, 195 | 12, 8, 11 |
+  | for scale: `disk.vdisk_lock` | 8,810, 9,215, 9,492 | 9,701, 10,161, 9,491 | 9,367, 9,316, 9,208 |
+
+  - **The split works.** Waits on the cache's own locks fell from about 360 per run to about
+    105 (bucket locks plus `evict`), although the locks are taken more often: about 357,000
+    bucket and 7,500 `evict` acquisitions against 244,000 of `bcache.lock`, because every
+    miss now locks all 13 buckets in turn.
+  - **Waits moved, they did not vanish.** Bucket waits are short (about 5,000 spins per run
+    against 14,000 to 19,000 for `bcache.lock`), but a miss that waits on `evict` waits for
+    another miss's whole search: about 20,000 spins per run over only about 30 waits.
+  - **Commit 4 created a new hot lock.** `tickslock`, taken by every `brelse`, was waited
+    for more often than all bucket locks together. Commit 5 removed `tickslock` from that read, and
+    `tickslock` went back to what the original kernel shows.
+  - **Hashing spreads blocks, not accesses.** Bucket 8 alone took 161,533, 166,769 and
+    162,816 of the bucket acquisitions (about 46%) and 50, 64 and 54 of the waits (about
+    70%). Two of the hottest blocks hash there: block 47, the root directory's data, read
+    by every lookup of a name in the root directory, and block 34, the inode block that holds
+    the test's first new files (inodes 16 to 31). They share bucket 8
+    only because of the modulus (with 17 buckets they would land in 13 and 0), so more
+    buckets or another hash could separate them, but not the waits on block 47 itself: a
+    block that everybody wants needs a different idea (see "Further").
+  - **The cache was never the bottleneck here.** The disk lock is waited for about 9,000
+    times per run in every kernel, roughly 25 times more than `bcache.lock` was. On three
+    QEMU harts with a RAM-backed disk, splitting `bcache.lock` removes a real but small
+    queue; we did not measure a change in run time.
+
+  **During `usertests -q`** there is little to remove: its tests mostly run one at a time.
+  `bcache.lock` was waited for 2, 4 and 11 times; the bucket locks 1, 0 and 11 times, and
+  `evict` never.
+
+  **Hit rate.** The time-stamp LRU behaves like the original list: disk reads were 7,538 to
+  7,599 (original) and 7,489 to 7,606 (branch) for boot + `bcachetest`, out of about 120,000
+  [[bread]] calls, and 1,082 to 1,091 against 1,075 to 1,115 for `usertests -q`, out of about
+  210,000. Without the stamp (Clinic 4) the same workloads needed 12,202 to 13,050 and 15,418
+  to 18,497 reads.
+
+  **Lock order.** The recorder from [[tour:51]] on the same workload: every new edge goes
+  from `evict` into a bucket, from a bucket into a higher bucket (81,822 times, all in the
+  search loop), or from something that already came before `bcache.lock` into a bucket or
+  `evict`. Maximum spinlock nesting is still 3, with one new path to it (`evict` → bucket →
+  bucket); maximum sleep-locks held at once is still 3. The last reveal step has the table.
+further: |
+  - **A finer clock.** `ticks` advances 10 times a second, so most stamps tie. The `time`
+    register is readable from S-mode in this tree (`start` sets `mcounteren`, and
+    [[clockintr]] reads it with `r_time()`), ticks at 10 MHz and needs no lock at all.
+    Use it for `lastuse` and measure the hit rate again: does real LRU beat "first in
+    bucket order within a tick" on these workloads?
+  - **Misses in parallel.** `bcache.evict` makes misses wait for each other's whole search.
+    Remove it: lock the victim's bucket and the destination bucket in index order, look
+    again, and start over if the victim was taken meanwhile. Then argue that duplicates and
+    deadlock are still impossible, and measure whether the extra complexity buys anything.
+  - **Hot buckets.** Bucket 8 took 70% of the bucket waits because two hot blocks live there.
+    Try a different hash, more buckets, or caching the root directory's block outside the
+    table, and measure which helps; then explain which part of the waiting none of them can
+    remove.
+  - **False sharing.** The 13 bucket locks are 32 bytes apart, two per 64-byte cache line.
+    Pad each bucket to a full line and measure whether a hart spinning on one lock slows
+    the hart that owns its neighbour (on QEMU, perhaps not; on real hardware, yes).
+  - **Wait instead of panic.** When every buffer is in use, `bget` still panics. Make a miss
+    sleep until some buffer's `refcnt` drops to 0, and find the lock and the channel that
+    make the wakeup impossible to lose.

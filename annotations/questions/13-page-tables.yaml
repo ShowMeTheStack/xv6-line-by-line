@@ -1,0 +1,776 @@
+title: Page tables and address spaces
+summary: Sv39 page tables in this kernel, from PTE bits and walk() to the kernel's direct map, the trampoline mapped twice, satp and the TLB on each hart, and what a user address space really contains.
+questions:
+  - id: pt-01
+    level: 1
+    type: choice
+    q: |
+      In [[kvminithart]], line 80 turns paging on with `csrw satp`. Nothing jumps to a new
+      address afterwards: the program counter simply moves on to the next instruction. Why
+      does that next instruction (the second `sfence.vma`) still get fetched correctly?
+    code: kernel/vm.c:72-84@80
+    options:
+      - text: The kernel page table maps the kernel's code at virtual addresses equal to its physical addresses, so the same PC value finds the same bytes before and after translation starts.
+        correct: true
+        why: |
+          [[kvmmake]] maps `KERNBASE`..`etext` to itself ([[kernel/vm.c:39]]). The PC holds
+          `0x80000f32`; with paging on it is translated, and the direct map translates it to
+          `0x80000f32`. Both views agree, so the switch is seamless.
+      - text: The CPU keeps fetching physical addresses until the next `sret` or `mret`, so translation only starts later.
+        why: |
+          You may have thought paging takes effect on the next privilege change. It doesn't:
+          once `satp` holds Sv39 mode, every fetch, load and store in S-mode is translated,
+          starting with the very next instruction.
+      - text: The second `sfence.vma` flushes the TLB, and fetching it is allowed to fail harmlessly.
+        why: |
+          You may have thought the fence makes the fetch safe. The fence is itself an
+          instruction that must be fetched through the new table first. If the code were not
+          mapped at that address, the fetch would fault before the fence could do anything.
+      - text: The trampoline page is mapped at the same virtual address in every table, and kvminithart runs from it.
+        why: |
+          You may have confused this with the trap path. The trampoline trick is what makes
+          [[uservec]] and [[userret]] survive their `csrw satp`. [[kvminithart]] is ordinary
+          kernel code at `0x80000f12`, not in the trampoline; it survives because of the
+          direct map.
+    explain: |
+      Turning paging on changes what every address *means*, not the PC itself. The kernel
+      makes this harmless by mapping itself (and all of RAM) at virtual = physical: the
+      [[g:direct-map]]. See [[tour:24]].
+
+  - id: pt-02
+    level: 1
+    type: number
+    q: |
+      A page-table page in Sv39 is one 4096-byte page. How many page-table entries ([[g:pte|PTEs]])
+      does it hold?
+    code: kernel/vm.c:86-97
+    answer: 512
+    wrong:
+      4096: |
+        You may have counted bytes. A PTE is a 64-bit (8-byte) value, so a 4096-byte page holds
+        4096 / 8 entries.
+      1024: |
+        That would be true for 4-byte PTEs (the 32-bit Sv32 scheme). Sv39 PTEs are 8 bytes
+        (`pte_t` is `uint64`), so only half as many fit.
+      9: |
+        You may have confused the index width with the entry count. Each index is 9 bits wide,
+        which can select one of 2^9 entries.
+    why_wrong: Divide the page size by the size of one PTE (`pte_t` is a `uint64`).
+    explain: |
+      4096 bytes / 8 bytes per PTE = 512 = 2^9 entries, which is exactly why each level of the
+      virtual address supplies a 9-bit index. [[freewalk]] loops `i < 512` for the same reason.
+      See [[g:sv39]].
+
+  - id: pt-03
+    level: 2
+    type: bits
+    q: |
+      Right after `exec`, the level-0 PTE for `sh`'s data page (virtual `0x2000`) read
+      `0x21fce817` in our run. Decode it using the macros in [[kernel/riscv.h]].
+    code: kernel/riscv.h:395-406
+    value: "0x21fce817"
+    fields:
+      - label: "V (bit 0)"
+        options: ["1 (valid)", "0 (invalid)"]
+        answer: "1 (valid)"
+        why: "The low byte is `0x17` = `0b0001_0111`; bit 0 is 1."
+      - label: "R, W, X (bits 1-3)"
+        options: ["R and W", "R and X", "R only", "R, W and X"]
+        answer: "R and W"
+        why: "`0x17` has bits 1 (R) and 2 (W) set and bit 3 (X) clear. You may have misread the hex digit 7 as including X; `0x7` is bits 0-2 only (V R W)."
+      - label: "U (bit 4)"
+        options: ["1: user mode may access it", "0: supervisor only"]
+        answer: "1: user mode may access it"
+        why: "Bit 4 is worth `0x10`, which is part of `0x17`. Every page of a program's own memory has U except the stack guard page."
+      - label: Physical page it maps (PTE2PA)
+        options: ["0x87f3a000", "0x21fce000", "0x87f3a817", "0x2000"]
+        answer: "0x87f3a000"
+        why: |
+          [[PTE2PA]] shifts right by 10 (dropping the flags) and left by 12: `0x87f3a` × 4096
+          = `0x87f3a000`. `0x21fce000` would be the PTE with its flags masked off, not an
+          address; `0x2000` is the virtual address, which the PTE does not store at all.
+    explain: |
+      A PTE is "physical page number in bits 53..10, flags in bits 9..0". Here the flags are
+      V R W U (a leaf, because R or W is set) and the page is `0x87f3a000`. A and D (bits 6
+      and 7) are still 0 because nothing has touched the page yet; the hardware sets them
+      later ([[g:svadu]]). See [[tour:25]].
+
+  - id: pt-04
+    level: 2
+    type: number
+    q: |
+      [[kernel:TRAMPOLINE]] is `0x3ffffff000`. What is its index in the **root** (level-2)
+      page-table page, `PX(2, TRAMPOLINE)`?
+    code: kernel/riscv.h:408-417
+    answer: 255
+    wrong:
+      511: |
+        You may have assumed the trampoline is at the very top of the 39-bit Sv39 space. xv6's
+        [[MAXVA]] is `1 << 38`, half of it, so bit 38 is 0 and the root index tops out at
+        `0b011111111` = 255.
+      256: |
+        You may have computed `MAXVA >> 30`. That is one past the last index;
+        `TRAMPOLINE` is one page *below* `MAXVA`, which lands in entry 255.
+      0: |
+        You may have masked the wrong bits. `(0x3ffffff000 >> 30) & 0x1ff` keeps bits
+        38..30, which are `011111111`.
+    why_wrong: Compute `(0x3ffffff000 >> 30) & 0x1ff`, remembering that bit 38 is never set in xv6.
+    explain: |
+      `0x3ffffff000 >> 30` = `0xff` = 255. Because [[MAXVA]] is 2^38, every root index in xv6
+      is 0..255; the upper half of the root is always empty. In both the kernel's and every
+      process's table, entry 255 leads to the trampoline, and in the kernel's also to the 64
+      kernel stacks. See [[tour:24]].
+
+  - id: pt-05
+    level: 2
+    type: choice
+    q: |
+      Sv39 can translate 39-bit virtual addresses, 512 GiB. Why does xv6 set [[MAXVA]] to
+      `1 << 38` (256 GiB) instead?
+    code: kernel/riscv.h:413-417
+    options:
+      - text: Sv39 requires bits 63..39 to be copies of bit 38, so addresses with bit 38 set would be huge sign-extended 64-bit numbers; xv6 avoids them by never using bit 38.
+        correct: true
+        why: |
+          The comment on [[MAXVA]] says exactly this. An address with bit 38 set must look like
+          `0xffffffc000000000` and up, which complicates comparisons and arithmetic. Staying
+          in the lower half keeps every address a small positive number.
+      - text: QEMU's virt machine has only 256 GiB of address space.
+        why: |
+          You may have mixed up virtual and physical addresses. The limit is on *virtual*
+          addresses, chosen by the kernel. Physical RAM here is only 128 MiB anyway.
+      - text: The top bit of the root index is reserved for the hardware's accessed and dirty bits.
+        why: |
+          You may have confused virtual-address bits with PTE bits. A and D live in each PTE
+          (bits 6 and 7), not in the virtual address.
+      - text: Half the address space is reserved for the kernel and the other half for user programs.
+        why: |
+          That would be true of kernels that map themselves into every process. xv6 gives
+          each side its own page table, and both use only the lower half: the kernel's
+          stacks and trampoline also sit just below `MAXVA`.
+    explain: |
+      The hardware rule is sign extension: bits 63..39 must equal bit 38. xv6 sidesteps it by
+      using only addresses below 2^38. [[walk]] panics at or above `MAXVA`, and
+      [[walkaddr]] and [[copyout]] reject such addresses. See [[tour:25]].
+
+  - id: pt-06
+    level: 1
+    type: tf
+    q: |
+      True or false: every xv6 user page table maps the whole kernel, protected from the
+      program only by leaving [[PTE_U]] clear.
+    answer: false
+    why_tf: |
+      You may know kernels that work this way (Linux maps itself into every process). xv6
+      does not: a user page table contains the program's own pages plus exactly two kernel
+      pages.
+    reasons:
+      - text: "It maps only the trampoline and the trapframe (without U); everything else in the kernel exists only in the kernel page table, which is why uservec switches satp before it uses the kernel stack."
+        correct: true
+        why: |
+          [[proc_pagetable]] adds just those two pages. Kernel code, data and the kernel
+          stacks are missing, so [[uservec]] must install the kernel table (from the
+          trapframe's `kernel_satp`) before it can push anything or call [[usertrap]].
+      - text: User page tables map nothing above `p->sz`.
+        why: |
+          You may have forgotten the two top pages. `TRAMPOLINE` and `TRAPFRAME` are mapped
+          far above `sz` in every user table; they are just not counted in `sz`.
+      - text: The kernel is mapped in every user table, but with U set and W clear, so programs can read it but not change it.
+        why: |
+          You may have mixed up the protection bits. No kernel page ever has U set, and
+          letting programs read kernel memory would leak other processes' data.
+    explain: |
+      Two page tables per process trip: the user table (program + trampoline + trapframe) and
+      the kernel table (everything else). The trampoline is the one page of code mapped at the
+      same address in both. See [[proc_pagetable]] and [[tour:25]].
+
+  - id: pt-07
+    level: 2
+    type: line
+    q: |
+      Click the line in [[walk]] without which a freshly allocated page-table page would be
+      full of entries that *look* valid, so that `walk` would follow garbage pointers or
+      [[mappages]] would panic with "remap".
+    code: kernel/vm.c:98-116
+    answer: 111
+    lines:
+      109: |
+        This line gets the new page from [[kalloc]], but that page arrives filled with `0x05`
+        junk bytes. Every 8-byte entry would read `0x0505050505050505`, which has V set.
+      112: |
+        This line makes the *parent* entry point at the new page. It does nothing about the
+        512 entries inside the new page.
+      106: |
+        This test reads an existing entry's V bit. It is the victim of junk entries, not the
+        protection against them.
+      115: |
+        This returns the address of the level-0 entry. With junk in the page, it would point
+        at an entry that already has V set, and `mappages` would panic on line 167.
+    why_wrong: Find the line that writes all 512 entries of the new page at once.
+    explain: |
+      Line 111, `memset(pagetable, 0, PGSIZE)`, makes all 512 entries invalid. [[kalloc]]
+      deliberately fills pages with `0x05` to expose code that forgets to initialise memory;
+      a page table is a place where forgetting would be fatal. See [[tour:24]].
+
+  - id: pt-08
+    level: 1
+    type: multi
+    q: |
+      `sh`'s address space has these pages. Which of them have [[PTE_U]] set, so that `sh`
+      itself, in user mode, may touch them?
+    options:
+      - text: "Code at `0x0`"
+        correct: true
+        why: "Program code must be fetchable in user mode: R X U."
+      - text: "Data and bss at `0x2000`"
+        correct: true
+        why: "The program reads and writes its globals: R W U."
+      - text: "The stack at `0x4000`"
+        correct: true
+        why: "The user stack is ordinary user memory: R W U."
+      - text: "The guard page at `0x3000`"
+        why: |
+          You may have thought every page below `sz` is the program's. [[kexec]] allocates
+          the guard page like a stack page and then [[uvmclear]] removes U, so a stack that
+          runs off its page faults here.
+      - text: "The trapframe at `0x3fffffe000`"
+        why: |
+          You may have thought the program can see its saved registers. The trapframe is
+          mapped R W without U: only supervisor code in the trampoline uses it.
+      - text: "The trampoline at `0x3ffffff000`"
+        why: |
+          You may have thought the trap entry code runs in user mode. It runs in supervisor
+          mode right after the trap, so it is mapped R X without U.
+    explain: |
+      Five pages are below `sz`; four carry U, the guard page does not. The two pages at the top
+      exist for the supervisor only. The hardware enforces U on every user-mode access
+      ([[g:pte]], [[tour:25]]).
+
+  - id: pt-09
+    level: 2
+    type: choice
+    q: |
+      Line 47 of [[kvmmake]] maps the trampoline page at [[kernel:TRAMPOLINE]], although the
+      direct map (line 39) already covers its physical page `0x80006000`. Why is this second
+      mapping necessary?
+    code: kernel/vm.c:38-47@45-47
+    options:
+      - text: The trap code switches satp between a user table and this one while executing in the trampoline, so the page must be at the same virtual address in both tables, and user tables have only the TRAMPOLINE mapping.
+        correct: true
+        why: |
+          After `csrw satp` in [[uservec]] or [[userret]], the next instruction is fetched
+          under the *other* table. User tables do not contain `0x80006000`; both contain
+          `0x3ffffff000`. So the code runs from `0x3ffffff000` throughout.
+      - text: The direct-mapped copy is read-only, and the trampoline needs to be writable.
+        why: |
+          You may have thought the trampoline stores data in itself. Both mappings are R X
+          (lines 39 and 47); the registers are saved into the *trapframe*, a separate page.
+      - text: So that user programs can call the trampoline directly instead of using ecall.
+        why: |
+          You may have thought the trampoline is a user-callable library. The TRAMPOLINE
+          mapping has no U bit; user code cannot fetch from it.
+      - text: Because the kernel's code above 0x80006000 is not mapped until later.
+        why: |
+          You may have thought the direct map is built in stages. Line 39 maps all of
+          `KERNBASE`..`etext` in one call, including the trampoline's physical page.
+    explain: |
+      The same physical page appears twice in the kernel table: at `0x80006000` (as part of
+      the kernel text) and at `0x3ffffff000`. Only the second is shared with every user table,
+      and that shared address is what lets the instruction after `csrw satp` be found. See
+      [[tour:24]] and [[tour:7]].
+
+  - id: pt-10
+    level: 3
+    type: choice
+    q: |
+      A buggy program passes its trapframe's address, `0x3fffffe000`, as a buffer to a system
+      call, and the kernel calls `copyout(p->pagetable, p->sz, 0x3fffffe000, src, 8)`. The
+      page **is** mapped in the user table (R W, no U). What happens?
+    code: kernel/vm.c:344-377
+    options:
+      - text: copyout returns -1 and writes nothing.
+        correct: true
+        why: |
+          [[walkaddr]] returns 0 because U is clear. copyout then tries [[vmfault]], which
+          refuses at once because `0x3fffffe000 >= p->sz` (a process's `sz` can never pass
+          `TRAPFRAME`). So line 358 returns -1.
+      - text: The 8 bytes are written into the trapframe, because the kernel reaches physical pages through its direct map and ignores U.
+        why: |
+          You may have thought the direct map bypasses all checks. It would, if copyout found
+          a physical address; but [[walkaddr]] deliberately refuses non-U pages, so the
+          kernel's software check matches what the hardware would allow the program.
+      - text: vmfault allocates a fresh page and maps it at 0x3fffffe000.
+        why: |
+          You may have thought vmfault fills any hole. It first checks `va >= psz` and
+          refuses: the trapframe is far above `sz`. (Even below `sz` it would refuse a page
+          that is already mapped.)
+      - text: The kernel takes a page fault and panics in kerneltrap.
+        why: |
+          You may have thought the kernel dereferences the user address. copyout never does;
+          it translates the address in software and only touches memory through the
+          physical address it found, so there is no fault at all.
+    explain: |
+      copyout translates user addresses itself, with the same rules the hardware applies to the
+      program: V and U must be set. A page the program could not touch, the kernel will not
+      touch on its behalf. See [[walkaddr]], [[tour:25]] and [[tour:28]].
+
+  - id: pt-11
+    level: 2
+    type: order
+    q: |
+      `sh` runs `lb a5, 0(a0)` with `a0 = 0x2020` in user mode, and the translation is not in
+      the TLB. Put the hardware's steps in order.
+    items:
+      - text: Look up virtual page 0x2 in this hart's TLB, and miss
+        why: The TLB is always consulted first; the walk only happens on a miss.
+      - text: Take the root page-table page's physical address from satp's PPN field
+        why: The walk has to start somewhere, and satp is the only register that names the table.
+      - text: Read the level-2 PTE at index bits 38..30 (0); it has V and no R/W/X, so follow it
+        why: The root is level 2; the walk goes from level 2 down to level 0.
+      - text: Read the level-1 PTE at index bits 29..21 (0) and follow it
+        why: Level 1 comes between the root and the leaf.
+      - text: Read the level-0 PTE at index bits 20..12 (2) and check V, U and R
+        why: The leaf is at level 0, and the permission check happens on the leaf.
+      - text: Add the offset 0x020 to the leaf's page address and load the byte
+        why: Only after the leaf is found and checked is there a physical address to load from.
+    why_wrong: The walk starts from satp, descends 2 → 1 → 0, and only the leaf gives the physical page.
+    explain: |
+      Three page-table reads precede the actual load, which is why every hart caches results in
+      its own [[g:tlb]]. [[walk]] does the same descent in software. See [[tour:25]].
+
+  - id: pt-12
+    level: 1
+    type: match
+    q: |
+      Match each macro from [[kernel/riscv.h]] with what it computes.
+    pairs:
+      - left: "`PX(level, va)`"
+        right: the 9-bit index into the page-table page at that level
+        why: "It shifts `va` right by `12 + 9 × level` and keeps 9 bits."
+      - left: "`PTE2PA(pte)`"
+        right: the physical address of the page a PTE points to
+        why: "It drops the 10 flag bits and appends 12 zero bits."
+      - left: "`PA2PTE(pa)`"
+        right: a physical page number shifted into PTE position, ready to OR with flags
+        why: "It is the inverse of PTE2PA: `pa >> 12 << 10`."
+      - left: "`PTE_FLAGS(pte)`"
+        right: "the low 10 bits: V, R, W, X, U and the rest"
+        why: "It masks with `0x3FF`; [[uvmcopy]] uses it to copy a page with the same permissions."
+      - left: "`PGROUNDDOWN(a)`"
+        right: the start of the page that contains a
+        why: "It clears the low 12 bits; [[copyout]] and [[vmfault]] use it to find the page of an address."
+      - left: "`MAKE_SATP(pt)`"
+        right: Sv39 mode bits ORed with the root page's physical page number
+        why: "It builds the value [[kvminithart]] writes to `satp`, and the value [[usertrap]] returns for [[userret]] to install with `csrw satp`."
+    explain: |
+      PTEs store page *numbers* starting at bit 10, while addresses have the page number
+      starting at bit 12; that two-bit difference is all PTE2PA and PA2PTE fix. See
+      [[tour:25]].
+
+  - id: pt-13
+    level: 1
+    type: choice
+    q: |
+      Hart 0 runs `sh` and hart 2 runs `ls`. At the same instant both execute a load from
+      virtual address `0x0`. Why don't they interfere?
+    options:
+      - text: Each hart's satp names a different page table, so the same virtual address translates to different physical pages.
+        correct: true
+        why: |
+          `satp` is a per-hart register. Hart 0's names `sh`'s table and hart 2's names
+          `ls`'s, so `0x0` reaches each program's own code page. Each hart also has its own
+          TLB.
+      - text: The kernel holds a lock on each page table while its process is running.
+        why: |
+          You may have assumed shared structures need locks. Nothing is shared here: two
+          different page tables, two different physical pages. No lock is involved in user
+          address translation.
+      - text: Only one program can be at address 0x0 at a time; the other was relocated by the linker.
+        why: |
+          You may have thought the linker gives programs different addresses. Every xv6
+          program is linked to start at 0 ([[user/user.ld]]); the page table, not the
+          linker, keeps them apart.
+      - text: They do interfere, but code pages are read-only, so both read the same bytes.
+        why: |
+          You may have thought both programs share one physical page at `0x0`. `sh` and `ls`
+          have different code, in different physical pages; each process's table maps `0x0`
+          to its own copy.
+    explain: |
+      "Same address, different memory" is the whole point of per-process page tables. The
+      translation depends on which table the hart's own `satp` names. See [[tour:25]].
+
+  - id: pt-14
+    level: 2
+    type: number
+    q: |
+      Line 36 of [[kvmmake]] maps the PLIC: 64 MiB (`0x4000000`) starting at `0x0c000000`.
+      The level-2 and level-1 tables for the first GiB already exist. How many **level-0**
+      page-table pages does [[walk]] allocate for this one call?
+    code: kernel/vm.c:29-36@35-36
+    answer: 32
+    wrong:
+      16384: |
+        You may have counted leaf PTEs instead of table pages. The PLIC needs 16,384 leaf
+        entries, but one level-0 page holds 512 of them.
+      1: |
+        You may have thought one level-0 page covers any range. It covers 512 × 4 KiB =
+        2 MiB.
+      33: |
+        You may have added a page for the UART at `0x10000000`. That address is in a
+        different 2 MiB region whose level-0 page was allocated by line 30, not by this call.
+    why_wrong: One level-0 page maps 512 pages of 4 KiB = 2 MiB. Divide the PLIC's size by that.
+    explain: |
+      64 MiB / 2 MiB = 32, and `0x0c000000` is 2 MiB-aligned, so the range covers exactly
+      level-1 indexes 96..127, each needing its own level-0 page. That is a third of the
+      kernel table's 98 level-0 pages, for a device whose registers xv6 barely uses. See
+      [[tour:24]].
+
+  - id: pt-15
+    level: 2
+    type: bits
+    q: |
+      gdb shows `satp = 0x8000000000087f41` on a hart. In this build the kernel's root
+      page is at `0x87fff000`. Decode it.
+    value: "0x8000000000087f41"
+    fields:
+      - label: "MODE (bits 63-60)"
+        options: ["8: Sv39 translation", "0: paging off", "1: user mode"]
+        answer: "8: Sv39 translation"
+        why: "The top hex digit is 8 = `SATP_SV39 >> 60`. You may have read the leading 8 as a sign bit; in satp it is the mode field."
+      - label: "ASID (bits 59-44)"
+        options: ["0", "0x87f", "the process's pid"]
+        answer: "0"
+        why: "xv6 never uses address-space IDs; [[MAKE_SATP]] leaves the field 0, which is why it flushes the whole TLB on every satp change."
+      - label: Physical address of the root page-table page
+        options: ["0x87f41000", "0x87f41", "0x21fd0400"]
+        answer: "0x87f41000"
+        why: "satp holds a page *number*: `0x87f41` × 4096 = `0x87f41000`. `0x87f41` is the PPN itself, not an address."
+      - label: Which table is this?
+        options: ["a user process's page table", "the kernel page table"]
+        answer: "a user process's page table"
+        why: "The kernel's satp in this build is `0x8000000000087fff`. Any other root means a process's table, installed by [[userret]]."
+    explain: |
+      [[MAKE_SATP]] is `SATP_SV39 | (pagetable >> 12)`: mode 8 in the top four bits and the root's
+      physical page number in the low 44. This value is `sh`'s table from our run ([[tour:25]]).
+
+  - id: pt-16
+    level: 3
+    type: state
+    q: |
+      Hart 1 has left its spin loop in [[main]], printed `hart 1 starting`, and has just
+      executed the `csrw satp` on line 80 of [[kvminithart]] (called from main line 39). What
+      is hart 1's state?
+    code: kernel/vm.c:72-84@80
+    state:
+      mode: S
+      stack: boot
+      satp: kernel
+      sie: "off"
+      noff: "0"
+      intena: "-"
+    why:
+      stack: |
+        No process has ever run on hart 1 yet. It is still on the stack `_entry` gave it, its
+        slice of `stack0`; that slice becomes its scheduler stack only when [[main]] calls
+        [[scheduler]].
+      satp: |
+        The `csrw` has just executed, so `satp` now names [[kernel_pagetable]]. Before it,
+        hart 1 was in Bare mode (`satp` = 0 since [[start]]).
+      sie: |
+        Interrupts have been off on this hart since reset. [[start]] enables *which*
+        interrupts may come (`sie` bits) but not `sstatus.SIE`; the first [[intr_on]] is in
+        [[scheduler]].
+      noff: |
+        [[printk]] took and released its lock, so the count is back to 0; nothing else is
+        held here.
+      mode: |
+        [[start]]'s `mret` dropped the hart to supervisor mode before [[main]] ran; M-mode is
+        never re-entered in this kernel.
+    why_wrong: Trace hart 1 from start's mret through main's else-branch; it has run no process and taken no lock that is still held.
+    explain: |
+      Supervisor mode, boot stack, kernel page table just installed, SIE off, no spinlocks.
+      Hart 1's stack keeps working across the `csrw` because `stack0` is inside the
+      direct-mapped RAM range ([[tour:24]], [[concept:stacks#boot]]).
+
+  - id: pt-17
+    level: 1
+    type: choice
+    q: |
+      Hart 0 executed `sfence.vma` around its `csrw satp` at boot. Why must harts 1 and 2 run
+      [[kvminithart]], with its own two `sfence.vma`, for themselves?
+    code: kernel/vm.c:72-84
+    options:
+      - text: "`sfence.vma` acts only on the hart that executes it: its own TLB and its own page-table walker; every hart also has its own satp."
+        correct: true
+        why: |
+          A fence on hart 0 orders hart 0's stores before hart 0's walks and flushes hart 0's
+          TLB. Harts 1 and 2 have separate TLBs and separate `satp` registers, so each must
+          install the table and fence for itself.
+      - text: Hart 0's fence was broadcast to the other harts, but they were in Bare mode and ignored it.
+        why: |
+          You may have thought `sfence.vma` is a global flush. It is local; xv6 never sends a
+          flush to another hart (no "TLB shootdown").
+      - text: They are only needed because harts 1 and 2 use a different kernel page table.
+        why: |
+          You may have thought each hart has its own kernel table. All three load the same
+          [[kernel_pagetable]] value into their own `satp`.
+      - text: Harts 1 and 2 don't actually need the fences; they are there only for symmetry with hart 0.
+        why: |
+          You may have thought nothing is cached yet, so nothing needs fencing. The first
+          fence is what guarantees the hart's walker sees the page-table stores (made
+          visible by the `started` acquire); without it, the RISC-V spec gives no such
+          guarantee.
+    explain: |
+      `satp`, the TLB and the page-table walker are all per hart. Shared memory (the table
+      itself) is published by the release/acquire on `started`; per-hart state is set up by
+      each hart separately. See [[tour:24]].
+
+  - id: pt-18
+    level: 2
+    type: tf
+    q: |
+      True or false: because three harts translate through [[kernel_pagetable]] at the same
+      time, xv6 must protect it with a lock.
+    answer: false
+    why_tf: |
+      You may have learned "shared data needs a lock". That holds for data someone writes.
+      After boot, no software writes this table.
+    reasons:
+      - text: "No software modifies the kernel page table after boot: kvmmap is only used by kvmmake and proc_mapstacks, and even the 64 kernel stacks are mapped once, up front."
+        correct: true
+        why: |
+          Readers without a writer cannot see a half-done change, so there is nothing to
+          order. (The hardware may set A/D bits, but the spec makes those updates atomic and
+          xv6 never reads them.)
+      - text: "Each hart has its own copy of the kernel page table."
+        why: |
+          You may have thought `kvminithart` copies the table. Every hart loads the *same*
+          root, `0x87fff000`, into its own `satp`.
+      - text: "The TLB serialises access, so walkers never read the table at the same time."
+        why: |
+          You may have thought the TLB is shared. Each hart has its own TLB and walker, and
+          they can read the same PTEs at the same instant; that is fine only because nobody
+          writes them.
+    explain: |
+      Build on one hart, publish with release/acquire (`started`), never modify again: then
+      any number of harts can share it with no lock. User page tables, which do change, are
+      kept safe by a different argument (one process, one hart at a time). See [[tour:24]].
+
+  - id: pt-19
+    level: 3
+    type: choice
+    q: |
+      Suppose a buggy kernel function, handling `sh`'s `read(0, buf, 100)`, did
+      `*(char *)0x2020 = 'l'` with the user's address (`buf` is at `0x2020`). What would
+      happen?
+    options:
+      - text: "A store page fault in supervisor mode; kerneltrap finds no device interrupt and panics."
+        correct: true
+        why: |
+          In the kernel, `satp` holds the kernel page table, whose lowest mapping is the PLIC
+          at `0x0c000000`. Nothing is mapped at `0x2020`, so the store faults, the trap goes
+          to [[kernelvec]] and [[kerneltrap]], [[devintr]] returns 0, and it panics
+          ([[kernel/trap.c:153]]).
+      - text: The byte lands in sh's buf, because the kernel can write any address.
+        why: |
+          You may have thought supervisor mode bypasses translation. It doesn't: S-mode
+          addresses are translated through the current `satp`, which is the kernel's table,
+          and that table knows nothing about `sh`.
+      - text: vmfault allocates a page at 0x2020 in the kernel page table and the store succeeds.
+        why: |
+          You may have thought every page fault goes to [[vmfault]]. Only [[usertrap]] (and
+          the copy functions) call it. A fault in kernel code goes to [[kerneltrap]], which
+          handles nothing but device interrupts.
+      - text: The store succeeds but writes to physical address 0x2020.
+        why: |
+          You may have thought the kernel runs with paging off. It runs with the kernel page
+          table, and physical `0x2020` is not mapped there (nor is it RAM).
+    explain: |
+      A user pointer is a number that only the user's page table can interpret. The kernel
+      must translate it with [[walkaddr]] (via [[copyout]]) instead. Even with the user
+      table installed, S-mode could not touch U pages, since xv6 leaves `sstatus.SUM` clear.
+      See [[tour:25]].
+
+  - id: pt-20
+    level: 2
+    type: choice
+    q: |
+      With [[KSTACK]]`(p) = TRAMPOLINE - (p+1) × 2 × PGSIZE`, what is mapped at virtual
+      address `0x3fffffc000` in the **kernel** page table?
+    code: kernel/memlayout.h:46-52@52
+    options:
+      - text: Nothing; it is the unmapped guard page between proc[0]'s and proc[1]'s kernel stacks.
+        correct: true
+        why: |
+          `KSTACK(0)` = `0x3fffffd000` and `KSTACK(1)` = `0x3fffffb000`. Only every other page
+          is mapped, so `0x3fffffc000` has a zero PTE: a stack overflowing downward from
+          `0x3fffffd000` faults there.
+      - text: proc[1]'s kernel stack
+        why: |
+          You may have been off by one page. `KSTACK(1)` = `0x3ffffff000 - 4 × 4096` =
+          `0x3fffffb000`; the page above it is the gap.
+      - text: proc[0]'s kernel stack
+        why: |
+          You may have computed `TRAMPOLINE - 3 × PGSIZE`. `KSTACK(0)` is `TRAMPOLINE - 2 ×
+          PGSIZE` = `0x3fffffd000`, one page higher.
+      - text: proc[0]'s trapframe
+        why: |
+          You may have mixed up the two page tables. `TRAPFRAME` (`0x3fffffe000`) is a user
+          page-table address, and it is not `0x3fffffc000` anyway; in the kernel table
+          `0x3fffffe000` is also unmapped.
+    explain: |
+      The factor 2 in [[KSTACK]] leaves an unmapped page below each stack: a [[g:guard-page]]
+      for kernel stacks. Unlike the user guard page, it is truly absent (PTE 0). See
+      [[tour:24]] and [[concept:stacks#guards]].
+
+  - id: pt-21
+    level: 3
+    type: choice
+    q: |
+      Why does [[proc_freepagetable]] unmap `TRAMPOLINE` and `TRAPFRAME` (with `do_free` = 0)
+      before calling [[uvmfree]]?
+    code: kernel/proc.c:207-215
+    options:
+      - text: "uvmfree only unmaps 0..sz, and freewalk panics on any leaf still present; do_free is 0 because the trampoline is kernel code and the trapframe is freed separately by freeproc."
+        correct: true
+        why: |
+          [[freewalk]] frees table pages and panics with "freewalk: leaf" if it meets a valid
+          leaf ([[kernel/vm.c:276]]). The two top pages are above `sz`, so [[uvmfree]]'s
+          [[uvmunmap]] would not remove them. Freeing the trampoline's physical page would
+          hand kernel code to [[kalloc]]; the trapframe is [[freeproc]]'s job.
+      - text: To flush those two pages from the TLB before the table is freed.
+        why: |
+          You may have thought unmapping flushes the TLB. [[uvmunmap]] only clears PTEs; no
+          `sfence.vma` is involved. TLB safety comes from the flushes in the trampoline.
+      - text: Because uvmfree would otherwise free the trampoline's physical page twice.
+        why: |
+          You may have thought uvmfree walks the whole table. It unmaps only `0..sz`; the
+          danger is not a double free but a leaf left behind for [[freewalk]] to panic on.
+      - text: The order doesn't matter; it is only for readability.
+        why: |
+          You may have thought freewalk ignores leaves. It panics on them, so these two
+          unmaps must come first.
+    explain: |
+      Freeing a user table has two phases: remove every leaf ([[uvmunmap]], freeing the
+      program's own pages), then free the now-empty tree ([[freewalk]]). The top two pages are
+      leaves that `sz` does not cover, so they get removed by hand, without freeing what they
+      point to.
+
+  - id: pt-22
+    level: 2
+    type: multi
+    q: |
+      Which of these mappings in the **kernel** page table have `PTE_X` (executable) set?
+    code: kernel/vm.c:29-50
+    options:
+      - text: "Kernel text, `KERNBASE` to `etext`"
+        correct: true
+        why: "Line 39 maps it `PTE_R | PTE_X`: readable and executable, not writable."
+      - text: "The trampoline at `TRAMPOLINE`"
+        correct: true
+        why: "Line 47 maps it `PTE_R | PTE_X`, because the trap code runs from this address."
+      - text: "RAM from `etext` to `PHYSTOP`"
+        why: |
+          You may have thought all of the kernel's memory is executable. Data and free pages
+          are mapped `PTE_R | PTE_W` (line 42), so the kernel can never execute data by
+          mistake.
+      - text: "The UART registers at `0x10000000`"
+        why: "Device registers are mapped `PTE_R | PTE_W`; executing from a device makes no sense."
+      - text: "The kernel stacks at `KSTACK(i)`"
+        why: |
+          You may have thought stacks hold code. [[proc_mapstacks]] maps them `PTE_R | PTE_W`
+          only.
+    explain: |
+      The kernel splits RAM at [[etext]]: code is R X, everything else R W, so a stray store
+      cannot corrupt instructions and data cannot be executed. Only two ranges are
+      executable. See [[tour:24]].
+
+  - id: pt-23
+    level: 3
+    type: multi
+    q: |
+      `sh`'s layout: code `0x0`–`0x1fff` (R X U), data `0x2000` (R W U), guard `0x3000` (R W),
+      stack `0x4000` (R W U), `sz` = `0x5000`, trapframe at `0x3fffffe000` (R W). Which of
+      these, executed by `sh` in user mode, raise a page fault?
+    options:
+      - text: "A store to `0x100`"
+        correct: true
+        why: "The code page has no W, so a store faults (scause 15). [[vmfault]] then refuses because the page is mapped, and `sh` is killed."
+      - text: "A load from `0x3fffffe000`"
+        correct: true
+        why: "The trapframe has no U, so a user-mode load faults (scause 13)."
+      - text: "A jump to `0x2020`"
+        correct: true
+        why: "The data page has no X, so the instruction fetch faults (scause 12)."
+      - text: "A load from `0x3010`"
+        correct: true
+        why: "The guard page is valid but has no U; any user access faults."
+      - text: "A store to `0x2020`"
+        why: |
+          You may have thought globals are read-only. The data page is R W U, exactly so the
+          program can write its variables.
+      - text: "A load from `0x4ff0`"
+        why: |
+          You may have thought the stack page is protected like the guard page. `0x4ff0` is
+          in the real stack page, R W U, where `exec` put `argv[0]`'s string.
+    explain: |
+      For every user access the hardware checks U plus the right permission bit: R for loads,
+      W for stores, X for fetches. Valid PTEs can still fault; "mapped" is not the same as
+      "allowed". See [[tour:25]] and [[g:page-fault]].
+
+  - id: pt-24
+    level: 1
+    type: choice
+    q: |
+      What does the `satp` register give the hardware?
+    code: kernel/riscv.h:245-248
+    options:
+      - text: The translation mode and the physical page number of the root page-table page.
+        correct: true
+        why: |
+          [[MAKE_SATP]] puts Sv39 (8) in the top four bits and `pagetable >> 12` in the low
+          bits. The walker needs a *physical* address to start from.
+      - text: The virtual address of the root page-table page.
+        why: |
+          You may have thought the hardware could translate the table's own address. It
+          cannot: to translate it would need the table it is trying to find. satp holds a
+          physical page number.
+      - text: The pid of the running process.
+        why: |
+          You may be thinking of the ASID field, which tags translations by address space.
+          xv6 leaves it 0, and the kernel's pids are never put in satp.
+      - text: The address of the first PTE for the current program counter.
+        why: |
+          You may have thought satp points into the middle of the tree. It names the root;
+          the walker computes every entry address from there.
+    explain: |
+      A page table is a tree in physical memory; `satp` names its root by physical page number.
+      Each hart has its own `satp`, which is how different harts can run different address
+      spaces. See [[g:csr-satp]] and [[tour:25]].
+
+  - id: pt-25
+    level: 3
+    type: number
+    q: |
+      `sh`'s page table uses 5 page-table pages (root; a level-1 and a level-0 page for the
+      bottom; a level-1 and a level-0 page for the top). If its heap grew eagerly from
+      `0x5000` by 4 MiB (to `sz` = `0x405000`), how many page-table pages would the table use
+      in total?
+    answer: 7
+    wrong:
+      5: |
+        You may have thought the existing level-0 page covers the heap. One level-0 page
+        maps only 2 MiB (512 × 4 KiB); addresses up to `0x404fff` reach into a third 2 MiB
+        region.
+      6: |
+        You may have divided 4 MiB by 2 MiB and added one page. The heap starts at
+        `0x5000`, not at a 2 MiB boundary, so it touches regions 0, 1 and 2: two *new*
+        level-0 pages on top of the existing one.
+      1029: |
+        You may have counted the data pages too. The question asks only for page-table
+        pages, the pages that make up the tree itself.
+    why_wrong: Count the 2 MiB regions that `0x0`–`0x404fff` touches; each needs one level-0 page, and they all hang off the same level-1 page.
+    explain: |
+      `0x0`–`0x1fffff`, `0x200000`–`0x3fffff` and `0x400000`–`0x404fff` need three level-0
+      pages under the bottom level-1 page. Total: root + 1 + 3 at the bottom + 2 at the top =
+      7. One level-1 page covers 1 GiB, so no new one is needed. See [[tour:25]].

@@ -1,0 +1,783 @@
+title: Interrupts, the PLIC and the timer
+summary: How the Sstc timer and the PLIC raise interrupts, which hart takes them and when, how devintr tells them apart, and how claim, complete and stimecmp acknowledge them.
+questions:
+  - id: irq-01
+    level: 1
+    type: choice
+    q: |
+      A supervisor timer interrupt is pending on hart 1. In this kernel, what makes it stop
+      being pending?
+    code: kernel/trap.c:166-180
+    options:
+      - text: "[[clockintr]] writes a new, later value into `stimecmp` (line 179)."
+        correct: true
+        why: |
+          With [[g:sstc|Sstc]] the timer interrupt is pending exactly while `time >= stimecmp`.
+          Moving `stimecmp` 1,000,000 units into the future makes that condition false, which is
+          why the comment says the write "also clears the interrupt request".
+      - text: "Taking the trap clears the pending bit automatically."
+        why: |
+          You may have thought a pending bit is a one-shot event that the hardware consumes when it
+          traps. The timer request is a *level*: it stays asserted as long as `time >= stimecmp`.
+          If nothing moved `stimecmp`, the hart would trap again as soon as interrupts were back on.
+      - text: "[[devintr]] calls [[plic_complete]] for the timer."
+        why: |
+          You may have confused the timer with a device. The timer is not behind the PLIC at all;
+          [[devintr]]'s timer branch (line 213) calls [[clockintr]] and never touches
+          `plic_claim` or `plic_complete`.
+      - text: "A machine-mode timer handler clears `mip.MTIP` and forwards a software interrupt to S-mode."
+        why: |
+          You may be remembering older xv6 (and the MIT book), which had an M-mode `timervec`
+          that re-armed `mtimecmp` and raised a supervisor *software* interrupt. This tree has
+          none: `mtvec` is never written, and the Sstc timer interrupts supervisor mode directly.
+    explain: |
+      The Sstc timer is level-triggered: pending while `time >= stimecmp`. The only way to
+      acknowledge it is to move the deadline, and [[clockintr]] does that on every hart with
+      `w_stimecmp(r_time() + 1000000)` ([[kernel/trap.c:179]]). See [[tour:11]] and
+      [[g:csr:stimecmp]].
+
+  - id: irq-02
+    level: 1
+    type: choice
+    q: |
+      In [[devintr]], the external-interrupt branch asks the PLIC who interrupted with
+      [[plic_claim]], but the timer branch does not. Why?
+    code: kernel/trap.c:187-220@213-216
+    options:
+      - text: "The timer is part of each hart, not a device behind the PLIC; its own scause code (5) already identifies it."
+        correct: true
+        why: |
+          Each hart compares its own `time` with its own `stimecmp`. The interrupt never passes
+          through the PLIC, so there is nothing to claim: `scause = 0x8000000000000005` says all
+          there is to know.
+      - text: "clockintr claims the timer interrupt itself, inside its own code."
+        why: |
+          You may have assumed every interrupt needs a claim somewhere. Read [[clockintr]]:
+          it updates `ticks` (on hart 0) and writes `stimecmp`. There is no PLIC access in it.
+      - text: "The timer has PLIC priority 0, so a claim would always return 0."
+        why: |
+          You may have connected priorities with the timer. [[plicinit]] only sets priorities for
+          the UART (10) and the disk (1). The timer has no PLIC source number at all.
+      - text: "Claiming is only needed when several harts might take the same interrupt, and only hart 0 takes timer interrupts."
+        why: |
+          You may have thought only hart 0 gets ticks because only hart 0 counts them. Every hart
+          has its own timer and takes its own ticks; only the `ticks++` in [[clockintr]] is limited
+          to hart 0.
+    explain: |
+      Two kinds of interrupt reach [[devintr]]: external ones (code 9), which all arrive through
+      the [[g:plic|PLIC]] and need a claim to learn *which* device, and the supervisor timer
+      (code 5), which is private to the hart. A timer interrupt always lands on the hart whose
+      timer fired ([[tour:11]]).
+
+  - id: irq-03
+    level: 2
+    type: number
+    q: |
+      [[plicinithart]] writes one 32-bit value into this hart's S-mode enable register. What is
+      that value? (Hex like `0x10` or decimal are both accepted.)
+    code: kernel/plic.c:19-30@26
+    answer: "0x402"
+    wrong:
+      11: |
+        You may have ORed the IRQ numbers themselves (10 | 1 = 11). Each source has one *bit*
+        in the enable register, at the position given by its number: `1 << 10` and `1 << 1`.
+      "0x401": |
+        You may have put the disk at bit 0. `VIRTIO0_IRQ` is 1, so its bit is `1 << 1` = `0x2`.
+        Bit 0 would be source 0, which the PLIC reserves to mean "no interrupt".
+      "0x600": |
+        You may have used 9 and 10 (the external interrupt code and the UART). The disk is
+        source 1 ([[kernel/memlayout.h:26]]), not 9; `scause`'s code 9 is unrelated.
+    why_wrong: |
+      Look up `UART0_IRQ` and `VIRTIO0_IRQ` in memlayout.h, set one bit for each, and add the bits.
+    explain: |
+      `UART0_IRQ` is 10 and `VIRTIO0_IRQ` is 1, so the value is `(1 << 10) | (1 << 1)` =
+      `0x400 + 0x2` = `0x402`. Every hart writes the same value into its *own* context's enable
+      register, so both devices may interrupt any hart ([[tour:9]]).
+
+  - id: irq-04
+    level: 2
+    type: number
+    q: |
+      What is the address of hart 2's S-mode claim/complete register, the one
+      [[plic_claim]] reads on hart 2? Give it in hex.
+    code: kernel/memlayout.h:32-38@38
+    answer: "0x0c205004"
+    wrong:
+      "0x0c203004": |
+        You may have used a stride of `0x1000` per hart. That is the stride per PLIC *context*,
+        and each hart has two contexts (M-mode and S-mode). The macro already accounts for that:
+        it adds `hart * 0x2000`.
+      "0x0c201004": |
+        That is hart 0's claim register. You may have forgotten to add `(hart) * 0x2000` for
+        hart 2.
+      "0x0c201008": |
+        You may have thought the harts' claim registers sit next to each other, 4 bytes apart.
+        Each hart's register is in its own `0x2000`-byte block.
+    why_wrong: |
+      Substitute hart = 2 into `PLIC_SCLAIM(hart) = PLIC + 0x201004 + hart * 0x2000` with
+      `PLIC = 0x0c000000`.
+    explain: |
+      `0x0c000000 + 0x201004 + 2 * 0x2000` = `0x0c000000 + 0x201004 + 0x4000` = `0x0c205004`.
+      Each hart has its own claim register, which is why three harts can claim at the same time
+      without a kernel lock: the PLIC itself makes sure each pending source is handed to one
+      claimer ([[tour:9]]).
+
+  - id: irq-05
+    level: 1
+    type: number
+    q: |
+      The machine has three harts, and QEMU's `time` counter runs at 10,000,000 per second.
+      Approximately how many times per second does the kernel's global `ticks` counter increase?
+      (Give the nearest whole number.)
+    code: kernel/trap.c:166-180
+    answer: 10
+    wrong:
+      30: |
+        You may have counted every hart's timer. All three harts get a tick every 0.1 s, but
+        only hart 0 runs `ticks++` (line 169 checks `cpuid() == 0`), so `ticks` advances at one
+        hart's rate.
+      1: |
+        You may have read 1000000 as one second. At 10,000,000 per second, 1,000,000 time units
+        is 0.1 s, as the comment on line 177 says.
+      100: |
+        You may be thinking of a typical Linux tick rate. xv6 schedules the next tick
+        1,000,000 units (0.1 s) after the current time.
+    why_wrong: |
+      Work out the interval between one hart's ticks (1,000,000 / 10,000,000 s), then ask how
+      many harts increment `ticks`.
+    explain: |
+      Each hart re-arms its timer 1,000,000 units ahead, so every hart gets about 10 ticks per
+      second, but only hart 0 counts them. The result is about 10 per second, whatever the
+      number of harts, and slightly fewer in practice, because each deadline is measured from
+      when the previous tick was *handled* ([[tour:14]]).
+
+  - id: irq-06
+    level: 2
+    type: multi
+    q: |
+      A hart is running kernel code in supervisor mode. Which of these does the **hardware**
+      check before it takes a supervisor timer interrupt?
+    options:
+      - text: "`time >= stimecmp` on this hart (so the timer interrupt is pending)"
+        correct: true
+        why: Without a pending request there is nothing to take. With Sstc, pending means `time >= stimecmp`.
+      - text: "`sie.STIE = 1`"
+        correct: true
+        why: "The per-kind enable bit. [[kernel:start]] sets it once at boot ([[kernel/start.c:33]]) and nothing clears it."
+      - text: "`sstatus.SIE = 1`"
+        correct: true
+        why: |
+          In S-mode this is the global switch. [[intr_on]], [[intr_off]], `push_off` and
+          `pop_off` flip it; when it is 0 the interrupt waits, pending.
+      - text: "`mstatus.MIE = 1`"
+        why: |
+          You may have thought machine-mode bits still gate everything. `MIE` controls
+          interrupts taken *into* M-mode. A supervisor interrupt taken in S-mode is governed by
+          `sie` and `sstatus.SIE`. MIE only gates interrupts while the hart runs in M-mode;
+          from S-mode even an M-level interrupt would be taken regardless of MIE.
+      - text: "The PLIC has the timer enabled for this hart"
+        why: |
+          You may have thought every interrupt goes through the PLIC. The timer is local to
+          the hart; the PLIC only routes the UART and the disk.
+      - text: "`cpus[hart].noff == 0`"
+        why: |
+          You may have mixed up a software rule with a hardware check. The hardware never reads
+          `noff`; it only looks at `sstatus.SIE`. (xv6 keeps SIE off whenever `noff > 0`, which
+          is why interrupts never land inside a critical section.)
+    explain: |
+      An interrupt reaches S-mode when it is *delegated* to S-mode (`mideleg`, set once at
+      [[kernel/start.c:32]]), *pending* (`sip`), *enabled for its kind* (`sie`), and, in S-mode,
+      *globally enabled* (`sstatus.SIE`). In U-mode the last condition does not
+      apply. See [[tour:44]] and [[concept:locks#invariant]].
+
+  - id: irq-07
+    level: 1
+    type: bits
+    q: |
+      [[kerneltrap]] reads `scause = 0x8000000000000009`. Decode it.
+    value: "0x8000000000000009"
+    fields:
+      - label: "Bit 63"
+        options: ["1: an interrupt", "0: an exception"]
+        answer: "1: an interrupt"
+        why: "The top hex digit is 8, so bit 63 is set. A set top bit means an asynchronous interrupt, not an exception caused by an instruction."
+      - label: "Cause code (low bits)"
+        options: ["9: supervisor external interrupt", "5: supervisor timer interrupt", "8: environment call from U-mode"]
+        answer: "9: supervisor external interrupt"
+        why: "The low bits are 9. Code 5 would be the timer; 8 is the code for `ecall` from user mode, but that is an exception (top bit 0)."
+      - label: "What devintr does next"
+        options: ["reads its PLIC claim register", "calls clockintr", "returns 0"]
+        answer: "reads its PLIC claim register"
+        why: "Code 9 says only \"some device, via the PLIC\". To learn which device, [[devintr]] calls [[plic_claim]] (line 196)."
+      - label: "devintr's return value"
+        options: ["1", "2", "0"]
+        answer: "1"
+        why: "The external-interrupt branch always returns 1 (line 212), even when the claim returns 0. Only the timer branch returns 2."
+    explain: |
+      `scause` packs two facts: bit 63 (interrupt or exception) and a cause code. xv6 compares
+      the whole value with `0x8000000000000009` (external) and `0x8000000000000005` (timer) in
+      [[devintr]] ([[kernel/trap.c:192]], [[kernel/trap.c:213]]). See [[tour:9]].
+
+  - id: irq-08
+    level: 2
+    type: bits
+    q: |
+      Under gdb, hart 0 at the first instruction of [[scheduler]] shows `sie = 0x220`. Decode
+      it.
+    value: "0x220"
+    fields:
+      - label: "STIE (bit 5)"
+        options: ["1: timer interrupts enabled", "0: timer interrupts disabled"]
+        answer: "1: timer interrupts enabled"
+        why: "`0x220` = `0x200 + 0x20`. Bit 5 has value `0x20`, which is present."
+      - label: "SEIE (bit 9)"
+        options: ["1: external (PLIC) interrupts enabled", "0: external interrupts disabled"]
+        answer: "1: external (PLIC) interrupts enabled"
+        why: "Bit 9 has value `0x200`, which is present."
+      - label: "SSIE (bit 1)"
+        options: ["0: software interrupts not enabled", "1: software interrupts enabled"]
+        answer: "0: software interrupts not enabled"
+        why: "Bit 1 would be `0x2`; `0x220` does not contain it. xv6 sets only SEIE and STIE ([[kernel/start.c:33]]); older xv6 needed SSIE for its forwarded M-mode timer."
+      - label: "Will hart 0 take a pending timer interrupt right now?"
+        options: ["not necessarily: that depends on sstatus.SIE", "yes: STIE is set"]
+        answer: "not necessarily: that depends on sstatus.SIE"
+        why: "`sie` says which *kinds* are enabled. In S-mode the global switch `sstatus.SIE` must also be 1. At this point it is 0; the scheduler first sets it at line 441."
+    explain: |
+      [[kernel:start]] sets `sie.SEIE | sie.STIE` once, in machine mode, and nothing clears them.
+      From then on, every "interrupts on/off" in the kernel is `sstatus.SIE`. Three switches
+      stand between a request and a trap: delegation, `sie`, and `sstatus.SIE` ([[tour:9]],
+      [[g:csr:sie]]).
+
+  - id: irq-09
+    level: 2
+    type: order
+    q: |
+      Hart 2 is idle in its scheduler when the disk finishes a read. Put the events in order,
+      from the device to the moment the PLIC may forward the disk's interrupts again.
+    items:
+      - text: "The disk raises interrupt source 1; the PLIC marks it pending and signals the harts (SEIP)"
+        why: Everything starts at the device. Until the PLIC signals a hart, no hart does anything.
+      - text: "Hart 2 executes `intr_on()` in its scheduler and takes the trap at `stvec`, which is kernelvec"
+        why: The trap can only be taken once `sstatus.SIE` is 1, and the scheduler's window is where that happens.
+      - text: "kerneltrap calls devintr, which sees scause `0x8000000000000009`"
+        why: "[[kernelvec]] saves registers and calls [[kerneltrap]]; only then does C code inspect `scause`."
+      - text: "plic_claim reads hart 2's claim register and gets 1"
+        why: "`scause` says only \"external\"; the claim is how devintr learns it was the disk."
+      - text: "virtio_disk_intr acknowledges the device, sets `b->disk = 0` and calls wakeup"
+        why: The dispatch to the driver needs the IRQ number from the claim.
+      - text: "plic_complete(1) writes 1 back to the claim register"
+        why: "Completion comes last: [[devintr]] calls it after the driver returns, re-opening the PLIC for source 1."
+    why_wrong: |
+      Follow the signal outward-in: device, PLIC, hart, trap vector, C handler, claim, driver,
+      completion.
+    explain: |
+      Device → PLIC → hart (only when `SIE` is on) → [[kernelvec]] → [[kerneltrap]] →
+      [[devintr]] → [[plic_claim]] → driver → [[plic_complete]]. The device-side acknowledgement
+      happens inside the driver, before the PLIC completion, so the PLIC does not re-fire for
+      work already done ([[tour:9]]).
+
+  - id: irq-10
+    level: 1
+    type: line
+    q: |
+      In [[clockintr]], click the line that acknowledges the timer interrupt, so that it stops
+      being pending.
+    code: kernel/trap.c:166-180
+    answer: 179
+    lines:
+      171: |
+        You may have thought counting the tick is the acknowledgement. `ticks++` only updates a
+        kernel variable; the hardware never sees it. It also runs only on hart 0.
+      172: |
+        You may have read `wakeup` as "tell the hardware we're done". It wakes processes
+        sleeping on `&ticks`; it has nothing to do with the timer's pending state.
+      169: |
+        This line decides whether *this hart* counts the tick. The acknowledgement must happen
+        on every hart, so it cannot be inside this `if`.
+    why_wrong: Look for the line that writes a CSR. Everything else here is ordinary kernel data.
+    explain: |
+      Line 179 writes `stimecmp`. With [[g:sstc|Sstc]] the timer interrupt is pending while
+      `time >= stimecmp`, so pushing the deadline 0.1 s into the future both clears this
+      request and asks for the next one ([[tour:11]]).
+
+  - id: irq-11
+    level: 2
+    type: line
+    q: |
+      Two harts trap for the same disk interrupt. Hart 2 claims it; hart 1's claim returns 0.
+      In [[devintr]], click the line that keeps hart 1 from sending a completion to the PLIC.
+    code: kernel/trap.c:187-220
+    answer: 209
+    lines:
+      202: |
+        You may have stopped at the first `if (irq)`. That one only guards the "unexpected
+        interrupt" message. Without line 209, the code would still reach `plic_complete`.
+      210: |
+        That is the completion itself. The question asks for the line that *prevents* it on
+        the hart whose claim returned 0.
+      196: |
+        The claim is where hart 1 learns there is nothing to serve, but it does not decide
+        anything by itself. The test that uses its result comes later.
+      212: |
+        `return 1` comes after the completion would already have happened. Its job is to tell
+        the caller this was a device interrupt.
+    why_wrong: Find the test that runs just before the call to `plic_complete`.
+    explain: |
+      A claim of 0 means "nothing pending for you": another hart got there first, or the
+      interrupt was already served. Line 209 skips [[plic_complete]] in that case. `devintr`
+      still returns 1, because it really was an external interrupt ([[tour:9]]).
+
+  - id: irq-12
+    level: 3
+    type: choice
+    q: |
+      Hart 1 is idle in its scheduler and traps for a disk interrupt that hart 2 has already
+      claimed, so hart 1's [[plic_claim]] returns 0. What happens next on hart 1?
+    code: kernel/trap.c:137-164
+    options:
+      - text: "devintr returns 1, so kerneltrap neither panics nor yields; it restores sepc and sstatus and returns into the scheduler."
+        correct: true
+        why: |
+          With `irq == 0` both dispatch tests and the completion are skipped, but the external
+          branch still ends with `return 1`. `which_dev` is 1, which is not 0 (no panic) and not 2
+          (no yield).
+      - text: "devintr returns 0, and kerneltrap panics with \"kerneltrap\"."
+        why: |
+          You may have read "claim returned 0" as "not recognized". Return value 0 is reserved for
+          an `scause` that devintr does not know. An empty claim still happens inside the
+          recognized external branch, which returns 1.
+      - text: "devintr returns 0, which kerneltrap treats as harmless."
+        why: |
+          You may have thought 0 is the "nothing happened" code. In [[kerneltrap]], 0 leads
+          straight to `panic("kerneltrap")` (line 153). This kernel avoids that by returning 1
+          for every external interrupt.
+      - text: "devintr calls plic_complete(0) to tell the PLIC it saw nothing."
+        why: |
+          You may have thought every claim must be paired with a completion. Line 209 completes
+          only a real IRQ number; completing 0 would mean nothing to the PLIC.
+    explain: |
+      Lost races are normal: the PLIC signals every hart whose context has the source enabled,
+      and only the first claim gets the number. [[devintr]] reports "external, handled" (1) even
+      for an empty claim, so [[kerneltrap]] simply returns ([[kernel/trap.c:209]],
+      [[kernel/trap.c:212]], [[tour:9]]).
+
+  - id: irq-13
+    level: 2
+    type: tf
+    q: |
+      True or false: while a hart is executing user code, a pending supervisor timer interrupt
+      (with `sie.STIE` set) is taken even if `sstatus.SIE` happened to be 0.
+    answer: true
+    why_tf: |
+      You may have thought `sstatus.SIE` gates supervisor interrupts in every mode. It gates
+      them only while the hart is *in* supervisor mode.
+    reasons:
+      - text: "RISC-V treats interrupts for a more privileged mode than the current one as always globally enabled; SIE matters only while the hart runs in S-mode."
+        correct: true
+        why: |
+          This is why a user program can never hold on to the CPU: it cannot turn off the
+          interrupts that will take it into the kernel ([[tour:11]]).
+      - text: "Because prepare_return sets SPIE and sret copies it into SIE, so SIE is never 0 in user mode."
+        why: |
+          You may have explained why SIE is *in practice* 1 in user mode. That is true here, but
+          it does not explain the statement, which is about the case where SIE is 0. The rule
+          does not depend on SIE at all.
+      - text: "Because the timer bypasses every enable bit, including sie.STIE."
+        why: |
+          You may have overstated the rule. `sie.STIE` still has to be 1; only the global
+          `sstatus.SIE` switch is ignored below S-mode.
+    explain: |
+      In U-mode a pending supervisor interrupt is taken if it is enabled in `sie`, regardless of
+      `sstatus.SIE`. This is the guarantee behind preemption: [[tour:11]]'s spinning child loses
+      its hart within one tick, and [[tour:42]] even caught `init` being interrupted before its
+      first user instruction ran.
+
+  - id: irq-14
+    level: 1
+    type: choice
+    q: |
+      [[clockintr]] increments `ticks` only when `cpuid() == 0`. What is the reason?
+    code: kernel/trap.c:166-180@169-174
+    options:
+      - text: "So that ticks advances at one hart's rate (about 10 per second) no matter how many harts there are."
+        correct: true
+        why: |
+          Every hart takes its own timer interrupt every 0.1 s. If all of them counted, `ticks`
+          would run three times too fast on three harts, and the speed would depend on `-smp`.
+      - text: "Only hart 0 receives timer interrupts."
+        why: |
+          You may have thought the other harts have no timer. Each hart runs [[timerinit]] and has
+          its own `stimecmp`; harts 1 and 2 take their ticks and re-arm them at line 179.
+      - text: "Only hart 0 is allowed to acquire tickslock."
+        why: |
+          You may have assumed a lock belongs to one hart. Any hart can take `tickslock`;
+          [[sys_pause]] and [[sys_uptime]] do so on whatever hart they run.
+      - text: "To avoid deadlock between harts that take tickslock at the same time."
+        why: |
+          You may have thought two harts contending for one lock deadlock. They don't: one spins
+          briefly until the other releases. A deadlock needs a cycle of waits, and here there is
+          only one lock.
+    explain: |
+      `ticks` is meant to mean "tenths of a second since boot". One hart feeds it; every hart
+      still needs its own ticks for preemption, which is why line 179 is outside the `if`
+      ([[tour:11]], [[tour:14]]).
+
+  - id: irq-15
+    level: 3
+    type: choice
+    q: |
+      Suppose [[clockintr]] were changed so that only hart 0 executes line 179
+      (`w_stimecmp(...)`), on the theory that only hart 0's ticks matter. What happens to
+      hart 1 after its first timer interrupt?
+    code: kernel/trap.c:166-180
+    options:
+      - text: "Its timer interrupt stays pending, so it traps again as soon as it returns to user mode or opens its scheduler window; no user instruction ever runs on hart 1 again."
+        correct: true
+        why: |
+          The request is pending while `time >= stimecmp`, and nothing moves hart 1's `stimecmp`.
+          In user mode the interrupt is taken immediately, whatever `SIE` says, so every return to
+          user mode on hart 1 traps back before the first instruction.
+      - text: "Hart 1 gets no more timer interrupts, so programs on it can no longer be preempted."
+        why: |
+          You may have thought each tick is a one-shot event that the hardware forgets once taken.
+          With Sstc the request is a level that stays high. The trouble is the opposite: too many
+          interrupts, not too few.
+      - text: "ticks stops advancing."
+        why: |
+          You may have mixed up the two jobs of `clockintr`. Counting is done by hart 0, and in this
+          scenario hart 0 still re-arms its own timer, so `ticks` keeps advancing.
+      - text: "Nothing changes, because stimecmp is a single shared register that hart 0 re-arms for everyone."
+        why: |
+          You may have confused `time` with `stimecmp`. `time` is one shared clock; `stimecmp` is a
+          per-hart CSR. Hart 0's write affects only hart 0.
+    explain: |
+      Re-arming is also the acknowledgement. A hart that never moves its `stimecmp` has a timer
+      interrupt pending forever: an interrupt storm on that hart only. Kernel code with
+      interrupts off still makes progress, but every `sret` to user mode on hart 1 is followed
+      immediately by another trap, and a system call with interrupts on is also preempted
+      before every instruction; such a process can make progress only after another hart picks
+      it up ([[tour:11]]).
+
+  - id: irq-16
+    level: 3
+    type: state
+    q: |
+      Hart 2 was idle in its [[scheduler]] when a disk interrupt arrived. It is now in
+      [[virtio_disk_intr]] and has just executed line 303, `acquire(&disk.vdisk_lock)`.
+      What is the state of hart 2?
+    code: kernel/virtio_disk.c:300-313@303
+    state:
+      mode: S
+      stack: scheduler
+      satp: kernel
+      sie: "off"
+      noff: 1
+      intena: 0
+    why:
+      stack: |
+        You may have expected a special interrupt stack, or the stack of the process that asked
+        for the read. xv6 has neither: [[kernelvec]] pushed its frame onto the stack hart 2 was
+        already using, its scheduler stack.
+      sie: |
+        The trap cleared `SIE`, and the acquire's `push_off` keeps it off. Interrupt handlers in
+        xv6 always run with interrupts off.
+      noff: |
+        The scheduler window opens only at `noff` 0, so the trap arrived with no spinlock held.
+        `vdisk_lock` is the first and only one: noff is 1.
+      intena: |
+        `intena` records SIE as it was just before the outermost `push_off`. The trap had already
+        turned SIE off, so it is 0, and the matching `release` will leave interrupts off.
+      satp: |
+        The scheduler always runs with the kernel page table, and a trap from S-mode does not
+        touch `satp`.
+    why_wrong: |
+      Trace it: scheduler (S-mode, kernel page table, own stack), trap (SIE cleared, same
+      stack), kernelvec, kerneltrap, devintr, virtio_disk_intr, acquire.
+    explain: |
+      Supervisor mode, on hart 2's scheduler stack with a 256-byte [[kernelvec]] frame on it,
+      kernel page table, SIE off, one spinlock held, `intena` 0. `myproc()` is 0: the handler
+      runs on behalf of no process ([[tour:9]], [[concept:locks#intena]]).
+
+  - id: irq-17
+    level: 2
+    type: match
+    q: |
+      Match each register with its role in taking an interrupt.
+    pairs:
+      - left: "`stimecmp`"
+        right: "the time at which this hart's next timer interrupt becomes pending"
+        why: "It is the per-hart deadline that [[clockintr]] moves forward at every tick."
+      - left: "`sie`"
+        right: "which kinds of interrupt this hart accepts (timer, external)"
+        why: "`sie` holds per-kind enable bits, STIE and SEIE, set once at boot."
+      - left: "`sstatus.SIE`"
+        right: "the global on/off switch for interrupts while this hart runs in S-mode"
+        why: "This is the bit `intr_on`, `intr_off`, `push_off` and `pop_off` change all the time."
+      - left: "`stvec`"
+        right: "the address the hart jumps to when it traps"
+        why: "It holds [[uservec]] while the hart runs user code, [[kernelvec]] while it runs the kernel."
+      - left: "`scause`"
+        right: "why the trap happened: interrupt or exception, and which kind"
+        why: "[[devintr]] compares it with the timer (5) and external (9) codes."
+      - left: "the PLIC claim register"
+        right: "which device needs service, handed to exactly one hart"
+        why: "Reading it returns the highest-priority pending source and clears its pending bit."
+    explain: |
+      Pending (`stimecmp` or the PLIC's signal), enabled (`sie`, `sstatus.SIE`), where to go
+      (`stvec`), and what happened (`scause`, then the claim register for devices). See
+      [[tour:44]] and [[tour:9]].
+
+  - id: irq-18
+    level: 2
+    type: choice
+    q: |
+      When its scan finds nothing to run, the [[scheduler]] executes `wfi` at line 467 with
+      interrupts **off** (line 442 turned them off). Why doesn't the hart sleep through the
+      interrupt that should wake it?
+    code: kernel/proc.c:435-469@441-442
+    options:
+      - text: "wfi resumes when an interrupt enabled in sie becomes pending, even if sstatus.SIE is 0; the loop then reaches intr_on() and the interrupt is taken there."
+        correct: true
+        why: |
+          `wfi` waits for a pending interrupt, not for one that can be taken. After it returns, the
+          loop goes around, line 441 turns SIE on, and the pending interrupt traps immediately,
+          with `sepc` pointing at the `intr_off` of line 442.
+      - text: "The scheduler turns interrupts back on right before wfi."
+        why: |
+          You may have assumed interrupts must be on for `wfi` to work. Look at the loop: the only
+          `intr_on` is line 441, before the scan, and line 442 turns them off again before `wfi`.
+      - text: "The interrupt is taken by machine mode, which wakes the hart."
+        why: |
+          You may be thinking of older xv6 with an M-mode timer handler. In this tree all
+          interrupts are delegated to S-mode, and M-mode is never entered after boot.
+      - text: "Another hart sends an inter-processor interrupt when a process becomes runnable."
+        why: |
+          You may have assumed harts notify each other. xv6 sends no inter-processor interrupts:
+          an idle hart notices new work only after its own next interrupt.
+    explain: |
+      The RISC-V spec lets `wfi` wake on any locally enabled pending interrupt, regardless of
+      the global enable. So the scheduler can keep interrupts off while it decides to sleep, and
+      still be woken. [[tour:44]] measured every scheduler-window trap at `sepc = 0x80001e10`,
+      the `csrci` of `intr_off`.
+
+  - id: irq-19
+    level: 3
+    type: choice
+    q: |
+      The scheduler turns interrupts on at line 441 and straight back off at line 442, and then
+      scans the table and possibly executes `wfi` with interrupts off. What would go wrong if
+      line 442 were removed, so interrupts stayed on during the scan and `wfi`?
+    code: kernel/proc.c:435-469@441-442
+    options:
+      - text: "An interrupt could arrive after the scan found nothing but before wfi, make a process runnable, and be fully handled; the hart would then sleep in wfi with work to do until some later interrupt."
+        correct: true
+        why: |
+          With interrupts off, that interrupt would stay pending, and `wfi` would return at once.
+          With them on, it is consumed early and `wfi` waits for the *next* one, possibly a whole
+          tick later.
+      - text: "An interrupt during the scan would deadlock, because the scheduler holds a p->lock."
+        why: |
+          You may have thought the scan holds locks with interrupts on. It cannot: [[acquire]]
+          turns interrupts off for as long as the lock is held, whatever line 442 does. The
+          danger is the gap *between* the scan and `wfi`.
+      - text: "Nothing: interrupts are off during the scan anyway, because each p->lock is held."
+        why: |
+          True while a lock is held, but between two slots, and after the scan before `wfi`,
+          no lock is held and interrupts would be on. That gap is where the lost-wakeup race
+          lives.
+      - text: "The scheduler would never take an interrupt at all."
+        why: |
+          You may have reversed the effect. Removing line 442 makes interrupts *more* available,
+          not less. The problem is the timing of `wfi`, not missing interrupts.
+    explain: |
+      The window is opened briefly so pending interrupts are taken at a safe moment (`noff` 0),
+      and closed so that a decision to `wfi` cannot be invalidated by an interrupt that has
+      already been handled. It is the same lost-wakeup pattern as sleep and wakeup, in
+      hardware ([[tour:44]]).
+
+  - id: irq-20
+    level: 2
+    type: number
+    q: |
+      A process calls `pause(5)` just after a tick. Assume nothing else wakes or kills it, and
+      that after each wakeup some scheduler runs it again before the next tick. How many times
+      does [[sys_pause]] call `sleep()` (line 85)?
+    code: kernel/sysproc.c:67-90
+    answer: 5
+    wrong:
+      6: |
+        You may have counted the loop *tests*. The condition on line 78 is tested six times
+        (differences 0, 1, 2, 3, 4 and 5), but the body, with its `sleep()`, runs only for the
+        five tests that are true.
+      4: |
+        You may have thought the first wakeup is immediate, or that the last tick needs no
+        sleep. `ticks - ticks0` must climb from 0 to 5, one tick per wakeup, and each step up
+        needs one sleep.
+      1: |
+        You may have thought `sleep()` waits for the whole duration. It knows nothing about time:
+        every tick's `wakeup(&ticks)` wakes it, and the loop re-checks.
+    why_wrong: |
+      Each tick increments `ticks` by one and wakes every sleeper on `&ticks`. Count how many
+      values of `ticks - ticks0` are less than 5.
+    explain: |
+      The body runs for differences 0, 1, 2, 3 and 4: five calls to `sleep()`. Each tick on hart
+      0 does `ticks++` and `wakeup(&ticks)` ([[kernel/trap.c:171]]), the process wakes, re-takes
+      `tickslock` and re-tests. `sleep` returning only means "look again" ([[tour:14]]).
+
+  - id: irq-21
+    level: 1
+    type: choice
+    q: |
+      Hart 0 started a disk read and its process went to sleep. When the disk finishes, which
+      hart runs [[virtio_disk_intr]]?
+    options:
+      - text: "Whichever hart claims the interrupt first from the PLIC; it can be any hart with interrupts on."
+        correct: true
+        why: |
+          [[plicinithart]] enables the disk on every hart's context, so the PLIC signals all of
+          them, and the first claim wins. In [[tour:9]]'s run the request went out on hart 0 and
+          hart 2 served the interrupt.
+      - text: "Always hart 0, because hart 0 ran plicinit."
+        why: |
+          You may have confused the one-time setup with routing. [[plicinit]] sets priorities;
+          every hart's own [[plicinithart]] enables both devices for itself.
+      - text: "The hart that started the read, since the request belongs to it."
+        why: |
+          You may have thought a request remembers its hart. The device and the PLIC know nothing
+          about harts that submit requests, and the process that asked is not running anywhere.
+      - text: "The PLIC picks harts in round-robin order."
+        why: |
+          You may have assumed load balancing. The PLIC offers the interrupt to every enabled
+          context at once; the claim decides, and the fastest hart wins.
+    explain: |
+      Enabling the same sources in every context *is* the routing. Several harts may trap; one
+      claim gets the IRQ number and the others get 0 ([[tour:9]], [[g:plic]]).
+
+  - id: irq-22
+    level: 2
+    type: choice
+    q: |
+      [[virtio_disk_intr]] writes the device's `INTERRUPT_ACK` register (line 311), and later
+      [[devintr]] calls [[plic_complete]]. What would happen if xv6 called `plic_complete`
+      without acknowledging the device?
+    code: kernel/virtio_disk.c:300-313@305-311
+    options:
+      - text: "The device would keep its interrupt line raised, so as soon as the PLIC was re-armed it would interrupt a hart again for work already done."
+        correct: true
+        why: |
+          The two acknowledgements do different things. The device ack lowers the device's line;
+          the PLIC completion re-opens the PLIC for that source. With the line still high, the
+          PLIC would see a new request at once.
+      - text: "Nothing: plic_complete acknowledges the device too."
+        why: |
+          You may have thought the PLIC talks to the device for the kernel. It only routes the
+          signal. Quieting the device is a register write in the device's own MMIO space.
+      - text: "The PLIC would never forward another disk interrupt."
+        why: |
+          You may have confused the two. *Skipping `plic_complete`* would leave source 1 blocked
+          at the PLIC; skipping the device ack causes the opposite, repeated interrupts.
+      - text: "The data in b->data would be lost."
+        why: |
+          You may have thought the ack moves the data. The device wrote `b->data` by DMA before it
+          raised the interrupt; the ack only tells it to lower its interrupt line.
+    explain: |
+      Every device interrupt has two conversations: one with the device (ack, so it stops
+      asserting) and one with the PLIC (claim, then complete). The device must be quieted first
+      ([[tour:9]]).
+
+  - id: irq-23
+    level: 1
+    type: tf
+    q: |
+      True or false: if hart 1 has interrupts off when its timer fires, hart 0 may handle that
+      timer interrupt instead.
+    answer: false
+    why_tf: |
+      You may have imagined timer interrupts as shared, like device interrupts that any hart
+      can claim. The timer is private to each hart.
+    reasons:
+      - text: "Each hart has its own stimecmp and its own pending timer bit; hart 1's interrupt waits, pending, until hart 1 turns interrupts on."
+        correct: true
+        why: |
+          Nothing routes a hart's timer elsewhere. The request simply stays pending on hart 1,
+          which is also why a tick can be late but is never taken by another hart.
+      - text: "Only hart 0 has a timer, so the question cannot arise."
+        why: |
+          You may have thought only hart 0 gets ticks because only it counts them. Every hart has
+          a timer; [[timerinit]] runs on every hart.
+      - text: "The PLIC routes timer interrupts to hart 0 only."
+        why: |
+          You may have thought the timer goes through the PLIC. It doesn't: [[devintr]] identifies
+          it by `scause` alone, with no claim.
+    explain: |
+      A timer interrupt always lands on the hart whose `time` passed its own `stimecmp`
+      ([[tour:11]]). Device interrupts are the shared ones, arbitrated by the PLIC's claim.
+
+  - id: irq-24
+    level: 3
+    type: multi
+    q: |
+      Which of these always run with interrupts **off** (`sstatus.SIE = 0`) on the hart executing
+      them?
+    options:
+      - text: "[[clockintr]], wherever it is called from"
+        correct: true
+        why: |
+          It is called only by [[devintr]], which runs from [[kerneltrap]] (interrupts off since the
+          trap) or from [[usertrap]]'s non-syscall branch, which never calls `intr_on`.
+      - text: "[[usertrap]] handling a timer interrupt from user mode, on that thread, from its first line to its return"
+        correct: true
+        why: |
+          `intr_on` (line 66) is only in the system-call branch. The trap cleared SIE, and when the
+          thread resumes after `yield`, `sched` restores its `intena` of 0, so SIE stays off until
+          `sret`.
+      - text: "[[kernel:main]] on hart 0 while it runs kinit, kvminit and the other initializers"
+        correct: true
+        why: |
+          Interrupts are off from power-on until the scheduler's first `intr_on` (gdb read
+          `sstatus = 0x200000000` in `main`).
+      - text: "[[syscall]] dispatching a `read` system call"
+        why: |
+          You may have thought the whole kernel runs with interrupts off. For a system call,
+          [[usertrap]] turns them on at line 66 before calling `syscall`; they go off again only
+          while a spinlock is held.
+      - text: "A user program's code"
+        why: |
+          You may have confused "SIE" with "can be interrupted". `sret` sets SIE from SPIE, which
+          [[prepare_return]] set, and in any case supervisor interrupts enabled in `sie` are always
+          taken in user mode, whatever SIE says.
+    explain: |
+      In this kernel interrupts are on in exactly three situations: user mode, system-call code
+      whenever it holds no spinlock, and the scheduler's two-instruction window.
+      Interrupt handlers, trap entry and exit, and boot all run with them off ([[tour:44]],
+      [[concept:locks#sie]]).
+
+  - id: irq-25
+    level: 3
+    type: multi
+    q: |
+      Hypothetically, hart 0 runs for 0.35 seconds with interrupts off (say, a buggy driver
+      spinning). Harts 1 and 2 run normally. Which statements are true?
+    options:
+      - text: "Hart 0's timer interrupt stays pending and is taken once, when hart 0 turns interrupts back on."
+        correct: true
+        why: The request is a level (`time >= stimecmp`), so it waits. It is one request, not one per missed deadline.
+      - text: "ticks does not advance during the stretch, and advances by only one when interrupts come back on."
+        correct: true
+        why: Only hart 0 counts, and it takes one interrupt. The next deadline is set 0.1 s after that, from the current `time`.
+      - text: "Harts 1 and 2 keep taking their own timer interrupts."
+        correct: true
+        why: Their `stimecmp` registers are their own, unaffected by hart 0.
+      - text: "Hart 1 notices that hart 0 is late and increments ticks instead."
+        why: |
+          You may have expected a fallback. [[clockintr]] tests `cpuid() == 0` and nothing else;
+          harts 1 and 2 never touch `ticks`.
+      - text: "clockintr later adds the three missed ticks in a burst."
+        why: |
+          You may have thought the kernel tracks missed deadlines. It computes the next deadline
+          from the current `time`, so missed ticks are never made up and `ticks` falls behind
+          real time.
+    explain: |
+      One hart keeps time, and its clock can be late but never catch up. That is acceptable for
+      xv6, where `pause(n)` means "n ticks", not an exact duration ([[tour:14]],
+      [[kernel/trap.c:179]]).

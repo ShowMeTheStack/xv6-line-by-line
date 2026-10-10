@@ -1,0 +1,1821 @@
+published: true
+title: A sampling profiler
+area: Traps and control flow
+stars: 2
+branch: ext/07-profiler
+prerequisites: {tours: [5, 8, 11, 12, 21, 22, 44, 50], concepts: [stacks, locks]}
+summary: |
+  Where does a program spend its time? A *sampling profiler* answers without changing the
+  program: every so often, it stops the program, writes down where it was, and lets it go
+  on. After a few hundred samples, the places that come up most are the places where the
+  time goes. In this lab you build one for xv6. A process asks the kernel to sample it, the
+  kernel counts the interrupted program counters in a histogram of address buckets, and a
+  new command, `prof grep ...`, prints the hottest functions of any program.
+
+  The hardware already stops every program ten times a second: the timer interrupt that
+  drives the scheduler. The design questions are about using that interrupt well. Which
+  piece of code sees every tick on every [[g:hart]], and which register says where the
+  program was? Where should a histogram live, who may touch it while an interrupt handler
+  is updating it, and what happens to it across `fork`, `exec` and `exit`? A program run
+  under the profiler does not know it is being profiled: how do the samples get out? And
+  when you point the same machinery at the kernel itself, what can it see, and what is it
+  structurally unable to see?
+
+  The reference solution is eight small commits. It finds the inner loop of `grep`'s regular
+  expression matcher from 61 samples, and its kernel profile of `usertests` turns up a
+  surprise about which kernel code a timer-driven profiler can see at all.
+learn:
+  - "How a timer interrupt reaches the kernel on every hart, which code runs for it when the hart was in user mode and when it was in the kernel, and what the `sepc` register holds at that moment."
+  - "How to attach per-process state with an interesting lifetime to `struct proc`: what `fork`, `exec`, `exit` and `wait` each do to it, and which of these places may sleep."
+  - "When an interrupt handler can update data without a lock, and when it cannot."
+  - "What a sample count means statistically: how many samples a second a process gets, and how long a run must be before a percentage means something."
+  - "What a profiler driven by interrupts can and cannot see inside the kernel, and where the time it cannot see ends up."
+spec: |
+  **The system calls.**
+
+  - `int profile(uint64 lo, uint64 hi, int shift)` starts sampling the calling process into a
+    new, empty histogram. Its buckets cover the addresses `[lo, hi)`, each bucket
+    `1 << shift` bytes, at most 1016 buckets. At every timer interrupt that finds the process
+    running in user mode, the interrupted user pc is counted in its bucket, or as "outside"
+    if it is not in `[lo, hi)`. `profile(0, 0, 0)` stops sampling and discards the histogram;
+    a second `profile` replaces the first. Bad arguments (an empty range, a negative or huge
+    shift, too many buckets) return -1.
+  - `int profget(struct prof *buf)` copies the calling process's histogram to `buf`; -1 if
+    it has none.
+  - `struct prof` is defined in `kernel/prof.h`, which user programs include too: the range,
+    the shift, the number of buckets, a count of all samples, a count of samples outside the
+    range, and the buckets. It is exactly one page.
+  - **Lifetime.** `fork` does not pass the profile to the child. `exec` keeps it (the profile
+    belongs to the process, not to the program). When a profiled process exits, the kernel
+    writes its histogram to the file `prof.out` in the process's current directory.
+  - **Kernel mode.** If `lo >= KERNBASE`, the histogram is a *kernel* profile: it counts the
+    kernel pc at every timer interrupt taken in supervisor mode, on all harts, whatever is
+    running. Only one kernel profile can exist at a time.
+
+  **The command.** `prof command args...` profiles the command's executable segment and prints
+  where the samples landed, by function (named from the program's `.sym` file, which the
+  Makefile now copies into `fs.img`) and by bucket. `prof -k command` profiles the kernel's
+  text while the command runs; `prof -k 0xLO 0xHI command` only `[LO, HI)`. The report goes to
+  the standard error, so the command's output can be redirected:
+
+  ```text
+  $ prof grep .*.*.*z b1 > o
+  prof: 72 ticks
+  prof: grep: 61 samples, 0 outside [0x0, 0xB71), 4-byte buckets
+  by function:
+    48	78%	matchstar
+    13	21%	matchhere
+  hottest buckets:
+    42	68%	0x24	matchstar+0x24
+  [...]
+  ```
+
+  **The test.** `proftest` prints one line per check: bad arguments are refused and
+  `profile(0, 0, 0)` stops; a 30-tick hot loop gets at least 10 samples and at least 90% of
+  the in-range ones fall inside the loop's function; `fork` does not pass the profile on and
+  `exec` keeps it; a child that spins for 20 ticks and exits while profiling leaves its
+  histogram in `prof.out`;
+  only one kernel profile may exist, and an idle second of the kernel yields at least 10
+  samples, none outside the profiled range; 20 profiled children leak no page. Everything
+  it reports, it checks.
+  The leak check counts free pages, so run it on an otherwise idle system.
+
+  ```text
+  $ proftest
+  proftest: arguments, and profile(0, 0, 0) stops: OK
+  proftest: hot loop: 30 samples, 30 in range, 30 in hot()
+  proftest: most samples in the hot loop: OK
+  [...]
+  proftest: no leaks: OK
+  proftest: ALL OK
+  ```
+
+  **Constraints.** A process that never calls `profile` must behave exactly as before, and
+  `usertests -q` must still print `ALL TESTS PASSED` on three harts. The sampling path runs
+  at every tick on every hart, so keep it short.
+think:
+  - title: Where can you catch every tick?
+    q: |
+      The profiler needs code that runs once per timer interrupt while the profiled process
+      is in user mode, on whichever of the three harts it happens to be running. Where in the
+      kernel is that? And is the global `ticks` counter a good clock for it?
+    hints:
+      - |
+        Follow a timer interrupt that arrives while a process is in user mode, from the
+        trampoline into C and on to the code that re-arms the timer ([[tour:11]]). Then
+        follow one that arrives while the kernel is running ([[tour:8]], [[tour:44]]).
+      - |
+        Each hart has its own timer: look at who writes `stimecmp`, in [[timerinit]] and in
+        [[clockintr]]. Now look at what [[clockintr]] does only on hart 0.
+      - |
+        You want a place that knows (a) that this was a timer interrupt, (b) that it came
+        from user mode, and (c) which process was running. One function in `trap.c` knows
+        all three, on every hart, right before it gives the CPU away.
+    answer: |
+      In [[usertrap]], in the branch for `which_dev == 2`, before `yield()`
+      ([[kernel/trap.c:85]]). [[devintr]] returns 2 for a supervisor timer interrupt
+      (`scause` `0x8000000000000005`), and `usertrap` only runs for traps from user mode, so
+      this one spot sees exactly "a timer tick while some process was in user mode", and `p`
+      is that process.
+
+      Every hart has its own timer. [[timerinit]] sets each hart's first `stimecmp` in
+      [[start]], and [[clockintr]] re-arms it on every interrupt with
+      `stimecmp = time + 1000000`: a tenth of a second at QEMU's 10 MHz timebase. So a running
+      process is interrupted about ten times a second *of its own running time*, whichever
+      hart it is on. In the recorded runs on the branch, `proftest`'s hot loop, spinning for
+      30 ticks, got between 28 and 30 samples every time.
+
+      [[clockintr]] is the wrong place, for two reasons. Its `ticks++` runs only on hart 0
+      (`if (cpuid() == 0)`), because `ticks` is a wall-clock counter, not a per-hart one: tie
+      sampling to it and a process on hart 1 or 2 is never sampled (clinic 1 measured
+      runs with 0 samples). And `clockintr` is shared by both trap paths, so it does not know
+      by itself whether the interrupted pc is a user or a kernel address.
+    checks:
+      - id: lab07-01
+        level: 1
+        type: choice
+        q: |
+          A learner samples in [[clockintr]], inside its `if (cpuid() == 0)` block, next to
+          `ticks++`. On three harts, a CPU-bound process runs its hot loop for 3 seconds. What
+          does its profile most likely show?
+        options:
+          - text: "Anywhere from 0 to about 30, depending on how much of the run was on hart 0"
+            correct: true
+            why: |
+              Only hart 0 executes that block. The process is sampled at hart 0's ticks
+              while it runs there and never on the other harts. The recorded runs gave 30,
+              0, 11 and 0 samples on one boot, and 23, 29, 26 and 0 on another.
+          - text: About 10 samples, one third of the ticks, every time
+            why: |
+              You may have pictured the process rotating evenly across the harts. The
+              recorded runs did not look like that: most were near 30 or at 0, depending on
+              where the process ran.
+          - text: About 90 samples, because three harts each tick ten times a second
+            why: |
+              You may have added up all three harts' timers. A process runs on one hart at a
+              time, and in this version only hart 0's ticks sample anything.
+          - text: About 30 samples always, because `ticks` counts every hart's interrupts
+            why: |
+              You may have thought `ticks` is incremented by every hart. Look at
+              [[kernel/trap.c:169]]: only `cpuid() == 0` increments it.
+        explain: |
+          Each hart has its own timer interrupt, but `ticks` is advanced by hart 0 alone, so it
+          is a wall clock, not a per-hart event. Sampling must happen on the trap path of the
+          hart that was running the process: [[usertrap]] with `which_dev == 2`. See
+          [[tour:11]].
+      - id: lab07-02
+        level: 2
+        type: number
+        q: |
+          The timer comparator is set to `time + 1000000` and QEMU's `time` counts at 10 MHz.
+          A process spins in user mode, alone on a hart, for 3 seconds. About how many samples
+          does a correct profiler take of it?
+        answer: 30
+        wrong:
+          90: |
+            You may have counted all three harts' ticks. Only the ticks of the hart running
+            the process interrupt it.
+          3: |
+            You may have taken 1000000 as microseconds (one tick a second). At 10 MHz,
+            1,000,000 counts are 0.1 s.
+          300: |
+            You may have assumed 100 ticks a second (a 10 ms tick, or a 100 MHz timebase).
+            At 10 MHz, 1,000,000 counts is 0.1 s: 10 ticks a second.
+        why_wrong: |
+          Work out the tick rate first: 10,000,000 counts a second divided by 1,000,000 counts
+          a tick, on the one hart that runs the process.
+        explain: |
+          Ten ticks a second, so 30 in three seconds. The recorded `proftest` runs, whose hot
+          loop spins for 30 ticks of `uptime`, got between 28 and 30 samples each time.
+  - title: Which register says where the program was?
+    q: |
+      You are now in the right spot in [[usertrap]]. Which value is the address of the user
+      instruction the timer interrupted, why is it exactly that instruction, and can you read
+      it at any time during `usertrap`?
+    hints:
+      - |
+        Read the first lines of [[usertrap]] ([[kernel/trap.c:52]]) and the comment above
+        [[kernel/trap.c:60]]. What does the hardware put in `sepc` when it takes a trap?
+      - |
+        An interrupt arrives *between* two instructions: one has finished, the next has not
+        started. `sepc` must let the kernel resume the program correctly. Now ask what else
+        can write `sepc` while `usertrap` is still running.
+      - |
+        What did `usertrap` do with `sepc` before anything else could run?
+    answer: |
+      The trap hardware writes `sepc` with the address of the instruction that was
+      interrupted, the one that has *not* executed yet; returning with `sret` to `sepc` runs
+      it as if nothing had happened. That is what makes it the right sample: it is exactly
+      where the program was. (For an `ecall` it is the `ecall` itself, which is why the
+      system-call path adds 4.) `usertrap` saves it at once in `p->trapframe->epc`
+      ([[kernel/trap.c:52]]) for a reason the comment at [[kernel/trap.c:64]] spells out: any
+      later trap on this hart overwrites `sepc`.
+
+      So the sample is `p->trapframe->epc`, taken before `yield()`. After `yield()` the live
+      `sepc` belongs to whatever trapped on this hart in the meantime: another process's user
+      pc, or the kernel pc of an interrupt taken in the scheduler. Clinic 2 samples
+      `r_sepc()` after `yield()`: with three CPU hogs running, only 12 of 30 samples landed in
+      the hot loop, 8 were outside the program's range, and 10 were inside it but outside the
+      hot loop, at addresses `proftest` was not executing.
+
+      A gdb stop at the sample in the recorded run: hart 1, pid 3 (`proftest`), `sepc` and
+      `trapframe->epc` both `0x112`, which is the `mulw` at the top of the hot loop's inner
+      loop.
+    checks:
+      - id: lab07-03
+        level: 2
+        type: bits
+        q: |
+          gdb stopped at the sample in [[usertrap]] (timer interrupt from user mode) and printed
+          `sstatus`. Decode three of its bits.
+        value: "0x200000020"
+        fields:
+          - label: "SIE (bit 1): interrupts enabled in S-mode now?"
+            options: ["0", "1"]
+            answer: "0"
+            why: |
+              You may have thought interrupts are on while the kernel handles a trap. Taking
+              the trap cleared SIE (saving the old value in SPIE), and on the timer path
+              `usertrap` never calls `intr_on`.
+          - label: "SPIE (bit 5): SIE before the trap"
+            options: ["0", "1"]
+            answer: "1"
+            why: |
+              You may have confused SPIE with SIE. SPIE holds the interrupt-enable bit as it
+              was before the trap; in user mode it was on, which is how the timer interrupt
+              could be taken at all.
+          - label: "SPP (bit 8): privilege before the trap"
+            options: ["0 (user)", "1 (supervisor)"]
+            answer: "0 (user)"
+            why: |
+              You may have thought SPP records the current mode. It records where the trap
+              came from, and `usertrap` panics unless it is 0 ([[kernel/trap.c:42]]).
+        explain: |
+          `0x200000020` has bits 5 and 33 set: SPIE = 1, SPP = 0, SIE = 0 (bit 33 belongs to
+          the UXL field, user mode is 64-bit). The trap came from user mode with interrupts on,
+          and the handler runs with them off. See [[concept:locks#sie]].
+      - id: lab07-04
+        level: 2
+        type: tf
+        q: |
+          True or false: in [[usertrap]], `r_sepc()` called right after `yield()` returns
+          still holds the interrupted user pc of this process.
+        answer: false
+        why_tf: |
+          You may have thought `sepc` belongs to the process. It is one register per hart, and
+          `yield()` lets the scheduler, other processes and other interrupts run on this hart
+          (or the process may come back on a different hart).
+        reasons:
+          - text: "False: any trap taken on this hart while the process was switched out rewrote sepc."
+            correct: true
+            why: This is the reason. That is why usertrap saves sepc in the trapframe before doing anything that can trap or switch.
+          - text: "True: yield saves and restores sepc in the process's context."
+            why: You may have thought swtch saves every register. struct context holds only ra, sp and the callee-saved registers; sepc is not among them.
+          - text: "False: yield clears sepc."
+            why: Nothing clears sepc. It is overwritten by the next trap, which is a different and less predictable thing.
+          - text: "True: sepc is per process because each process has its own page table."
+            why: You may have confused CSRs with memory. The page table changes what addresses mean; the CSRs are per hart.
+        explain: |
+          CSRs such as `sepc` belong to the hart, not the process. The kernel copies what it
+          needs into the process's trapframe (`p->trapframe->epc`) right away; clinic 2 shows
+          what sampling the live register later records. See [[tour:44]].
+  - title: Where does the histogram live, and for how long?
+    q: |
+      A histogram needs about a thousand counters. Where do you keep it, and what must `fork`,
+      `exec`, `exit` and `wait` each do to it? Decide each case, then say where the memory is
+      freed.
+    hints:
+      - |
+        Look at how the trapframe is allocated and freed: [[allocproc]] and [[freeproc]]. Then
+        look at what [[kfork]] copies, what [[kexec]] replaces, and when [[freeproc]] runs.
+      - |
+        `struct proc` is in a static array of 64 entries; a few kilobytes each would cost a
+        lot for the processes that never profile. Think about the command you will write:
+        it must set up profiling and then run some other program in the same process.
+      - |
+        Something allocated on demand and pointed to from `struct proc`; then one decision
+        per event, each justified by what that event does to the `struct proc` itself.
+    answer: |
+      One page, `kalloc`'d when the process calls `profile` and pointed to by `p->prof`, a new
+      field in the section of `struct proc` that is private to the process. `struct prof` is
+      exactly one page: a 32-byte header and 1016 four-byte buckets. Processes that never
+      profile pay 8 bytes.
+
+      - **fork** gives the child nothing: [[allocproc]] hands out a slot that [[freeproc]]
+        cleared, so `p->prof` is 0. Copying would make two processes write two copies of a
+        histogram that describes one program, and both would write `prof.out`.
+      - **exec** keeps it, because [[kexec]] replaces the memory image but keeps the
+        `struct proc`. That is what lets `prof` call `profile` and then `exec` the command:
+        the samples are the new program's. (The range must describe the new program, so
+        `prof` reads it from the command's ELF headers before the `exec`.)
+      - **exit** writes it out (question 5) but cannot free the slot's other resources yet.
+      - **wait** reaps the slot: [[freeproc]] frees the page with the trapframe and sets
+        `p->prof = 0`. Clearing the pointer matters as much as freeing the page: clinic 4
+        freed it on `exec` only, left the pointer in the slot, and the next process to use
+        that slot started life with a stranger's histogram (observed in another run of
+        clinic 4: a later `proftest` failed `fork does not inherit the profile`).
+    checks:
+      - id: lab07-05
+        level: 2
+        type: match
+        q: |
+          Match each event to what the reference design does with the histogram page.
+        pairs:
+          - left: "`fork`"
+            right: the child starts with no profile
+            why: |
+              You may have expected the child to inherit it like open files. A profile
+              describes one program; the child gets a slot whose `prof` field `freeproc`
+              cleared.
+          - left: "`exec`"
+            right: kept, so the new program is sampled
+            why: |
+              You may have thought exec discards everything about the old program. It keeps
+              the `struct proc`; `prof` depends on that.
+          - left: "`exit`"
+            right: written to `prof.out`, not yet freed
+            why: |
+              You may have thought exit frees everything. The slot's resources are freed when
+              the parent reaps it; exit is the last moment the process can still do file I/O.
+          - left: "`wait` reaping the zombie"
+            right: freed, and the pointer cleared
+            why: |
+              You may have put the write-out here. `freeproc` runs with spinlocks held, where
+              file-system code must not run (clinic 5), but freeing a page is fine.
+        explain: |
+          The page follows the *process* (the slot), not the program, and is freed with the
+          slot's other resources in [[freeproc]]. See [[tour:21]] for the exit/wait split.
+  - title: Does the sampling path need a lock?
+    q: |
+      The sample is taken in an interrupt handler, the histogram is shared memory, and there
+      are three harts. Does the increment in the sample path need a spinlock? Who else could
+      be reading or writing the same histogram at that instant?
+    hints:
+      - |
+        List every piece of code that touches `p->prof` or the page it points to so far:
+        the sample in [[usertrap]], `profile`, `profget`, [[freeproc]]. (Wherever the
+        histogram is saved at exit, ask the same question of that code.)
+      - |
+        Each of them runs either *as* the process or on a zombie nobody runs. A process runs
+        on at most one hart at a time. And while the process is in [[usertrap]] for the
+        timer, it is not in a system call.
+      - |
+        Ask, for each pair, whether they can overlap in time. If no pair can, the field is
+        private, exactly like `p->sz`.
+    answer: |
+      No lock. The user histogram is touched only by its own process: the sample in
+      [[usertrap]] runs on the hart that was running the process, with interrupts off
+      (`sstatus` showed SIE 0 in the recorded stop), and the system calls run as the same
+      process on its kernel stack. A process is never in a system call and in the timer path
+      at the same time, so the increment cannot race with `profile` freeing the page. The
+      process can move to another hart, but only by `yield()`, which happens after the sample.
+      [[freeproc]] touches the page only after the process is a zombie.
+
+      The state at the sample in the recorded run: hart 1, supervisor mode, kernel page table,
+      `proftest`'s kernel stack with only `usertrap` and `profsample` on it, interrupts off,
+      `noff` 0. A lock here would cost an atomic swap, a fence and an interrupt-state push and
+      pop per tick, and protect nothing.
+
+      This changes for the kernel profile (the last question): there, three harts' interrupt
+      handlers write one histogram.
+    checks:
+      - id: lab07-06
+        level: 2
+        type: state
+        q: |
+          A timer interrupt from user mode has brought `proftest` into [[usertrap]], which is
+          about to count the sample. Fill in the machine state of that hart.
+        state: {mode: S, stack: kernel, satp: kernel, sie: "off", noff: "0", intena: "-"}
+        why:
+          mode: You may have thought the sample is taken in user mode. The trap moved the hart to supervisor mode; the user program is frozen at sepc.
+          stack: You may have thought a trap handler has its own interrupt stack. uservec loaded the process's kernel stack ([[kernel/trampoline.S:76]]); xv6 has no separate interrupt stack.
+          satp: You may have thought the user page table is still installed. uservec switched to the kernel page table before jumping to usertrap ([[kernel/trampoline.S:92]]).
+          sie: You may have thought interrupts are on, as in a system call. Only the system-call branch calls intr_on; the trap itself cleared SIE.
+          noff: You may have assumed a lock protects the histogram. None is taken, so noff is 0 (the gdb stop printed 0).
+          intena: With noff 0 there is no saved interrupt state.
+        why_wrong: |
+          Ask the three questions of [[concept:mode-stack-page-table]], then whether any
+          spinlock is held. Interrupts are off because the hardware turned them off.
+        explain: |
+          The sample runs in supervisor mode on the process's own kernel stack with the kernel
+          page table, interrupts off and no lock held. Nothing else can touch this process's
+          histogram at that moment, which is why no lock is needed.
+  - title: How do the samples get out?
+    q: |
+      `prof grep hello README` will run `grep`, which knows nothing about profiling and will
+      never call `profget`. When `grep` exits, its histogram must reach `prof`. Where in the
+      exit/wait sequence can the kernel hand it over, and what rules out the other places?
+    hints:
+      - |
+        Read the exit and wait path from top to bottom ([[tour:21]]): the exiting process's
+        side, then the parent's. At each line, ask: which locks are held, and could this code
+        sleep?
+      - |
+        A simple hand-over is a file. Writing one needs the log ([[begin_op]]), path lookup
+        relative to the current directory, and sleep-locks on inodes and buffers. All of
+        them may sleep, and releasing a sleep-lock calls [[wakeup]]. Look at what `wakeup`
+        acquires.
+      - |
+        The write must happen while the exiting process still has its current directory and
+        holds no spinlock.
+    answer: |
+      In [[kexit]], at its top, before the files are closed and before `iput(p->cwd)` (line
+      338 of `kernel/proc.c` on the branch): `profdump` creates (or reuses) `prof.out` in the
+      process's current directory and writes the page with [[writei]] inside one log
+      transaction. At that point the process holds no lock and may sleep, exactly like a
+      system call.
+
+      [[freeproc]] would be the tidy place, next to the free, but it runs in the parent's
+      [[kwait]] holding `wait_lock` and the child's `p->lock`. File-system code there breaks
+      in a way that is instructive: releasing an inode's sleep-lock calls [[wakeup]], which
+      acquires *every* process's `p->lock` in turn, including the zombie's, which this hart
+      already holds. Clinic 5 ran it: `panic: acquire`, with `wakeup` → `releasesleep` →
+      `iunlock` → `namex` → `create` → `profdump` → `freeproc` → `kwait` on the stack.
+
+      The parent reads the file after `wait` returns, by which time the write is complete:
+      `kexit` finished it before the child became a zombie.
+    checks:
+      - id: lab07-07
+        level: 3
+        type: choice
+        q: |
+          A learner moves the write-out into [[freeproc]] (called from [[kwait]]). What
+          happens the first time a profiled child is reaped?
+        options:
+          - text: "`panic: acquire`: `wakeup`, called while releasing an inode sleep-lock, tries to take the zombie's `p->lock`, which this hart holds"
+            correct: true
+            why: |
+              [[kwait]] holds the child's `p->lock`. Path lookup unlocks the directory inode,
+              [[releasesleep]] calls [[wakeup]], and `wakeup` acquires every `p->lock`; at the
+              zombie's slot [[acquire]] finds this hart already holding it.
+          - text: "`panic: sched locks`, because the disk read sleeps with spinlocks held"
+            why: |
+              That would happen if the code got as far as sleeping. It fails earlier: the
+              first sleep-lock release already calls `wakeup`, before any disk wait.
+          - text: The file is written to the child's current directory as intended
+            why: |
+              You may have thought `freeproc` runs as the child. It runs in the parent; path
+              lookup would use the *parent's* current directory, even if nothing else broke.
+          - text: It deadlocks silently, because `wait_lock` is held
+            why: |
+              `wait_lock` is not the problem here: nothing on that path takes it again. The
+              repeated `p->lock` is, and [[acquire]] detects a re-acquire on the same hart and
+              panics instead of spinning.
+        explain: |
+          File-system code may sleep and calls `wakeup`, so it can run only where the caller
+          holds no spinlock. That is the exiting process itself, in [[kexit]] before it takes
+          `wait_lock`. See [[concept:locks#rules]] and [[tour:21]].
+  - title: How long must you sample?
+    q: |
+      `prof grep .*.*.*z README` runs for about a second and reports `matchstar 70%`. Run it
+      again and you may see 62% or 87%. How many samples do you need before a percentage is
+      trustworthy to a few points, and how long is that in seconds of the program's run?
+    hints:
+      - |
+        Each sample is a draw: it lands in function F with probability p, F's true share of
+        the running time. The number in F after n samples is binomial.
+      - |
+        The standard error of a binomial proportion is `sqrt(p(1-p)/n)`. And you know the
+        sampling rate from the first question.
+      - |
+        Solve `sqrt(p(1-p)/n) = target` for n, then divide by ten samples a second.
+    answer: |
+      With n samples, a share p comes out with a standard error of about `sqrt(p(1-p)/n)`.
+      For p = 0.7:
+
+      | samples | standard error | at 10 a second |
+      |---|---|---|
+      | 8 | 16 points | under a second |
+      | 60 | 6 points | 6 seconds |
+      | 2,100 | 1 point | 3.5 minutes |
+
+      The recorded runs agree. Six runs of `grep .*.*.*z README` (7 to 10 samples each) gave
+      `matchstar` 87%, 100%, 50%, 70%, 71% and 62%. Two runs on eight times the input
+      (60 and 61 samples) gave 65% and 78%.
+
+      Two more things limit accuracy. A process gets about ten samples a second *of its own
+      running time*: a program that mostly waits gets almost none, however long it takes
+      (`prof wc` on 937 KB of text took 55 ticks and got 1 sample; see Measure). And a sample
+      attributes the tick to the instruction the interrupt landed in front of; with 4-byte
+      buckets that is close to exact, but a bucket that straddles two functions is labelled
+      with the first one.
+    checks:
+      - id: lab07-08
+        level: 2
+        type: number
+        q: |
+          You want a function's share, about 50%, to within one standard error of 2
+          percentage points. How many samples do you need? (Use `sqrt(p(1-p)/n)`.)
+        answer: 625
+        wrong:
+          25: |
+            You may have divided `sqrt(p(1-p))` = 0.5 by 0.02 without squaring. The error
+            shrinks with the square root of n, so n grows with the square of the precision.
+          62: |
+            You may have converted to seconds already. 625 samples, at about ten a second,
+            is about 62 seconds of running time; the question asks for samples.
+          2500: |
+            You may have aimed for 1 point instead of 2. 0.25 / 0.01² = 2500; with 2 points
+            it is 0.25 / 0.0004 = 625.
+        why_wrong: |
+          Solve 0.02 = sqrt(0.25 / n): n = 0.25 / 0.0004.
+        explain: |
+          n = p(1-p) / 0.02² = 625 samples, about a minute of running time at ten samples a
+          second. Precision costs a quadratic amount of running time: halving the error needs
+          four times the samples.
+  - title: What would a kernel profile see?
+    q: |
+      Now point the same idea at the kernel: count the kernel pc at timer interrupts taken in
+      supervisor mode. Where do you take the sample, does it need a lock now, and, most
+      interesting, which kernel code can such a profile *never* catch, and where will that
+      time show up instead?
+    hints:
+      - |
+        Follow a timer interrupt taken in supervisor mode ([[tour:8]]), then read the
+        invariant in [[concept:locks#invariant]]: when can the hart take an interrupt in
+        supervisor mode at all?
+      - |
+        A pending timer interrupt is not lost while SIE is 0; it is taken at the first
+        instruction after SIE becomes 1. Find every instruction in the kernel that sets SIE.
+      - |
+        Count the writers of a kernel histogram. Then, for the blind spot, ask two things of
+        each place in the kernel: is SIE on there, and if not, where is the next instruction
+        that turns it back on?
+    answer: |
+      Sample `sepc` in [[kerneltrap]] when `which_dev == 2`. Unlike the user histogram, this
+      one is written by every hart's interrupt handler at once, so it needs a lock
+      (`kproflock`, taken in interrupt context, like `tickslock`), and there can be only one
+      kernel profile at a time. It can never deadlock: it is never held with interrupts on,
+      and nothing that runs in interrupt context is acquired while holding it. (It is not a
+      leaf, though: `profget` holds it across a `copyout` that may call `kalloc`.) Before the page is freed or written out, it must
+      be unhooked under the lock, so no hart is still adding to it.
+
+      The blind spot: a supervisor-mode interrupt is taken only when SIE is 1, and SIE is 0
+      whenever `noff > 0` ([[concept:locks#invariant]]): inside every spinlock critical
+      section, every `push_off` region, the trap entry before `intr_on`, the scheduler's scan.
+      None of that code can ever be sampled. The time is not lost, though: the interrupt
+      stays pending and is taken at the first instruction after SIE comes back on. So all
+      the time spent in critical sections is billed to the instruction after `csrsi
+      sstatus,2` in [[pop_off]], the entry time of a system call to the one after
+      [[usertrap]]'s `intr_on`, and the scheduler's time (idle waiting, but also its scans
+      and context switches) to the one after the scheduler's `intr_on`. Ticks that arrive
+      during other traps from user mode, or on the way back to user mode, stay pending until
+      the hart is in user mode again and never reach the kernel profile at all.
+
+      Measured over `usertests -q`: of 4,003 kernel samples, the 642 bytes holding [[kalloc]],
+      [[kfree]], [[acquire]], [[release]], [[push_off]] and [[pop_off]] got 242, and 240 of
+      them sat on one instruction, `0x80000c50` in `pop_off`. The other two were on the first
+      instructions of `kalloc` and `push_off`, before interrupts go off. Not one sample
+      landed between a `push_off` and its `pop_off`.
+    checks:
+      - id: lab07-09
+        level: 3
+        type: multi
+        q: |
+          A kernel profile samples `sepc` in [[kerneltrap]] on timer interrupts. Which of these
+          kernel instructions can never be the sampled pc?
+        options:
+          - text: The `amoswap.w.aq` in [[acquire]]'s spin loop
+            correct: true
+            why: acquire spins after push_off has cleared SIE, so no interrupt can be taken there. Lock contention is invisible to this profiler.
+          - text: An instruction in [[kalloc]] between `acquire(&kmem.lock)` and `release`
+            correct: true
+            why: Any spinlock held means noff > 0 and SIE 0.
+          - text: The instruction right after `csrsi sstatus,2` in [[pop_off]]
+            why: |
+              You may have thought pop_off is also inside the critical section. That
+              instruction is the first one after SIE comes back on: every interrupt that
+              arrived during the critical section is taken right there. It is the hottest
+              non-idle address in the measured profile.
+          - text: A `memmove` inside [[copyout]] during a `read` of a file
+            why: |
+              You may have thought all kernel code runs with interrupts off. A system call
+              runs with SIE on after [[usertrap]]'s `intr_on`, unless it holds a spinlock, and
+              a file read copies out holding only sleep-locks. (A read from a pipe or the
+              console is different: `piperead` and `consoleread` copy under a spinlock.)
+          - text: An instruction in [[uservec]] before it jumps to `usertrap`
+            correct: true
+            why: The trap that entered uservec cleared SIE, and nothing sets it before usertrap's intr_on. (uservec also runs with the user page table, never in kerneltrap.)
+        explain: |
+          Interrupt-driven sampling sees only code that runs with SIE on. Time spent with SIE
+          off is billed to the first instruction after it comes back on. See
+          [[concept:locks#invariant]] and the measurements below.
+build: |
+  **Start.**
+
+  ```text
+  git checkout -b my-prof 06aad25
+  ```
+
+  **Milestones.**
+
+  1. **The plumbing.** Two system-call numbers (23 and 24), the stubs in `user/usys.pl`, the
+     prototypes in `user/user.h`, the table entries in `kernel/syscall.c`, and
+     `kernel/prof.h` with `struct prof`. Put the handlers in a new `kernel/prof.c` (add
+     `$K/prof.o` to `OBJS`) and have them return -1. Test: it builds, and a call returns -1.
+  2. **The page.** `p->prof`, `profile` allocating and filling in the header, `profile(0, 0,
+     0)` freeing, [[freeproc]] freeing and clearing. Test: `usertests -q` (nothing samples
+     yet).
+  3. **The sample.** One `if` in [[usertrap]]'s timer branch and the counting function.
+  4. **`profget`.** A [[copyout]] of the page. Now write a test program with a hot loop:
+     profile your own text, spin for a few seconds, `profget`, print the buckets. You should
+     see about ten samples a second, all in the loop.
+  5. **Exit.** The write-out in [[kexit]]. Test: a profiled child exits; the parent reads
+     `prof.out`.
+  6. **The command.** `prof`: read the ELF header, choose the shift, fork, `profile`,
+     `exec`, `wait`, read `prof.out`, print. Copy the `.sym` files into `fs.img` and name the
+     buckets. Inputs must run for seconds, not milliseconds: `README` is grepped in less
+     than one tick. Build a bigger file inside xv6 with `cat README README ... > b1`, and use
+     a pattern that makes `grep`'s matcher backtrack (`.*.*.*z`).
+  7. **Kernel mode** (optional): a sample in [[kerneltrap]], a lock, one owner at a time.
+
+  After each milestone: `usertests -q` on three harts.
+
+  **Debugging.** Run QEMU with `-smp 3`, as `make qemu` does. To see a sample being taken:
+  start QEMU halted with `make qemu-gdb` (it adds `-S` and a gdb port of its own, which it
+  writes into `.gdbinit`), run `${TOOLPREFIX}gdb kernel/kernel` in another terminal,
+  `break profsample` (or your name for it) before the first `continue`, run your
+  test, then `bt`, `p/x $sepc`, `p/x $sstatus` and `p cpus[$tp].noff`. If a process gets no
+  samples, check which hart it runs on (`info threads`). If the kernel faults in your sample
+  function, print the computed index: a pc outside the range is the usual cause (clinic 3).
+  To check for leaks, count free pages before and after with an `sbrk` loop, on an otherwise
+  idle system. `TOOLPREFIX` is your RISC-V toolchain's prefix, the same one xv6's Makefile
+  detects (`riscv64-unknown-elf-`, `riscv64-linux-gnu-` or `riscv64-elf-`); set it with
+  `export TOOLPREFIX=riscv64-unknown-elf-` or whichever you have. On Debian/Ubuntu/WSL,
+  `gdb-multiarch` also works as the debugger.
+clinic:
+  - bug: Sampled on hart 0's tick, in clockintr
+    change: |
+      The sample moves from [[usertrap]] into [[clockintr]], next to `ticks++`. The learner
+      even checks that the interrupt came from user mode:
+
+      ```diff
+         if (cpuid() == 0) {
+           acquire(&tickslock);
+           ticks++;
+      +    // a tick: sample the running process, if it was in user mode.
+      +    struct proc *p = myproc();
+      +    if (p && p->prof && p->prof->lo < KERNBASE &&
+      +        (r_sstatus() & SSTATUS_SPP) == 0)
+      +      profsample(p->prof, r_sepc());
+           wakeup(&ticks);
+           release(&tickslock);
+         }
+      ```
+
+      and the `profsample` call in `usertrap` is gone.
+    symptom: |
+      $ proftest
+      proftest: arguments, and profile(0, 0, 0) stops: OK
+      proftest: hot loop: 30 samples, 30 in range, 30 in hot()
+      proftest: most samples in the hot loop: OK
+      [...]
+      proftest: ALL OK
+      $ proftest
+      proftest: arguments, and profile(0, 0, 0) stops: OK
+      proftest: hot loop: 0 samples, 0 in range, 0 in hot()
+      proftest: most samples in the hot loop: FAIL
+      [...]
+      proftest: 1 FAILED
+      $ proftest
+      proftest: arguments, and profile(0, 0, 0) stops: OK
+      proftest: hot loop: 11 samples, 11 in range, 11 in hot()
+      proftest: most samples in the hot loop: OK
+      proftest: fork does not inherit the profile: OK
+      proftest: exec keeps the profile: OK
+      proftest: prof.out: 0 samples, 0 in range, 0 in hot()
+      proftest: exit writes prof.out: FAIL
+      [...]
+      proftest: 1 FAILED
+      $ proftest
+      proftest: arguments, and profile(0, 0, 0) stops: OK
+      proftest: hot loop: 0 samples, 0 in range, 0 in hot()
+      proftest: most samples in the hot loop: FAIL
+      [...]
+      proftest: prof.out: 0 samples, 0 in range, 0 in hot()
+      proftest: exit writes prof.out: FAIL
+      [...]
+      proftest: 2 FAILED
+    why: |
+      Four runs of `proftest` in one boot, three harts. The code is right in every detail but
+      one: the block it sits in runs only on hart 0. `ticks` is the kernel's wall clock, so
+      only one hart advances it ([[kernel/trap.c:169]]); the other two harts take their timer
+      interrupts just as often but skip the block.
+
+      A CPU-bound process mostly stays on the hart it started on, because when it yields at
+      a tick, that hart's scheduler finds it RUNNABLE again before the idle harts wake from
+      `wfi` (reasoned from the scheduler's code). So the count is anywhere from 0 to about
+      30, depending on how much of the run was on hart 0: 30, 0, 11 and 0 in this boot; 23,
+      29, 26 and 0 in a second boot. Nothing crashes, and a run that happens to land on hart
+      0 looks perfect.
+
+      A sampling profiler must use the event that every hart sees: its own timer interrupt,
+      on the trap path of the hart running the process.
+  - bug: Read sepc after yield
+    change: |
+      The sample is taken after `yield()`, from the live register:
+
+      ```diff
+         if (which_dev == 2) {
+      -    // first record where the program was. (a kernel
+      -    // profile is fed by kerneltrap instead.)
+      -    if (p->prof && p->prof->lo < KERNBASE)
+      -      profsample(p->prof, p->trapframe->epc);
+           yield();
+      +    // record where the program was.
+      +    if (p->prof && p->prof->lo < KERNBASE)
+      +      profsample(p->prof, r_sepc());
+         }
+      ```
+    symptom: |
+      $ proftest
+      proftest: arguments, and profile(0, 0, 0) stops: OK
+      proftest: hot loop: 30 samples, 30 in range, 30 in hot()
+      proftest: most samples in the hot loop: OK
+      [...]
+      proftest: ALL OK
+      $ grep .*.*.*z b1 > o1 &
+      $ grep .*.*.*z b1 > o2 &
+      $ grep .*.*.*z b1 > o3 &
+      $ proftest
+      proftest: arguments, and profile(0, 0, 0) stops: OK
+      proftest: hot loop: 30 samples, 22 in range, 12 in hot()
+      proftest: most samples in the hot loop: FAIL
+      proftest: fork does not inherit the profile: OK
+      proftest: exec keeps the profile: OK
+      proftest: prof.out: 10 samples, 9 in range, 5 in hot()
+      proftest: exit writes prof.out: FAIL
+      [...]
+      proftest: free pages 32440 before, 32470 after
+      proftest: no leaks: FAIL
+      proftest: 3 FAILED
+    why: |
+      Alone on the machine, the bug is invisible: `proftest` yields at a tick, its own
+      hart's scheduler runs it again at once, nothing else traps on that hart in between,
+      and `sepc` still holds its pc. Every check passes.
+
+      With three CPU hogs (`grep` with a backtracking pattern) and three harts, `proftest`
+      shares the harts. When `yield()` returns, the process may have spent time switched out
+      and may be back on another hart. `sepc` is a per-hart register that every trap
+      overwrites: it holds the pc of the last trap taken *on that hart*, which may have been a
+      `grep`'s timer interrupt (a user pc, mostly inside `[0, 0x1000)`, the range `proftest`
+      profiles) or an interrupt in the scheduler's idle loop (a kernel pc, counted as
+      outside). The run shows both: of 30 samples, 8 outside the range and 10 inside it but
+      not in `hot()`. Only 12 of 30 were right. That attribution of samples to the wrong
+      program and the kernel is reasoned from the code; the counts are from the log.
+
+      The reference samples `p->trapframe->epc`, saved at the top of [[usertrap]]
+      ([[kernel/trap.c:52]]), before anything can trap or switch. The same experiment on the
+      reference (three hogs, then `proftest`) gave `hot loop: 30 samples, 30 in range, 30 in
+      hot()`.
+
+      (`no leaks: FAIL` here is not this bug: the `grep`s were still running, holding memory,
+      when `proftest` first counted free pages, and had exited by the second count. The
+      reference failed that check the same way in the same experiment, which is why the spec
+      says to run `proftest` on an idle system.)
+  - bug: No range check in profsample
+    change: |
+      The learner trusts the range and drops the test:
+
+      ```diff
+       pr->nsample++;
+      -  if (pc < pr->lo || pc >= pr->hi) {
+      -    pr->nout++;
+      -    return;
+      -  }
+       pr->bucket[(pc - pr->lo) >> pr->shift]++;
+      ```
+
+      With a user profile made by `prof` this changes nothing: `prof` profiles the whole
+      executable segment, and a user program's pc is always in it. The bug shows with a
+      kernel profile of part of the kernel, where most samples are outside the range.
+    symptom: |
+      $ prof -k 0x80000b00 0x80000d00 usertests -q
+      usertests starting
+      [...]
+      ALL TESTS PASSED
+      prof: 1207 ticks
+      prof: kernel: 3565 samples, 0 outside [0x80000B00, 0x80000D00), 2-byte buckets
+      by function:
+        223	6%	pop_off
+        14	0%	memset
+      hottest buckets:
+        223	6%	0x80000C50	pop_off+0x28
+        14	0%	0x80000CBC	memset+0x14
+      $ proftest
+      [...]
+      proftest: ALL OK
+
+      (another boot, a range with 8-byte buckets:)
+      $ prof -k 0x80001000 0x80002f00 ls
+      .              1 1 1024
+      ..             1 1 1024
+      README         2 2 2441
+      [...]
+      dorphan.sym   scause=0xd sepc=0x8000577a stval=0x8000000087f04e48
+      panic: kerneltrap
+    why: |
+      For a pc outside `[lo, hi)` the index is garbage, and what the garbage does depends on
+      the shift.
+
+      **2-byte buckets** (`shift` 1). With `hi = 0x80000d00` only 256 buckets are in use.
+      For `pc > hi` the index is `(pc - lo) / 2`: up to `0x800012f0` it lands in the page's
+      own unused buckets, beyond that up to tens of kilobytes *after* the histogram page. For `pc < lo`, `pc - lo` wraps around to nearly 2^64; shifted right by
+      one and multiplied by 4 (the size of a `uint`) for the address, it wraps around again
+      and lands `2 * (lo - pc)` bytes *before* the bucket array: in the header for the last
+      16 bytes below `lo`, in a neighbouring page further down. The idle samples, the large majority, all hit one
+      word: the scheduler's pc `0x80001e22` gives an offset of `32 + 2 * 0x1322` = `0x2664`
+      bytes, two pages above the histogram. The run counted 3,565 samples, `0 outside`
+      (nothing counts them now), and only 237 in the 256 buckets in use. Of the other 3,328
+      increments, nearly all went **into memory the profiler does not own**: the idle ones
+      alone are most of them, and the whole-kernel profile suggests that only about ten
+      samples in such a run fall in the page's unused buckets. `usertests -q` still passed and `proftest` after it
+      passed. Whatever those pages held, nothing that ran noticed. That is the worst kind of
+      bug: the profile looks plausible, the system looks healthy, and memory is being
+      changed behind everyone's back. Had the word been a free page's `next` pointer or a
+      page-table entry, the failure would have appeared much later, somewhere else.
+
+      **8-byte buckets** (`shift` 3, a range of 7,936 bytes). Now the wrapped index is shifted
+      by 3 and multiplied by 4, so the factor 2^64 no longer cancels: for `pc < lo` the
+      address is the histogram plus about 2^63. The first sample below `lo` faulted:
+      `scause` 13 (load page fault) at `sepc` `0x8000577a`, the `lw` that reads the bucket
+      in `profsample`, with `stval` `0x8000000087f04e48`. That value fits exactly a sample
+      at `0x80000c50` (the hot instruction in `pop_off`, `0x3b0` below `lo`) and a histogram
+      page at `0x87f05000`: `0x87f05000 + 32 + 4 * (2^61 - 0x76)` = `0x8000000087f04e48`
+      (inferred from the arithmetic; gdb was not attached). The fault happened inside
+      [[kerneltrap]], with interrupts off, so it trapped again into `kerneltrap`, which found
+      no device and panicked.
+
+      The range check is two comparisons per tick and it is the only thing between a sample
+      and an arbitrary memory write.
+  - bug: Freed the histogram on exec, not on exit
+    change: |
+      The learner reasons that a profile belongs to a program, so `exec` should end it, and
+      leaves [[freeproc]] alone:
+
+      ```diff
+       // kernel/exec.c, kexec, after the old image is freed
+         proc_freepagetable(oldpagetable, oldsz);
+      +
+      +  // the profile belonged to the old program.
+      +  if (p->prof) {
+      +    kfree((void *)p->prof);
+      +    p->prof = 0;
+      +  }
+
+       // kernel/proc.c, freeproc
+      -  if (p->prof)
+      -    kfree((void *)p->prof);
+      -  p->prof = 0;
+      ```
+    symptom: |
+      $ proftest
+      proftest: arguments, and profile(0, 0, 0) stops: OK
+      proftest: hot loop: 30 samples, 30 in range, 29 in hot()
+      proftest: most samples in the hot loop: OK
+      proftest: fork does not inherit the profile: OK
+      proftest: exec keeps the profile: FAIL
+      proftest: prof.out: 10 samples, 10 in range, 10 in hot()
+      proftest: exit writes prof.out: OK
+      proftest: only one kernel profile at a time: OK
+      proftest: kernel: 30 samples, 0 outside [0x80000000, 0x8000FE00)
+      proftest: kernel samples, all in the kernel's text: OK
+      proftest: free pages 32470 before, 32469 after
+      proftest: no leaks: FAIL
+      proftest: 2 FAILED
+      $ prof grep .*.*.*z README > o
+      prof: 9 ticks
+      prof: no prof.out
+
+      (another boot, same kernel: gdb attached after proftest finished)
+      s_sstatus (x=2) at kernel/riscv.h:67
+      warning: 67	kernel/riscv.h: No such file or directory
+      proc[0] pid 1 state 2 prof (nil) name init
+      proc[1] pid 2 state 2 prof (nil) name sh
+      proc[2] pid 0 state 0 prof (nil) name 
+      proc[3] pid 0 state 0 prof 0x8002e000 name 
+      proc[4] pid 0 state 0 prof (nil) name 
+      [...]
+
+      (the same mistake, another fresh boot:)
+      $ prof -k echo hi
+      hi
+      prof: 0 ticks
+      prof: no prof.out
+      $ prof -k echo hi
+      prof: profile failed
+      prof: 0 ticks
+      prof: no prof.out
+      $ proftest
+      [...]
+      proftest: a kernel profile: FAIL
+      [...]
+      $ usertests -q
+      [...]
+      ALL TESTS PASSED
+      $ proftest
+      proftest: arguments, and profile(0, 0, 0) stops: OK
+      proftest: hot loop: 29 samples, 29 in range, 29 in hot()
+      proftest: most samples in the hot loop: OK
+      proftest: fork does not inherit the profile: FAIL
+      proftest: exec keeps the profile: FAIL
+      [...]
+    why: |
+      (In the first run the kernel check prints under an older name, "all in the kernel's
+      text"; the current `proftest` calls it "none outside the profiled range", which is
+      what it tests.)
+
+      Three failures, and the last two are worse than "a leak".
+
+      `exec keeps the profile: FAIL` and `prof: no prof.out` are the design error: `prof`
+      sets the profile and then execs the command, so a profile that dies at `exec` is gone
+      before the command runs a single instruction. The profile has to belong to the
+      process.
+
+      The leak is only one page, although 20 profiled children exited without `exec`. The
+      gdb listing shows why: slot 3 is UNUSED (state 0) and still points at a histogram page.
+      [[freeproc]] neither freed the page nor cleared the pointer, so the slot carries it to
+      the next process that [[allocproc]] puts there. The 20 children were allocated one
+      after another, each in the slot the previous one had just left; each called `profile`,
+      which frees the old `p->prof` before installing a new one, so each freed its
+      predecessor's page. Only the last stays behind, and it stays until a later process in
+      slot 3 calls `profile` or `exec` (in a second run in another boot, the next `proftest`
+      started again from 32,470 free pages). That last part is reasoned from the code.
+
+      Worse than the leak: a process that lands in that slot inherits a stranger's
+      histogram. Between its `fork` and its `exec`, it is sampled into that page; if it
+      exits without `exec`, [[kexit]] writes the stranger's profile to its `prof.out`. The
+      second run above shows it: after `usertests`, a `proftest` child started with a profile
+      it never asked for (`fork does not inherit the profile: FAIL`). A pointer left in a
+      recycled slot is a bug in its own right, which is why the reference [[freeproc]] both
+      frees and clears (`p->prof = 0`).
+
+      Worst of all, under `prof -k`. The `kfree` in `exec` skips `profdetach`, so the freed
+      page stays published in `kprof`: every hart keeps incrementing a page that the
+      allocator has already handed to someone else, a use-after-free on three harts at ten
+      ticks a second. And because `kprof` is never cleared, every later kernel profile is
+      refused: the second `prof -k echo hi` printed `prof: profile failed`, and `proftest`
+      reported `a kernel profile: FAIL`. (The first `prof -k` got no `prof.out` for the
+      design reason above.) Freeing anything a lock-protected global still points to must
+      go through the code that unhooks it.
+  - bug: Wrote prof.out from freeproc
+    change: |
+      The learner keeps all the profile's end-of-life code together, in [[freeproc]]:
+
+      ```diff
+       // kexit
+      -  if (p->prof)
+      -    profdump(p);
+
+       // freeproc
+      -  if (p->prof)
+      +  if (p->prof) {
+      +    profdump(p); // save the profile before freeing it
+           kfree((void *)p->prof);
+      +  }
+      ```
+    symptom: |
+      $ proftest
+      proftest: arguments, and profile(0, 0, 0) stops: OK
+      proftest: hot loop: 29 samples, 29 in range, 29 in hot()
+      proftest: most samples in the hot loop: OK
+      proftest: fork does not inherit the profile: OK
+      panic: acquire
+
+      (another boot, gdb attached with a breakpoint on panic:)
+      Thread 2 hit Breakpoint 1, panic (s=s@entry=0x80007048 "acquire") at kernel/printk.c:139
+      [...]
+      #0  panic (s=s@entry=0x80007048 "acquire") at kernel/printk.c:139
+      #1  0x0000000080000c28 in acquire (lk=lk@entry=0x80010240 <proc+1104>) at kernel/spinlock.c:26
+      #2  0x0000000080001fd8 in wakeup (chan=chan@entry=0x8001e110 <itable+40>) at kernel/proc.c:586
+      #3  0x000000008000406a in releasesleep (lk=lk@entry=0x8001e110 <itable+40>) at kernel/sleeplock.c:42
+      #4  0x0000000080003340 in iunlock (ip=ip@entry=0x8001e100 <itable+24>) at kernel/fs.c:328
+      #5  0x0000000080003988 in namex (path=0x80007640 "", path@entry=0x80007638 "prof.out", nameiparent=nameiparent@entry=1, name=name@entry=0x3fffff9ec0 "prof.out") at kernel/fs.c:713
+      #6  0x0000000080003b20 in nameiparent (path=path@entry=0x80007638 "prof.out", name=name@entry=0x3fffff9ec0 "prof.out") at kernel/fs.c:740
+      #7  0x000000008000503a in create (path=path@entry=0x80007638 "prof.out", type=type@entry=2, major=major@entry=0, minor=minor@entry=0) at kernel/sysfile.c:264
+      #8  0x0000000080005976 in profdump (p=p@entry=0x80010240 <proc+1104>) at kernel/prof.c:145
+      #9  0x0000000080001b00 in freeproc (p=p@entry=0x80010240 <proc+1104>) at kernel/proc.c:162
+      #10 0x0000000080002220 in kwait (addr=24492) at kernel/proc.c:403
+      #11 0x00000000800029bc in sys_wait () at kernel/sysproc.c:36
+      #12 0x000000008000292a in syscall () at kernel/syscall.c:150
+      #13 0x000000008000268c in usertrap () at kernel/trap.c:69
+      #14 0x0000003ffffff09c in ?? ()
+      $1 = (void *) 0x1
+      $2 = 4
+      $3 = 1
+      $4 = 3
+      $5 = "proftest\000\000\000\000\000\000\000"
+      [...]
+    why: |
+      The first profiled child to be reaped is the one `proftest` execs to check that `exec`
+      keeps the profile. Its parent, `proftest` (pid 3, `$4`), reaps it in [[kwait]], which
+      holds `wait_lock` and the zombie's `p->lock` (the slot at `proc+1104`), and calls
+      [[freeproc]], which now calls `profdump`.
+
+      `create` looks up `prof.out` in the *parent's* current directory, `/`. [[namex]] locks
+      the directory inode and unlocks it again ([[iunlock]]), which is a sleep-lock release:
+      [[releasesleep]] calls [[wakeup]] for anyone waiting on that inode. `wakeup` walks the
+      whole process table and acquires each `p->lock` to look at the process. At
+      `proc+1104` it reaches the zombie, whose lock this hart already holds, and [[acquire]]
+      panics rather than spin forever (frame #1). `noff` was 4 (`$2`): `wait_lock`, the
+      zombie's lock, the inode's inner spinlock, and the `push_off` that `acquire` does before
+      it checks.
+
+      Had it got past that, the first disk read would have slept with spinlocks held and
+      [[sched]] would have panicked with `sched locks`. Any code that may sleep, and anything
+      that releases a sleep-lock, must run with no spinlock held. The reference writes the
+      file in [[kexit]], as the exiting process, before it takes `wait_lock`, and leaves
+      [[freeproc]] only the `kfree`, which takes nothing but `kmem.lock`.
+reveal:
+  - title: A histogram that fills exactly one page
+    commit: 1
+    file: kernel/prof.h
+    lines: 1-14
+    focus: 5-14
+    diff: true
+    state:
+      hart: 1
+      mode: U
+      proc: proftest (pid 3)
+      intr: "on"
+      satp: user
+      locks: []
+      stack: [main, hotloop, profile]
+      sp: {"on": user, detail: "proftest's user stack"}
+    note: |
+      The story of this tour follows `proftest` (pid 3, which gdb found on hart 1 when it
+      stopped at a sample) through the reference branch: it asks to be profiled, spins in a
+      hot loop, reads its histogram, and later exits with a profile; at the end, `prof -k`
+      profiles the kernel while `usertests` runs. Machine states marked as observed come from
+      gdb stops in recorded runs; the others follow from the code.
+
+      The first commit adds the two system calls (numbers 23 and 24, wired up exactly as in
+      lab 1) and this header, which the kernel and user programs share, so `profget` can copy
+      the page out byte for byte. A 32-byte header records the range `[lo, hi)`, the bucket
+      size `1 << shift`, the number of buckets in use, and two counters: every sample, and
+      the samples that fell outside the range. Then 1016 four-byte buckets: 32 + 4 × 1016 =
+      4096. One page from [[kalloc]] holds the whole histogram, and nothing has to be
+      allocated at interrupt time.
+
+      Why `nout`: a sample outside the range is still information ("12% of the time the
+      program was somewhere you did not ask about"), and counting it separately is what lets
+      the sample path refuse an out-of-range index (clinic 3).
+  - title: Two entries in the system-call table
+    commit: 1
+    file: kernel/syscall.c
+    lines: 100-138
+    focus: 106-136
+    diff: true
+    state:
+      hart: 1
+      mode: S
+      proc: proftest (pid 3)
+      intr: "on"
+      satp: kernel
+      locks: []
+      stack: [usertrap, syscall]
+      sp: {"on": kernel, detail: "proftest's kernel stack"}
+      irq: 0
+    note: |
+      `profile` and `profget` are registered like any system call: an `extern` prototype and
+      a designated-initializer entry each; `SYS_profile` is 23 and `SYS_profget` 24 in
+      [[kernel/syscall.h]], and `user/usys.pl` generates the two stubs. The handlers live in a
+      new file, `kernel/prof.c`, added to `OBJS` in the Makefile, and at this commit both
+      return -1.
+
+      The arguments are two 64-bit addresses and an `int`: [[argaddr]] for `lo` and `hi`,
+      [[argint]] for `shift`. Addresses, not pointers into user memory: the kernel never
+      dereferences them, it only compares pcs against them, so no [[copyin]] is involved.
+      `profget` is the one call that writes user memory, and it will use [[copyout]].
+  - title: profile allocates a page and fills in the header
+    commit: 2
+    file: kernel/prof.c
+    lines: 12-47
+    focus: 30-46
+    diff: true
+    state:
+      hart: 1
+      mode: S
+      proc: proftest (pid 3)
+      intr: "on"
+      satp: kernel
+      locks: []
+      stack: [usertrap, syscall, sys_profile]
+      sp: kernel
+      irq: 0
+    note: |
+      `proftest` calls `profile(0, 4096, 3)`: its own first page of text, 8-byte buckets,
+      512 of them. `sys_profile` checks the arguments first: a non-empty range, a shift
+      between 0 and 31 (user code computes the bucket size as `1 << shift`, an `int`), and at most
+      `PROFBUCKETS` buckets. `(hi - lo - 1) >> shift` is the index of the last byte's bucket,
+      so the test is exact even when the range is not a multiple of the bucket size.
+
+      The page comes from [[kalloc]] (which takes and releases `kmem.lock`: `noff` 1 for a
+      moment, back to 0), is zeroed, and gets its header. Then the old histogram, if any, is
+      freed and the new one installed. `profile(0, 0, 0)` takes the same path with `pr = 0`:
+      stop and free.
+
+      No lock anywhere. At this commit only the process itself ever touches `p->prof`, and it
+      is here, in a system call, so nothing else can be using the page being freed.
+  - title: A field in the private part of struct proc
+    commit: 2
+    file: kernel/proc.h
+    lines: 81-105
+    focus: 95-104
+    diff: true
+    state:
+      hart: 1
+      mode: S
+      proc: proftest (pid 3)
+      intr: "on"
+      satp: kernel
+      locks: []
+      stack: [usertrap, syscall, sys_profile]
+      sp: kernel
+      irq: 0
+    note: |
+      `p->prof` goes at the end of the section "private to the process, so p->lock need not
+      be held", next to `sz` and `trapframe`. The rule for that section is that only the
+      process itself (or code that runs before it can run, or after it is dead) touches the
+      field. Check it against every user of `p->prof` on this branch: `profile`, `profget`
+      and the exit write-out run as the process; the sample runs in the process's own trap
+      handler; [[freeproc]] runs on a zombie. None of these can overlap.
+
+      Eight bytes per slot is the whole cost to processes that never profile. A histogram in
+      the struct itself would have added 4 KiB to each of the 64 slots.
+  - title: freeproc frees the page and clears the pointer
+    commit: 2
+    file: kernel/proc.c
+    lines: 152-175
+    focus: 158-163
+    diff: true
+    state:
+      hart: 1
+      mode: S
+      proc: proftest (pid 3)
+      intr: "off"
+      satp: kernel
+      locks: [wait_lock, "the child's p->lock"]
+      stack: [usertrap, syscall, sys_wait, kwait, freeproc]
+      sp: kernel
+      irq: {noff: 2, intena: 1}
+    note: |
+      Jump ahead: `proftest` reaps a child that was profiling (the one that checks that
+      `exec` keeps the profile). [[kwait]] holds `wait_lock` and the zombie's `p->lock`, so
+      `noff` is 2 and interrupts are off; `intena` is 1 because the first `acquire` happened
+      in a system call with interrupts on. The page is freed next to the trapframe, and the
+      `kfree` takes `kmem.lock` for a moment (`noff` 3, the deepest nesting in the kernel,
+      which [[kwait]] already reached before this lab).
+
+      Two decisions sit in these three lines. **Where**: with the slot's other resources,
+      when the slot is recycled; not in `exec` (the profile must survive it) and not at the
+      top of `kexit` (later commits still need the page there). **Clearing the pointer**: the
+      slot will be handed out again by [[allocproc]], and that is the only reason a forked
+      child starts with no profile. `kfork` copies nothing; the child gets `0` because this
+      line wrote it. Clinic 4 shows a slot that kept its pointer.
+    others: |
+      While this hart holds the zombie's `p->lock`, a scheduler on another hart that reaches
+      this slot spins in `acquire` until `freeproc` has finished and the lock is released,
+      then sees UNUSED. Nobody else can be using the histogram: its owner is dead.
+  - title: The sample, in usertrap, before yield
+    commit: 3
+    file: kernel/trap.c
+    lines: 37-95
+    focus: 84-90
+    diff: true
+    state:
+      hart: 1
+      mode: S
+      proc: proftest (pid 3)
+      intr: "off"
+      satp: kernel
+      locks: []
+      stack: [usertrap]
+      sp: {"on": kernel, detail: "proftest's kernel stack, empty until uservec loaded it"}
+      irq: 0
+    note: |
+      This is the profiler. A timer interrupt arrived while `proftest` was in user mode on
+      hart 1; [[uservec]] saved the registers and switched to the kernel stack and page
+      table; [[usertrap]] saved `sepc` in `p->trapframe->epc` (line 52), and [[devintr]] saw
+      `scause` `0x8000000000000005` (supervisor timer), called [[clockintr]] to re-arm this
+      hart's timer, and returned 2. Now, before `yield()` gives the hart away, one `if` counts
+      the sample.
+
+      Observed (gdb, breakpoint at the sample): thread 2 = hart 1, `proftest` pid 3, `sepc`
+      and `p->trapframe->epc` both `0x112`, `sstatus` `0x200000020` (SIE 0, SPIE 1, SPP 0),
+      `noff` 0. `0x112` is the `mulw` at the top of `hot()`'s inner loop: the instruction
+      that had not run yet when the interrupt arrived. (A loop head is a typical place for
+      a sample under QEMU, which takes interrupts between blocks of translated code.)
+
+      Why here: the branch runs exactly once per timer interrupt that found *some* process in
+      user mode, on every hart, and `p` is that process. Why `trapframe->epc` and not
+      `r_sepc()`: the saved copy belongs to the process; the register belongs to the hart,
+      and after `yield()` it holds someone else's pc (clinic 2). Why before `yield()`: after
+      it, the process may have been switched out for a long time, and the moment being
+      sampled is now.
+
+      Interrupts stay off for the whole branch: the trap cleared SIE and this path never
+      calls `intr_on`.
+    others: |
+      Hart 0 and hart 2 are idle in their schedulers, each waiting in `wfi` for its own next
+      timer interrupt. Their ticks are unrelated to this one: every hart's `stimecmp` was set
+      by its own [[timerinit]] and is re-armed by its own [[clockintr]]. They never touch
+      `proftest`'s histogram.
+  - title: Counting one sample
+    commit: 3
+    file: kernel/prof.c
+    lines: 12-22
+    focus: 14-21
+    diff: true
+    state:
+      hart: 1
+      mode: S
+      proc: proftest (pid 3)
+      intr: "off"
+      satp: kernel
+      locks: []
+      stack: [usertrap, profsample]
+      sp: kernel
+      irq: 0
+    note: |
+      `profsample` counts the sample, checks the range, and adds one to bucket
+      `(pc - lo) >> shift`. In the observed stop, `pc` was `0x112`, the range `[0, 0x1000)`
+      with `shift` 3, and `nsample` still 0: the first sample this histogram received. `0x112 >> 3` is bucket 34, which covers `0x110`–`0x117`.
+
+      The range check is not optional. `pc - lo` is unsigned: for a pc below `lo` it wraps to
+      a number near 2^64, and for a pc above `hi` the index runs past the buckets in use and
+      soon past the page. Either way the increment can land in memory the profiler does not
+      own. Clinic 3 removed these four lines: thousands of increments went into neighbouring
+      pages of a running system without anyone noticing, and with a different bucket size
+      the kernel faulted on an address near 2^63.
+
+      No lock and no atomic instruction: a plain load, add and store. That is safe because
+      this histogram is written only here, by the one hart running its process, with
+      interrupts off; and read only by that same process in a system call, which cannot be
+      running at the same time.
+  - title: Why not in clockintr
+    commit: 3
+    file: kernel/trap.c
+    lines: 170-184
+    focus: 173-178
+    state:
+      hart: 1
+      mode: S
+      proc: proftest (pid 3)
+      intr: "off"
+      satp: kernel
+      locks: []
+      stack: [usertrap, devintr, clockintr]
+      sp: kernel
+      irq: 0
+    note: |
+      [[clockintr]] looks like the natural home for a profiler: it runs at every tick. But
+      look at the `if`: the kernel's notion of time, `ticks`, is advanced only by hart 0,
+      under `tickslock`, because it is a single wall clock for `pause` and `uptime`. Hart 1,
+      where `proftest` runs in this story, skips the block and only re-arms its own timer at
+      line 183.
+
+      So code placed next to `ticks++` sees one hart's ticks, not the profiled process's.
+      Clinic 1 did exactly that, carefully checking `SPP` to keep only user-mode ticks. Its
+      `proftest` hot loop got 30 samples on hart 0, and 0 on the other harts.
+
+      `clockintr` is also called from [[kerneltrap]], for interrupts that land in the
+      kernel. It cannot tell the two cases apart without reading `sstatus` itself, while
+      [[usertrap]] knows by construction.
+  - title: profget copies the page out
+    commit: 4
+    file: kernel/prof.c
+    lines: 61-74
+    focus: 63-74
+    diff: true
+    state:
+      hart: 1
+      mode: S
+      proc: proftest (pid 3)
+      intr: "on"
+      satp: kernel
+      locks: []
+      stack: [usertrap, syscall, sys_profget]
+      sp: kernel
+      irq: 0
+    note: |
+      `proftest`'s hot loop has spun for 30 ticks; it calls `profget(&pr)`. One
+      [[copyout]] of 4096 bytes, translated page by page through `proftest`'s page table, into
+      its `static struct prof pr` in `.bss`. No process without a profile gets anything (-1).
+
+      Interrupts are on (this is a system call), so a timer interrupt can arrive in the middle
+      of the copy. It would land in [[kerneltrap]], not [[usertrap]], so it does not touch
+      the histogram being copied; at this commit, nothing samples kernel time.
+
+      The test then counts the buckets that fall inside `hot()`. In the recorded runs on the
+      branch: between 28 and 30 samples per run, and all or all but one of the in-range
+      samples in `hot()`.
+  - title: kexit writes the profile while it still can
+    commit: 5
+    file: kernel/proc.c
+    lines: 325-353
+    focus: 336-339
+    diff: true
+    state:
+      hart: 2
+      mode: S
+      proc: proftest's child
+      intr: "on"
+      satp: kernel
+      locks: []
+      stack: [usertrap, syscall, sys_exit, kexit]
+      sp: kernel
+      irq: 0
+    note: |
+      A program run under `prof` never calls `profget`; it just exits. So [[kexit]] saves the
+      histogram first thing, while the process still has everything file I/O needs: no lock
+      held (`noff` 0), interrupts on, and its current directory, which line 351 is about to
+      give up with `iput`.
+
+      Placement is the whole lesson of this step. Everything after line 355 runs under
+      `wait_lock` and then `p->lock`: no sleeping allowed. And [[freeproc]], later, runs in
+      the parent under two spinlocks; clinic 5 put the write there and panicked in `acquire`
+      on the first reap.
+
+      The state is reasoned, not observed. The hart is illustrative: an exiting process can
+      be on any hart.
+  - title: The write itself is ordinary file-system code
+    commit: 5
+    file: kernel/prof.c
+    lines: 76-90
+    focus: 79-90
+    diff: true
+    state:
+      hart: 2
+      mode: S
+      proc: proftest's child
+      intr: "on"
+      satp: kernel
+      locks: []
+      stack: [usertrap, syscall, sys_exit, kexit, profdump]
+      sp: kernel
+      irq: 0
+    note: |
+      `profdump` does what `open("prof.out", O_CREATE|O_WRONLY)` and `write` would, without
+      the file descriptor: inside one log transaction ([[begin_op]] / [[end_op]]), `create`
+      (made non-`static` in `sysfile.c` for this) finds or creates `prof.out` relative to the
+      process's current directory and returns it locked; [[writei]] with `user_src = 0`
+      copies 4096 bytes from kernel memory; [[iunlockput]] drops it.
+
+      Four data blocks, an inode, a bitmap block and a directory block fit easily in one
+      transaction. Any of these calls may sleep (log space, a sleep-lock, the disk), which is
+      allowed here and only here in the exit path.
+
+      `create` on an existing `prof.out` returns the old inode, and the write overwrites its
+      first 4096 bytes from offset 0. The parent can read it as soon as `wait` returns: the
+      write finished before the child became a zombie. Two caveats. A full disk makes
+      `writei` stop short: a run on a full disk printed `balloc: out of blocks`, left a
+      0-byte `prof.out`, and `prof` printed `prof: no prof.out`, with no hang or panic. And a larger `prof.out` left by someone
+      else keeps its tail, which `prof` ignores because it reads only one page.
+  - title: A test with a hot loop it can find
+    commit: 6
+    file: user/proftest.c
+    lines: 21-79
+    focus: 21-52
+    diff: true
+    state:
+      hart: 1
+      mode: U
+      proc: proftest (pid 3)
+      intr: "on"
+      satp: user
+      locks: []
+      stack: [main, hotloop, hot]
+      sp: user
+    note: |
+      `hot(n)` spins for `n` ticks of `uptime()`, doing a million multiply-adds between
+      checks. It is `noinline` so that it has an address of its own; the check is "at least
+      90% of the in-range samples landed in `hot()`, and at least 10 samples in all".
+
+      Where does `hot()` end? The first try used a marker function placed after it in the
+      source, but the compiler placed that marker at address 0, before `hot`: GCC does not
+      promise source order. `hotend()` takes the nearest of several known functions above
+      `hot` instead. In this build `hot` starts at `0xd0` and the next function at `0x136`.
+
+      Each check prints `OK` or `FAIL`, and the final `ALL OK` covers only what was checked.
+      The tests also cover the lifetime rules: a forked child's `profget` must fail, a child
+      that calls `profile` and then `exec`s `proftest exec` must still have it, and 20
+      children that exit while profiling must not change the free-page count.
+  - title: prof finds the command's text and runs it profiled
+    commit: 7
+    file: user/prof.c
+    lines: 171-214
+    focus: 186-203
+    diff: true
+    state:
+      hart: 0
+      mode: U
+      proc: prof
+      intr: "on"
+      satp: user
+      locks: []
+      stack: [main]
+      sp: user
+    note: |
+      `prof` reads the command's ELF program headers (`textrange`, above) and takes the
+      loadable segment marked executable: for `grep`, `[0, 0xb71)`, its text and read-only
+      data. The loop picks the smallest shift, starting at 1, for which the range fits in
+      1016 buckets: 2-byte buckets would resolve every compressed instruction, but `grep`
+      would need 1,465 of them, so it gets 4-byte buckets.
+
+      Then the fork-profile-exec sequence the lifetime rules were designed for: the child
+      calls `profile` *for itself*, then `exec`s the command, which keeps the profile; the
+      parent waits, prints the elapsed ticks, and reads `prof.out`, written by the child's
+      [[kexit]]. Between `profile` returning and the `exec` system call, the child runs a
+      handful of `prof`'s own instructions; a sample there would be counted at a `prof`
+      address. That window is far shorter than a tick.
+
+      The elapsed ticks are the yardstick for the report: in the recorded `grep .*.*.*z b1`,
+      72 ticks and 61 samples. The difference is time `grep` did not spend in user mode:
+      `exec`, reading its input, the write-out at exit.
+  - title: Symbol files on the disk
+    commit: 7
+    file: Makefile
+    lines: 133-163
+    focus: 157-162
+    diff: true
+    state:
+      hart: 0
+      mode: U
+      proc: prof
+      intr: "on"
+      satp: user
+      locks: []
+      stack: [main, loadsyms]
+      sp: user
+    note: |
+      The Makefile already writes `user/grep.sym` for every program: `objdump -t` reduced to
+      "address name" lines. These lines copy them into `fs.img` (mkfs strips the `user/`
+      prefix, so the file is `/grep.sym`; the longest name, `usertests.sym`, fits in
+      `DIRSIZ`). `forktest` is linked by its own rule and has none. The empty pattern rule
+      tells make that a `.sym` file is produced by linking its program.
+
+      `prof` names a bucket by the function with the highest address at or below the
+      bucket's start. With 4-byte buckets that is nearly exact. With coarse buckets a bucket
+      can straddle two functions and is named after the first: in the 32-byte kernel profile
+      in Measure, the bucket at `release+0x30` is almost all `memset`'s loop.
+  - title: kerneltrap feeds the kernel profile
+    commit: 8
+    file: kernel/trap.c
+    lines: 140-175
+    focus: 162-164
+    diff: true
+    state:
+      hart: 1
+      mode: S
+      proc: none (hart 1 idle)
+      intr: "off"
+      satp: kernel
+      locks: []
+      stack: [scheduler, kernelvec, kerneltrap]
+      sp: {"on": scheduler, detail: "hart 1's stack0 slice, with a kernelvec frame on top"}
+      irq: 0
+    note: |
+      The last commit points the same idea at the kernel. A profile whose `lo` is at or
+      above `KERNBASE` is a *kernel* profile, fed from [[kerneltrap]]: on every timer
+      interrupt taken in supervisor mode, on every hart, `sepc` (read at the top, line 146) is
+      the kernel pc the interrupt landed in front of.
+
+      Observed (gdb, `prof -k grep .*.*.*z README > o`, breakpoint on `kprofsample` once the
+      profile existed): hart 1, no process (`cpus[1].proc` was 0), pc `0x80001e22`,
+      `sstatus` `0x200000120` (SPP 1: from supervisor mode; SPIE 1; SIE 0), `noff` 0. Hart 1
+      was idle: `0x80001e22` is the `csrci sstatus,2` of [[scheduler]]'s `intr_off()`, the
+      instruction right after `intr_on()`. An idle hart sleeps in `wfi` with interrupts off;
+      the timer wakes it, the loop turns interrupts on, and the pending interrupt is taken
+      at once, in front of that one instruction. Every idle tick of every hart lands there.
+
+      This is the important difference from the user path: a kernel interrupt is taken only
+      where the kernel had SIE on. More on that in the last step.
+    others: |
+      Meanwhile gdb's thread list showed hart 2 in [[usertrap]] (presumably for `grep`, the
+      only runnable process) and hart 0 halted in `wfi`. Hart 2's tick from user mode does not feed the kernel profile; `grep` is
+      not profiled in this run.
+  - title: Three harts, one histogram, one lock
+    commit: 8
+    file: kernel/prof.c
+    lines: 20-61
+    focus: 41-50
+    diff: true
+    state:
+      hart: 1
+      mode: S
+      proc: none (hart 1 idle)
+      intr: "off"
+      satp: kernel
+      locks: [kproflock]
+      stack: [scheduler, kernelvec, kerneltrap, kprofsample]
+      sp: {"on": scheduler, detail: "with a kernelvec frame on top"}
+      irq: {noff: 1, intena: 0}
+    note: |
+      A kernel profile is written by every hart's [[kerneltrap]], possibly at the same
+      moment, so the increments need a lock: `kproflock`, a new spinlock. It is taken in
+      interrupt context, like `tickslock`, which is safe for the same reason: an interrupt
+      is only ever taken at `noff` 0, so no hart can be interrupted while holding it and then
+      try to take it again in the handler. Nothing that runs in interrupt context is
+      acquired while holding it, so it cannot deadlock. It is not a leaf lock, though:
+      `profget` holds it across a `copyout`, which may call [[kalloc]] (and `kmem.lock`)
+      for a lazily allocated destination page. (`tickslock` is not a leaf either:
+      `clockintr` calls `wakeup` under it.)
+
+      Observed after the `acquire` (same gdb stop, two `next`s later): `noff` 1, `intena` 0
+      (interrupts were already off in the trap handler), `kproflock` locked by `cpus+128`,
+      hart 1's `struct cpu`.
+
+      `profdetach`, below, is the other half: before a kernel histogram is freed or written
+      out, its owner unhooks it under the same lock. Once `kprof` is 0, no hart can be
+      inside `profsample` on that page, so `kfree` cannot race with an increment on another
+      hart. (An atomic add would make the increments safe, but not the free.)
+    others: |
+      If hart 0 and hart 2 take a timer interrupt in the kernel at the same moment, one of
+      them spins in `acquire(&kproflock)` for the few instructions of `profsample`. At ten
+      ticks a second per hart, contention is rare and short. Every kernel tick takes the
+      lock even when no kernel profile exists, which costs an atomic swap and a fence per
+      tick; checking `kprof` before locking would avoid that at the price of a racy read.
+  - title: One kernel profile at a time
+    commit: 8
+    file: kernel/prof.c
+    lines: 70-114
+    focus: 102-110
+    state:
+      hart: 0
+      mode: S
+      proc: prof's child
+      intr: "off"
+      satp: kernel
+      locks: [kproflock]
+      stack: [usertrap, syscall, sys_profile]
+      sp: kernel
+      irq: {noff: 1, intena: 1}
+    note: |
+      `sys_profile` now has two kinds of histogram. The old one is unhooked (`profdetach`)
+      before it is freed. A new kernel histogram is published in `kprof` under the lock, and
+      only if no other process owns one; the loser frees its page and gets -1 (`proftest`
+      checks this with a forked child). A user histogram is installed exactly as before.
+
+      The page still belongs to the process (`p->prof`), so the lifetime rules stay the same:
+      `profget` copies it (now under `kproflock`, so the copy is a consistent snapshot while
+      other harts add to it), [[kexit]] writes it (after `profdetach`), and [[freeproc]]
+      frees it.
+
+      State: inside the critical section (lines 102 to 110) during a system call, so `noff`
+      1 and `intena` 1; interrupts come back on at the `release`. Reasoned from the code.
+  - title: usertrap leaves a kernel profile alone
+    commit: 8
+    file: kernel/trap.c
+    lines: 82-95
+    focus: 85-92
+    state:
+      hart: 0
+      mode: S
+      proc: usertests
+      intr: "off"
+      satp: kernel
+      locks: []
+      stack: [usertrap]
+      sp: kernel
+      irq: 0
+    note: |
+      One condition is added to the user sample: `p->prof->lo < KERNBASE`. Without it, the
+      process that owns the kernel profile would add its own user pcs to the kernel
+      histogram, without `kproflock`, at the same time as other harts' locked increments: a
+      data race on `nsample`, and user addresses counted as "outside" in a kernel profile.
+
+      With it, the two paths split cleanly: a user histogram is written only here, by its
+      own process, without a lock; the kernel histogram only in [[kerneltrap]], by any hart,
+      under the lock.
+  - title: Where the critical sections went
+    commit: 8
+    file: kernel/spinlock.c
+    lines: 88-116
+    focus: 114-115
+    state:
+      hart: 1
+      mode: S
+      proc: usertests
+      intr: "off"
+      satp: kernel
+      locks: []
+      stack: [usertrap, syscall, sys_sbrk, growproc, uvmalloc, kalloc, release, pop_off]
+      sp: kernel
+      irq: {noff: 0, note: "line 113 has just brought noff from 1 to 0; line 115 turns interrupts back on"}
+    note: |
+      The measurement that makes this lab worth doing: `prof -k 0x80000a26 0x80000ca8
+      usertests -q` profiled, at 2-byte resolution, the 642 bytes holding [[kfree]],
+      [[kalloc]], [[initlock]], [[holding]], [[push_off]], [[acquire]], [[pop_off]] and
+      [[release]] for the whole of `usertests`. These functions run hundreds of thousands of
+      times. Result: 242 samples, 240 of them on a single instruction, `0x80000c50`. That
+      is the instruction after `csrsi sstatus,2`, which is line 115's `intr_on()` in this
+      build. The other two were on the first instructions of `kalloc` and `push_off`, before
+      interrupts go off. Not one sample landed between a `push_off` and its `pop_off`.
+
+      The reason is the invariant from [[concept:locks#invariant]]: while `noff > 0`, SIE is
+      0, so a timer interrupt that arrives in a critical section stays pending, and is taken
+      the moment line 115 sets SIE. All the time spent inside critical sections, including
+      every spin in `acquire` waiting for another hart, is billed to this one instruction. In
+      the whole-kernel profile of `usertests` it was the hottest non-idle bucket: 265 of
+      3,467 samples, with the instruction after [[usertrap]]'s `intr_on()` next (65:
+      trap-entry time). The idle harts' time piles up at the matching instruction in
+      [[scheduler]] (3,110).
+
+      A profiler built on maskable interrupts sees only code that runs with interrupts on.
+      On x86, Linux's `perf` delivers its samples as a non-maskable interrupt for exactly
+      this reason. On RISC-V, the performance-counter overflow interrupt (Sscofpmf) is
+      masked by SIE like any other, so a kernel sampling with it has the same blind spot.
+    others: |
+      The other two harts are in the same situation: each one's critical sections are
+      invisible to its own timer, and each one's deferred ticks land on its own `pop_off`.
+      Lock contention between harts (a hart spinning in `acquire`) is the most expensive
+      thing this profiler cannot see.
+verify: |
+  On the branch (`ext/07-profiler`, 8 commits), built with the project toolchain and run on
+  three harts (`-smp 3 -m 128M`), in one boot: `proftest` four times, `usertests -q`, then
+  `proftest` four more times. All eight `proftest` runs printed `ALL OK`. The first one and
+  the one right after `usertests`:
+
+  ```text
+  $ proftest
+  proftest: arguments, and profile(0, 0, 0) stops: OK
+  proftest: hot loop: 30 samples, 30 in range, 30 in hot()
+  proftest: most samples in the hot loop: OK
+  proftest: fork does not inherit the profile: OK
+  proftest: exec keeps the profile: OK
+  proftest: prof.out: 20 samples, 20 in range, 20 in hot()
+  proftest: exit writes prof.out: OK
+  proftest: only one kernel profile at a time: OK
+  proftest: kernel: 30 samples, 0 outside [0x80000000, 0x8000FE00)
+  proftest: kernel samples, none outside the profiled range: OK
+  proftest: free pages 32470 before, 32470 after
+  proftest: no leaks: OK
+  proftest: ALL OK
+  [...]
+  $ usertests -q
+  usertests starting
+  [...]
+  ALL TESTS PASSED
+  $ proftest
+  proftest: arguments, and profile(0, 0, 0) stops: OK
+  proftest: hot loop: 30 samples, 30 in range, 30 in hot()
+  proftest: most samples in the hot loop: OK
+  proftest: fork does not inherit the profile: OK
+  proftest: exec keeps the profile: OK
+  proftest: prof.out: 20 samples, 20 in range, 19 in hot()
+  proftest: exit writes prof.out: OK
+  proftest: only one kernel profile at a time: OK
+  proftest: kernel: 30 samples, 0 outside [0x80000000, 0x8000FE00)
+  proftest: kernel samples, none outside the profiled range: OK
+  proftest: free pages 32470 before, 32470 after
+  proftest: no leaks: OK
+  proftest: ALL OK
+  ```
+
+  Over the eight runs the 30-tick hot loop got 30 samples every time, all inside `hot()`,
+  and the 20-tick child that leaves `prof.out` got 19 or 20. (A tick-driven count can
+  always come out one short: a 10-tick child required to get at least 10 samples was seen
+  to get 9, which is why this child spins for 20.) The idle second of
+  the kernel gave 30 to 33 samples: three harts, ten ticks each. `usertests -q` passing (its
+  `usertrap()` lines, trimmed here, are the expected kills of `kernmem` and friends) shows
+  that processes that never profile are unaffected, and the equal free-page counts show
+  that profiled processes leave no page behind. `usertests -q` also passed under `prof -k`
+  (in both kernel runs of Measure), with the kernel profile active on all three harts
+  throughout. In the same build, `/prof /grep .*.*.*z /README` and `/prof -k /echo hi` run
+  from a subdirectory found their `.sym` files, which `prof` opens from `/`.
+
+  Every commit builds on its own with `make kernel/kernel fs.img` (only the two existing
+  warnings about RWX segments).
+measure: |
+  **User profiles of real programs.** `b1` is `README` eight times (19,528 bytes), `b2` is
+  `b1` eight times (156,224 bytes), both made with `cat` inside xv6.
+
+  ```text
+  $ prof grep .*.*.*z b1 > o
+  prof: 72 ticks
+  prof: grep: 61 samples, 0 outside [0x0, 0xB71), 4-byte buckets
+  by function:
+    48	78%	matchstar
+    13	21%	matchhere
+  hottest buckets:
+    42	68%	0x24	matchstar+0x24
+    3	4%	0x4C	matchhere+0x0
+    3	4%	0x50	matchhere+0x4
+    3	4%	0x94	matchhere+0x48
+  [...]
+  ```
+
+  The pattern makes `grep`'s recursive matcher backtrack, and the profile finds the loop:
+  the bucket at `matchstar+0x24` holds one instruction, `bnez a0` at `0x26`, the first one
+  after `matchstar`'s call to `matchhere` returns, inside its `do ... while`. Two thirds of
+  all samples landed there. That concentration is partly QEMU's doing: QEMU executes
+  guest code in translated blocks and takes pending interrupts between blocks, so samples
+  land on block entry points such as this return address (and `proftest`'s `0x112`, a loop
+  head). A test confirms it: with a loop whose body is about a hundred
+  instructions with no branch inside, over three runs, 248 of 249 samples landed in the loop-head bucket,
+  where an interrupt that could be taken anywhere would have spread them over the body. It
+  also shifts time between functions: the time of a block of `matchhere` that ends in `ret`
+  is charged to `matchstar`'s return address. On real hardware the samples would spread
+  over the instructions actually executing, and the split between `matchstar` and
+  `matchhere` could differ (reasoned, not measured). 61 samples in 72 ticks: `grep` was in
+  user mode for most of its run.
+
+  ```text
+  $ prof wc b2 b2 b2 b2 b2 b2 > o
+  prof: 55 ticks
+  prof: wc: 1 samples, 0 outside [0x0, 0xA81), 4-byte buckets
+  [...]
+  $ prof -k wc b2 b2 b2 b2 b2 b2 > o
+  prof: 53 ticks
+  prof: kernel: 156 samples, 0 outside [0x80000000, 0x80007000), 32-byte buckets
+  by function:
+    151	96%	scheduler
+    4	2%	pop_off
+    1	0%	usertrap
+  [...]
+  ```
+
+  `wc` on 937 KB took 5.5 seconds and got **one** user sample. The kernel profile of the same
+  run explains it: 156 of the 159 hart-ticks (3 harts × 53) were kernel samples, and 151 of
+  them were idle schedulers. `wc` spends its time asleep, waiting for the disk (the buffer
+  cache holds 30 blocks, `b2` is 153). A sampling profiler measures where the CPU goes, and
+  an I/O-bound program barely uses one.
+
+  **Statistics.** Six runs of `prof grep .*.*.*z README` (the three that printed a tick count
+  took 9 to 12 ticks) gave 7 to 10 samples each; `matchstar`'s share came out as 87%, 100%, 50%, 70%, 71% and 62%. Two runs
+  on `b1` (60 and 61 samples) gave 65% and 78%. That is the spread `sqrt(p(1-p)/n)` predicts
+  (16 points at n = 8, 6 at n = 60). The hot loop in `proftest` got 28 to 30 samples for 30
+  ticks in every run on the branch, including one with three CPU-bound `grep`s competing for
+  the three harts.
+
+  **The kernel profile of `usertests -q`**, all of the kernel's text, 32-byte buckets:
+
+  ```text
+  $ prof -k usertests -q
+  [...]
+  ALL TESTS PASSED
+  prof: 1173 ticks
+  prof: kernel: 3467 samples, 0 outside [0x80000000, 0x80007000), 32-byte buckets
+  by function:
+    3110	89%	scheduler
+    265	7%	pop_off
+    65	1%	usertrap
+    18	0%	release
+    4	0%	walk
+  [...]
+  hottest buckets:
+    3110	89%	0x80001E20	scheduler+0x98
+    265	7%	0x80000C40	pop_off+0x18
+    65	1%	0x80002680	usertrap+0x92
+  [...]
+  ```
+
+  The `pop_off+0x18` bucket covers `0x80000c40`–`0x80000c5f`, which contains `0x80000c50`;
+  the `usertrap+0x92` bucket contains `0x80002690`, the instruction after `usertrap`'s
+  `csrsi sstatus,2`. In 1,173 ticks the three harts took about 3,519 timer
+  interrupts (3 × 1,173, assuming one per hart per tick); 3,467 of them found the hart in the kernel, and 3,110 of those in the idle
+  scheduler. Under QEMU, `usertests` mostly waits for its disk. Almost all the non-idle
+  kernel samples are on three instructions, each the first after interrupts come back on:
+  in [[pop_off]] (time spent in critical sections), in [[usertrap]] after `intr_on()` (trap
+  entry), and in the scheduler (idle). The `release` bucket at `0x80000ca0` is really
+  `memset`'s loop at `0x80000cbc`, which shares the 32-byte bucket.
+
+  **The blind spot at instruction resolution**: the 642 bytes from [[kfree]] to the end of
+  [[release]], 2-byte buckets, over another full `usertests -q` run:
+
+  ```text
+  $ prof -k 0x80000a26 0x80000ca8 usertests -q
+  [...]
+  ALL TESTS PASSED
+  prof: 1351 ticks
+  prof: kernel: 4003 samples, 3761 outside [0x80000A26, 0x80000CA8), 2-byte buckets
+  by function:
+    240	99%	pop_off
+    1	0%	push_off
+    1	0%	kalloc
+  hottest buckets:
+    240	99%	0x80000C50	pop_off+0x28
+    1	0%	0x80000B0E	kalloc+0x0
+    1	0%	0x80000BAE	push_off+0x0
+  ```
+
+  `kalloc`, `kfree`, `acquire` and `release` ran throughout, and no sample landed in any of
+  their critical sections, nor in `acquire`'s spin loop: every interrupt that arrived there
+  was delivered at `0x80000c50`.
+further: |
+  - **A profiler that sees critical sections.** Count, in `pop_off`, how many timer
+    interrupts were pending when SIE came back on (`sip.STIP`), and attribute them to the
+    lock just released (pass its name down from `release`). Teaches the difference between
+    when an event happens and when the kernel notices it, and gives a crude lock-hold-time
+    profile.
+  - **Call stacks, not just pcs.** At each sample, walk the user stack's frame pointers
+    (xv6 compiles with `-fno-omit-frame-pointer`) with `copyin` and count call chains.
+    Teaches the user stack layout and why the kernel must not trust it.
+  - **Profile across fork.** Give children a copy of the settings and merge their counts
+    into the parent's histogram when [[kwait]] reaps them, so `prof sh` covers a whole
+    pipeline. Teaches which `struct proc` fields a parent may touch, and when.
+  - **Faster sampling.** Program a second, faster `stimecmp` deadline for profiled
+    processes only, and measure what a 1 kHz profile costs in time and gains in precision.
+    Teaches what `clockintr` really controls and why the scheduler quantum and the sampling
+    period need not be the same.

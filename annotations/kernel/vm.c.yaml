@@ -1,0 +1,759 @@
+summary: |
+  Everything xv6 does with [[g:page-table|page tables]]: building them, changing them,
+  copying them, freeing them, and moving data between the kernel and a process's memory
+  through them.
+
+  **The hardware's side.** With [[g:sv39|Sv39]] paging on, every address the hart uses is
+  a *virtual* address of 39 bits, split as 9 + 9 + 9 + 12:
+
+  ```
+   38      30 29      21 20      12 11          0
+  +----------+----------+----------+-------------+
+  |  L2 idx  |  L1 idx  |  L0 idx  |   offset    |
+  +----------+----------+----------+-------------+
+  ```
+
+  The hardware starts at the root page-table page named by [[g:csr:satp|satp]], uses
+  *L2 idx* to pick one of its 512 [[g:pte|PTEs]], follows that PTE to a second page, uses
+  *L1 idx* there, follows again, uses *L0 idx* in the third page, and finds the leaf PTE:
+  its physical page number, plus the 12-bit offset, is the physical address. For example
+  the trampoline address `0x3ffffff000` has indices 255, 511, 511 and offset 0. The
+  macros [[PX]], [[PTE2PA]] and [[PA2PTE]] in [[kernel/riscv.h]] do the same bit
+  arithmetic, and [[walk]] repeats the whole lookup in software.
+
+  **Two kinds of page table.**
+
+  - One **kernel page table**, [[kernel_pagetable]], built once by [[kvmmake]] and used by
+    every hart whenever it runs kernel code. It is a [[g:direct-map]]: RAM and devices
+    appear at virtual addresses equal to their physical addresses, so the kernel can turn
+    any physical address into a pointer. User memory does not appear in it.
+  - One **user page table per process** (`p->pagetable`), built by [[proc_pagetable]],
+    [[kexec]] and [[uvmalloc]]. It maps the program's memory from address 0 up, with the
+    U bit set, plus the [[g:trampoline]] and [[g:trapframe]] pages at the top (see the
+    [[g:user-memory-layout]]). It is installed only while that process runs in user mode.
+
+  Because the kernel cannot use user addresses directly, [[copyin]], [[copyout]] and
+  [[copyinstr]] translate them in software, through the process's page table, and copy
+  through the direct map. Those three, and the page-fault handler in [[kernel/trap.c]],
+  also call [[vmfault]], which allocates the pages of memory grown lazily by `sbrklazy`.
+
+  Function names follow a pattern: `kvm...` works on the kernel page table, `uvm...` on a
+  user one.
+
+  **Read before:** [[kernel/riscv.h]] (the PTE macros), [[kernel/memlayout.h]] (the
+  address map), [[kernel/kalloc.c]]. **Read next:** [[kernel/proc.c]] and
+  [[kernel/exec.c]], which build user address spaces with these functions.
+
+blocks:
+  - lines: 1-9
+    title: Headers
+    note: |
+      [[kernel/memlayout.h]] supplies the addresses being mapped, [[kernel/riscv.h]] the
+      page-table macros, [[kernel/defs.h]] the prototypes ([[kalloc]], [[memset]],
+      [[proc_mapstacks]], ...), and [[kernel/param.h]] and [[kernel/types.h]] the basics.
+      Those five are all it needs: `elf.h`, `fs.h`, `spinlock.h` and `proc.h` are unused,
+      and the file compiles without them.
+
+  - lines: 11-14
+    title: The kernel's page table
+    note: |
+      A pointer to the root page of the kernel page table. [[kvminit]] sets it once, on
+      hart 0; after that it never changes, and every hart loads it into
+      [[g:csr:satp|satp]] ([[kvminithart]]). The trap code also needs it, to switch back to
+      the kernel's page table when a process traps: [[prepare_return]] saves the current
+      `satp` in the trapframe for [[kernel/trampoline.S]].
+
+  - lines: 16-18
+    title: Two addresses from outside C
+    note: |
+      [[etext]] is defined by the linker script ([[kernel/kernel.ld]]): the page-aligned
+      end of the kernel's code. [[trampoline]] is a label in [[kernel/trampoline.S]], the
+      start of the trampoline page. Declaring them as `char` arrays makes the name stand for
+      the address, which is all [[kvmmake]] needs.
+
+  - lines: 20-27
+    title: "kvmmake(): an empty root page"
+    note: |
+      Builds the kernel page table. The first step is its root: one page from [[kalloc]],
+      cleared to zero. All-zero bytes mean all 512 PTEs have V = 0, so nothing is mapped
+      yet. The clearing matters: [[kalloc]] fills a fresh page with junk, and junk with the
+      low bit set would look like valid mappings.
+
+      The result of `kalloc` is not checked. At boot (this runs inside [[kvminit]], right
+      after [[kinit]]) memory cannot have run out.
+
+  - lines: 29-36
+    title: Map the device registers
+    note: |
+      Each call maps a range at the same virtual address as its physical address, so the
+      drivers can use the physical addresses from [[kernel/memlayout.h]] as pointers after
+      paging is on. All three are readable and writable but not executable:
+
+      - the [[g:uart|UART]], one page at [[UART0]];
+      - the [[g:virtio]] disk, one page at [[VIRTIO0]];
+      - the [[g:plic|PLIC]], `0x4000000` bytes (64 MiB) from [[PLIC]] up to
+        `0x10000000`, enough to cover the per-hart registers at large offsets that
+        [[kernel/plic.c]] uses.
+
+      The CLINT and the boot ROM are not mapped: the kernel never touches them.
+
+  - lines: 38-43
+    title: Map the kernel and all of RAM
+    note: |
+      Two calls map all of RAM from [[KERNBASE]] to [[PHYSTOP]], again at equal virtual and
+      physical addresses, split at [[etext]]:
+
+      - `KERNBASE`..`etext`, the kernel's code, gets R and X but not W. A stray write into
+        the kernel's own instructions causes a [[g:page-fault]] (and a panic) instead of
+        silently changing the code.
+      - `etext`..`PHYSTOP` gets R and W but not X: the kernel's data and bss, and every
+        page the [[g:page-allocator]] will ever hand out. Mapping the free pages here is
+        what makes the direct map work: any page from [[kalloc]], whoever it is later used
+        for, is reachable by the kernel at its physical address.
+
+      The split is exact because `etext` is page-aligned ([[kernel/kernel.ld]]).
+
+      The kernel is now mapped where it already runs. That is why the instruction after
+      [[kvminithart]]'s `satp` write still works: its virtual address translates to the
+      same physical address it had with paging off.
+
+  - lines: 45-47
+    title: Map the trampoline at the top
+    note: |
+      The trampoline page is mapped a second time, at [[TRAMPOLINE]] (`0x3ffffff000`),
+      read and execute. Its physical page is part of the kernel code, so it is already
+      mapped once in the direct map. The high mapping exists because every user page table
+      maps the same physical page at the same address ([[proc_pagetable]]), so the
+      trampoline code keeps running when it switches between the two page tables. See
+      [[g:trampoline]].
+
+  - lines: 49-53
+    title: Map the kernel stacks
+    note: |
+      [[proc_mapstacks]] allocates one page per process slot ([[NPROC]] = 64) and maps it
+      at [[KSTACK]]`(p)`, leaving an unmapped [[g:guard-page]] between consecutive stacks
+      (layout in [[kernel/memlayout.h]]). These are the only kernel mappings whose virtual
+      address differs from their physical one, apart from the trampoline.
+
+      The function returns the root; [[kvminit]] stores it.
+
+  - lines: 55-63
+    title: "kvmmap(): map or panic"
+    note: |
+      A wrapper around [[mappages]] for building the kernel page table, called only during
+      boot (by [[kvmmake]] and [[proc_mapstacks]]). A failure here can only mean that
+      [[mappages]] could not get a page for a page-table page, and the kernel cannot run
+      without its page table, so it panics.
+
+      As the comment says, it only writes PTEs: the change takes effect for a hart when
+      [[kvminithart]] loads `satp` and flushes the [[g:tlb]].
+
+  - lines: 65-70
+    title: "kvminit(): build the kernel page table once"
+    note: |
+      Called by [[main]] on hart 0 only. All harts share this one table, which never
+      changes after boot; each hart installs it with [[kvminithart]].
+
+  - lines: 72-84
+    title: "kvminithart(): turn paging on"
+    note: |
+      Called by [[main]] on every hart. Writing [[g:csr:satp|satp]] switches this hart
+      from "Bare" mode (no translation, set by [[start]]) to [[g:sv39|Sv39]] translation
+      through [[kernel_pagetable]]. From the next instruction on, every address the hart
+      uses is virtual.
+
+      The two [[g:insn:sfence.vma|sfence.vma]] instructions ([[sfence_vma]]) bracket the
+      switch:
+
+      - The first makes sure the page-table writes that are already visible to this hart
+        (made by [[kvmmake]] on hart 0; the other harts see them thanks to the
+        acquire/release on [[started]] in [[main]]) are ordered before the hardware starts
+        reading the page table.
+      - The second discards any translations cached in the [[g:tlb]], so none from before
+        the switch can be used afterwards.
+
+  - lines: 86-100
+    title: "walk(): find the PTE for a virtual address"
+    note: |
+      [[walk]] does in software what the hardware does on every memory access: descend the
+      three levels of the page table to the leaf [[g:pte]] for `va`. It returns a pointer to
+      that PTE (a `pte_t *`) so the caller can read *or modify* it; [[mappages]] uses it to
+      create mappings, [[uvmunmap]] to remove them.
+
+      The comment describes the [[g:sv39|Sv39]] split of `va`. One detail is simplified:
+      the specification requires bits 63–39 to be copies of bit 38, not zero. Since xv6
+      never uses addresses with bit 38 set ([[MAXVA]] = 2^38), for xv6's addresses this
+      amounts to "must be zero".
+
+      Page-table pages hold *physical* addresses. [[walk]] uses them directly as pointers,
+      which works because of the kernel's [[g:direct-map]] (or because paging is still
+      off, during [[kvmmake]]).
+
+      With `alloc` set, [[walk]] allocates the page-table pages that are missing on the way
+      down: at most two (a level-1 page and a level-0 page; the root always exists). It
+      never allocates the page that the leaf PTE will map: that is the caller's job.
+
+  - lines: 101-102
+    title: Reject addresses beyond the address space
+    note: |
+      An address at or above [[MAXVA]] (`0x4000000000`) has no PTE in xv6's scheme. Callers
+      are expected to have checked, so reaching this is a kernel bug. The compiled
+      comparison is against `0x3fffffffff`, built with `li a5,-1; srli a5,a5,0x1a`
+      (`kernel/kernel.asm`).
+
+  - lines: 104-114
+    title: Descend levels 2 and 1
+    note: |
+      The loop runs twice, for `level` = 2 and 1. Each time:
+
+      1. [[PX]]`(level, va)` extracts this level's 9-bit index from `va`, and `pte` points
+         at that entry of the current page-table page.
+      2. If the entry is valid, it points to the next level's page: [[PTE2PA]] turns its
+         physical page number into the page's address, and the loop continues there.
+      3. If not, and `alloc` is 0, the address is not mapped: return 0. Otherwise
+         allocate a page for the missing next-level table, zero it (all 512 entries
+         invalid), and store a PTE pointing to it: its physical page number
+         ([[PA2PTE]]) with only [[PTE_V]] set. A valid PTE with R, W and X all clear is,
+         by the specification's definition, a pointer to the next level rather than a
+         mapping.
+
+      [[walk]] assumes every valid PTE at levels 2 and 1 is such a pointer. That holds
+      because xv6 never creates superpages (leaf PTEs at higher levels).
+
+      If [[kalloc]] fails partway down, the page allocated at the level above stays in the
+      tree. It is not leaked: it is reachable from the root, and [[freewalk]] frees it with
+      the rest of the page table.
+
+  - lines: 115-116
+    title: Return the level-0 PTE
+    note: |
+      After the loop, `pagetable` is the level-0 page; index it with the last 9 bits.
+      The PTE returned may itself be invalid (V = 0): [[walk]] promises only that the
+      page-table pages leading to it exist. Callers check `*pte & PTE_V` themselves.
+
+  - lines: 118-139
+    title: "walkaddr(): translate a user address"
+    note: |
+      Returns the physical address of the page containing user virtual address `va`, or 0
+      if there is none. It never allocates anything (`alloc` = 0).
+
+      It refuses three cases: the address is out of range, there is no valid PTE, or the
+      PTE lacks [[PTE_U]]. The last check is what the comment means by "only ... user
+      pages": a page the user cannot access must not be reachable through a user-supplied
+      address either. Such pages exist in every user page table: the trampoline, the
+      trapframe and the stack's [[g:guard-page]]. Without the check, a system call given
+      the address [[TRAPFRAME]] could make the kernel read or overwrite the process's saved
+      registers on its behalf.
+
+      The result is the *page's* physical address; [[walkaddr]] drops the offset, and its
+      callers ([[copyin]], [[copyout]], [[copyinstr]], [[loadseg]]) add it back.
+
+  - lines: 141-151
+    title: "mappages(): create mappings"
+    note: |
+      Maps the `size` bytes of virtual memory starting at `va` onto the physical memory
+      starting at `pa`, page by page, with permission bits `perm` ([[PTE_R]], [[PTE_W]],
+      [[PTE_X]], [[PTE_U]] combined). It is the only function in xv6 that writes leaf PTEs
+      with new physical addresses. Its callers: [[kvmmap]], [[proc_pagetable]],
+      [[uvmalloc]], [[uvmcopy]], [[vmfault]].
+
+  - lines: 152-159
+    title: Insist on whole pages
+    note: |
+      Mappings exist only for whole pages, so a misaligned `va` or a `size` that is not a
+      multiple of 4096 means the caller has made a mistake; so does a size of zero, which
+      would also break the computation of `last` below. `pa` is not checked: [[PA2PTE]]
+      would silently drop its low 12 bits.
+
+  - lines: 161-175
+    title: One PTE per page
+    note: |
+      `a` walks over the virtual pages and `pa` over the physical ones in step. `last` is
+      the address of the final page, computed up front so that the loop stops *at* it
+      (`a == last`) rather than comparing against `va + size`.
+
+      For each page, [[walk]] with `alloc` = 1 finds the leaf PTE, creating page-table pages
+      as needed. If that PTE is already valid, the caller is trying to map a page twice:
+      that is a kernel bug, and overwriting the PTE would lose track of the old physical
+      page, so it panics. Otherwise the new PTE is written: the physical page number, the
+      permissions, and [[PTE_V]].
+
+      If [[walk]] runs out of memory, the function returns -1, but the pages already mapped
+      by earlier iterations stay mapped. The callers that map more than one page are boot
+      code, where a failure panics anyway.
+
+  - lines: 177-188
+    title: "uvmcreate(): an empty user page table"
+    note: |
+      Allocates and zeroes a root page: a page table with nothing mapped. [[proc_pagetable]]
+      calls it and then adds the trampoline and trapframe pages. Unlike [[kvmmake]] this
+      runs long after boot, every time a process is created or `exec`s, so running out of
+      memory is a real possibility and it returns 0.
+
+  - lines: 190-213
+    title: "uvmunmap(): remove mappings"
+    note: |
+      Clears the PTEs for `npages` pages starting at `va` and, if `do_free` is set, gives
+      the physical pages back to [[kfree]]. Callers pass `do_free` = 0 when the physical
+      page is not owned by this mapping: the trampoline (kernel code) and the trapframe
+      (freed separately by [[freeproc]]); see [[proc_freepagetable]].
+
+      Pages that are not mapped are skipped. This matters with lazy allocation: a process
+      that grew with `sbrklazy` has addresses below its size `p->sz` that it never touched
+      and that therefore have no page. Freeing the process walks all of them.
+
+      Only the leaf PTEs are cleared; the page-table pages stay, to be freed by
+      [[freewalk]].
+
+      The function does not flush the [[g:tlb]]. It does not need to: the kernel runs on
+      its own page table, and every return to user mode executes `sfence.vma` right after
+      loading the user page table ([[kernel/trampoline.S:110]]–112), so no stale
+      translation of an unmapped page survives into user code.
+
+  - lines: 215-242
+    title: "uvmalloc(): grow a process eagerly"
+    note: |
+      Adds pages so that the addresses from `oldsz` up to `newsz` are backed by memory.
+      Used by [[kexec]] to load the program's segments and make its stack, and by
+      [[growproc]] for an eager `sbrk`. Each new page is zeroed (C requires `.bss` variables
+      to start at zero, xv6 promises that memory from `sbrk` reads as zeros, and a page
+      must never leak the previous owner's data) and mapped readable and user-accessible, plus `xperm`:
+      [[PTE_W]] for data, stack and heap, [[PTE_X]] for program code (from
+      [[flags2perm]]).
+
+      `oldsz` is rounded up first because the page containing the old end already belongs
+      to the process (it is mapped, or will be supplied by [[vmfault]] if it was grown
+      lazily): sizes need not be page-aligned, but mappings are.
+
+      If memory runs out partway, it undoes its own work: [[uvmdealloc]] frees the pages it
+      had already added (from the rounded `oldsz` up to `a`), and the function returns 0.
+      The process is left exactly as it was.
+
+  - lines: 244-260
+    title: "uvmdealloc(): shrink a process"
+    note: |
+      The reverse of [[uvmalloc]]: unmaps and frees the pages that lie above `newsz` but
+      below `oldsz`. Used by [[growproc]] for a negative `sbrk` and by [[uvmalloc]] to
+      clean up.
+
+      The rounding makes partial pages come out right. A page is freed only if no byte of
+      it is below `newsz`: pages from `PGROUNDUP(newsz)` to `PGROUNDUP(oldsz)`. If both
+      sizes fall in the same page, nothing is freed. Pages that were never allocated
+      (lazy `sbrk`) are skipped by [[uvmunmap]].
+
+  - lines: 262-280
+    title: "freewalk(): free the page-table pages"
+    note: |
+      Frees a page table's own pages, recursively: for each valid entry that points to a
+      lower-level table, free that table first, then the page itself. Line 270 recognizes
+      such entries by the [[g:pte]] rule: valid, with R, W and X all clear.
+
+      The caller must already have removed every leaf mapping ([[uvmfree]] does so with
+      [[uvmunmap]]). A remaining leaf means some physical page is still mapped and would
+      be leaked, or freed while still in use, so line 276 panics. That is why
+      [[proc_freepagetable]] unmaps the trampoline and trapframe pages before calling
+      [[uvmfree]].
+
+      The recursion is at most three calls deep, one per level.
+
+  - lines: 282-290
+    title: "uvmfree(): free a whole user address space"
+    note: |
+      Frees the user memory from 0 up to `sz` (the page containing byte `sz − 1` included),
+      then every page-table page, root included. After this the page table no longer
+      exists. Called through [[proc_freepagetable]] when a process's slot is freed
+      ([[freeproc]]) and when `exec` replaces the old memory or abandons a half-built new
+      one, and directly to clean up after a failure in [[proc_pagetable]].
+
+  - lines: 292-305
+    title: "uvmcopy(): copy a process's memory for fork"
+    note: |
+      [[kfork]] calls this to give the child a private copy of every page of the parent's
+      memory, from 0 up to `sz`. The child's page table (`new`) already has its trampoline
+      and trapframe pages from [[proc_pagetable]].
+
+      xv6 copies everything at `fork` time; it does not share pages between parent and
+      child (there is no copy-on-write).
+
+  - lines: 306-320
+    title: Copy page by page
+    note: |
+      For each parent page:
+
+      1. Skip it if it is not mapped. As in [[uvmunmap]], pages below `sz` can be missing
+         because of lazy `sbrk`; the child's copy stays unallocated too, and either
+         process gets a fresh zero page from [[vmfault]] when it touches it, which is
+         exactly what the parent would have got.
+      2. Read the physical address and the flags from the parent's PTE.
+      3. Allocate a new page and copy the 4096 bytes. Both addresses are physical and used
+         as pointers, through the [[g:direct-map]].
+      4. Map the copy at the same virtual address in the child with the *same* flags, so
+         text stays read-only, the stack's [[g:guard-page]] stays non-user, and so on.
+
+  - lines: 321-326
+    title: Undo on failure
+    note: |
+      On success the child has an identical copy. On failure (out of memory), every page
+      mapped so far, those below `i`, is unmapped and freed, so the child's page table
+      holds no leaf mappings except the trampoline and trapframe. [[kfork]] then calls
+      [[freeproc]], which frees the page table, page-table pages included.
+
+  - lines: 328-339
+    title: "uvmclear(): make a page inaccessible to user code"
+    note: |
+      Clears the [[PTE_U]] bit of the page at `va`, leaving it mapped but reachable only by
+      the kernel. [[kexec]] uses it on the page just below the user stack to make it a
+      [[g:guard-page]]: a program whose stack overflows gets a [[g:page-fault]] there and
+      is killed.
+
+      Clearing U instead of unmapping the page matters with lazy allocation: an
+      *unmapped* page below `p->sz` looks to [[vmfault]] like a lazily-grown page, and it
+      would quietly map it. A mapped page with U clear is rejected (see [[ismapped]]).
+
+      The address must have a PTE; if not, [[kexec]] made a mistake, hence the panic.
+
+  - lines: 341-349
+    title: "copyout(): copy from the kernel to user memory"
+    note: |
+      Copies `len` bytes from kernel address `src` to user virtual address `dstva` in the
+      address space described by `pagetable`. System calls use it to deliver results:
+      [[kernel/file.c]] for `fstat`, [[kernel/proc.c]] for `wait`, `read` through
+      [[either_copyout]], [[kexec]] to build the new stack, and others.
+
+      Why not a plain `memmove` to `dstva`? The kernel runs on [[kernel_pagetable]], where
+      user addresses mean something else entirely: user address `0x10000000`, for
+      instance, would be the UART's registers. The user's page table is not active, and
+      even if it were, supervisor mode may not access pages with [[PTE_U]] set unless the
+      `SUM` bit of [[g:csr:sstatus|sstatus]] is on, which xv6 never does. So
+      [[copyout]] translates each page itself and writes through the [[g:direct-map]].
+
+      `psz` is the process's size, needed only to tell [[vmfault]] which unmapped
+      addresses are lazily-grown memory.
+
+  - lines: 350-360
+    title: Find the physical page, allocating it if lazy
+    note: |
+      Each iteration handles the part of the copy that falls in one page. `va0` is the
+      start of the page containing `dstva`.
+
+      If [[walkaddr]] finds no user-accessible page, the address may still be valid: part
+      of memory grown lazily by `sbrklazy` and not yet touched. [[vmfault]] allocates it in
+      that case (the kernel's access stands in for the user's first touch). If
+      [[vmfault]] also fails, the address is bad (beyond `psz`, or a non-user page such as
+      the guard page) or memory has run out, and the copy fails with -1. The system call
+      then returns an error; the process is not killed, as it would be for the same access
+      from user code.
+
+  - lines: 362-365
+    title: Refuse to write read-only pages
+    note: |
+      [[walkaddr]] checks that the page is a user page, but not that it is writable. A
+      user program could otherwise pass the address of its own code as the buffer of a
+      `read` or `fstat` and have the kernel overwrite instructions that the hardware
+      prevents it from overwriting itself. This check enforces [[PTE_W]] in software. The
+      PTE certainly exists at this point, since the page was just found or created.
+
+  - lines: 367-377
+    title: Copy one page's worth
+    note: |
+      `dstva - va0` is the offset within the page, so `PGSIZE - (dstva - va0)` bytes remain
+      in it; copy that many, or fewer if less is left. The destination pointer is the
+      page's physical address plus the offset, usable directly thanks to the
+      [[g:direct-map]]. Then advance to the start of the next page: user pages that are
+      next to each other in virtual memory are usually not next to each other physically,
+      which is why the copy must be split at page boundaries.
+
+  - lines: 379-405
+    title: "copyin(): copy from user memory to the kernel"
+    note: |
+      The mirror image of [[copyout]]: copies `len` bytes from user virtual address `srcva`
+      into the kernel buffer `dst`, one page at a time, for the same reasons. Used to fetch
+      system-call arguments ([[fetchaddr]]), `write` data via [[either_copyin]], pipe data
+      ([[kernel/pipe.c]]), and more.
+
+      Two checks of [[copyout]] are absent. There is no [[MAXVA]] test: for such an
+      address [[walkaddr]] returns 0 and [[vmfault]] rejects it because it is beyond
+      `psz`. And there is no permission test beyond [[PTE_U]], since every user page is
+      readable.
+
+  - lines: 407-417
+    title: "copyinstr(): copy a string from user memory"
+    note: |
+      Copies a NUL-terminated string from user address `srcva` into `dst`, at most `max`
+      bytes including the terminating `'\0'`. Used for path names and `exec` arguments
+      ([[fetchstr]], [[argstr]]).
+
+      It cannot use [[copyin]], because it does not know the length in advance; and it
+      cannot run `strlen` on user memory, for the same reason [[copyout]] cannot use
+      `memmove`. So it translates page by page like the others, and inside each page scans
+      byte by byte.
+
+  - lines: 418-429
+    title: Translate the next page
+    note: |
+      The loop continues until the terminator is found or `max` bytes have been copied.
+      Translation and lazy allocation work as in [[copyin]]. `n` is the number of bytes
+      left in this page, capped at `max`, and `p` is the kernel pointer to the first byte
+      to read.
+
+  - lines: 430-446
+    title: Scan and copy the bytes in this page
+    note: |
+      Copies bytes one at a time until it copies the `'\0'` (then sets `got_null` and stops
+      both loops) or runs out of the page or of `max`. Each byte copied uses up one unit of
+      `max`. Then `srcva` moves to the start of the next page.
+
+  - lines: 447-452
+    title: Fail if no terminator
+    note: |
+      Success means the whole string, terminator included, fit in `max` bytes. If not,
+      `dst` holds `max` bytes with no terminator and the caller gets -1; for example
+      [[argstr]] then fails the system call, so an over-long path name is an error rather
+      than a truncated name.
+
+  - lines: 454-460
+    title: "vmfault(): allocate a lazily-grown page"
+    note: |
+      With `sbrklazy`, [[sys_sbrk]] only raises the process size `p->sz` and allocates
+      nothing ([[kernel/vm.h]]). This function supplies the memory on first use. It is
+      called from two places:
+
+      - [[usertrap]], on a load or store [[g:page-fault]] from user code (`scause` 13 or 15),
+        with the faulting address from [[g:csr:stval|stval]]. If it returns 0 the process
+        is killed. A fault while *fetching an instruction* (cause 12) is not handled, so
+        lazily-grown memory cannot hold code: the pages are mapped without [[PTE_X]] anyway.
+      - [[copyin]], [[copyout]] and [[copyinstr]], when the kernel is asked to touch a user
+        page that does not exist yet.
+
+      It returns the new page's physical address, or 0 if the address is not one it may
+      allocate.
+
+      The parameter `read` (1 for a load fault or a copy *from* user memory) is not used:
+      the page is created the same way either way.
+
+  - lines: 461-478
+    title: Check the address, then map a fresh zero page
+    note: |
+      Two checks decide whether `va` is lazily-grown memory:
+
+      - `va < psz`: it lies inside the process's memory. Anything at or above the size is
+        a genuinely bad address.
+      - It is not mapped already. A *mapped* page that still faulted was refused for its
+        permissions: a write to read-only code, or a user access to the stack's
+        [[g:guard-page]] (valid, but [[PTE_U]] clear). Mapping a new page over it would be
+        wrong (and [[mappages]] would panic), so the fault is treated as an error.
+
+      Then the page is allocated, zeroed (memory from `sbrk` must read as zeros, eager or
+      lazy) and mapped readable, writable and user-accessible. If either allocation fails
+      (the page, or a page-table page inside [[mappages]]), the result is 0: for a user
+      fault the process is killed, and for a copy the system call fails.
+
+      After [[usertrap]] returns to user mode, the faulting instruction runs again and now
+      succeeds.
+
+  - lines: 480-491
+    title: "ismapped(): is there a valid PTE?"
+    note: |
+      Returns 1 if `va` has a valid leaf PTE in `pagetable`, whatever its permissions, and
+      0 if it has none (either the PTE is invalid or the page-table pages leading to it do
+      not exist). Unlike [[walkaddr]], it does not look at [[PTE_U]], so the guard page
+      counts as mapped; [[vmfault]] relies on that.
+
+lines:
+  14: |
+    Physical (and, through the direct map, virtual) address of the root page of the
+    kernel page table.
+  26: |
+    One page for the root page table: 512 PTEs of 8 bytes each.
+  27: |
+    Mark every entry invalid.
+  30: |
+    The UART's registers: one page at `0x10000000`, read/write.
+  33: |
+    The virtio disk's registers: one page at `0x10001000`, read/write.
+  36: |
+    The PLIC: 64 MiB from `0x0c000000`, read/write.
+  39: |
+    Kernel code from `0x80000000` to [[etext]]: read and execute, not write. The size is
+    `etext - KERNBASE` bytes.
+  42-43: |
+    Everything else, from [[etext]] to [[PHYSTOP]]: read and write, not execute.
+  47: |
+    Virtual [[TRAMPOLINE]] → physical [[trampoline]], one page, read and execute. No
+    [[PTE_U]]: only supervisor mode runs this code.
+  50: |
+    A kernel stack for each process slot; see [[proc_mapstacks]] in [[kernel/proc.c]].
+  61-62: |
+    Create the mappings; panic if a page-table page could not be allocated.
+  69: |
+    Build the table and remember its root for [[kvminithart]].
+  78: |
+    Order earlier page-table writes before the translations that follow
+    ([[g:insn:sfence.vma|sfence.vma]]).
+  80: |
+    Turn on paging with the kernel page table. [[MAKE_SATP]] combines mode 8 (Sv39) with
+    the root page's physical page number (its address ÷ 4096).
+  83: |
+    Discard any cached translations from before the switch.
+  101-102: |
+    Panic on an address outside the 38-bit range xv6 uses.
+  105: |
+    Point at this level's entry for `va`: the index is bits 38–30 at level 2 and bits
+    29–21 at level 1.
+  106: |
+    Is there already a next-level page-table page?
+  107: |
+    Yes: continue in it. [[PTE2PA]] turns the entry's page number into an address.
+  109: |
+    No: give up if the caller did not ask for allocation, or if no memory is left.
+    Otherwise `pagetable` now points to a fresh page.
+  111: |
+    A new page-table page must start with all entries invalid; [[kalloc]] returns junk.
+  112: |
+    Link the new page into the tree: its page number in bits 53–10, flag V only (a
+    pointer to the next level, not a mapping).
+  115: |
+    The address of the level-0 entry: index bits 20–12 of `va`.
+  127-128: |
+    Out-of-range addresses are not mapped. Unlike [[walk]], this returns 0 instead of
+    panicking, because the address may come from a user program.
+  130-132: |
+    Find the leaf PTE without allocating anything; no page-table page means no mapping.
+  133-134: |
+    An invalid PTE means no mapping.
+  135-136: |
+    A page user code may not access must not be reachable through a user address either.
+  137-138: |
+    The physical address of the page: the PTE's page number times 4096.
+  162: |
+    The address of the last page to map.
+  164-165: |
+    Find (creating page-table pages if necessary) the leaf PTE for page `a`; -1 if memory
+    runs out.
+  166-167: |
+    Mapping an already-mapped page is a kernel bug.
+  168: |
+    The new mapping: physical page number, permissions, valid.
+  169-170: |
+    Stop after the last page.
+  183-185: |
+    One page for the root; 0 if out of memory.
+  186: |
+    No mappings yet: all 512 entries invalid.
+  199-200: |
+    Unmapping works on whole pages only.
+  203-204: |
+    No level-0 page-table page means no mapping here: nothing to do.
+  205-206: |
+    PTE present but invalid: nothing mapped here either.
+  207-210: |
+    Give the physical page back to the allocator, if this mapping owns it.
+  211: |
+    Erase the PTE, making the page unmapped.
+  223-224: |
+    Nothing to do if the size does not grow.
+  226: |
+    Start at the first page that is not already (at least partly) in use.
+  228-232: |
+    Get a physical page; if none is left, undo this call's earlier pages and fail.
+  233: |
+    New user memory always starts as zeros.
+  234-239: |
+    Map the page at `a`, readable and user-accessible plus `xperm`. If that fails (no page
+    for a page-table page), free the page and undo as above.
+  241: |
+    Success: the process now has `newsz` bytes of memory.
+  251-252: |
+    Nothing to do if the size does not shrink.
+  254-257: |
+    Free the whole pages between the two (rounded-up) sizes.
+  268: |
+    Visit all 512 entries of this page-table page.
+  270: |
+    Valid and none of R, W, X: a pointer to a lower-level page-table page.
+  272-274: |
+    Free that subtree first, then clear the entry.
+  275-276: |
+    A valid leaf: some page is still mapped, which the caller promised not to leave.
+  279: |
+    Finally free this page-table page itself.
+  287-288: |
+    Unmap and free every page of user memory, from 0 to `sz` rounded up.
+  289: |
+    Then free the page-table pages.
+  306: |
+    Every page from 0 up to the parent's size.
+  307-310: |
+    Skip pages the parent never allocated (lazy `sbrk`).
+  311-312: |
+    The parent's physical page and its permission bits.
+  313-314: |
+    A page for the child's copy.
+  315: |
+    Copy the contents of the parent's page into it.
+  316-319: |
+    Map it into the child at the same address with the same permissions.
+  324: |
+    Unmap and free the child's pages from 0 up to (not including) page `i`.
+  335-337: |
+    Find the PTE; it must exist.
+  338: |
+    Clear the U bit, keeping V and the other permissions.
+  351: |
+    The start of the page containing `dstva`.
+  352-353: |
+    An address beyond the 38-bit range can never be valid.
+  355: |
+    The physical page, if it is mapped and user-accessible.
+  357: |
+    Not mapped: try lazy allocation (`read` = 0, since this is a write to user memory).
+  362: |
+    Look the PTE up again to check its permissions.
+  364-365: |
+    Never write to a user page that is not writable, such as program text.
+  367-369: |
+    Bytes to copy into this page: the rest of the page, or the rest of the data if less.
+  370: |
+    Copy to the page's physical address plus the offset of `dstva` within it.
+  372-374: |
+    Advance past what was copied; the next destination is the start of the next page.
+  388-389: |
+    Find the physical page holding `srcva`.
+  390-394: |
+    Not mapped: try lazy allocation (`read` = 1); otherwise the copy fails.
+  395-398: |
+    Copy the part of the data that lies in this page.
+  400-402: |
+    Advance to the next page.
+  416: |
+    Set once the terminating `'\0'` has been copied.
+  430: |
+    Kernel pointer to the byte at `srcva`, through the direct map.
+  432-435: |
+    Found the end of the string: store the terminator and stop.
+  437: |
+    Copy one ordinary byte.
+  439-442: |
+    One byte fewer left in this page and in the budget; advance both pointers.
+  445: |
+    Continue at the start of the next page.
+  463-464: |
+    Beyond the process's size: not memory this process has, lazily or otherwise.
+  465: |
+    Work with the whole page containing the address.
+  466-468: |
+    Already mapped: the fault was a permission problem, not a missing page.
+  469-471: |
+    A physical page for it; fail if memory has run out.
+  472: |
+    Lazily allocated memory must read as zeros, like eagerly allocated memory.
+  473-476: |
+    Map it readable, writable and user-accessible (not executable); undo on failure.
+  477: |
+    Return the page's physical address, which [[copyin]] and friends use directly.
+  483: |
+    Find the leaf PTE without allocating.
+  484-486: |
+    The page-table pages do not even exist: not mapped.
+  487-489: |
+    A valid PTE, whatever its permission bits: mapped.

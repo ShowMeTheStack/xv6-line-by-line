@@ -1,0 +1,223 @@
+summary: |
+  The **on-disk format** of xv6's file system: how the disk is divided into regions
+  ([[g:disk-layout]]), and the exact byte layout of the structures stored on it (the
+  [[g:superblock]], the on-disk inode [[dinode]], and the directory entry [[dirent]]).
+
+  Three different programs must agree on these definitions, so they live in one header:
+
+  - [[mkfs:main|mkfs]] ([[mkfs/mkfs.c]]), which runs on your computer at build time and
+    writes `fs.img`;
+  - the kernel ([[kernel/fs.c]], [[kernel/log.c]] and others), which reads and writes that
+    image through the [[g:buffer-cache]];
+  - user programs such as [[user/ls.c]], which read directories as raw [[dirent]] records.
+
+  Changing anything here changes the disk format, and an `fs.img` made with the old
+  definitions would then be misread.
+
+  **Read next:** [[kernel/fs.c]], which implements files and directories on top of this
+  layout.
+
+blocks:
+  - lines: 1-5
+    title: Two basic constants
+    note: |
+      [[ROOTINO]] is the [[g:inode-number]] of the root directory `/`. Inode numbers start at
+      1, and number 0 is never used: in a directory entry, inode number 0 marks an empty
+      slot. [[mkfs:main|mkfs]] allocates the root first, so it gets number 1, and asserts
+      that it did.
+
+      [[BSIZE]] is the size of a file system [[g:block]], 1024 bytes. The disk hardware
+      works in 512-byte sectors, so one block is two sectors, which the driver accounts for
+      ([[kernel/virtio_disk.c:218]]). (The comment "1 fs block = 1 disk sector" in
+      [[mkfs/mkfs.c]] is therefore not true of the device; it is true only of mkfs's own
+      file I/O, which writes `fs.img` in 1024-byte units.)
+
+  - lines: 7-12
+    title: The disk layout
+    note: |
+      The disk is a sequence of numbered 1024-byte blocks, divided into regions in this
+      order. [[mkfs:main|mkfs]] decides how big each region is and records the boundaries in
+      the superblock. For the default `fs.img` ([[FSSIZE]] = 2000 blocks, 200 inodes,
+      [[LOGBLOCKS]] = 30) mkfs prints
+      `nmeta 47 (boot, super, log blocks 31, inode blocks 13, bitmap blocks 1) blocks 1953 total 2000`,
+      which gives:
+
+      ```text
+      block:  0      1       2 ........ 32   33 ...... 45    46       47 ............ 1999
+            +------+-------+-------------+---------------+--------+---------------------+
+            | boot | super |     log     |    inodes     | bitmap |     data blocks     |
+            +------+-------+-------------+---------------+--------+---------------------+
+                             1 header +    13 blocks of    1 block     1953 blocks
+                             30 blocks     16 inodes       (2000 bits
+                                                           used)
+      ```
+
+      - **Block 0**, the boot block, is not used: QEMU loads the kernel directly from the
+        `kernel` file, not from this disk.
+      - **Block 1**, the superblock, describes the layout (below).
+      - **Blocks 2–32**, the [[g:write-ahead-log|log]]: one header block and 30 blocks for
+        logged block contents ([[kernel/log.c]]).
+      - **Blocks 33–45**, the inodes: `200 / 16 + 1` = 13 blocks of 16 [[dinode]] structures.
+        That is room for 208; numbers 1–199 are usable ([[ialloc]] searches below
+        `ninodes`, and inode 0 is never allocated).
+      - **Block 46**, the [[g:free-bitmap]]: one bit per block of the whole disk, 1 meaning
+        "in use". One block holds 8192 bits, enough for 2000 blocks. mkfs marks all the
+        metadata blocks, and the data blocks it filled, as in use.
+      - **Blocks 47–1999**, data blocks: file contents, directory contents and indirect
+        blocks.
+
+      All of these numbers can be read back from `fs.img`: its block 1 holds the superblock
+      fields 2000, 1953, 200, 31, 2, 33 and 46.
+
+  - lines: 13-22
+    title: The superblock
+    note: |
+      Block 1 of the disk holds this struct (in its first 32 bytes). It is how the kernel
+      learns the layout instead of hard-coding it: [[readsb]] reads it at boot, [[fsinit]]
+      checks the magic number, and the rest of the file system uses the global copy `sb`.
+      See [[g:superblock]].
+
+      For the default `fs.img` the values are: `size` 2000, `nblocks` 1953, `ninodes` 200,
+      `nlog` 31, `logstart` 2, `inodestart` 33, `bmapstart` 46.
+
+      There is no field for where the data blocks start; it follows from the others
+      (`bmapstart` plus the number of bitmap blocks). [[balloc]] does not need it, because
+      every metadata block is already marked in use in the bitmap.
+
+  - lines: 24
+    title: The magic number
+    note: |
+      [[mkfs:main|mkfs]] writes `0x10203040` into the superblock's `magic` field, and
+      [[fsinit]] panics with "invalid file system" if it does not find it. It catches a disk
+      that does not hold an xv6 file system at all. The value is arbitrary; it only needs to
+      be unlikely to appear by accident.
+
+  - lines: 26-29
+    title: How big a file can be
+    note: |
+      An inode holds [[NDIRECT]] (12) block numbers directly, plus the number of one
+      [[g:indirect-block]], a block filled with further block numbers. A block number is a
+      4-byte `uint`, so an indirect block holds [[NINDIRECT]] = 1024 / 4 = 256 of them.
+
+      So a file has at most [[MAXFILE]] = 12 + 256 = 268 blocks, which is 274,432 bytes
+      (268 KiB). [[writei]] refuses to write past that ([[kernel/fs.c:551]]).
+
+      [[NLINK_MAX]] is the largest value a `short` can hold, 32767. `nlink` in [[dinode]] is
+      a `short`, so [[sys_link]] and [[create]] refuse to add a link that would make it
+      overflow ([[kernel/sysfile.c:145]]).
+
+  - lines: 31-39
+    title: The on-disk inode
+    note: |
+      Every file, directory and device has one [[dinode]] in the inode region; its
+      [[g:inode-number]] is its index there. This is the on-disk form; the kernel keeps an
+      in-memory copy with extra bookkeeping in `struct inode` ([[kernel/file.h]]). See
+      [[g:dinode]].
+
+      The struct is 2 + 2 + 2 + 2 + 4 + 13 × 4 = 64 bytes with no padding, so 1024 / 64 =
+      16 fit exactly in one block, and none straddles a block boundary. [[mkfs:main|mkfs]]
+      asserts that [[BSIZE]] is a multiple of the struct's size.
+
+      `type` 0 means the inode is free. The other values ([[T_DIR]], [[T_FILE]],
+      [[T_DEVICE]]) are in [[kernel/stat.h]].
+
+  - lines: 41-45
+    title: Find the block holding an inode
+    note: |
+      [[IPB]] is the number of inodes per block: 1024 / 64 = 16.
+
+      [[IBLOCK]] gives the disk block that contains inode `i`: the inodes are stored in
+      order starting at block `sb.inodestart`, 16 per block, so inode `i` is in block
+      `i / 16 + 33` (for the default image). Within that block it is entry `i % IPB`, which
+      is how [[ialloc]] and [[iupdate]] find it ([[kernel/fs.c:209]]).
+
+      The macro writes `sb.inodestart`, so its second argument must be a struct (like the
+      kernel's global `sb`), not a pointer to one. The parentheses around `i` keep an
+      argument such as `inum + 1` from being split by operator precedence.
+
+  - lines: 47-51
+    title: Find the bitmap bit for a block
+    note: |
+      [[BPB]] is the number of bits in one bitmap block: 1024 × 8 = 8192. Bit `b` of the
+      bitmap (counting from the start of the first bitmap block) records whether block `b`
+      of the disk is in use.
+
+      [[BBLOCK]] gives the bitmap block that contains block `b`'s bit. With 2000 blocks it
+      is always block 46, `sb.bmapstart`. Within that block the bit is number `b % BPB`,
+      which [[balloc]] and [[bfree]] address as byte `bi / 8`, bit `bi % 8`.
+
+  - lines: 53-61
+    title: Directory entries
+    note: |
+      A directory is stored like a file: its data blocks contain an array of [[dirent]]
+      records. Each maps a name to an [[g:inode-number]]. See [[g:directory]].
+
+      Each entry is 16 bytes: a 2-byte inode number and a 14-byte name, so 64 entries fit in
+      a block. `inum == 0` marks an unused slot (inode 0 is never allocated), which is how
+      [[dirlink]] finds room for a new entry and [[dirlookup]] skips empty slots.
+
+      Names are at most [[DIRSIZ]] (14) characters. As the comment says, a name of exactly
+      14 characters fills the array and has no terminating NUL, so code must never treat
+      `name` as an ordinary C string; [[namecmp]] compares with `strncmp` limited to
+      `DIRSIZ`. The [[g:attribute|__attribute__]] `nonstring` tells GCC the same thing, so
+      it does not warn when `strncpy` fills the array without a NUL.
+
+lines:
+  4: |
+    Inode number of the root directory `/`.
+  5: |
+    The block size: 1024 bytes, two disk sectors.
+  14: |
+    Must equal [[FSMAGIC]]; otherwise the disk does not hold an xv6 file system.
+  15: |
+    Total number of blocks the file system covers, metadata included: 2000.
+  16: |
+    How many data blocks there are (1953 by default). The kernel does not use it.
+  17: |
+    How many inodes the inode region holds (200 by default); [[ialloc]] searches up to
+    this number.
+  18: |
+    Number of log blocks, header included (31). The kernel does not use it; it relies on
+    [[LOGBLOCKS]] from [[kernel/param.h]], which [[mkfs:main|mkfs]] used to compute this
+    value.
+  19: |
+    First block of the log, which is the log header (block 2).
+  20: |
+    First block of the inode region (block 33).
+  21: |
+    First block of the free bitmap (block 46).
+  27: |
+    Block numbers per indirect block: 256. `sizeof` yields an unsigned `size_t`, so the
+    whole expression is unsigned.
+  28: |
+    Maximum file size in blocks: 268.
+  29: |
+    The most links an inode may have, `SHRT_MAX`.
+  33: |
+    File type: 0 for a free inode, otherwise [[T_DIR]], [[T_FILE]] or [[T_DEVICE]].
+  34-35: |
+    For a device file, which device: `major` selects the driver in [[devsw]] (the console
+    is 1), `minor` is passed along but xv6's drivers ignore it.
+  36: |
+    How many directory entries refer to this inode ([[g:link-count]]). When it reaches 0
+    and no process has the file open, the inode and its blocks are freed.
+  37: |
+    File length in bytes.
+  38: |
+    Block numbers of the file's data: entries 0–11 are direct, entry 12 ([[NDIRECT]]) is
+    the indirect block. A 0 entry means no block has been allocated there yet.
+  42: |
+    Inodes per block: 16.
+  45: |
+    The block that holds inode `i`.
+  48: |
+    Bits per bitmap block: 8192.
+  51: |
+    The bitmap block that holds block `b`'s bit.
+  54: |
+    Longest name a directory entry can hold, in bytes.
+  59: |
+    Inode number of the entry; 0 if the slot is free. `ushort` is 16 bits, so inode
+    numbers are limited to 65535.
+  60: |
+    The name, possibly without a terminating NUL.

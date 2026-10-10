@@ -1,0 +1,1736 @@
+published: true
+title: A growable user stack
+area: Memory
+stars: 3
+branch: ext/13-growstack
+prerequisites: {tours: [10, 20, 21, 22, 25, 26, 28], concepts: [stacks]}
+summary: |
+  In this tree every user program gets exactly one page of stack. [[kexec]] places a
+  [[g:guard-page]] and a single stack page right after the program's data, and the heap grows
+  from just above them. A recursive function that needs 5 KiB of stack is killed. In this lab
+  the stack moves to the top of the user address space and grows down, one page at a time, as
+  the program touches it, up to a fixed maximum. The heap keeps growing up from the end of the
+  program, and an unmapped gap separates the two.
+
+  The fault handler is the easy part. The lazy heap already fills missing pages on demand.
+  What decides which addresses it will fill, and what else in the kernel decides the same
+  thing its own way? Every one of those places has to be asked again: does it still see the
+  whole process? Some of them fail loudly when they get it wrong, some quietly, and one only in a
+  situation `usertests` never creates. And `usertests` has opinions about where the stack
+  ends.
+
+  The reference solution is seven small commits. With it, 65 recursive calls with 1 KiB of
+  locals each use 70,944 bytes of stack (18 pages), and unbounded recursion is killed one
+  frame above the limit.
+learn:
+  - "How the user address space is laid out, who decides it, and what it means to move one region of it: which code assumes the old layout without saying so."
+  - "What happens when the kernel, not the program, is the first to touch a page of user memory, and where the kernel checks user addresses on its own."
+  - "What a fixed-size, page-aligned region buys you compared with tracking a moving boundary per process."
+  - "How a guard page works when it is not mapped at all, and what limits it has."
+  - "What `fork`, `exec` and `exit` each do with the pages of an address space, and what goes wrong, and how visibly, when one of them overlooks a region."
+spec: |
+  **Behaviour.** A process's stack starts with one page at the top of user memory, just below
+  the trapframe, and grows down by whole pages when the program, or the kernel on its behalf,
+  touches an address below the pages it already has. It grows to at most `USERSTACK` pages
+  (64, 256 KiB, in the reference). A touch below that limit kills the process, exactly as the
+  guard page does today. The heap starts right after the program image and grows up with
+  `sbrk` as before, eagerly or lazily, but never so far that it would reach the page just below
+  the stack's lowest possible page: that page stays unmapped, as a guard between the two.
+
+  - A new stack page is zero-filled and writable, like a lazy heap page.
+  - `fork` gives the child its own copy of every stack page the parent has.
+  - `exit` and `exec` free the stack pages along with the rest of the old image.
+  - System calls that copy into a stack page nobody has touched yet (`read`, `pipe`,
+    `wait(&status)` with a local `status`) succeed and grow the stack; they do not fail.
+  - `exec`'s arguments must still fit in one page, as before.
+
+  **What must not change.** Everything `usertests` checks about bad pointers, the trapframe,
+  the trampoline, `MAXVA`, lazy and eager `sbrk`, and stack overflow. **`usertests -q` must
+  print `ALL TESTS PASSED` on 3 harts.** A few tests know the old layout; the think section
+  finds which, and decides for each one whether it still tests something true.
+
+  **The test program**, `growstack`, runs five checks, each in a child process
+  (`growstack NAME` runs one):
+
+  ```text
+  $ growstack
+  growstack: deep: 65 calls used 70944 bytes of stack
+  growstack: deep: OK
+  growstack: fork: OK
+  growstack: read: OK
+  usertrap(): unexpected scause 0xf pid=8
+              sepc=0x36a stval=0x3ffffbdef8
+  growstack: overflow: status -1, deepest sp 0x3FFFFBE330, limit 0x3FFFFBE000: OK
+  usertrap(): unexpected scause 0xf pid=9
+              sepc=0xce stval=0x3ffffbd000
+  growstack: collide: OK
+  growstack: ALL OK
+  ```
+
+  - **deep**: a recursive function with a 1 KiB local array calls itself 64 times (65
+    frames), filling each array with its depth and checking all of them on the way back.
+  - **fork**: the same recursion forks at the bottom. The child checks all 65 frames of its copy
+    and scribbles over each one as it unwinds; after the child has exited, the parent checks
+    its own frames.
+  - **read**: `read()` from a pipe into a stack buffer that lies in pages nobody has touched,
+    50 bytes before a page boundary, so the 100 bytes land in two such pages.
+  - **overflow**: unbounded recursion, with every frame reporting its `sp` through a pipe. The
+    child must be killed (exit status -1), and its deepest frame must be within one frame of
+    the limit: not killed earlier, not allowed below.
+  - **collide**: the heap grows (lazily) to exactly the highest address allowed and no
+    further; its last byte works; a store to the guard page above it kills.
+
+  The two `usertrap()` lines are the expected kills of the overflow and collide children. The
+  program checks what the final line claims: each child's exit status (-1), how deep the
+  overflow child got before it died (its last reported `sp` lies within one frame above the
+  limit), and that the collide child passed its heap checks before its store into the guard.
+  The `stval` values are shown for information; the line `ALL OK` does not depend on them.
+think:
+  - title: Where does a stack that grows have to live?
+    q: |
+      In this tree [[kexec]] places a guard page and one stack page (`USERSTACK` is 1) right after
+      the program image, and the heap grows from just above them. Recursion that needs more than
+      4 KiB dies. In this layout, where could a second stack page come from? Where would you put
+      the stack instead, in which direction does it grow, what stops it, and what does your
+      choice do to `p->sz`, which today covers everything a process owns?
+    hints:
+      - |
+        Draw the user address space from 0 to `MAXVA` using [[kernel/exec.c:86]]-[[kernel/exec.c:97]],
+        the comment at [[kernel/memlayout.h:54]] and the heap's ceiling in [[growproc]]
+        ([[kernel/proc.c:243]]). A stack grows toward lower addresses: what lies directly below
+        the stack page today, and what lies directly above it?
+      - |
+        Two regions that both grow must grow away from each other into free space, with something
+        between them that neither can take. The heap is `[0, p->sz)` and grows up. Nothing lives
+        between the top of the heap and the trapframe. And a region whose bounds are constants is
+        the same for every process: no new per-process state.
+      - |
+        Fix the stack's top at a constant high address, give the stack a fixed maximum size,
+        keep one unmapped page below the lowest page the stack may reach, and lower the heap's
+        ceiling to just below that page. `p->sz` then describes the image and the heap only.
+    answer: |
+      In the original layout the stack is boxed in. Below its page is the guard page, a real
+      page that [[uvmclear]] made inaccessible to user mode ([[kernel/exec.c:95]]), and below that
+      the program's data. Above it is the first page of the heap ([[kernel/exec.c:96]] sets the
+      initial `sp` to `sz`, which is also where `sbrk` starts). The stack cannot grow down
+      without overwriting data, and it cannot move up because the heap is there.
+
+      The reference moves the stack to the top of user memory, where nothing lives:
+
+      | address | what |
+      |---|---|
+      | `0x3ffffff000` | TRAMPOLINE (not user-accessible) |
+      | `0x3fffffe000` | TRAPFRAME (not user-accessible); also `USTACKTOP`, the stack's top (exclusive) |
+      | `0x3ffffbe000` to `0x3fffffdfff` | the stack region: 64 pages, grown from the top down as needed (`USTACKBASE` is its bottom) |
+      | `0x3ffffbd000` to `0x3ffffbdfff` | the guard page, never mapped |
+      | up to `0x3ffffbd000` | `MAXHEAP`, the highest `p->sz` the heap may reach |
+      | from `0` | text, data, bss, then the heap, growing up |
+
+      Three constants describe it, in `memlayout.h`: `USTACKTOP` (= `TRAPFRAME`), `USTACKBASE`
+      (`USTACKTOP - USERSTACK * PGSIZE`) and `MAXHEAP` (`USTACKBASE - PGSIZE`). `USERSTACK`
+      keeps its name but changes its meaning, from "the stack's size" to "the most pages it may
+      grow to" (64 here). Virtual addresses cost nothing: the region costs memory only for the
+      pages a program actually touches.
+
+      Why a fixed region instead of a per-process "lowest stack page" that moves? With constants,
+      every question below ("is this address a stack address?", "which pages might the stack
+      have?") has the same answer for every process, with no new field to keep correct across
+      fork, exec and exit. The price is a fixed maximum. Putting the heap at the top growing
+      down instead would have changed the meaning of `sbrk`'s return value for every program.
+
+      What it does to `p->sz` is the real subject of this lab. The stack now lies *above*
+      `p->sz`, so every piece of kernel code that means "all of this process's memory" when it
+      says `[0, p->sz)` is now wrong about the stack. The next three questions find those
+      places.
+
+      The guard is now a page that is simply never mapped, rather than a mapped page with `PTE_U`
+      cleared. The old guard used a page of physical memory in every process: on the branch,
+      right after boot, 2 more pages are free than on the original kernel (32,547 against
+      32,545; `init` and `sh` each saved one).
+    checks:
+      - id: lab13-01
+        level: 1
+        type: choice
+        q: |
+          On the original kernel, a program's stack needs a second page: the next function call
+          stores below the stack page. What is at that address, and what happens?
+        code: kernel/exec.c:86-97
+        options:
+          - text: "The guard page: a mapped page with PTE_U cleared. The store faults, vmfault refuses because the page is mapped, and the process is killed."
+            correct: true
+            why: |
+              [[uvmclear]] clears `PTE_U` on the lower of the two pages [[uvmalloc]] mapped. The
+              hart faults, and [[vmfault]]'s `ismapped` test ([[kernel/vm.c:466]]) refuses to
+              map over a page that is already mapped.
+          - text: "The first page of the heap, so the stack silently overwrites the heap."
+            why: |
+              You may have pictured the heap below the stack. In this tree the heap starts *above*
+              the stack page, at the `sz` that [[kexec]] stores in `p->sz` ([[kernel/exec.c:135]]).
+          - text: "An unmapped address below p->sz, so vmfault gives it a fresh zero page and the stack grows."
+            why: |
+              That would be true if the guard page were unmapped. It is mapped, without `PTE_U`,
+              and [[vmfault]] refuses mapped pages; that is exactly why the guard works with a
+              lazy heap in the same address range.
+          - text: "Nothing: the hart lets the store through, because the page is below p->sz."
+            why: |
+              `p->sz` is a software notion; the hardware only reads the PTE. Without `PTE_U` a
+              user-mode store faults, whatever `p->sz` says.
+        explain: |
+          The old stack is boxed in: guard and data below, heap above. That is why it cannot
+          grow where it is, and why the lab moves it. `usertests stacktest` checks the guard: with
+          the old layout (commit 1 of the branch) it faulted at `stval=0x10e90`, inside
+          `usertests`' guard page at `0x10000`.
+      - id: lab13-02
+        level: 2
+        type: number
+        q: |
+          With `USTACKTOP` = `TRAPFRAME` = `0x3fffffe000`, `USERSTACK` = 64 and one guard page,
+          what is `MAXHEAP`, the highest value `p->sz` may reach? (Answer in hex.)
+        answer: "0x3ffffbd000"
+        wrong:
+          "0x3ffffbe000": |
+            That is `USTACKBASE`, the lowest stack page. A heap allowed to reach it would end
+            right where the stack's lowest page begins, with no guard between them.
+          "0x3fffffd000": |
+            You may have counted one stack page, as in the original tree. With 64 pages the
+            region starts `0x40000` below the top.
+          "0x3fffffe000": |
+            That was the old ceiling, `TRAPFRAME`, before the stack moved up there.
+        why_wrong: "USTACKBASE = 0x3fffffe000 - 64 * 0x1000 = 0x3ffffbe000; MAXHEAP is one page lower."
+        explain: |
+          `0x3fffffe000 - 0x40000` = `0x3ffffbe000` (`USTACKBASE`), and one guard page below it
+          is `0x3ffffbd000` (`MAXHEAP`). The page `[0x3ffffbd000, 0x3ffffbe000)` belongs to
+          nobody. The kernel in this build compiles `MAXHEAP` as `0x3ffffbd << 12`.
+  - title: Who grows the stack when the program touches a new page?
+    q: |
+      A function call stores a frame onto a page the stack has never used. What does the hart
+      do, which kernel function decides what happens next, and on what test does it decide
+      today? What must it learn, and how will it tell a stack page from a wild pointer?
+    hints:
+      - |
+        Follow a store fault through [[usertrap]]'s fault branch ([[kernel/trap.c:71]]-[[kernel/trap.c:73]])
+        into the function it calls there, and read that function's very first test.
+      - |
+        The new stack pages lie above `p->sz`; whatever [[vmfault]] refuses, [[usertrap]] kills.
+        With a fixed region, "is this a stack address?" is a pair of comparisons with constants.
+        Decide whether you also need to know where `sp` is.
+      - |
+        One more condition in front of the `p->sz` test: an address inside the region is legal
+        even though it is above `p->sz`. Everything after that test (not mapped yet, a zeroed
+        page, `PTE_R | PTE_W | PTE_U`) already does what a new stack page needs.
+    answer: |
+      The store raises a store page fault (`scause` 15; a load would raise 13), the trampoline
+      takes it to [[usertrap]], and [[usertrap]] calls [[vmfault]] with the process's page table,
+      `p->sz` and `stval`. Today [[vmfault]]'s first test, `va >= psz`, rejects every address at
+      or above `p->sz`, and the process dies. In the new layout that would kill every program at
+      its first deep call.
+
+      The reference changes that one test:
+
+      ```c
+      if (va >= psz && (va < USTACKBASE || va >= USTACKTOP))
+        return 0;
+      ```
+
+      An address below `p->sz` (the image and heap) or inside the stack region passes; the rest
+      of [[vmfault]] is unchanged. It refuses a page that is already mapped, allocates a page,
+      zeroes it, and maps it readable, writable and user-accessible. Zeroing matters here as it
+      does for the heap: [[kalloc]] fills pages with junk (`0x05` bytes), and a page that
+      another process freed must never show its old contents to a new owner.
+
+      Any address in the region grows the stack, even one far below `sp`. Telling a real stack
+      access from a wild pointer would need the faulting `sp`, and a program may legitimately
+      address a local array whose low end lies far below its last touched page (the `read`
+      check does exactly that). Inside a fixed region the cost of a wild pointer is bounded:
+      at most the region's 64 pages, all freed at exit.
+
+      gdb logged the first five store faults of `growstack deep` (pid 4, hart 0): the first
+      with `stval=0x3fffffce28`, then `0x3fffffbd28`, `0x3fffffac28`, … each about 4 KiB lower,
+      each one in [[vmfault]] called from [[usertrap]] with interrupts off and no lock held. A
+      counting copy of the kernel counted 17 in all. The process ended with 18 stack pages: the
+      17 grown by faults and the top one, inherited through fork (exec grew it in the parent,
+      `growstack` itself).
+    checks:
+      - id: lab13-03
+        level: 2
+        type: state
+        q: |
+          `growstack deep` (pid 4) stores into a stack page it has never touched, and [[vmfault]],
+          called from [[usertrap]], is about to allocate the page. Fill in the hart's state at
+          that moment.
+        code: kernel/vm.c:458-478@469
+        state:
+          mode: S
+          stack: kernel
+          satp: kernel
+          sie: "off"
+          noff: 0
+        why:
+          stack: |
+            The trap switched to pid 4's kernel stack in [[uservec]]; [[usertrap]] and
+            [[vmfault]] run on it. The user stack is the thing being grown, and S-mode code
+            does not use it.
+          satp: |
+            [[uservec]] switched to the kernel page table before calling [[usertrap]];
+            [[vmfault]] edits the user page table through its physical address.
+          sie: |
+            A fault from user mode never reaches `intr_on` ([[kernel/trap.c:66]] is only on the
+            system-call path), so interrupts stay off from the trap until the return to user mode.
+          noff: |
+            No spinlock is held yet. [[kalloc]] will take `kmem.lock` in a moment, briefly.
+        why_wrong: Follow the trap through uservec into usertrap's fault branch, which never turns interrupts on and takes no lock before calling vmfault.
+        explain: |
+          gdb recorded exactly this: hart 0, `noff` 0, `intena` 0, `SIE` 0, `sp` `0x3fffff7fb0`
+          on pid 4's kernel stack (`0x3fffff7000`-`0x3fffff8000`), `stval` `0x3fffffce28`, and
+          the page being mapped, `0x3fffffc000`.
+      - id: lab13-04
+        level: 1
+        type: choice
+        q: |
+          On the reference branch, a program stores to `0x3ffffbd010`, with `p->sz` =
+          `0x3000`. What does [[vmfault]] return, and what happens to the process?
+        options:
+          - text: "0; usertrap prints an unexpected scause 0xf and kills the process."
+            correct: true
+            why: |
+              `0x3ffffbd010` is above `p->sz` and below `USTACKBASE` (`0x3ffffbe000`): it is in
+              the guard page, which no rule allows.
+          - text: "A new zeroed page, because the address is inside the stack's 64 pages."
+            why: |
+              You may have counted the guard page as part of the stack. The region is
+              `[0x3ffffbe000, 0x3fffffe000)`; `0x3ffffbd010` is one page below it.
+          - text: "A new zeroed page, because the stack grows down without a limit."
+            why: |
+              The limit is the point of the region's lower bound. Clinic 3 shows what an
+              unbounded stack does to the kernel.
+          - text: "0, and the kernel panics, because a user address faulted in the guard."
+            why: |
+              A user fault the kernel refuses only kills the process; nothing in the kernel is
+              inconsistent.
+        explain: |
+          `growstack collide` does exactly this store (to `0x3ffffbd000`, the first byte of the
+          guard page) after growing the heap to `MAXHEAP`, and is killed:
+          `usertrap(): unexpected scause 0xf pid=9`, `stval=0x3ffffbd000`.
+  - title: The kernel touches the stack too
+    q: |
+      Not every first touch of a stack page is made by user code. Which kernel paths read or
+      write user memory, and what do they do when the page they need is not mapped yet? Which
+      of them compare a user address with `p->sz` on their own, before they get that far? And
+      who writes into a new process's stack before it has run a single instruction?
+    hints:
+      - |
+        List the functions in `vm.c` and `syscall.c` that read or write user memory on the
+        kernel's behalf, and follow what each does with an address it cannot find in the page
+        table. Then follow one `exec` with a local `argv` array: how [[sys_exec]] collects the
+        arguments ([[kernel/sysfile.c:465]]-[[kernel/sysfile.c:486]]), and how [[kexec]] puts
+        them on the new stack ([[kernel/exec.c:99]]-[[kernel/exec.c:119]]).
+      - |
+        A kernel copy into an unmapped page raises no trap: the copy functions look the page up
+        themselves and, if it is missing, call the same function a fault would. A test against
+        `p->sz` that runs before that call is a second gate. Also ask what the calling code
+        holds at that moment: a fault handler that could sleep would be a problem under a
+        spinlock.
+      - |
+        The change from the previous question already serves every copy function. Find the
+        one explicit `p->sz` test on the way and accept the region there as well. Let exec's
+        first copy grow the new stack's first page.
+    answer: |
+      **The copy functions need nothing.** [[copyout]], [[copyin]] and [[copyinstr]] look a page
+      up with [[walkaddr]] and, if it is missing, call [[vmfault]] with the page table and size
+      they were given. Teaching [[vmfault]] the region taught all three. `growstack read` relies
+      on it: its buffer lies in pages the child never touched, and gdb saw [[copyout]] grow
+      them, `0x3fffffa000` and then `0x3fffffb000`, for [[piperead]] in pid 7.
+
+      That path holds a spinlock: [[piperead]] copies byte by byte under `pi->lock`
+      ([[kernel/pipe.c:133]]). gdb recorded `noff` 1, `intena` 1, interrupts off at the
+      allocation. That is safe because growing a stack page never sleeps: [[vmfault]] calls
+      [[kalloc]], which takes `kmem.lock` for a few instructions, and [[mappages]], which may
+      allocate a page-table page the same way. Neither waits for anything. (Compare lab 12, where
+      the fault handler reads from disk and every copy under a lock became a hazard.) The same
+      holds for [[kwait]]'s copyout of the exit status under `wait_lock` and the child's
+      `p->lock`.
+
+      **[[fetchaddr]] needs a change.** It refuses any address at or above `p->sz` before it
+      copies ([[kernel/syscall.c:15]]-[[kernel/syscall.c:16]]). [[sys_exec]] fetches each
+      `argv[i]` pointer with it, and a program that builds `argv` in a local array, like
+      `usertests exectest` (`char *echoargv[] = {"echo", "OK", 0};`), would have its `exec`
+      refused. The reference accepts the 8 bytes if they lie below `p->sz` *or* inside the stack
+      region. gdb saw the three fetches for `exectest`: `0x3fffffde70`, `0x3fffffde78`,
+      `0x3fffffde80`. [[fetchstr]] needs nothing: it has no bound of its own and goes straight
+      to [[copyinstr]].
+
+      **exec writes the first stack page.** [[kexec]] copies the argument strings and the
+      `argv` array onto the new stack with [[copyout]] *into the new page table*, before the
+      process has ever run on it. The reference no longer maps a stack page in [[kexec]] at all:
+      the first [[copyout]] finds `USTACKTOP - 4096` unmapped and [[vmfault]] grows it. This
+      works because [[vmfault]] receives a page table and a size, not a process: it does not
+      care that this page table is not installed yet. The arguments must still fit in that one
+      page (the `sp < stackbase` test stays, with `stackbase = USTACKTOP - PGSIZE`).
+
+      One of those execs runs with interrupts off: the very first, `init`'s, called from
+      [[forkret]]. gdb saw pid 1's [[copyout]] → [[vmfault]] at `0x3fffffd000` with `SIE` 0 and
+      `intena` 0. Every later exec, from [[sys_exec]], ran with interrupts on. Neither matters
+      to [[vmfault]], which never sleeps.
+    checks:
+      - id: lab13-05
+        level: 2
+        type: multi
+        q: |
+          The stack now lives above `p->sz`. Which of these functions must change so that a
+          system call can use a pointer into the stack, including a stack page not grown yet?
+        options:
+          - text: "vmfault"
+            correct: true
+            why: "Its `va >= psz` test refuses every stack address; every lazy path ends here."
+          - text: "fetchaddr"
+            correct: true
+            why: "It tests `addr` against `p->sz` itself, before any copy: `exec` with a local `argv` would fail."
+          - text: "copyout"
+            why: |
+              You may have thought [[copyout]] knows about `p->sz`. It only passes `psz` on to
+              [[vmfault]]; once [[vmfault]] accepts the region, [[copyout]] grows stack pages.
+          - text: "copyinstr"
+            why: |
+              Same as [[copyout]]: it calls [[vmfault]] for a missing page and has no bound of
+              its own.
+          - text: "fetchstr"
+            why: |
+              It has no `p->sz` test; it calls [[copyinstr]] directly.
+          - text: "usertrap"
+            why: |
+              [[usertrap]] already sends load and store faults to [[vmfault]] with `stval`;
+              the decision is entirely inside [[vmfault]].
+        explain: |
+          One function decides, for faults and for copies alike: [[vmfault]]. The only other
+          gate is [[fetchaddr]]'s explicit test. Clinic 6 removes the [[fetchaddr]] change:
+          `usertests -q` then fails `exectest: exec echo failed`.
+      - id: lab13-06
+        level: 3
+        type: choice
+        q: |
+          A learner grows the stack in [[usertrap]] instead (an extra branch that maps a page
+          when `stval` is in the region), leaves [[vmfault]] as it was, and makes [[kexec]] map
+          the first stack page itself. They run `growstack`, then `usertests -q`. What do they see?
+        options:
+          - text: "growstack: read: FAIL, and every other check OK; usertests prints ALL TESTS PASSED."
+            correct: true
+            why: |
+              `read` asks [[copyout]] to write into an unmapped stack page. No trap happens, so
+              the new branch never runs; [[copyout]] calls the unchanged [[vmfault]], which
+              refuses, and `read` returns -1. Nothing in `usertests` writes into an untouched
+              stack page from the kernel.
+          - text: "growstack: ALL OK, because usertrap sees every page fault."
+            why: |
+              You may have thought a kernel copy faults like a user access. [[copyout]] looks
+              the page up with [[walkaddr]] and handles a missing page itself; no trap happens.
+          - text: "panic at boot, because exec cannot copy the arguments."
+            why: |
+              That is what happens if [[kexec]] does *not* map the first page itself (the variant
+              in clinic 4's `why`: `panic: exec`). This learner's [[kexec]] maps it.
+          - text: "growstack: deep: FAIL, because the recursion is too deep for usertrap."
+            why: |
+              The recursion faults from user mode, page by page; the new branch handles each
+              fault. `deep`, `fork` and `overflow` all pass.
+        explain: |
+          Clinic 4 is this kernel, run on 3 harts. The bug is invisible to `usertests`, which is
+          why `growstack` has a `read` check.
+  - title: Fork, exec and exit walk the address space too
+    q: |
+      Which kernel functions copy, walk or free "the process's memory" by a size? What happens
+      to the stack pages at `fork`, at `exit`, at the end of `exec` (the old image), and on
+      `exec`'s error path? For each, what exactly would go wrong if you missed it, and
+      how would you notice?
+    hints:
+      - |
+        [[kfork]] ([[kernel/proc.c:271]]) and the loop in [[uvmcopy]] ([[kernel/vm.c:306]]);
+        [[uvmfree]] ([[kernel/vm.c:288]]) and what [[freewalk]] does with a leaf it finds
+        ([[kernel/vm.c:276]]); the three callers of [[proc_freepagetable]]: [[freeproc]]
+        ([[kernel/proc.c:162]]) and [[kexec]] ([[kernel/exec.c:138]], [[kernel/exec.c:144]]).
+      - |
+        [[uvmcopy]] and [[uvmunmap]] already skip pages that are not mapped, so a whole
+        region can be walked even if only a few of its pages exist. And think about what
+        [[freeproc]] frees if a fork fails halfway, after one copy succeeded.
+      - |
+        Give [[uvmcopy]] a range and let [[kfork]] copy two; unmap and free the whole stack
+        region in [[proc_freepagetable]], the one function every teardown passes through; set
+        the child's `sz` before anything can fail.
+    answer: |
+      **fork.** [[uvmcopy]] copied `[0, sz)`. The reference gives it a start and an end
+      (`start` page-aligned, the error path unmapping only `[start, i)`), and [[kfork]] calls it
+      twice: `0` to `p->sz`, then `USTACKBASE` to `USTACKTOP`. Unmapped pages are skipped, so
+      the second call copies exactly the pages the parent's stack has grown into. gdb saw the
+      `growstack fork` process (pid 5, at the bottom of its 65 frames, user `sp` `0x3ffffecad0`)
+      fork with 18 stack pages, `0x3ffffec000` to `0x3fffffd000`. A fork from the shell copies
+      one.
+
+      The child's `np->sz` is now set *before* the copies. If the first copy succeeds and the
+      second fails, [[freeproc]] frees the child's page table with [[proc_freepagetable]] and
+      `np->sz`; with `np->sz` still 0 it would leave the first copy's pages mapped, and
+      [[freewalk]] would panic.
+
+      Forget the stack copy and the child gets an *empty* stack region. Its first stack access
+      does not fail: [[vmfault]] hands it a zero page. So the child reads zeros where its
+      frames should be, and returns to address 0 (clinic 1: every command the shell forks
+      prints a second prompt and dies).
+
+      **exit and exec.** [[uvmfree]] unmaps `[0, sz)` and then [[freewalk]] frees the
+      page-table pages, panicking with `freewalk: leaf` if any page is still mapped. Stack pages
+      above `sz` are such leaves. All three teardown paths go through [[proc_freepagetable]]:
+      [[freeproc]] (when a parent reaps its child in [[kwait]]), the end of [[kexec]] (the old
+      image) and [[kexec]]'s `bad:` path (a half-built new image, which may already have its
+      first stack page). The reference adds one line there:
+      `uvmunmap(pagetable, USTACKBASE, USERSTACK, 1)`, which frees whatever is mapped in the
+      region and skips the rest. gdb saw it free 18 pages for the `deep` child, 3 for the `read`
+      child and 64 for the `overflow` child.
+
+      Forget it entirely and the kernel panics with `freewalk: leaf` at the first exec of a
+      process that has a stack page (clinic 2's `why`: `init`'s child exec'ing `sh`). Unmap the
+      region without freeing it (`do_free` 0) and nothing panics: the pages are simply lost
+      (clinic 2).
+    checks:
+      - id: lab13-07
+        level: 2
+        type: number
+        q: |
+          `growstack fork` forks at the bottom of 65 frames of 1,088 bytes each (the frame
+          `dive` allocates), which started near the top of the stack. How many stack pages did
+          [[uvmcopy]] copy for that fork?
+        answer: 18
+        wrong:
+          64: |
+            You may have thought fork copies the whole region. [[uvmcopy]] skips pages that are
+            not mapped; only the 18 pages the stack has grown into are copied.
+          17: |
+            You may have counted only the pages the faults grew. The top page, which pid 5
+            inherited through fork (exec grew it in `growstack` itself), is copied too.
+          1: |
+            That is a fork from the shell, whose stack never grew. Here the parent is deep in
+            its recursion.
+        why_wrong: "65 frames of 1,088 bytes is 70,720 bytes plus a little for main and fork1: a bit over 17 pages, so 18 pages are mapped."
+        explain: |
+          gdb read the parent's page table at the call: 18 valid PTEs from `0x3ffffec000` to
+          `0x3fffffd000`. The `deep` check, which recurses the same way without forking, printed
+          `65 calls used 70944 bytes of stack`, and its address space was freed with 18 stack
+          pages.
+      - id: lab13-08
+        level: 2
+        type: choice
+        q: |
+          A kernel has everything right except that [[kfork]] still copies only `[0, p->sz)`.
+          It boots to the shell prompt. You type `growstack`. What do you see?
+        options:
+          - text: "Another \"$ \" prompt, then usertrap(): unexpected scause 0xf with stval=0x0, then the next prompt; growstack never runs."
+            correct: true
+            why: |
+              The shell's child returns from `fork1` with a return address loaded from its
+              empty, zero-filled stack, jumps to address 0 (which is `getcmd` in `sh`), prints
+              a prompt, and dies storing to address 0, which is read-only text.
+          - text: "growstack: fork: FAIL, and the other checks pass."
+            why: |
+              You may have expected the test to catch it. The bug strikes earlier: every fork
+              loses the stack, including the shell's fork that would have run `growstack`.
+          - text: "panic: freewalk: leaf"
+            why: |
+              That is the bug of not *freeing* the stack. Here every page that is mapped is also
+              freed; the child simply never got the stack pages.
+          - text: "Nothing: the child faults on its stack and is killed silently."
+            why: |
+              The child's stack accesses do not fault fatally: [[vmfault]] grows zero pages
+              for them. The child runs on, with zeros for its saved registers.
+        explain: |
+          Clinic 1 is this run. The machine still boots because `init`'s child calls `exec`
+          without returning from any function first, and `exec` builds a fresh stack.
+  - title: Where exactly does the stack stop?
+    q: |
+      Name every limit and what enforces it: how far down the stack may grow, what happens one
+      byte below that, how the heap is kept out of the gap, and how much of the stack `exec` may
+      fill with arguments. At each boundary, check the comparison for an off-by-one.
+    hints:
+      - |
+        Three numbers: the lowest stack address, the highest heap address, and the room for
+        arguments ([[kernel/exec.c:97]], [[kernel/exec.c:104]]; and [[user:bigargtest]]). The
+        heap has two ways to grow: [[growproc]] ([[kernel/proc.c:243]]) and the lazy path in
+        [[sys_sbrk]] ([[kernel/sysproc.c:60]]).
+      - |
+        A guard works only if nobody can map it: not the stack (its lower bound in [[vmfault]]),
+        and not the heap (both `sbrk` paths). And a guard of one page stops a stack that grows
+        a few bytes at a time; think about a single frame larger than a page.
+      - |
+        The stack: `[USTACKBASE, USTACKTOP)` in [[vmfault]]. The heap: `sz + n > MAXHEAP`
+        refused in both `sbrk` paths. Arguments: `stackbase = USTACKTOP - PGSIZE`, unchanged
+        in spirit.
+    answer: |
+      | limit | value | enforced by | one past it |
+      |---|---|---|---|
+      | lowest stack address | `USTACKBASE` = `0x3ffffbe000` | [[vmfault]]: `va < USTACKBASE` is not a stack address | a touch at `0x3ffffbdfff` is in the guard: killed |
+      | highest heap end | `MAXHEAP` = `0x3ffffbd000` | [[growproc]] and the lazy path of [[sys_sbrk]]: `sz + n > MAXHEAP` → -1 | `sbrk` refuses; `p->sz` never covers the guard |
+      | arguments | one page below `USTACKTOP` | [[kexec]]: `sp < stackbase` → fail | `exec` returns -1, as `bigargtest` expects |
+
+      gdb saw both `sbrk` refusals in `growstack collide` (pid 6, heap at `0x3ffffbd000`):
+      [[sys_sbrk]]'s lazy path with `addr + n` = `0x3ffffbd001`, and [[growproc]] with `sz` =
+      `0x3ffffbd000`, `n` = `0x1000`. The one-byte case matters: `MAXHEAP` itself is allowed as
+      the end (the heap's last byte is `0x3ffffbcfff`), and one byte more is not.
+
+      `growstack overflow` shows the stack's limit from the other side. Each frame of `dive` is
+      1,088 bytes; the deepest frame that reported its `sp` had `sp` = `0x3ffffbe330`, 816 bytes above
+      `USTACKBASE`. The next frame's first store below `USTACKBASE` (`stval=0x3ffffbdef8`, in
+      the guard page) was refused and the child was killed, with exactly 64 stack pages mapped.
+
+      The guard has a known hole: it is one page. A function whose frame is larger than a page
+      can move `sp` past the guard in one step, and its first store can land in a heap page that
+      is already mapped, with no fault at all. The same was true of the original guard page. (Not
+      run here; real systems add a larger gap, or make the compiler touch every page of a large
+      frame in order, which is called stack probing.)
+
+      Off by one page in either direction is a real bug. A heap ceiling of `USTACKBASE`
+      instead of `MAXHEAP` leaves no guard (clinic 5). A stack test of `va >= USTACKTOP` alone,
+      with no lower bound, lets the stack grow over anything above `p->sz` (clinic 3).
+    checks:
+      - id: lab13-09
+        level: 3
+        type: tf
+        q: |
+          True or false: on the reference branch, with the heap grown to `MAXHEAP` and the stack
+          grown to its limit, any further stack growth is caught by the guard page and kills the
+          process.
+        answer: false
+        why_tf: |
+          You may have thought a guard page catches every overflow. It catches every access
+          *inside* it; an access that skips over it is not caught.
+        reasons:
+          - text: "A single frame larger than 4 KiB can move sp past the guard, and its first store can land in a mapped heap page without any fault."
+            correct: true
+            why: "Right. The guard is one page wide, so it only stops growth that touches it."
+          - text: "vmfault grows the stack into the guard page when the heap has not reached it."
+            why: |
+              [[vmfault]] never accepts an address below `USTACKBASE` as a stack address; the
+              guard page is never mapped by anyone.
+          - text: "sbrk can always map the guard page later, so the guard is not reliable."
+            why: |
+              Both `sbrk` paths refuse to move `p->sz` past `MAXHEAP`, which is the guard's
+              lower edge.
+        explain: |
+          The same limit applies to the original guard page, and to every one-page guard,
+          including the kernel stacks' ([[kernel/memlayout.h:50]]). See [[g:guard-page]].
+      - id: lab13-10
+        level: 2
+        type: number
+        q: |
+          `growstack overflow` recurses until it is killed. How many stack pages does the child
+          have when its address space is freed?
+        answer: 64
+        wrong:
+          65: |
+            You may have counted the guard page. It is never mapped; the store into it is what
+            killed the child.
+          63: |
+            You may have left out the top page, which the child inherited through fork (exec
+            grew it in the parent) rather than grew by a fault. It is part of the region and is
+            freed with it.
+          18: |
+            That is the `deep` and `fork` checks, which stop after 65 frames.
+        why_wrong: "The stack grows until every page of the 64-page region is mapped; the next frame's store is in the guard."
+        explain: |
+          gdb read the child's page table in [[proc_freepagetable]], called from [[freeproc]] in
+          the parent's [[kwait]]: 64 valid PTEs, `0x3ffffbe000` to `0x3fffffd000`. 63 of them
+          were grown by page faults; 1, the top page, came through fork (exec grew it in the
+          parent).
+  - title: What does usertests think?
+    q: |
+      Some tests in `usertests` know the old layout. Find each test that depends on where the
+      stack, its guard or the heap's ceiling is. For each one, decide: does the property it
+      checks still hold (then it must pass unchanged), or did this lab change that property on
+      purpose (then change the expectation, as little as possible, and say why)?
+    hints:
+      - |
+        Search `user/usertests.c` for `USERSTACK`, `TRAPFRAME`, `r_sp` and literal addresses
+        near `0x3fffff…`; also find the test that checks exec's argument limit.
+      - |
+        `stacktest` reads `USERSTACK` pages below its `sp`; what is there on the branch, given
+        what `USERSTACK` now means? Which of `lazy_copy`'s "must fail" addresses are now legal?
+      - |
+        One test passes untouched because of what `USERSTACK` means now; one changes its
+        ceiling from `TRAPFRAME` to `MAXHEAP`; one replaces two addresses that are now stack
+        pages with two that must still fail; one keeps passing because exec's argument limit
+        stayed one page.
+    answer: |
+      | test | what it assumed | on the branch |
+      |---|---|---|
+      | `stacktest` | the page below the stack is a guard | reads `USERSTACK * PGSIZE` (256 KiB) below `sp`: below `USTACKBASE`, in the guard. Still killed, **unchanged** |
+      | `lazy_sbrk` | the heap may grow up to `TRAPFRAME` | ceiling is `MAXHEAP` now: `TRAPFRAME` → `MAXHEAP` in two places, **changed** |
+      | `lazy_copy` | `read`/`write` at `0x3fffffc000` and `0x3fffffd000` must fail | those are stack pages now (`0x3fffffd000` is the one every process has); probes replaced by `MAXHEAP - PGSIZE` and `MAXHEAP` (the guard), which must fail, **changed** |
+      | `bigargtest` | arguments larger than a page make `exec` fail | the argument area is still one page, **unchanged** |
+      | `copyin`, `copyout`, `copyinstr1`, `nowrite` | `0x3fffffe000` (`TRAPFRAME`) is not user memory | `USTACKTOP` is exclusive, and the page is mapped without `PTE_U`; still refused, **unchanged** |
+
+      `stacktest` is the nicest case. It was written as "read one stack's worth below `sp`", with
+      `USERSTACK` meaning the stack's size. With `USERSTACK` meaning the maximum, the same
+      expression lands just below the maximum, which is exactly the overflow the new guard must
+      catch. On the branch it faulted at `stval=0x3ffffbde90`, in the guard page; with the old
+      layout (commit 1) at `stval=0x10e90`.
+
+      The `lazy_copy` change is the one to defend. The test wants "addresses that are not this
+      process's memory". `0x3fffffd000` was such an address and is now the top stack page of
+      every process: a `read` into it succeeds (it would write into the test's own unused stack
+      space). The replacements keep the intent: the last page the heap could have but does not,
+      and the guard. Keeping the old addresses would have meant putting the stack somewhere
+      other than the top for no reason except the test.
+    checks:
+      - id: lab13-11
+        level: 2
+        type: match
+        q: |
+          Match each `usertests` test with what the branch does about it.
+        pairs:
+          - left: "stacktest"
+            right: "passes unchanged: USERSTACK pages below sp is now the guard below the limit"
+            why: "With USERSTACK the maximum, `sp - USERSTACK * PGSIZE` is below `USTACKBASE`."
+          - left: "lazy_sbrk"
+            right: "expects MAXHEAP instead of TRAPFRAME as the heap's ceiling"
+            why: "sbrk refuses to grow past MAXHEAP; the test walks the heap up to its ceiling."
+          - left: "lazy_copy"
+            right: "probes MAXHEAP - PGSIZE and MAXHEAP instead of two addresses that are now stack"
+            why: "`0x3fffffd000` is the top stack page now; a read into it succeeds."
+          - left: "bigargtest"
+            right: "passes because exec's arguments must still fit in one page"
+            why: "31 arguments of 400 bytes need 12,400 bytes; exec refuses at `sp < stackbase`."
+        explain: |
+          Two tests change their expectations, each because the lab changed the property on
+          purpose; the others still test something true and pass unchanged. `usertests -q`
+          printed `ALL TESTS PASSED` on 3 harts at every one of the branch's seven commits.
+      - id: lab13-12
+        level: 1
+        type: choice
+        q: |
+          `stacktest`'s child reads at `sp - USERSTACK * PGSIZE`. On the branch, where is that?
+        code: user/usertests.c:2442-2461@2449-2452
+        options:
+          - text: "In the guard page below USTACKBASE, so the read faults and the child is killed."
+            correct: true
+            why: |
+              `sp` is in the top stack page; 64 pages below it is the page below the region,
+              which nothing maps.
+          - text: "In an ungrown stack page, so the read returns 0 and the test fails."
+            why: |
+              You may be thinking of `USERSTACK` as 1, the old value. With 64 the address
+              is past the whole region.
+          - text: "In the heap, so the read succeeds."
+            why: |
+              The heap of `usertests` ends far below; between its end and the guard nothing is
+              mapped, and the address is in the guard anyway.
+          - text: "Below MAXVA's user half, so the kernel panics."
+            why: |
+              The address is an ordinary user address (`0x3ffffbde90` in the recorded run). A
+              user fault there only kills the child.
+        explain: |
+          The recorded run: `test stacktest: usertrap(): unexpected scause 0xd pid=6569`,
+          `sepc=0x1c40 stval=0x3ffffbde90`, then `OK`. The test needed no change.
+build: |
+  **Start.**
+
+  ```text
+  git checkout -b my-13 06aad25
+  ```
+
+  **Milestones, in an order that keeps `usertests -q` passing after each one.** The trick is
+  to prepare every piece of code that will have to know about the stack region *before* the
+  stack moves there; until the last kernel milestone the region is empty, so each new piece is
+  tested by the existing suite while it carries no weight. (The reference branch has the same
+  changes, with the test program committed last; `usertests -q` passed on 3 harts at every one
+  of its commits.)
+
+  1. **Name the layout.** Three constants in `memlayout.h` for the stack's top, its lowest
+     page and the heap's ceiling (leave `USERSTACK` at 1 for now). Lower the ceiling in
+     [[growproc]] and in [[sys_sbrk]]'s lazy path, and update the one test that walks the heap
+     up to its ceiling. Test: `usertests -q`.
+  2. **Write the test program now**, `user/growstack.c` with the spec's five checks, and add
+     `$U/_growstack\` to `UPROGS`. On this kernel `deep`, `fork`, `read` and `overflow` print
+     `FAIL` and `collide` prints `OK`: that is the test working.
+  3. **Free the region.** One line in [[proc_freepagetable]]. Test: `usertests -q`.
+  4. **Copy the region in fork.** A range for [[uvmcopy]], two calls in [[kfork]], and the
+     child's `sz` set before anything can fail. Test: `usertests -q`.
+  5. **Grow on demand.** The region test in [[vmfault]]. One of `lazy_copy`'s probes
+     (`0x3fffffd000`) now points into the one-page region and will succeed; the other
+     (`0x3fffffc000`) joins the region at milestone 7. Replace both with `MAXHEAP - PGSIZE` and
+     `MAXHEAP`. Test: `usertests -q`.
+  6. **Let `exec` find arguments on the stack**: [[fetchaddr]]. Test: `usertests -q`.
+  7. **Move the stack.** [[kexec]] stops mapping a guard and a stack page after the image and
+     starts `sp` at the top; `USERSTACK` becomes the maximum. Test: `growstack`, then
+     `usertests -q`, then `growstack` again.
+
+  **Debugging advice.**
+
+  - A process killed with `stval` in the region (`0x3ffffbe000`-`0x3fffffdfff`) means
+    [[vmfault]] refused a stack address; one killed with `stval` 0 and a `sepc` in a function
+    such as `memset` or sh's `getcmd` usually means it returned through a zeroed frame: look at the
+    fork path.
+  - `panic: freewalk: leaf`: break on `panic`, run `bt`, and read the leaf's page table. With
+    gdb attached, a small Python helper that walks the three levels of a page table from a
+    `pagetable_t` (reading physical memory, which the kernel maps one to one) lists which
+    pages are still mapped; for a stack bug they are in `0x3ffffbe000`-`0x3fffffd000`.
+  - To watch growth, break on the [[kalloc]] call in [[vmfault]] with a condition on `va`
+    (`va >= 0x3ffffbe000 && va < 0x3fffffe000`) and print `bt`: the second frame tells you
+    whether a fault ([[usertrap]]) or a kernel copy ([[copyout]] from [[piperead]],
+    [[kexec]], …) grew the page.
+  - The kernel's `printk` prints hex in lower case and user `printf` in upper case, so the
+    same address appears as `0x3ffffbe000` and `0x3FFFFBE000`.
+clinic:
+  - bug: fork copies only the pages below p->sz
+    change: |
+      Milestone 4 is skipped: [[kfork]] still copies one range.
+
+      ```diff
+      -  if (uvmcopy(p->pagetable, np->pagetable, 0, p->sz) < 0 ||
+      -      uvmcopy(p->pagetable, np->pagetable, USTACKBASE, USTACKTOP) < 0) {
+      +  if (uvmcopy(p->pagetable, np->pagetable, 0, p->sz) < 0) {
+      ```
+    symptom: |
+      xv6 kernel is booting
+
+      hart 1 starting
+      hart 2 starting
+      init: starting sh
+      $ growstack
+      $ usertrap(): unexpected scause 0xf pid=3
+                  sepc=0xa70 stval=0x0
+      $ usertests -q
+      $ usertrap(): unexpected scause 0xf pid=4
+                  sepc=0xa70 stval=0x0
+      $
+    why: |
+      The child gets no stack pages at all, and it does not notice at first. When it
+      returns from `fork`, its first access to the stack is a load, which faults; [[vmfault]]
+      sees an address in the stack region and hands it a fresh *zero* page. The child carries
+      on, with zeros where its frames were.
+
+      In `sh` the fork is wrapped in `fork1`, which ends `ld ra,8(sp)` / `ret` (`user/sh.asm`,
+      `0x7a`-`0x80`). The child loads `ra` = 0 and returns to address 0, which is `getcmd`, the
+      first function in `sh`. `getcmd` prints `$ ` (the second prompt on each line above) and
+      calls `memset(buf, 0, nbuf)` with `buf` = `a0` = 0, the child's return value from `fork`.
+      `memset`'s store at `0xa70` (`sb a1,0(a5)`) writes to address 0, which is read-only text:
+      store page fault, `stval=0x0`, killed. The parent shell then prints its own prompt. (This
+      chain is read from `sh.asm`; the console lines are the recorded run.)
+
+      Every command dies this way, so `growstack` never runs. The machine still boots because
+      `init`'s child goes from `fork` straight to `exec("sh", argv)` in `main`, and `main` loads
+      nothing from its stack on that path (`user/init.asm`, `0x38`-`0xa6`); `exec` builds a new
+      stack. A missing stack copy does not crash the kernel: the zero page makes it a quiet
+      corruption of the child, which is worse.
+  - bug: Stack pages are unmapped but not freed
+    change: |
+      Milestone 3 with the wrong last argument: the pages leave the page table but are never
+      given back to [[kalloc]].
+
+      ```diff
+      -  uvmunmap(pagetable, USTACKBASE, USERSTACK, 1);
+      +  uvmunmap(pagetable, USTACKBASE, USERSTACK, 0);
+      ```
+    symptom: |
+      $ growstack
+      growstack: deep: 65 calls used 70944 bytes of stack
+      [...]
+      growstack: ALL OK
+      $ usertests -q
+      usertests starting
+      test copyin: OK
+      [...]
+      test sbrkfail: sbrkfail: failed sbrk leaked memory
+      FAILED
+      SOME TESTS FAILED
+    why: |
+      Nothing panics, because the PTEs are cleared, so [[freewalk]] finds no leaf. But every
+      exit and every exec loses at least one physical page (the top stack page every process
+      has), and every page a deep recursion grew: `growstack`'s `overflow` child alone takes 64
+      with it. `usertests` forks thousands of processes, and memory runs out quietly. `sbrkfail` noticed first: it forks ten children that each try to take 100 MB; a
+      child whose `sbrk` fails gives back what it got. While they all still sit there, the
+      parent asks for one page ([[user/usertests.c:2241]]). With thousands of pages leaked
+      there is none left.
+      In another boot of the same kernel, `sbrkfail` happened to pass, and `usertests` caught the leak at its final
+      count instead: `FAILED -- lost some free pages 25710 (out of 32353)`.
+
+      Leaving the line out entirely is louder. That kernel (also run) panics at boot, right
+      after `init: starting sh`, with `panic: freewalk: leaf`; gdb's backtrace:
+      `freewalk ← freewalk ← freewalk ← uvmfree (sz=8192) ← proc_freepagetable ← kexec
+      (path "sh") ← sys_exec`. `init`'s child (pid 2) is exec'ing the shell, and the old image
+      it frees, a copy of `init`'s, has one stack page that nobody unmapped. [[freewalk]] only
+      frees page-table pages and panics on any leaf it finds ([[kernel/vm.c:276]]): a leak
+      check built into the code.
+  - bug: The stack has no lower limit
+    change: |
+      The region test in [[vmfault]] only checks the top:
+
+      ```diff
+      -  if (va >= psz && (va < USTACKBASE || va >= USTACKTOP))
+      +  if (va >= psz && va >= USTACKTOP)
+           return 0;
+      ```
+    symptom: |
+      $ usertests -q
+      usertests starting
+      test copyin: write(fd, 0x0000000080000000, 8192) returned 8192, not -1
+      panic: freewalk: leaf
+
+      # another boot of the same kernel
+      $ growstack
+      growstack: deep: 65 calls used 70944 bytes of stack
+      growstack: deep: OK
+      growstack: fork: OK
+      growstack: read: OK
+      usertrap(): unexpected scause 0xf pid=8
+                  sepc=0x36a stval=0x3ff812dcb8
+      panic: freewalk: leaf
+    why: |
+      Now *every* unmapped address between `p->sz` and the trapframe is a "stack" address.
+      `usertests copyin` passes `0x80000000` to `write` and expects -1. [[copyin]] finds the
+      page missing, [[vmfault]] maps a zero page there, and `write` writes 8,192 zeros to the
+      file. The test fails and its process exits. When `usertests` reaps it, gdb's backtrace
+      reads `freewalk ← freewalk ← freewalk ← uvmfree (sz=65536) ← proc_freepagetable ←
+      freeproc ← kwait ← sys_wait`: [[proc_freepagetable]] freed the stack region and
+      `[0, sz)`, but the pages at `0x80000000` are in neither, so [[freewalk]] finds them and
+      panics.
+
+      `growstack overflow` shows the other half. The recursion never meets a limit; it grows
+      the stack page by page, far below `USTACKBASE`, until [[kalloc]] runs out of memory:
+      `stval=0x3ff812dcb8` is about 127 MiB below the top (32,464 pages), nearly all of the
+      machine's free memory (32,547 pages are free after boot). Only then does [[vmfault]] return 0 and the process die, and again the pages
+      below the region are never freed.
+
+      In a program with a big heap the stack would also grow straight into it: a heap page
+      that is mapped never faults, so a deep recursion would silently overwrite heap data,
+      and an eager `sbrk` into a page the stack had taken would panic with `mappages: remap`.
+      (Reasoned from the code, not run.) A limit is not a nicety: the kernel's own bookkeeping
+      (what to copy, what to free) depends on knowing where the stack can be.
+  - bug: The stack grows only in usertrap
+    change: |
+      The learner adds a branch to [[usertrap]] that maps a page when `stval` is in the
+      region, leaves [[vmfault]] unchanged, and lets [[kexec]] map the first stack page itself
+      (it can no longer rely on [[copyout]] to grow it):
+
+      ```diff
+         } else if ((r_scause() == 15 || r_scause() == 13) &&
+      +             r_stval() >= USTACKBASE && r_stval() < USTACKTOP &&
+      +             uvmalloc(p->pagetable, PGROUNDDOWN(r_stval()),
+      +                      PGROUNDDOWN(r_stval()) + PGSIZE, PTE_W) != 0) {
+      +    // grew the stack
+      +  } else if ((r_scause() == 15 || r_scause() == 13) &&
+                    vmfault(p->pagetable, p->sz, r_stval(),
+      ```
+
+      ```diff
+         sz = PGROUNDUP(sz);
+      +  if (uvmalloc(pagetable, USTACKTOP - PGSIZE, USTACKTOP, PTE_W) == 0)
+      +    goto bad;
+         sp = USTACKTOP;
+      ```
+    symptom: |
+      $ growstack
+      growstack: deep: 65 calls used 70944 bytes of stack
+      growstack: deep: OK
+      growstack: fork: OK
+      growstack: read: FAIL
+      usertrap(): unexpected scause 0xf pid=8
+                  sepc=0x36a stval=0x3ffffbdef8
+      growstack: overflow: status -1, deepest sp 0x3FFFFBE330, limit 0x3FFFFBE000: OK
+      usertrap(): unexpected scause 0xf pid=9
+                  sepc=0xce stval=0x3ffffbd000
+      growstack: collide: OK
+      growstack: SOME FAILED
+      $ usertests -q
+      usertests starting
+      [...]
+      ALL TESTS PASSED
+    why: |
+      Every stack access *by the program* works: each one that misses traps into [[usertrap]],
+      which grows the page. But `read` does not trap. [[piperead]] calls [[copyout]], which
+      looks the page up with [[walkaddr]], finds it missing and asks the unchanged [[vmfault]],
+      which refuses an address above `p->sz`. [[copyout]] returns -1, [[piperead]] returns -1
+      for the first byte ([[kernel/pipe.c:133]]), and `read` fails. A real program sees a
+      system call fail on a perfectly good local buffer, and only when the buffer happens to lie
+      in a page the program has not touched yet.
+
+      `usertests` passes: none of its system calls writes into a stack page that has not been
+      touched. That is why the lab's test has a `read` check with an untouched buffer.
+
+      Without the [[kexec]] change the same learner gets a louder failure (also run): the
+      boot stops at `panic: exec`, because the very first [[kexec]], `init`'s from [[forkret]],
+      cannot copy `"/init"` onto a stack with no page, and [[forkret]] panics when it fails.
+  - bug: No gap between heap and stack
+    change: |
+      An off-by-one page at the guard: the heap may grow right up to the stack's lowest page.
+
+      ```diff
+      -#define MAXHEAP    (USTACKBASE - PGSIZE)
+      +#define MAXHEAP    USTACKBASE
+      ```
+    symptom: |
+      $ growstack
+      [...]
+      growstack: overflow: status -1, deepest sp 0x3FFFFBE330, limit 0x3FFFFBE000: OK
+      growstack: collide: FAIL
+      growstack: collide: heap checks passed, exit status 4
+      growstack: SOME FAILED
+      $ usertests -q
+      usertests starting
+      [...]
+      test lazy_copy: read succeeded
+      FAILED
+      SOME TESTS FAILED
+    why: |
+      `growstack` and `usertests` are compiled with the same `memlayout.h`, so they see the
+      wrong `MAXHEAP` too. `collide` grows the heap to it (`0x3ffffbe000`), finds that the next
+      `sbrk` fails and that the heap's last byte works, and then stores to `MAXHEAP`, which it
+      believes is the guard. But `0x3ffffbe000` is `USTACKBASE`, a legal stack page: [[vmfault]]
+      grows it, the store succeeds, and the child exits with 4 instead of being killed. There is
+      no guard any more. `lazy_copy` fails the same way: its probe at `MAXHEAP` is a stack page,
+      and `read` into it succeeds.
+
+      What it would do to a real program (reasoned): a process whose heap has reached the
+      ceiling and whose stack overflows its limit writes into the heap's top page, which is
+      mapped, so nothing faults and heap data is silently overwritten. The guard page exists so
+      that the overflow lands in a page that nobody can map.
+  - bug: fetchaddr still checks only p->sz
+    change: |
+      Milestone 6 is skipped:
+
+      ```diff
+      -  int inmem = addr < p->sz && addr + sizeof(uint64) <= p->sz;
+      -  int instack = addr >= USTACKBASE && addr < USTACKTOP &&
+      -                addr + sizeof(uint64) <= USTACKTOP;
+      -  if (!inmem && !instack)
+      +  if (addr >= p->sz ||
+      +      addr + sizeof(uint64) > p->sz) // both tests needed, in case of overflow
+           return -1;
+      ```
+    symptom: |
+      $ growstack
+      [...]
+      growstack: ALL OK
+      $ usertests -q
+      usertests starting
+      test copyin: OK
+      [...]
+      test exectest: exectest: exec echo failed
+      exectest: nonzero wait status 1
+      FAILED
+      SOME TESTS FAILED
+    why: |
+      `exectest` builds its argument vector on its stack (`char *echoargv[] = {"echo", "OK",
+      0};`, [[user/usertests.c:686]]) and calls `exec("echo", echoargv)`. [[sys_exec]] fetches
+      each pointer with [[fetchaddr]] ([[kernel/sysfile.c:474]]), which compares the address
+      (a stack address such as `0x3fffffde70`, where gdb found `echoargv` on the reference
+      branch) with `p->sz` and refuses it. `exec` returns -1
+      before it has opened `echo`.
+
+      `growstack` passes because it never calls `exec`, and the shell passes because it builds
+      `argv` inside a heap-allocated command structure. [[fetchstr]] would have worked: it has
+      no bound of its own. Two functions with the same job, one with an extra check, is
+      exactly the kind of code this lab makes you hunt for.
+reveal:
+  - title: Three constants describe the new layout
+    commit: 1
+    file: kernel/memlayout.h
+    lines: 54-72
+    focus: 65-72
+    diff: true
+    state:
+      hart: any
+      proc: "(definitions: used by sbrk now, and by vmfault, fork, exec and exit in later commits)"
+      locks: []
+    note: |
+      The story of this tour was recorded with gdb on the finished branch, three harts: the
+      machine boots, the shell runs `growstack`, whose children recurse, fork, read into
+      untouched stack pages, overflow and collide, and later `usertests exectest`. Where a step
+      shows code from an early commit, the machine state comes from those runs of the finished
+      branch, where the same lines are executing.
+
+      Commit 1 only names things. The stack region is the top `USERSTACK` pages below
+      `TRAPFRAME`: `USTACKTOP` is its top (exclusive), `USTACKBASE` its lowest page, and
+      `MAXHEAP`, one page lower still, is the highest end the heap may have. The page between
+      `MAXHEAP` and `USTACKBASE` belongs to nobody: the guard.
+
+      `USERSTACK` is still 1 here, so the region is the single page `0x3fffffd000` and
+      `MAXHEAP` is `0x3fffffc000`. Nothing uses the region yet. Commit 6 raises `USERSTACK` to
+      64, and the same three lines then give `0x3ffffbe000` and `0x3ffffbd000`.
+
+      Why right under the trapframe? It is the highest address user code could use: the
+      trapframe and the trampoline above it are mapped without `PTE_U`, so the stack's top page
+      sits directly under a page the program cannot touch. And it is as far as possible from the
+      heap, which starts near 0 and grows up. Because these are constants, every later question
+      ("is this a stack address?", "which pages might the stack have?") is answered the same way
+      for every process, with no new field in `struct proc`.
+  - title: The eager heap stops below the guard
+    commit: 1
+    file: kernel/proc.c
+    lines: 233-254
+    focus: 242-245
+    diff: true
+    state:
+      hart: 1
+      mode: S
+      proc: growstack (pid 6, the collide check)
+      intr: "on"
+      satp: kernel
+      locks: []
+      irq: 0
+      stack: [usertrap, syscall, sys_sbrk, growproc]
+      sp: {"on": kernel, detail: "pid 6's kernel stack, `sp` = `0x3fffff7f70`"}
+    note: |
+      [[growproc]] used to refuse growth past `TRAPFRAME`; now the ceiling is `MAXHEAP`. If it
+      did not, [[uvmalloc]] would map pages over the guard and then over the stack region, and
+      the two would meet.
+
+      gdb stopped at the refusal (`return -1` on line 244, address `0x80001c70` in this build)
+      in the `collide` child, which had already grown its heap lazily to the ceiling: `sz` =
+      `0x3ffffbd000`, `n` = `0x1000`, `sz + n` = `0x3ffffbe000`, which is `USTACKBASE`. One page
+      more would have been the guard. `MAXHEAP` itself is an allowed end: the heap's last byte
+      is then `0x3ffffbcfff`.
+
+      No lock is taken: `p->sz` and the page table are private to the process (the comment in
+      `struct proc` says so, [[kernel/proc.h:95]]), and a process has one thread, which is here.
+      Interrupts are on, because this is a system call, and [[usertrap]] turned them on before
+      calling [[syscall]].
+    others: |
+      The other harts run other processes. If this call had succeeded, [[uvmalloc]] would take
+      pages from [[kalloc]] under `kmem.lock`, the only shared state on this path; the page
+      table being edited belongs to pid 6 alone.
+  - title: So does the lazy heap
+    commit: 1
+    file: kernel/sysproc.c
+    lines: 39-65
+    focus: 54-62
+    diff: true
+    state:
+      hart: 1
+      mode: S
+      proc: growstack (pid 6, the collide check)
+      intr: "on"
+      satp: kernel
+      locks: []
+      irq: 0
+      stack: [usertrap, syscall, sys_sbrk]
+      sp: {"on": kernel, detail: "pid 6's kernel stack"}
+    note: |
+      `sbrklazy` never calls [[growproc]]: it only moves `p->sz`, and [[vmfault]] allocates
+      pages when they are touched. So it needs its own ceiling, the same `MAXHEAP`. This path
+      matters most here, because it can reach the ceiling without any memory: the `collide`
+      check moves its heap end from `0x3000` to `0x3ffffbd000` (about 256 GiB) in 1 GiB steps,
+      allocating nothing.
+
+      gdb stopped at the refusal with `addr` (the old end) = `0x3ffffbd000` and `addr + n` =
+      `0x3ffffbd001`: `sbrklazy(1)` at the ceiling, refused. (The earlier test on line 58 catches
+      a wrap-around of `addr + n`; the ceiling test needs it, since a wrapped sum would be small.)
+
+      Keeping `p->sz` at or below `MAXHEAP` is what makes the guard safe from the heap's side:
+      [[vmfault]] gives out heap pages only below `p->sz`, so the guard page can never become
+      a heap page, however the heap grows.
+  - title: The one test that knew the old ceiling
+    commit: 1
+    file: user/usertests.c
+    lines: 2778-2826
+    focus: 2793-2805
+    diff: true
+    state:
+      hart: any
+      mode: U
+      proc: usertests (lazy_sbrk's child)
+      intr: "on"
+      satp: user
+      locks: []
+      stack: [main, drivetests, runtests, run, lazy_sbrk]
+      sp: {"on": user}
+    note: |
+      [[user:lazy_sbrk]] walks the heap lazily up toward `MAXVA` in 1 GiB steps, then asks for
+      exactly the rest up to the ceiling, then one eager page, and checks that one more byte
+      fails both ways. It encoded the ceiling as `TRAPFRAME`. The property it tests (the heap
+      can grow lazily to its ceiling and not one byte further) is still the right one; only the
+      ceiling moved, so the change is `TRAPFRAME` → `MAXHEAP` in the two places that name it.
+
+      The loop above the change still works unchanged: it stops once the heap end passes
+      `MAXVA - 1 GiB` = `0x3fc0000000`, which is below `MAXHEAP` (`0x3ffffbd000` with 64 stack
+      pages, `0x3fffffc000` at this commit). A stack region bigger than 1 GiB would break that
+      loop; 256 KiB is far from it.
+
+      This is the first of two changes to `usertests` in this lab. Lab 10 made the same one for
+      the same reason: anything fixed at the top of the address space lowers the heap's ceiling.
+  - title: Every teardown frees the stack region
+    commit: 2
+    file: kernel/proc.c
+    lines: 207-217
+    focus: 210-217
+    diff: true
+    state:
+      hart: 0
+      mode: S
+      proc: growstack (pid 3), reaping pid 4
+      intr: "off"
+      satp: kernel
+      locks: [wait_lock, "pid 4's p->lock"]
+      irq: {noff: 2, intena: 1}
+      stack: [usertrap, syscall, sys_wait, kwait, freeproc, proc_freepagetable]
+      sp: {"on": kernel, detail: "pid 3's kernel stack, `sp` = `0x3fffff9f10`"}
+    note: |
+      [[uvmfree]] frees `[0, sz)` and then hands the page-table pages to [[freewalk]], which
+      panics if it finds a page still mapped. Stack pages live above `sz`. One line before
+      [[uvmfree]] unmaps and frees the whole region; [[uvmunmap]] skips pages that are not
+      mapped, so it works for a stack of 1 page or 64.
+
+      [[proc_freepagetable]] is the right place because every teardown goes through it:
+      [[freeproc]] when a parent reaps a child, [[kexec]] when it drops the old image, and
+      [[kexec]]'s error path when it drops a half-built new one. At this commit the region is
+      always empty, so the line does nothing yet, and `usertests -q` passes.
+
+      gdb stopped here as `growstack` (pid 3) reaped its `deep` child (pid 4): 18 stack pages
+      mapped, `0x3ffffec000` to `0x3fffffd000`, all freed by this line. Two spinlocks are held:
+      [[kwait]] took `wait_lock` and then the child's `p->lock` ([[kernel/proc.c:376]],
+      [[kernel/proc.c:384]]) before calling [[freeproc]], so `noff` is 2 and interrupts are off;
+      `intena` 1 records that they were on in the system call. Each [[kfree]] takes and releases
+      `kmem.lock` inside that (noff 3 for a moment).
+    others: |
+      The child is a `ZOMBIE`: it will never run again, and its `p->lock` (held here) keeps
+      the scheduler and [[kkill]] away from its slot while it is torn down. The pages go back
+      to the free list under `kmem.lock`; a hart allocating at the same moment waits a few
+      instructions for it.
+  - title: uvmcopy learns a range
+    commit: 3
+    file: kernel/vm.c
+    lines: 292-327
+    focus: 299-326
+    diff: true
+    state:
+      hart: 0
+      mode: S
+      proc: growstack (pid 5, the fork check)
+      intr: "off"
+      satp: kernel
+      locks: ["pid 6's p->lock (the new child, from allocproc)"]
+      irq: {noff: 1, intena: 1}
+      stack: [usertrap, syscall, sys_fork, kfork, uvmcopy]
+      sp: {"on": kernel, detail: "pid 5's kernel stack, `sp` = `0x3fffff7f70`"}
+    note: |
+      [[uvmcopy]] copied `[0, sz)`. It now copies `[start, end)`, which needs only three
+      changes: the parameters, the loop's start, and the error path, which unmaps (and frees)
+      just what this call copied, `[start, i)`. `start` must be page-aligned, because the loop
+      steps by whole pages from it.
+
+      The loop already skipped pages that are not mapped (lines 308-311). That is what makes a
+      copy of the whole 64-page region cheap: only the pages the stack has grown into are
+      copied, and the rest cost one [[walk]] each. gdb stopped on the call for the stack region
+      in the `fork` check: pid 5, at the bottom of its 65 frames (user `sp` `0x3ffffecad0`), had
+      18 stack pages, `0x3ffffec000` to `0x3fffffd000`. A fork from the shell copies one.
+
+      Each copy keeps the parent's PTE flags (line 313), so the child's stack pages are
+      writable and user-accessible like the parent's.
+    others: |
+      `noff` 1 is the new child's `p->lock`, which [[allocproc]] returned held and [[kfork]]
+      keeps until the child is fully built; it is why interrupts are off for the whole copy.
+      The child is `USED`, not `RUNNABLE`, so no scheduler on another hart can pick it up
+      half-copied. Every page comes from [[kalloc]], under `kmem.lock`, shared with all harts.
+  - title: fork copies two ranges, and sets sz first
+    commit: 3
+    file: kernel/proc.c
+    lines: 258-300
+    focus: 272-282
+    diff: true
+    state:
+      hart: 0
+      mode: S
+      proc: growstack (pid 5, the fork check)
+      intr: "off"
+      satp: kernel
+      locks: ["pid 6's p->lock (the new child, from allocproc)"]
+      irq: {noff: 1, intena: 1}
+      stack: [usertrap, syscall, sys_fork, kfork]
+      sp: {"on": kernel, detail: "pid 5's kernel stack"}
+    note: |
+      [[kfork]] copies the image and heap, `[0, p->sz)`, and then the stack region. The child
+      inherits exactly the parent's stack pages; pages the parent never touched stay unmapped in
+      the child too, and the child grows them on demand, as the parent would have.
+
+      `np->sz = p->sz` moved *above* the copies. If the first copy succeeds and the second runs
+      out of memory, [[freeproc]] frees the child's page table with [[proc_freepagetable]] and
+      `np->sz`: with the old order `np->sz` would still be 0, the image pages would stay mapped,
+      and [[freewalk]] would panic. The second [[uvmcopy]] has already cleaned up after itself,
+      and [[proc_freepagetable]] frees the stack region whatever `sz` is.
+
+      Without the second copy (clinic 1) nothing fails here. The child returns from `fork` with
+      an empty stack region, [[vmfault]] gives it zero pages, and it runs on with zeros in place
+      of its saved registers.
+    others: |
+      The parent is the only thread of its process and is busy here, so its stack cannot
+      change during the copy: there is no race between copying page 3 and the program pushing
+      a frame onto page 4. That argument depends on xv6 processes having one thread; with
+      user threads (lab 9) a fork would have to stop or account for the other threads.
+  - title: vmfault learns the stack region
+    commit: 4
+    file: kernel/vm.c
+    lines: 455-480
+    focus: 465-466
+    diff: true
+    state:
+      hart: 0
+      mode: S
+      proc: growstack (pid 4, the deep check)
+      intr: "off"
+      satp: kernel
+      locks: []
+      irq: 0
+      stack: [usertrap, vmfault]
+      sp: {"on": kernel, detail: "pid 4's kernel stack, `sp` = `0x3fffff7fb0`"}
+    note: |
+      The whole fault-side change is one condition. An address at or above `p->sz` used to be
+      refused at once; now it is refused only if it is also outside `[USTACKBASE, USTACKTOP)`.
+      Everything below is shared with the lazy heap and already right for a stack page: refuse
+      a page that is mapped, allocate, zero, map `PTE_W | PTE_U | PTE_R`.
+
+      gdb, in the `deep` child: the store `sd a2,-1080(s0)` (`0x36a`; with `s0` = `sp + 1088` it
+      is `sp + 8`) at the start of a new `dive` frame
+      faulted with `scause` 15, `stval` = `0x3fffffce28` (user `sp` `0x3fffffce20`). The page
+      `0x3fffffc000` is above `p->sz` (`0x3000`) and inside the region, so [[vmfault]] went on
+      to [[kalloc]]. gdb logged the next faults at `0x3fffffbd28`, `0x3fffffac28`,
+      `0x3fffff9f68`, … one per page (its breakpoint recorded only the first five); the
+      counting kernel counted 17 in all.
+
+      A fault from user mode reaches here with interrupts off and no lock held: [[usertrap]]
+      calls `intr_on` only for system calls. Nothing here sleeps, so that is fine. After the
+      return, the hart retries the store, which now succeeds. The PTEs of these pages read
+      `…0d7` at exit: `V R W U` plus `A` and `D`, set by the hardware when the program used them.
+    others: |
+      [[kalloc]] takes `kmem.lock` for a few instructions; another hart allocating at that
+      moment spins briefly. The page table is pid 4's own, and pid 4 is the one running here,
+      so no lock protects it.
+  - title: The kernel grows the stack too, without a trap
+    commit: 4
+    file: kernel/vm.c
+    lines: 342-378
+    focus: 356-361
+    diff: false
+    state:
+      hart: 0
+      mode: S
+      proc: growstack (pid 7, the read check)
+      intr: "off"
+      satp: kernel
+      locks: [pi->lock]
+      irq: {noff: 1, intena: 1}
+      stack: [usertrap, syscall, sys_read, fileread, piperead, copyout, vmfault]
+      sp: {"on": kernel, detail: "pid 7's kernel stack, `sp` = `0x3fffff7e60`"}
+    note: |
+      [[copyout]] did not change, and it did not need to. When the page it must write is not
+      mapped, it calls [[vmfault]] itself (line 358). So the same condition from the previous
+      step decides for kernel copies too.
+
+      gdb, in the `read` child: [[piperead]] copies one byte at a time with [[copyout]]
+      ([[kernel/pipe.c:133]]), into a buffer in pages the child never touched. [[vmfault]] grew
+      `0x3fffffa000`, and 50 bytes later `0x3fffffb000`. No trap was involved: the hart never
+      tried to use those addresses; the kernel looked them up in the page table. When the
+      child exited, these two pages' PTEs read `…457` and `…857` (flags `0x57`: `A` set, but no
+      `D`), unlike the pages the program wrote itself (`0xd7`). The kernel wrote them through
+      their physical addresses, so the hardware never saw a store through these PTEs.
+
+      [[piperead]] holds `pi->lock` here (`noff` 1, interrupts off). Growing a page under a
+      spinlock is legal because it never sleeps: [[kalloc]] and, if a page-table page is needed,
+      [[walk]]'s [[kalloc]] only spin on `kmem.lock`. (In lab 12 the same path could read from
+      disk, and that made every copy under a lock a hazard.)
+    others: |
+      pid 7 itself wrote the 100 bytes just before this read, so no writer is waiting. A writer on another hart that wanted `pi->lock` now would spin
+      until this copy finishes, which is short because nothing in it waits.
+  - title: An address in lazy_copy is now a stack page
+    commit: 4
+    file: user/usertests.c
+    lines: 2694-2741
+    focus: 2712-2716
+    diff: true
+    state:
+      hart: any
+      mode: U
+      proc: usertests (lazy_copy's child)
+      intr: "on"
+      satp: user
+      locks: []
+      stack: [main, drivetests, runtests, run, lazy_copy]
+      sp: {"on": user}
+    note: |
+      [[user:lazy_copy]] checks that `read` and `write` refuse addresses that are not the
+      process's memory. Two of them, `0x3fffffc000` and `0x3fffffd000`, were simply "high and
+      unused". From this commit on, [[vmfault]] grows any page in the stack region, and
+      `0x3fffffd000` is that region's only page (`USERSTACK` is still 1); at commit 6 it becomes
+      the stack page every process has. A `read` into it would succeed, and the test would fail
+      even though nothing is wrong. `0x3fffffc000` is still refused at this commit (it is
+      `MAXHEAP`, the guard), but it joins the region at commit 6, when the region grows to 64
+      pages, so it has to go too.
+
+      The replacements keep the test's intent with the new layout: `MAXHEAP - PGSIZE`, the
+      highest page the heap could have but this process does not, and `MAXHEAP`, the guard.
+      Both must still fail: the first is heap address space this process has not claimed (it
+      is above `p->sz`), and the second can never belong to anyone. The other four addresses (the trapframe, the trampoline, `MAXVA`
+      and above) are unchanged.
+
+      This is the second and last change to `usertests`. Clinic 5 shows that the replaced probe
+      at `MAXHEAP` is also a good guard detector: with no gap, `read` into it succeeds.
+  - title: fetchaddr accepts the stack
+    commit: 5
+    file: kernel/syscall.c
+    lines: 10-36
+    focus: 14-21
+    diff: true
+    state:
+      hart: 0
+      mode: S
+      proc: usertests (pid 9, about to exec echo for exectest)
+      intr: "on"
+      satp: kernel
+      locks: []
+      irq: 0
+      stack: [usertrap, syscall, sys_exec, fetchaddr]
+      sp: {"on": kernel, detail: "pid 9's kernel stack, `sp` = `0x3fffff5de0`"}
+    note: |
+      [[fetchaddr]] is the one place that checks a user address against `p->sz` on its own,
+      before any copy. [[sys_exec]] uses it to fetch each pointer of the `argv` array, and a
+      program that builds `argv` in a local array passes a stack address. The new test accepts
+      8 bytes that lie entirely below `p->sz` (`inmem`) or entirely inside the stack region
+      (`instack`). In each case `addr` is compared first, so `addr + 8` cannot wrap around.
+
+      gdb, during `usertests exectest`: three calls with `addr` = `0x3fffffde70`,
+      `0x3fffffde78` and `0x3fffffde80`, the three slots of `echoargv` (`"echo"`, `"OK"`, 0) in
+      the test's stack frame. Each passes `instack`, and [[copyin]] reads the pointer from a
+      page that is mapped. Had the array been in a stack page not grown yet, [[copyin]] would
+      have grown it.
+
+      [[fetchstr]], just below, needed nothing: it has no bound of its own and relies on
+      [[copyinstr]], which relies on [[vmfault]]. Clinic 6 removes this commit: `exectest`
+      fails with `exec echo failed`.
+  - title: exec starts the stack empty, at the top
+    commit: 6
+    file: kernel/exec.c
+    lines: 78-119
+    focus: 86-104
+    diff: true
+    state:
+      hart: 2
+      mode: S
+      proc: init's child (pid 2), becoming sh
+      intr: "on"
+      satp: kernel
+      locks: []
+      irq: 0
+      stack: [usertrap, syscall, sys_exec, kexec, copyout, vmfault]
+      sp: {"on": kernel, detail: "pid 2's kernel stack, `sp` = `0x3fffffbb20`"}
+    note: |
+      This is the switch. [[kexec]] no longer maps a guard page and a stack page after the
+      image. `sz`, rounded up to a page, is now just the end of the image, where the heap will
+      start. `sp` starts at `USTACKTOP`, and `stackbase`, the lowest address the arguments may
+      use, is one page lower: arguments must fit in one page, as before.
+
+      Nothing maps that page explicitly. The first [[copyout]] of an argument string (line 101)
+      finds `0x3fffffd000` unmapped in the *new* page table and calls [[vmfault]], which grows
+      it. That works because [[vmfault]] is given a page table and a size, not a process: gdb
+      saw it map the page into page table `0x87f43000` (the new one, for `sh`) with `psz` =
+      `0x3000`, `sh`'s new image size, while the process was still running on `init`'s old one.
+
+      The very first exec of the system, `init`'s from [[forkret]], takes the same path with
+      interrupts off (gdb: pid 1, `SIE` 0, `intena` 0); every later exec comes from
+      [[sys_exec]] with interrupts on, as here. [[vmfault]] works either way: it never sleeps.
+      If the page cannot be allocated, [[copyout]] fails and [[kexec]] goes to `bad:`.
+    others: |
+      `init` (pid 1) is, or will shortly be, waiting for this child in [[kwait]]. The new page table is not
+      installed anywhere yet, so no hart can be using it; the only shared resource touched is
+      the free list.
+  - title: Committing the image, and freeing the old stack
+    commit: 6
+    file: kernel/exec.c
+    lines: 116-145
+    focus: 127-139
+    diff: false
+    state:
+      hart: 2
+      mode: S
+      proc: sh (pid 2)
+      intr: "on"
+      satp: kernel
+      locks: []
+      irq: 0
+      stack: [usertrap, syscall, sys_exec, kexec, proc_freepagetable]
+      sp: {"on": kernel, detail: "pid 2's kernel stack, `sp` = `0x3fffffbba0`"}
+    note: |
+      `p->sz = sz` now records only the image (the heap is empty); the stack is described by
+      the constants and the page table, not by any field. `p->trapframe->sp` is the `sp` the
+      argument copies left, a little below `USTACKTOP`, so the program starts on its one stack
+      page.
+
+      [[proc_freepagetable]] then frees the old image. gdb: the old page table (a copy of
+      `init`'s, made by `fork`) had `sz` = `0x2000` and one stack page at `0x3fffffd000`, which
+      commit 2's line freed. The error path (line 139) calls the same function on the half-built
+      new page table, which may already hold the first stack page if a later argument did not
+      fit (`usertests bigargtest` does exactly that: the first argument fits, the eleventh does
+      not).
+
+      The name is copied before the commit (line 125), which is why gdb already reported pid 2
+      as `sh` here.
+  - title: USERSTACK becomes a maximum
+    commit: 6
+    file: kernel/memlayout.h
+    lines: 54-73
+    focus: 54-73
+    diff: true
+    state:
+      hart: any
+      proc: "(definitions)"
+      locks: []
+    note: |
+      `param.h` changes in the same commit: `#define USERSTACK 64 // max user stack pages`. The
+      name stays and the meaning changes, from "the stack's size" to "the most it may grow to",
+      256 KiB. With it the constants become `USTACKBASE` = `0x3ffffbe000` and `MAXHEAP` =
+      `0x3ffffbd000`, and the layout comment now tells the truth: heap up to `MAXHEAP`, a guard
+      page, then the stack, growing down from `USTACKTOP`.
+
+      [[uvmclear]] is gone from `vm.c` and `defs.h`: it existed only to make the old guard page
+      inaccessible. The new guard is a page that is never mapped at all, so it costs no memory.
+      Right after boot the branch has 2 more free pages than the original kernel (32,547 against
+      32,545): the guard pages of `init` and `sh`. Every fork also copies one page less, since
+      [[uvmcopy]] used to copy the old guard page along with everything else below `sz`.
+
+      Keeping the name was deliberate: `usertests stacktest` uses it (next step).
+  - title: stacktest passes without a change
+    commit: 6
+    file: user/usertests.c
+    lines: 2438-2462
+    focus: 2447-2453
+    diff: false
+    state:
+      hart: any
+      mode: U
+      proc: usertests (stacktest's child, pid 6569)
+      intr: "on"
+      satp: user
+      locks: []
+      stack: [main, drivetests, runtests, run, stacktest]
+      sp: {"on": user, detail: "in the top stack page, just below `0x3fffffe000`"}
+    note: |
+      [[user:stacktest]] reads one byte `USERSTACK * PGSIZE` below its own `sp` and expects to
+      be killed. Written for the old layout, it meant "just below the one stack page, in the
+      guard". With `USERSTACK` the maximum, the same expression means "just below the deepest
+      the stack may go", which is the new guard. The test checks the right thing without
+      knowing anything moved.
+
+      The recorded runs, same test on two kernels:
+
+      ```text
+      original:  test stacktest: usertrap(): unexpected scause 0xd pid=6568
+                             sepc=0x1c3e stval=0x10e90
+      branch:    test stacktest: usertrap(): unexpected scause 0xd pid=6569
+                             sepc=0x1c40 stval=0x3ffffbde90
+      ```
+
+      (The first is from commit 1 of the branch, which still has the old layout.) On the
+      original kernel `0x10e90` is in `usertests`' guard page at `0x10000`, right after its 16
+      pages of image. On the branch, `0x3ffffbde90` is in the guard page `0x3ffffbd000`. A load
+      gives `scause` 13 (`0xd`).
+  - title: The test recurses through 18 pages
+    commit: 7
+    file: user/growstack.c
+    lines: 20-88
+    focus: 24-50
+    diff: true
+    state:
+      hart: 0
+      mode: U
+      proc: growstack (pid 4, the deep check)
+      intr: "on"
+      satp: user
+      locks: []
+      stack: [main, deep, inchild, deep1, dive]
+      sp: {"on": user, detail: "`0x3ffffecae0` at the deepest of 65 frames"}
+    note: |
+      `dive` has a 1 KiB `volatile` array, so the compiler must keep it in memory and write
+      every byte; its frame is 1,088 bytes (`addi sp,sp,-1088` in `growstack.asm`). It fills its
+      array with its depth, recurses, and on the way back checks the array and scribbles over it.
+      Sixty-five frames are about 69 KiB, so the stack must grow by 17 pages beyond the top page
+      the child inherited through fork (exec grew that one in `growstack` itself).
+
+      The recorded run: `65 calls used 70944 bytes of stack`. The deepest `sp` was
+      `0x3fffffe000 - 70944` = `0x3ffffecae0`, in page `0x3ffffec000`; the child's address
+      space was freed with 18 stack pages. A counting copy of the kernel (instrumentation not on
+      the branch) counted 18 stack growths for this command: 17 from the child's page faults, plus the
+      one from `growstack`'s exec.
+
+      Each check runs in its own child (`inchild`), so `growstack` itself keeps a one-page stack.
+      That matters for `read` (its buffer must lie in pages *nobody* has touched, and a child
+      inherits its parent's stack pages) and for `overflow` and `collide`, which are supposed to
+      die.
+
+      On the original layout (commit 1) this check dies at the first frame past the page:
+      `usertrap(): unexpected scause 0xf pid=4`, `stval=0x3e28`, in `growstack`'s old guard page
+      `0x3000`, and the line reads `deep: FAIL`.
+  - title: Overflow, killed one frame above the limit
+    commit: 7
+    file: user/growstack.c
+    lines: 175-214
+    focus: 194-211
+    diff: false
+    state:
+      hart: 0
+      mode: U
+      proc: growstack (pid 8, the overflow child)
+      intr: "on"
+      satp: user
+      locks: []
+      stack: [main, overflow, forever, dive]
+      sp: {"on": user, detail: "`0x3ffffbe330`, the deepest frame that reported its `sp`"}
+    note: |
+      The child recurses without end and writes each frame's `sp` into a pipe; the parent keeps
+      the last value it reads. When the child dies, the pipe's write end closes, `read` returns
+      0, and the parent checks three things: the child was killed (status -1), its deepest frame
+      is not below `USTACKBASE`, and it is within one frame (plus a little) of it, so the kill
+      came at the limit and not earlier.
+
+      Recorded: `status -1, deepest sp 0x3FFFFBE330, limit 0x3FFFFBE000` (user `printf` prints
+      hex in upper case). `0x3ffffbe330` is 816 bytes above `USTACKBASE`; the next frame starts
+      1,088 bytes lower, at `0x3ffffbdef0`, and its first store, at `sp + 8` = `0x3ffffbdef8`,
+      is in the guard page. That is exactly the `stval` on the console.
+
+      The program does not read `stval`; its `sp` window already pins the kill to the first frame
+      below the limit. The next step is the kernel's side of that moment.
+  - title: The kill, and 64 pages freed
+    commit: 7
+    file: kernel/trap.c
+    lines: 60-85
+    focus: 71-79
+    diff: false
+    state:
+      hart: 0
+      mode: S
+      proc: growstack (pid 8, the overflow child)
+      intr: "off"
+      satp: kernel
+      locks: []
+      irq: 0
+      stack: [usertrap]
+      sp: {"on": kernel, detail: "pid 8's kernel stack, `sp` = `0x3fffff7fe0`"}
+    note: |
+      [[usertrap]] did not change in this lab. The fault (`scause` 15, `stval` `0x3ffffbdef8`)
+      goes to [[vmfault]] as always; `0x3ffffbdef8` is above `p->sz` (`0x3000`) and below
+      `USTACKBASE`, so [[vmfault]] returns 0, and the `else` branch prints the two lines and
+      marks the process killed. gdb stopped at the `setkilled` call (line 78), right after
+      the two lines were printed, and read exactly these values from `scause` and `stval`.
+
+      The child exits, and its parent reaps it in [[kwait]]. gdb read the child's page table in
+      [[proc_freepagetable]] at that moment: 64 valid stack PTEs, `0x3ffffbe000` to
+      `0x3fffffd000`, the whole region, all freed by commit 2's line. 63 were grown by page
+      faults; the top one came through fork (exec grew it in the parent).
+
+      What did the lab cost? Seven commits: three constants, one condition in [[vmfault]], a
+      range for [[uvmcopy]], one line in [[proc_freepagetable]], a widened test in
+      [[fetchaddr]], a shorter [[kexec]], and two changed expectations in `usertests`. What
+      it took to find them: every place the kernel says "the process's memory" by `[0, p->sz)`,
+      found by asking, for each one, whether it still sees the whole process.
+    others: |
+      The kill only marks this process; the other harts are unaffected. Its parent (pid 3) is
+      reading the pipe. When the child's [[kexit]] closes the write end, [[pipeclose]] wakes it,
+      `read` returns 0, and the parent then calls `wait` and reaps the zombie; the 64 stack pages
+      return to the free list then, under `wait_lock` and the child's `p->lock`, as in the step
+      "Every teardown frees the stack region".
+verify: |
+  On the branch (`ext/13-growstack`, 7 commits), built with the project toolchain and run on
+  3 harts (`-smp 3 -m 128M`), one boot:
+
+  ```text
+  $ growstack
+  growstack: deep: 65 calls used 70944 bytes of stack
+  growstack: deep: OK
+  growstack: fork: OK
+  growstack: read: OK
+  usertrap(): unexpected scause 0xf pid=8
+              sepc=0x36a stval=0x3ffffbdef8
+  growstack: overflow: status -1, deepest sp 0x3FFFFBE330, limit 0x3FFFFBE000: OK
+  usertrap(): unexpected scause 0xf pid=9
+              sepc=0xce stval=0x3ffffbd000
+  growstack: collide: OK
+  growstack: ALL OK
+  $ usertests -q
+  usertests starting
+  test copyin: OK
+  [...]
+  test stacktest: usertrap(): unexpected scause 0xd pid=6569
+              sepc=0x1c40 stval=0x3ffffbde90
+  OK
+  [...]
+  test lazy_copy: OK
+  test lazy_copyinstr: OK
+  test lazy_sbrk: OK
+  test partial_write: OK
+  test unlinkcwd: OK
+  ALL TESTS PASSED
+  $ growstack
+  growstack: deep: 65 calls used 70944 bytes of stack
+  growstack: deep: OK
+  growstack: fork: OK
+  growstack: read: OK
+  usertrap(): unexpected scause 0xf pid=6661
+              sepc=0x36a stval=0x3ffffbdef8
+  growstack: overflow: status -1, deepest sp 0x3FFFFBE330, limit 0x3FFFFBE000: OK
+  usertrap(): unexpected scause 0xf pid=6662
+              sepc=0xce stval=0x3ffffbd000
+  growstack: collide: OK
+  growstack: ALL OK
+  ```
+
+  The two `usertrap()` lines in each `growstack` run are the expected kills: the `overflow`
+  child's store into the guard page below the stack (`stval` `0x3ffffbdef8`), and the
+  `collide` child's store into the guard page above the heap (`0x3ffffbd000`, its first byte).
+  Both are the same page, seen from two sides. In `usertests`, `stacktest`'s kill is the guard
+  doing its job; `usertests -q` passing shows that bad pointers, the trapframe, the trampoline,
+  `MAXVA`, lazy and eager `sbrk`, `exec`'s argument limit and memory accounting all still work.
+
+  Every commit builds with `make kernel/kernel fs.img`, and `usertests -q` printed `ALL TESTS
+  PASSED` on 3 harts at each of the 7 commits. At commits 1-5 (old layout, with `growstack`
+  added to the tree) `growstack` printed `deep`, `fork`, `read` and `overflow` `FAIL` and
+  `collide` `OK`; from commit 6 on, `ALL OK`.
+measure: |
+  A counting copy of the branch (instrumentation not on the branch) counted every stack page
+  grown, and how many of them came from page faults, and recorded, for every address space
+  freed, how many stack pages it had. A counting copy of the original kernel printed only free
+  pages. Both printed their counters on Ctrl-P; one boot each.
+
+  **Who uses how much stack.**
+
+  | command | stack growths (by page faults) | address spaces freed, by stack pages |
+  |---|---|---|
+  | boot and `echo hi` | 3 (0) | 1 page: 3 (and one empty: the first process's, before its exec) |
+  | `growstack deep` | 18 (17) | 1 page: 2, 18 pages: 1 |
+  | `growstack` (all five checks) | 100 (97) | 1 page: 3, 3 pages: 1, 18 pages: 3, 64 pages: 1 |
+  | `usertests -q` | 3 (0) | 1 page: 6,649 |
+
+  Every growth that did not come from a page fault came from a kernel copy: one for each
+  `exec` that got as far as copying its arguments ([[copyout]] into the new page table), and
+  two in `growstack read` ([[copyout]] from [[piperead]]).
+  `growstack`'s 97 faults are 17 (deep) + 17 (fork) + 63 (overflow). The forked grandchild in
+  the `fork` check grew nothing: [[uvmcopy]] gave it all 18 pages.
+
+  The `usertests -q` row is the interesting one. 6,649 address spaces were torn down during the
+  run, and every one had exactly one stack page: no test in `usertests` ever needed more than
+  4 KiB of stack. That is why the original layout was enough for xv6's own programs, and why a
+  growable stack costs them nothing. Each of them uses one stack page, as before, and no guard
+  page.
+
+  **Memory.** Free pages after boot, with `init` and `sh` running: 32,545 on the original
+  kernel, 32,547 on the branch. The 2 pages are the two old guard pages, which [[uvmalloc]]
+  allocated and [[uvmclear]] only hid from user mode. The same page was also copied by every
+  `fork`, since it lies below `sz`: on the original kernel each of `usertests`' thousands of
+  forks copied two pages of stack (the guard and the stack), on the branch one. (That last
+  point is reasoned from [[uvmcopy]], not counted.)
+further: |
+  - **Shrink the stack.** Pages the stack grew into stay mapped until exit, even after the
+    recursion returns. Free pages below `sp` on some event (a system call, a timer tick), and
+    think about what makes it safe: can the program still use memory below its own `sp`?
+    (RISC-V's calling convention has no "red zone", but check what the compiler does.)
+  - **Close the guard's hole.** A frame larger than a page can jump over a one-page guard. Make
+    the gap larger, or check at fault time that the address is not far below the faulting
+    `sp`, and write a test with a 64 KiB local array near the limit.
+  - **A per-process limit.** Replace the constant with a field set by a new system call
+    (`setstacklimit`), as Unix does with `RLIMIT_STACK`. Which of the places you changed now
+    need the process instead of a constant, and how does fork inherit the limit?
+  - **Randomize the top.** Start the stack a random number of pages below `USTACKTOP` at each
+    exec. What does that defend against, and what in this lab would have to learn the
+    per-process top?
+  - **Copy-on-write stacks.** With lab 11, fork would share the stack pages instead of copying
+    them. The `fork` check here scribbles over every frame in the child: what does that cost
+    under copy-on-write, page by page?

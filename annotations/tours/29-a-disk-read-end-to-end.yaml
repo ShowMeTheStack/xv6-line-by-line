@@ -1,0 +1,712 @@
+title: A disk read, end to end
+group: File system
+prerequisites: [5, 9, 16, 17]
+summary: |
+  You type `cat README`. The first 512 bytes `cat` asks for live in disk block **48**: in a
+  fresh `fs.img` from this build, README is inode 2, its data blocks are 48, 49 and 50, and
+  it is 2,441 bytes long (read straight out of the image's root directory and inode table).
+  Nobody has read block 48 since boot, so it is not in memory. This tour follows that one
+  block from the request to the bytes landing in `cat`'s buffer.
+
+  Along the way, `cat` takes four locks of two different kinds (two sleep-locks and two
+  spinlocks, not counting the brief per-process locks), builds a three-part
+  message for the disk in shared memory, tells the device with a single store to a device
+  register, and goes to sleep. The device copies 1024 bytes straight into kernel memory
+  ([[g:dma]]), then raises an interrupt that any hart may answer (in our run, a different
+  one). That hart walks a ring of completed requests and wakes `cat`, which resumes on
+  whichever hart's scheduler picks it up.
+
+  The numbers in this tour come from a traced run of this build under QEMU and gdb: `cat`
+  was pid 3, it issued the request for block 48 from hart 0 using descriptors 0, 1 and 2,
+  and hart 1 took the completion interrupt.
+cast: |
+  | Hart | What it is doing |
+  |---|---|
+  | 0 | Running `cat README` (pid 3): the process this tour follows |
+  | 1 | Idle in its [[kernel:scheduler]], or running something else |
+  | 2 | Idle, or running something else; the shell (pid 2) is asleep in `wait` |
+
+  `cat` has already opened README (descriptor 3). Opening it needed the root directory
+  (block 47) and the inode block (33), which were already in the [[g:buffer-cache]], so no
+  disk I/O happened until now.
+steps:
+  - title: cat asks for 512 bytes
+    file: user/cat.c
+    lines: 5-22
+    focus: 12
+    state:
+      hart: 0
+      mode: U
+      proc: cat (pid 3)
+      intr: on
+      satp: user
+      locks: []
+      stack: [main, cat]
+      sp:
+        "on": user
+        detail: "`cat`'s stack page; `buf` itself is a global, not on the stack"
+    note: |
+      `cat` calls `read(3, buf, 512)`. `buf` is a global array at `0x1010` in `cat`'s
+      memory (`user/cat.sym`). The system call path into the kernel is the subject of
+      [[tour:5]]; here it ends in [[sys_read]], which finds the open file and calls
+      [[fileread]].
+
+      512 bytes is half a disk block. xv6's file system uses 1024-byte blocks ([[BSIZE]]),
+      while the disk itself speaks in 512-byte **sectors**. The kernel will fetch the whole
+      1024-byte block, give `cat` the half it asked for, and keep the rest cached for the
+      next `read`.
+
+  - title: fileread locks the inode
+    file: kernel/file.c
+    lines: 104-130
+    focus: 122-123
+    state:
+      hart: 0
+      mode: S
+      proc: cat (pid 3)
+      intr: on
+      satp: kernel
+      locks: ["README's ip->lock (sleep-lock)"]
+      irq: 0
+      stack: [usertrap, syscall, sys_read, fileread]
+      sp:
+        "on": kernel
+        switched: "`ld sp, 8(a0)` in [[uservec]] ([[kernel/trampoline.S:76]]), after the `ecall`"
+        detail: "`cat`'s kernel stack, `KSTACK(2)` = `0x3fffff9000` in our run (pid 3, slot 2)"
+    note: |
+      README is an `FD_INODE` file. [[fileread]] takes the inode's [[g:sleeplock]] with
+      [[ilock]], reads with [[readi]] at the file's current offset (`f->off` = 0), advances
+      the offset by the number of bytes read, and unlocks.
+
+      The inode lock is held across the whole read, disk wait included. That is why it is a
+      sleep-lock: the holder is about to sleep for a disk transfer, and a spinlock holder
+      must never sleep. It also makes the read atomic with respect to writers of the same
+      file: nobody can change README's size or block list while `cat` is in the middle.
+    others: |
+      If another process on hart 2 reads README at the same moment, it sleeps in [[ilock]]
+      until `cat` is done. A process reading a *different* file is not blocked: inode locks
+      are per inode.
+
+  - title: readi finds block 48
+    file: kernel/fs.c
+    lines: 505-534
+    focus: 520-525
+    state:
+      hart: 0
+      mode: S
+      proc: cat (pid 3)
+      intr: on
+      satp: kernel
+      locks: ["README's ip->lock (sleep-lock)"]
+      irq: 0
+      stack: [usertrap, syscall, sys_read, fileread, readi]
+      sp: kernel
+    note: |
+      [[readi]] trims the request to the file's size (2,441 bytes, so 512 is fine) and loops
+      over the blocks the range touches. Offset 0 is in file block 0, and [[bmap]] looks it
+      up in the inode's `addrs[]` array: `addrs[0] = 48`.
+
+      Then `bread(ip->dev, 48)`: "give me block 48 of device 1, locked, with its contents".
+      Everything below this line is the job of the [[g:buffer-cache]] and the disk driver.
+      `readi` does not know or care whether the block comes from memory or from the disk.
+
+  - title: bread asks the cache first
+    file: kernel/bio.c
+    lines: 90-102
+    focus: 96
+    state:
+      hart: 0
+      mode: S
+      proc: cat (pid 3)
+      intr: on
+      satp: kernel
+      locks: ["README's ip->lock (sleep-lock)"]
+      irq: 0
+      stack: [usertrap, syscall, sys_read, fileread, readi, bread]
+      sp: kernel
+    note: |
+      [[bread]] is two steps:
+
+      1. [[bget]] returns a buffer assigned to block 48, with its sleep-lock held.
+      2. If the buffer's `valid` flag is 0, its `data` does not hold the block yet: call
+         [[virtio_disk_rw]] to read it from the disk, then set `valid = 1`.
+
+      The `valid` check and the read happen while holding the buffer's lock, so exactly one
+      process reads a given block from disk, and anyone else who wants the same block
+      waits for that lock and then finds `valid = 1`. [[tour:30]] follows that race in
+      detail.
+
+  - title: bget misses and recycles a buffer
+    file: kernel/bio.c
+    lines: 57-88
+    focus: 62-81
+    state:
+      hart: 0
+      mode: S
+      proc: cat (pid 3)
+      intr: off
+      satp: kernel
+      locks: ["README's ip->lock (sleep-lock)", bcache.lock]
+      irq: {noff: 1, intena: 1}
+      stack: [usertrap, syscall, sys_read, fileread, readi, bread, bget]
+      sp: kernel
+    note: |
+      [[bget]] takes `bcache.lock`, a [[g:spinlock]] (interrupts off on hart 0), and scans
+      the 30 buffers ([[NBUF]]) for device 1, block 48. None matches: nobody has read
+      README since boot.
+
+      So it recycles the least recently used buffer that nobody holds (`refcnt == 0`),
+      relabels it as block 48 with `valid = 0`, sets `refcnt = 1`, releases `bcache.lock`
+      and takes the buffer's sleep-lock with [[acquiresleep]]. Nobody else held it, so this
+      does not wait.
+
+      After `bget` returns, `cat` holds two sleep-locks: README's inode and block 48's
+      buffer. The buffer is 1024 bytes of `data` plus bookkeeping, inside the global
+      `bcache` array (at `0x800157e8` in this build).
+    others: |
+      `bcache.lock` protects the cache's *directory*: which buffer holds which block, the
+      reference counts and the LRU list. Hart 1 or 2 calling `bread` for any block right
+      now spins here for the length of a 30-entry scan. Without the lock, two harts missing
+      on different blocks could pick the same free buffer and both relabel it. [[tour:30]]
+      covers the cache in depth.
+
+  - title: virtio_disk_rw takes the disk lock
+    file: kernel/virtio_disk.c
+    lines: 215-237
+    focus: 220-231
+    state:
+      hart: 0
+      mode: S
+      proc: cat (pid 3)
+      intr: off
+      satp: kernel
+      locks: ["README's ip->lock (sleep-lock)", "block 48's b->lock (sleep-lock)", vdisk_lock]
+      irq: {noff: 1, intena: 1}
+      stack: [usertrap, syscall, sys_read, fileread, readi, bread, virtio_disk_rw]
+      sp: kernel
+    note: |
+      Now the driver. [[virtio_disk_rw]] first converts the block number into a sector
+      number: `48 * (1024 / 512)` = **sector 96**. The device addresses the disk in 512-byte
+      sectors and will transfer two of them.
+
+      Then it takes `vdisk_lock` (a spinlock, so interrupts go off on hart 0). This lock
+      protects everything in the global `disk` structure: the descriptor table, the free
+      flags, the two rings and the per-request `info`. Every hart issuing a request, and
+      every hart handling a disk interrupt, takes it. That second group is why interrupts must be off while it is held: if hart 0 took the disk interrupt now, [[virtio_disk_intr]] would spin on `vdisk_lock`, waiting for code it had itself interrupted ([[concept:locks#handlers]]).
+
+      The loop asks [[alloc3_desc]] for three free descriptors. If it cannot get them,
+      it sleeps and retries. That case comes at the end of the tour; for `cat` the disk is
+      idle and the call succeeds at once.
+
+  - title: Allocating three descriptors
+    file: kernel/virtio_disk.c
+    lines: 155-213
+    focus: 199-212
+    state:
+      hart: 0
+      mode: S
+      proc: cat (pid 3)
+      intr: off
+      satp: kernel
+      locks: ["README's ip->lock (sleep-lock)", "block 48's b->lock (sleep-lock)", vdisk_lock]
+      irq: {noff: 1, intena: 1}
+      stack: [usertrap, syscall, sys_read, fileread, readi, bread, virtio_disk_rw, alloc3_desc]
+      sp: kernel
+    note: |
+      A **descriptor** tells the device about one piece of memory: a physical address, a
+      length, flags, and the index of the next descriptor in a chain. The driver has
+      [[NUM]] = 8 of them, in a page shared with the device ([[g:virtqueue]]). The array
+      `disk.free[]` records which are unused.
+
+      [[alloc_desc]] returns the first free index. [[alloc3_desc]] calls it three times;
+      if any call fails, it gives back the ones it got and returns -1, so a request never
+      holds a partial set while waiting.
+
+      In our traced run the disk was idle, so `cat` got descriptors **0, 1 and 2**. In our
+      traced interactive run, requests rarely overlapped, so almost every request got 0, 1,
+      2 ([[alloc_desc]] always returns the lowest free index).
+
+      `alloc_desc` and [[free_desc]] touch `disk.free[]` with no lock of their own. They
+      are only ever called with `vdisk_lock` held.
+
+  - title: The request, in three descriptors
+    file: kernel/virtio_disk.c
+    lines: 238-273
+    focus: 241-272
+    state:
+      hart: 0
+      mode: S
+      proc: cat (pid 3)
+      intr: off
+      satp: kernel
+      locks: ["README's ip->lock (sleep-lock)", "block 48's b->lock (sleep-lock)", vdisk_lock]
+      irq: {noff: 1, intena: 1}
+      stack: [usertrap, syscall, sys_read, fileread, readi, bread, virtio_disk_rw]
+      sp: kernel
+    note: |
+      A virtio block request is a header, the data, and a status byte. xv6 always puts them
+      in three separate descriptors, the arrangement the code's comment cites from the
+      spec's section 5.2 for legacy devices (a modern device must accept other splits too):
+
+      | Descriptor | Points at | Length | Flags | Contents |
+      |---|---|---|---|---|
+      | 0 | `disk.ops[0]` | 16 | `NEXT` | header: `type = VIRTIO_BLK_T_IN` (read), `sector = 96` |
+      | 1 | `b->data` | 1024 | `WRITE`, `NEXT` | where the device should put the block |
+      | 2 | `disk.info[0].status` | 1 | `WRITE` | one status byte, preset to `0xff` |
+
+      `VRING_DESC_F_WRITE` is from the *device's* point of view: "you may write here". For a
+      disk read, the device writes the data buffer and the status byte, and only reads the
+      header.
+
+      The addresses are kernel virtual addresses used directly as physical addresses. That
+      works because the kernel maps RAM one-to-one ([[g:direct-map]]): `b->data`, inside the
+      kernel's `bcache`, has the same number in both spaces. The device knows nothing about
+      page tables.
+
+      Finally the driver records, for the interrupt handler, which buffer this request is
+      for (`info[0].b = b`) and marks it `b->disk = 1`: "the disk owns this buffer now".
+
+  - title: Publish in the avail ring, fence, notify
+    file: kernel/virtio_disk.c
+    lines: 274-285
+    focus: 275-284
+    state:
+      hart: 0
+      mode: S
+      proc: cat (pid 3)
+      intr: off
+      satp: kernel
+      locks: ["README's ip->lock (sleep-lock)", "block 48's b->lock (sleep-lock)", vdisk_lock]
+      irq: {noff: 1, intena: 1}
+      stack: [usertrap, syscall, sys_read, fileread, readi, bread, virtio_disk_rw]
+      sp: kernel
+    note: |
+      The **avail ring** is how the driver hands requests to the device: an array of chain
+      heads plus an index `avail->idx` that only ever counts up (it wraps at 65,536, not at
+      `NUM`). In our run 34 requests had been issued since boot, so `idx` was 34:
+
+      1. `ring[34 % 8]` = `ring[2]` = 0, the head of our chain.
+      2. [[io_fence]]: `fence iorw, iorw`. All earlier memory writes, including the
+         descriptors and the ring entry, become visible before any later one.
+      3. `avail->idx` = 35. The device treats the new index as "one more request is ready".
+      4. Another fence, so the index is visible before step 5.
+      5. A 32-bit store to the `QueueNotify` register at `0x10001050`, a
+         [[g:mmio|memory-mapped]] device register: "queue 0 has work".
+
+      Without the fences, the hart (or the compiler) could make the index or the notify
+      visible before the descriptors were written, and the device could read a
+      half-built request ([[g:memory-barrier]], [[tour:19]]). The order is the protocol: data,
+      then index, then doorbell.
+    others: |
+      Why can't two harts both write `ring[avail->idx % 8]` and both bump `idx`? Because
+      they would both have to hold `vdisk_lock`. With the lock, a second request from hart 2
+      would land in `ring[3]` and set `idx` to 36. Without it, both could write `ring[2]`
+      and one request would never be seen by the device.
+
+  - title: cat sleeps on its buffer
+    file: kernel/virtio_disk.c
+    lines: 286-298
+    focus: 287-288
+    state:
+      hart: 0
+      mode: S
+      proc: cat (pid 3)
+      intr: off
+      satp: kernel
+      locks: ["README's ip->lock (sleep-lock)", "block 48's b->lock (sleep-lock)", vdisk_lock]
+      irq: {noff: 1, intena: 1}
+      stack: [usertrap, syscall, sys_read, fileread, readi, bread, virtio_disk_rw]
+      sp:
+        "on": kernel
+        detail: "416 bytes of `cat`'s kernel stack in use (`sp` = `0x3fffff9e60` in our run)"
+    note: |
+      The disk is slow compared with a CPU, so `cat` must wait without burning hart 0.
+      While `b->disk` is still 1:
+
+      1. [[sleep_prepare]]`(b)`: register as waiting on channel `b`, the buffer's address.
+      2. `release(&disk.vdisk_lock)`: the interrupt handler will need it.
+      3. [[sleep]]`()`: if no wakeup has arrived in the meantime, mark `cat` `SLEEPING` and
+         switch to hart 0's scheduler.
+
+      Registering *before* releasing the lock is what prevents a lost wakeup: if the
+      interrupt arrives between steps 2 and 3, [[wakeup]] clears `p->chan`, and `sleep`
+      returns at once instead of sleeping forever ([[tour:16]]).
+
+      `cat` sleeps still holding **two sleep-locks**, README's inode and buffer 48. That is
+      allowed for sleep-locks and is exactly why these two are sleep-locks. It holds no
+      spinlock while asleep. On the way in it holds exactly one, its own `p->lock`, which is what [[sched]] demands (noff exactly 1); sleep-locks are not counted in noff at all ([[concept:locks#sleep-locks]]).
+
+      It also leaves its whole system call behind, on its **kernel stack**
+      ([[concept:stacks#kernel]]). [[sleep]] calls [[sched]], `sched` calls [[swtch]], and
+      `swtch` stores `ra`, `sp` and `s0`–`s11` in `p->context` (a save area, not the stack)
+      and then loads hart 0's scheduler `sp` ([[kernel/swtch.S:26]]). What stays behind,
+      measured with gdb in our run:
+
+      ```text
+      cat's kernel stack, KSTACK(2), while cat sleeps
+        0x3fffffa000  top ─► usertrap
+                             syscall
+                             sys_read
+                             fileread
+                             readi
+                             bread
+                             virtio_disk_rw   ← idx[] = {0, 1, 2} lives here
+                             sleep
+                             sched
+        0x3fffff9e10         sp saved in p->context  (496 bytes used)
+                             … about 3.5 KiB free …
+        0x3fffff9000  bottom; unmapped guard page below
+      ```
+
+      The user's registers are not on it: they are in the trapframe, saved by [[uservec]].
+      Nothing touches this stack until some scheduler switches back to `cat`.
+    others: |
+      Hart 0 is now free and runs something else. Anyone who wants README's inode or block
+      48 meanwhile sleeps in [[ilock]] or [[acquiresleep]]. Anyone who wants *other* blocks
+      is unaffected, and can even issue its own disk request: `vdisk_lock` is free again.
+
+  - title: The device does the transfer by DMA
+    file: kernel/virtio.h
+    lines: 53-99
+    focus: 55-84
+    state:
+      proc: "none: the device works alone (cat, pid 3, is asleep)"
+      locks: []
+      stack: []
+      sp:
+        "on": none
+        detail: "no hart executes the transfer; `cat`'s kernel stack sits frozen, and each hart is on a stack of its own"
+    note: |
+      Now the device works on its own. These are the structures it reads and writes, in
+      the pages the driver gave it at boot ([[virtio_disk_init]]):
+
+      1. It sees `avail->idx` = 35, one more than it has handled, and reads `ring[2]` = 0.
+      2. It follows the chain: descriptor 0 (the header: read, sector 96), descriptor 1
+         (1024 bytes at `b->data`), descriptor 2 (one status byte).
+      3. It reads 1024 bytes from the disk image at byte offset `96 * 512` = 49,152, which
+         is `48 * 1024`, and writes them **directly into `b->data`** in RAM. No hart copies
+         them. This is [[g:dma]].
+      4. It writes 0 ("OK") into the status byte.
+      5. It adds an entry to the **used ring**: `{id = 0}` (the chain head), and increments
+         `used->idx`, which we infer went from 34 to 35 (every earlier request had
+         completed, so the device's count matched the 34 requests issued).
+      6. It raises its interrupt line, IRQ 1 ([[VIRTIO0_IRQ]]).
+
+      (Simplified: in QEMU the "device" is emulator code. It does the same steps in the same
+      order, and its "DMA" is the emulator writing into the guest's RAM.)
+
+  - title: Some hart takes the interrupt
+    file: kernel/trap.c
+    lines: 182-212
+    focus: 192-210
+    state:
+      hart: 1
+      mode: S
+      proc: whatever hart 1 was running (in our run, most likely nothing)
+      intr: off
+      satp: kernel
+      locks: []
+      irq: 0
+      stack: [scheduler, kernelvec, kerneltrap, devintr]
+      sp:
+        "on": scheduler
+        switched: "no switch: [[kernelvec]] pushed a 256-byte frame onto the stack hart 1 was already on ([[kernel/kernelvec.S:14]])"
+        detail: "the scenario assumes hart 1 was idle in its scheduler; its slice of `stack0` has top `0x80009890`"
+    note: |
+      The [[g:plic|PLIC]] forwards IRQ 1 to every hart that enabled it, which is all of
+      them ([[plicinithart]]). All three see the interrupt pending. A hart parked in `wfi`
+      wakes (`wfi` wakes even with interrupts off) and takes the trap during its
+      scheduler's brief `intr_on`. At that moment the scheduler holds no spinlock: noff is 0, the only state in which an interrupt can be taken ([[concept:locks#invariant]]). Usually only the first hart to claim does any work: once
+      IRQ 1 is claimed, the PLIC stops signalling it to the others. In our run that was
+      **hart 1**, while `cat` slept and hart 0 did something else.
+
+      The trap arrives in [[devintr]] ([[kerneltrap]] if hart 1 was in the kernel, as it is
+      when idle in its scheduler; [[usertrap]] if it was running a user program). `scause`
+      says "supervisor external interrupt". [[plic_claim]] returns 1, so it calls
+      [[virtio_disk_intr]], and afterwards [[plic_complete]] tells the PLIC that the disk may
+      interrupt again.
+
+      Notice whose time this is: hart 1 is doing `cat`'s work in the middle of something
+      unrelated. Interrupt handlers serve the device, not the running process.
+
+      And on whose stack. xv6 has no separate interrupt stack: [[kernelvec]] subtracts 256
+      from whatever `sp` holds and saves the registers there ([[kernel/kernelvec.S:14]]).
+      Our scenario assumes hart 1 was idle, so that is hart 1's **scheduler** stack, its
+      slice of `stack0`:
+
+      ```text
+      hart 1's scheduler stack (stack0 slice, top 0x80009890)
+        top ─► start, main  (16 bytes each, never popped)
+               scheduler
+               kernelvec frame (256 bytes: the interrupted registers)
+               kerneltrap
+               devintr
+               virtio_disk_intr …
+      ```
+
+      Had hart 1 been running some process's system call, the same frames would sit on
+      *that process's* kernel stack; had it been in user mode, [[uservec]] would have moved
+      to that process's empty kernel stack and [[usertrap]] would have called `devintr`.
+      Never on `cat`'s stack: it is asleep, and only `cat` ever runs on it. (In one of our
+      gdb runs the interrupt landed on idle hart 0: on entry to `virtio_disk_intr`, `sp` was
+      `0x800086c0`, 464 bytes below the top of hart 0's slice.)
+    others: |
+      If hart 2 also tries to claim at the same moment, the PLIC hands IRQ 1 to only one of
+      them; the other's claim returns 0 and `devintr` does nothing for it. The PLIC itself
+      arbitrates, so no kernel lock is needed for the claim.
+
+  - title: virtio_disk_intr walks the used ring
+    file: kernel/virtio_disk.c
+    lines: 300-333
+    focus: 303-330
+    state:
+      hart: 1
+      mode: S
+      proc: whatever hart 1 was running
+      intr: off
+      satp: kernel
+      locks: [vdisk_lock]
+      irq: {noff: 1, intena: 0, note: "an interrupt handler: SIE was already off when this `acquire` pushed the first level, so intena is 0 and the `release` at line 332 leaves interrupts off until `sret` ([[concept:locks#intena]])"}
+      stack: [scheduler, kernelvec, kerneltrap, devintr, virtio_disk_intr]
+      sp:
+        "on": scheduler
+        detail: "a `kernelvec` frame on top of `scheduler`'s, as in step 12"
+    note: |
+      [[virtio_disk_intr]] takes `vdisk_lock`, then acknowledges the interrupt by writing
+      the device's interrupt-status bits back to its `InterruptACK` register.
+
+      Then it catches up with the used ring. The driver's own counter `disk.used_idx` is
+      (by the same inference) 34; the device's `used->idx` is 35. So there is one completion to handle:
+
+      - `id = used->ring[34 % 8].id` = 0, the head of `cat`'s chain.
+      - `info[0].status` must be 0. Anything else is a disk error, and xv6's response is to
+        `panic`.
+      - `b = info[0].b`, buffer 48. `b->disk = 0`: the disk is done with it.
+      - [[wakeup]]`(b)`: wake whoever sleeps on this buffer.
+      - `used_idx` becomes 35.
+
+      The loop handles *all* new completions, not one per interrupt. As the comment
+      explains, a completion that lands after the ACK may be handled now, and the next
+      interrupt then finds nothing to do, which is harmless.
+    others: |
+      `vdisk_lock` is what makes this safe. If hart 2 is in [[virtio_disk_rw]] adding a
+      request at this moment, it spins until hart 1 is done. Without the lock, hart 1 could
+      read `info[id].b` while hart 2 was rewriting `info[]` for a new request.
+
+      Lock order: `vdisk_lock`, then each `p->lock` inside `wakeup`. `virtio_disk_rw`
+      takes them in the same order (`vdisk_lock`, then `p->lock` in [[sleep_prepare]]), so
+      no deadlock is possible.
+
+  - title: wakeup makes cat runnable
+    file: kernel/proc.c
+    lines: 574-595
+    focus: 580-594
+    state:
+      hart: 1
+      mode: S
+      proc: whatever hart 1 was running
+      intr: off
+      satp: kernel
+      locks: [vdisk_lock, "each p->lock in turn"]
+      irq: {noff: 2, intena: 0}
+      stack: [scheduler, kernelvec, kerneltrap, devintr, virtio_disk_intr, wakeup]
+      sp:
+        "on": scheduler
+        detail: "a `kernelvec` frame on top of `scheduler`'s; `cat`'s own stack is untouched"
+    note: |
+      [[wakeup]] visits all 64 process slots. For `cat`, `p->chan` equals `b`, so it clears
+      the channel and, if `cat` is already `SLEEPING` (by now it almost certainly is; the disk
+      is far slower than the few instructions between `sleep_prepare` and `sleep`), makes
+      it `RUNNABLE`. `wakeup` sends no signal to other harts: a hart parked in `wfi` notices
+      `cat` only after its next interrupt, such as its timer.
+
+      Then hart 1 releases `vdisk_lock`, returns from the interrupt and goes back to what it
+      was doing. If that was idling in its scheduler, it will find `cat` on its next pass
+      over the process table. In our traced run, `cat`'s *next* disk request (for block 49)
+      was issued from hart 1. That suggests, but does not prove, that `cat` resumed on hart
+      1: between the two requests it returned to user space and wrote to the console, and a
+      timer-driven yield could have moved it. Any hart running its scheduler loop may pick
+      it up.
+
+  - title: cat resumes and frees the descriptors
+    file: kernel/virtio_disk.c
+    lines: 184-197
+    focus: 185-196
+    state:
+      hart: 1
+      mode: S
+      proc: "cat (pid 3), on hart 1 (inferred, see step 14)"
+      intr: off
+      satp: kernel
+      locks: ["README's ip->lock (sleep-lock)", "block 48's b->lock (sleep-lock)", vdisk_lock]
+      irq: {noff: 1, intena: 1, note: "`sched` restored the intena `cat` saved before sleeping (1, from the system call) into hart 1's `struct cpu`; `sleep`'s release of `p->lock` then turned interrupts on, and the re-acquire of `vdisk_lock` at line 291 recorded intena 1 again ([[concept:locks#sched-intena]])"}
+      stack: [usertrap, syscall, sys_read, fileread, readi, bread, virtio_disk_rw, free_chain]
+      sp:
+        "on": kernel
+        switched: "`ld sp, 8(a1)` in [[swtch]] ([[kernel/swtch.S:26]]), called by hart 1's scheduler"
+        detail: "`KSTACK(2)` again, with the frames `cat` left; `sched` and `sleep` have returned"
+    note: |
+      `cat` returns from `sleep()` inside [[virtio_disk_rw]] ([[kernel/virtio_disk.c:290]]),
+      re-acquires `vdisk_lock`, and re-checks the loop condition: `b->disk` is 0 (the re-check is needed because
+      `kkill` can make a sleeping process `RUNNABLE` without any `wakeup` on `b`). It clears
+      `info[0].b` and calls [[free_chain]]`(0)`.
+
+      `free_chain` follows the `NEXT` links (0 → 1 → 2) and calls [[free_desc]] on each,
+      which zeroes the descriptor, marks it free and calls `wakeup(&disk.free[0])`, in case
+      some request is waiting for descriptors (the last step of this tour). That is three
+      calls to `wakeup`, each visiting every process slot, for one request.
+
+      Then `virtio_disk_rw` releases `vdisk_lock` and returns. `cat` still holds its two
+      sleep-locks; it never let go of them while asleep.
+
+      Its kernel stack is the same one it went to sleep with, so `virtio_disk_rw`'s local
+      `idx[]` still says {0, 1, 2}, even if, as we infer, the function now continues on hart 1.
+      Getting back onto it took one instruction: hart 1's [[scheduler]] called [[swtch]],
+      whose `ld sp, 8(a1)` ([[kernel/swtch.S:26]]) loaded the `sp` saved in `cat`'s
+      `p->context`, and `swtch`'s `ret` returned into [[sched]] on `cat`'s stack. Then
+      `sched` and [[sleep]] returned, popping their frames. A process's kernel stack is
+      not tied to a hart: whichever hart switches to it carries on from there.
+
+  - title: Back in bread, then into cat's buffer
+    file: kernel/fs.c
+    lines: 520-534
+    focus: 524-530
+    state:
+      hart: 1
+      mode: S
+      proc: "cat (pid 3), on hart 1 (inferred, see step 14)"
+      intr: on
+      satp: kernel
+      locks: ["README's ip->lock (sleep-lock)", "block 48's b->lock (sleep-lock)"]
+      irq: 0
+      stack: [usertrap, syscall, sys_read, fileread, readi]
+      sp: kernel
+    note: |
+      [[bread]] sets `valid = 1` and returns. From now on, until this buffer is recycled,
+      any `bread(1, 48)` is a cache hit with no disk I/O. That will be true for `cat`'s
+      second `read`, which wants bytes 512–1023 of the same block.
+
+      In [[readi]], `m = min(512, 1024 - 0)` = 512, and [[either_copyout]] copies 512 bytes
+      from `bp->data` to user address `0x1010` in `cat`'s memory ([[copyout]] walks `cat`'s
+      page table, as in [[tour:28]]). Then [[brelse]] drops the buffer's lock and moves it to
+      the front of the LRU list.
+
+      `readi` returns 512, `fileread` advances `f->off` to 512 and calls [[iunlock]], and
+      the system call returns 512 to `cat`, which writes the bytes to the console
+      ([[tour:5]]).
+
+  - title: Three requests, eight descriptors
+    file: kernel/virtio_disk.c
+    lines: 226-236
+    focus: 228-232
+    state:
+      hart: 2
+      mode: S
+      proc: a third process issuing a disk request
+      intr: off
+      satp: kernel
+      locks: ["its b->lock (sleep-lock)", vdisk_lock]
+      irq: {noff: 1, intena: 1}
+      stack: [bread, virtio_disk_rw]
+      sp: kernel
+    note: |
+      What if several harts issue requests at once? Each request needs 3 descriptors and
+      there are only 8, so at most **two** requests can be in flight (6 descriptors), with 2
+      left over. Running `logstress f1 f2 f3`, three processes writing files in parallel,
+      we saw two requests in flight (the second using descriptors 3, 4, 5) 122 times, but
+      never a third request having to wait for descriptors. A third request can arrive,
+      though, and then it must wait:
+
+      | Time | Hart 0 (A) | Hart 1 (B) | Hart 2 (C) |
+      |---|---|---|---|
+      | t1 | descriptors 0, 1, 2; notify; sleeps on its buf | | |
+      | t2 | | descriptors 3, 4, 5; notify; sleeps | |
+      | t3 | | | gets 6 and 7, fails on the third, frees them |
+      | t4 | | | `sleep_prepare(&disk.free[0])`, releases `vdisk_lock`, `sleep()` |
+      | t5 | (on some hart) A resumes, `free_chain(0)` → `wakeup(&disk.free[0])` | | |
+      | t6 | | | wakes, re-takes `vdisk_lock`, tries again: gets 0, 1, 2 |
+
+      The channel `&disk.free[0]` is just an agreed-on address; any descriptor being freed
+      wakes the waiters. And because `alloc3_desc` gives back partial allocations, a sleeping
+      request holds no descriptors, so every allocated descriptor belongs to a request the
+      device will finish and free. If waiters kept partial sets, four waiters holding two
+      each could own all eight with nothing in flight, and nobody would ever free one.
+
+      (In the state box, the call stack is shortened to the driver; C could be any file
+      system operation, and its lock list shows only the driver-level locks.)
+
+  - title: What one block cost
+    file: user/cat.c
+    lines: 7-22
+    focus: 12-17
+    state:
+      hart: 1
+      mode: U
+      proc: "cat (pid 3), on hart 1 (inferred, see step 14)"
+      intr: on
+      satp: user
+      locks: []
+      stack: [main, cat]
+      sp:
+        "on": user
+        switched: "`ld sp, 48(a0)` in [[userret]] ([[kernel/trampoline.S:118]]) and `sret` ([[kernel/trampoline.S:153]])"
+    note: |
+      `cat` has its first 512 bytes. To get them, the kernel:
+
+      - took 2 sleep-locks (README's inode, buffer 48) and 2 kinds of spinlock besides the
+        `p->lock`s and the sleep-locks' own internal spinlocks (`bcache.lock` twice, in `bget` and `brelse`; `vdisk_lock` three times:
+        to issue, in the interrupt handler, and on resuming),
+      - built 3 descriptors and 1 ring entry, and issued the request with 2 `io_fence`s and
+        a single doorbell store (the interrupt handler added 2 more `io_fence`s, a read of
+        the device's interrupt status, a write to its `InterruptACK` register, and the PLIC
+        claim and complete),
+      - slept once, while 1,024 bytes moved by DMA with no hart executing a single instruction to copy them,
+      - took 1 interrupt on a different hart, and called `wakeup` 4 times in the driver
+        alone (once for `cat`, three times for freed descriptors), each visiting all 64
+        process slots.
+
+      The next `read` will cost almost nothing: block 48 is in the cache. So will block
+      49's second half, after the first read of block 49 brings it in. The buffer cache
+      turns three disk reads into the whole file.
+
+      The key ideas:
+
+      - The disk is driven by shared memory (descriptors and rings) plus one doorbell
+        register; the fences make the order of writes part of the protocol.
+      - A request sleeps holding sleep-locks but no spinlock. `vdisk_lock` is released
+        before sleeping, because the interrupt handler needs it.
+      - The completion can be handled by any hart, and the requester can resume on any
+        hart; the buffer address is the meeting point.
+      - Eight descriptors allow two requests in flight; a third waits on `disk.free[0]`.
+locks:
+  - lock: "ip->lock (sleep-lock)"
+    where: "[[fileread]] via [[ilock]]"
+    protects: "README's in-memory inode for the whole read, including the disk wait"
+  - lock: "bcache.lock (spinlock)"
+    where: "[[bget]], [[brelse]]"
+    protects: "Which buffer holds which block, reference counts, the LRU list"
+  - lock: "b->lock (sleep-lock)"
+    where: "[[bget]] (acquire), [[brelse]] (release)"
+    protects: "Buffer 48's contents and `valid` flag; held through the disk read"
+  - lock: "vdisk_lock (spinlock)"
+    where: "[[virtio_disk_rw]], [[virtio_disk_intr]]"
+    protects: "The descriptor table, `free[]`, the avail and used rings, `used_idx`, `info[]` and `b->disk`"
+  - lock: "p->lock (spinlock)"
+    where: "[[sleep_prepare]], [[sleep]], [[wakeup]]"
+    protects: "`p->chan` and `p->state`, so the disk wakeup cannot be lost"
+  - lock: "no kernel lock: the PLIC claim"
+    where: "[[plic_claim]]"
+    protects: "The PLIC gives each pending interrupt to exactly one claiming hart"
+quiz:
+  - q: "`virtio_disk_rw` releases `vdisk_lock` before calling `sleep()`, but keeps the buffer's sleep-lock. Why each choice?"
+    a: "The interrupt handler must take `vdisk_lock` to process the completion, and a spinlock may not be held while sleeping, so it must be released. The buffer's sleep-lock must stay held so that no other process reads or modifies the buffer, or sees `valid`, while the device is filling it (its `refcnt` of 1 is what stops it being recycled). Sleep-locks may be held while sleeping."
+  - q: "Suppose the first `io_fence` in `virtio_disk_rw` were removed. What could the device see?"
+    a: "It could see `avail->idx` = 35 before the descriptors or `ring[2]` were written, and process a stale or half-built chain: the wrong sector, the wrong buffer, or garbage. The fence makes the ring entry and descriptors visible before the index."
+  - q: "The completion interrupt for `cat`'s request is taken on hart 1, while `cat` was sleeping after issuing it on hart 0. How does hart 1 know which process to wake?"
+    a: "The driver recorded the buffer in `disk.info[0].b`, indexed by the chain's head descriptor. The used ring tells hart 1 that chain 0 finished, so it calls `wakeup(b)`, and `cat` registered on exactly that channel with `sleep_prepare(b)`."
+  - q: "The interrupt arrives on hart 1 just after `cat` released `vdisk_lock` on hart 0 but before it called `sleep()`. Trace why `cat` does not sleep forever."
+    a: "`cat` already called `sleep_prepare(b)`, so `p->chan == b`. `wakeup(b)` on hart 1 clears `p->chan`. When `cat` then runs `sleep()`, it sees `p->chan == 0` and returns at once, re-takes `vdisk_lock`, and finds `b->disk == 0`."
+  - q: "Why does `alloc3_desc` give back the descriptors it got when it cannot get all three?"
+    a: "If a waiting request kept 1 or 2 descriptors while sleeping, the remaining ones might be too few for anyone, and several waiters each holding a partial set could block one another forever. Giving them back means a waiter holds nothing, and any completed request frees a full set."
+  - q: "`cat` reads README 512 bytes at a time. How many disk reads does the whole 2,441-byte file take if nothing is evicted, and why?"
+    a: "Three: blocks 48, 49 and 50, one each. Every 1024-byte block serves two 512-byte reads (the last block serves the final 393 bytes); after the first read of a block it stays valid in the buffer cache."

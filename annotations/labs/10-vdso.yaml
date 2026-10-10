@@ -1,0 +1,1878 @@
+published: true
+title: "A shared read-only page: system calls without a trap"
+area: Memory
+stars: 2
+branch: ext/10-vdso
+prerequisites: {tours: [5, 7, 20, 22, 25, 26, 28], concepts: [stacks, locks]}
+summary: |
+  `getpid()` asks the kernel for one integer it already knows. To get it, the process executes
+  `ecall`, the hart traps, [[uservec]] saves 31 registers, the kernel switches page tables,
+  [[usertrap]] and [[syscall]] run, and the whole trip is undone on the way back. In this tree
+  that is 1,103 instructions after the `ecall`, two writes to `satp` and four `sfence.vma`
+  (counted with gdb). In this lab you map one extra page into every process, at a fixed
+  address just below the [[g:trapframe]], with the process's pid in it, readable but not
+  writable from user mode. `ugetpid()` then becomes one load: 12 instructions, no trap.
+
+  A second page, the same physical page in every process, carries a copy of the kernel's
+  `ticks`, written by [[clockintr]] and read with no lock by `uuptime()`. That raises the
+  question every shared-memory design must answer: can a reader see a half-written value?
+
+  The code is small (about 70 lines of kernel, a third of them comments), but placing a page
+  at the top of the user address space touches more than you might expect. What else in the
+  kernel already decides what lives near the top of a user address space? Who creates a page
+  table, who throws one away, and how often does that happen in the life of one process? Does
+  the kernel itself obey a read-only PTE when a system call touches user memory? Answering
+  those is the lab. On QEMU the result is about 500 times faster per call.
+learn:
+  - "The top of a user address space: [[TRAMPOLINE]] (no `PTE_U`, used only in S-mode), the [[g:trapframe]] page below it, and now two pages that user code may read; how a fixed virtual address becomes a contract between the kernel and the user library."
+  - "What the PTE permission bits do to each kind of access, and what happens in this tree, where store faults already mean lazy allocation, when a user program stores to a page it may only read."
+  - "How long a page lives compared with the page tables that map it, and what `exec`, which builds a whole new page table, does to a page that must outlive it."
+  - "Whether the kernel's own copies to and from user memory obey the same PTE bits as the hardware does, and what that means for a page user code may read but should not hand to a system call."
+  - "When a value shared between harts can be read with no lock (one writer, one naturally aligned 32-bit word, a `volatile` read) and when it cannot (two values that must agree)."
+  - "What a trap costs, measured two ways: instructions counted with gdb, and calls per tick timed from user mode, and why user code here cannot read the `time` CSR."
+spec: |
+  **Behaviour.** Every process has two extra pages mapped at fixed addresses just below the
+  trapframe, both readable and not writable from user mode:
+
+  | address | name | contents | physical page |
+  |---|---|---|---|
+  | `0x3fffffd000` | `USYSCALL` | `struct usyscall { int pid; }` | one per process |
+  | `0x3fffffc000` | `USHARED` | `struct ushared { uint ticks; }` | one for the whole system |
+
+  The user library gains two functions that read them without a system call:
+
+  ```c
+  int ugetpid(void);   // == getpid()
+  int uuptime(void);   // == uptime(), give or take a tick in flight
+  ```
+
+  - A forked child reads its own pid; an `exec`'d image reads the same pid as before `exec`.
+  - The copy of `ticks` changes by itself, once per tick, in every process.
+  - A user store to either page kills the process, like a store to program text. Nothing may
+    turn that store into a lazily allocated page.
+  - The heap may not grow into the pages: `sbrk` and `sbrklazy` stop at `USHARED`.
+
+  **What must not change.** System calls behave as before for every address below `p->sz`.
+  A system call handed a pointer into the new pages fails, as it did when nothing was mapped
+  there (`usertests lazy_copy` checks `read` and `write` on exactly these addresses). No page
+  leaks; the shared page is never freed. **`usertests -q` must print `ALL TESTS PASSED` on 3
+  harts.** (One test, `lazy_sbrk`, checks the old heap ceiling by its exact value; the
+  reference branch updates that one expected value, see the reveal.)
+
+  **The test program**, `vdsotest`, prints one line per check:
+
+  ```text
+  $ vdsotest
+  vdsotest: pid: OK
+  vdsotest: uptime agrees: OK
+  vdsotest: uptime advances: OK
+  usertrap(): unexpected scause 0xf pid=4
+              sepc=0x14 stval=0x3fffffd000
+  vdsotest: usyscall read-only: OK
+  usertrap(): unexpected scause 0xf pid=5
+              sepc=0x2e stval=0x3fffffc000
+  vdsotest: ushared read-only: OK
+  vdsotest: read() into usyscall fails: OK
+  vdsotest: write() from ushared fails: OK
+  vdsotest: pid unchanged: OK
+  usertrap(): unexpected scause 0xf pid=6
+              sepc=0xd2 stval=0x3fffffd000
+  vdsotest: heap ceiling: OK
+  vdsotest: fork: OK
+  vdsotest: exec: OK
+  vdsotest: 20 children: OK
+  vdsotest: ALL OK
+  ```
+
+  - **pid**: `ugetpid() == getpid()`.
+  - **uptime agrees**: `uptime()`, then `uuptime()`, then `uptime()` again; the middle value
+    lies between the other two. **uptime advances**: after `pause(2)`, `uuptime()` is at least 2
+    larger.
+  - **usyscall / ushared read-only**: a child stores to the page; it must be killed (exit
+    status -1), not survive (status 0). The `usertrap()` lines are those kills, expected; the
+    test checks each child's status itself.
+  - **read() into usyscall fails, write() from ushared fails, pid unchanged**: system calls
+    refuse the pages in both directions.
+  - **heap ceiling**: a child grows its heap lazily to the limit; `sbrklazy(1)` more must fail,
+    and a store to `USYSCALL` with `p->sz` at its maximum must still kill it.
+  - **fork**, **exec**: a child, and a child that `exec`s `vdsotest exec`, read their own pid.
+  - **20 children**: 20 children on 3 harts each read their own pid 100,000 times.
+
+  `vdsotest time` measures: it reports whether user mode may execute `rdtime`, then how many
+  `getpid`, `ugetpid`, `uptime` and `uuptime` calls fit into 20 ticks.
+think:
+  - title: What does getpid cost, and which part of it is necessary?
+    q: |
+      Trace `getpid()` from the user stub to the return. List what the hardware and the kernel do
+      on the way in and on the way out. Then ask: which of those steps is needed to produce the
+      answer, and what would user code need in order to find the pid by itself, with no trap?
+      Commit to an answer before reading the hints: could the kernel *give* the process its pid
+      once, and keep it correct afterwards?
+    hints:
+      - "Follow [[tour:5]]: the stub in `usys.S`, `ecall`, [[uservec]] ([[kernel/trampoline.S:22]]), [[usertrap]], [[syscall]], [[sys_getpid]], then [[prepare_return]] and [[userret]]. Count what is saved, switched and flushed."
+      - "The only work that produces the answer is one load of `p->pid` in [[sys_getpid]]. Everything else exists to cross the boundary between user mode and the kernel safely. A user load can reach any page its page table maps with `PTE_U`."
+      - "Put the pid in a page of its own, filled in by the kernel when the process is created, and map that page into the process's own page table where user code can read it. A pid never changes for the life of a process, so the kernel never has to update it."
+    answer: |
+      On the way in: `ecall` switches the hart to S-mode and jumps to [[uservec]] on the
+      [[g:trampoline]] page; [[uservec]] saves all 31 user registers in the trapframe, loads the
+      kernel stack, `satp` and `tp`, and jumps to [[usertrap]], which saves `sepc`, checks
+      [[killed]] (taking `p->lock`), turns interrupts on and calls [[syscall]]. [[sys_getpid]]
+      finally loads `p->pid`. On the way out, [[usertrap]] checks [[killed]] again,
+      [[prepare_return]] sets `stvec`, `sstatus` and `sepc`, and [[userret]] switches `satp` back
+      and restores the 31 registers before `sret`.
+
+      Counted with gdb on the reference branch (see Measure): 1,103 instructions from the first
+      instruction of [[uservec]] to `sret`, with 2 `csrw satp`, 4 `sfence.vma` and one
+      `fence.i`. 392 of them are in [[mycpu]], 144 in [[push_off]] and 118 in [[pop_off]]: the
+      bookkeeping behind [[myproc]] (called 4 times) and the two acquisitions of `p->lock` in
+      [[killed]]. Ten are in [[sys_getpid]].
+
+      The answer itself needs none of that. The pid is fixed from [[allocproc]] to
+      [[freeproc]], so the kernel can write it once into a page and map the page into the
+      process's own page table with `PTE_U`. A user load then reads it: `ugetpid()` compiles
+      to `lui`, `addi`, `slli` and one `lw`: 12 instructions from its entry to its `ret`.
+      Values that change, like the tick count, need the kernel to keep the page up to date
+      (a later question).
+    checks:
+      - id: lab10-01
+        level: 1
+        type: number
+        q: |
+          In one `getpid()` round trip on this kernel, from `ecall` to the instruction after it,
+          how many times is `satp` written?
+        code: kernel/trampoline.S:86-112@92-111
+        answer: 2
+        wrong:
+          4: |
+            You may have counted the `sfence.vma` instructions: there are four (two around each
+            `csrw satp`). They flush cached translations; they do not write `satp`.
+          1: |
+            You may have counted only the switch into the kernel page table in [[uservec]].
+            [[userret]] must switch back to the user page table before `sret`
+            ([[kernel/trampoline.S:111]]).
+          0: |
+            You may have thought a system call keeps the user page table. In xv6 the kernel runs
+            on its own page table, which does not map user memory at user addresses, so every
+            trap switches tables.
+        why_wrong: "One `csrw satp` in uservec (into the kernel page table) and one in userret (back to the user page table)."
+        explain: |
+          [[uservec]] loads the kernel's `satp` from the trapframe at
+          [[kernel/trampoline.S:92]], and [[userret]] loads the user's at
+          [[kernel/trampoline.S:111]]; each is bracketed by `sfence.vma`. That is why both live
+          on the trampoline page, which is mapped at the same address in both tables. See
+          [[tour:7]] and [[tour:43]].
+      - id: lab10-02
+        level: 2
+        type: choice
+        q: |
+          gdb counted 1,103 instructions from the first instruction of [[uservec]] to `sret` for
+          one `getpid`. Which part of that work does `ugetpid()` keep?
+        options:
+          - text: "None of it: ugetpid is an ordinary call that loads the pid from a page in the process's own address space."
+            correct: true
+            why: |
+              Right. No `ecall`, so no trap, no register save, no page-table switch and no lock.
+              The page-table walk for the load is done by the hardware, usually from the TLB.
+          - text: "The page-table switch: the page with the pid belongs to the kernel, so satp must change to read it."
+            why: |
+              You may have thought kernel-written data needs the kernel page table. The page is
+              mapped into the user page table too, with `PTE_U`; the hardware lets a user load
+              reach it directly.
+          - text: "The register save in uservec, because a load into a0 would destroy a user register."
+            why: |
+              You may be thinking of a trap, which interrupts code that does not expect it.
+              `ugetpid` is a normal function call: the compiler already treats `a0` and the
+              other caller-saved registers as clobbered.
+          - text: "The lock: reading a field of struct proc requires p->lock."
+            why: |
+              [[sys_getpid]] does not take `p->lock` for `p->pid` either; the locks in the count
+              come from [[killed]]. And `ugetpid` does not read `struct proc` at all, only a
+              copy of the pid that never changes.
+        explain: |
+          A system call is expensive because of the boundary, not because of the work. When
+          the answer is a value the process may know, the kernel can publish it in memory the
+          process can read, and the boundary disappears. Linux does the same with its vDSO
+          (`clock_gettime`, `getcpu`).
+  - title: Where in the address space?
+    q: |
+      User code must find the page without asking the kernel, so its address must be fixed and
+      known when the user library is compiled. Look at the user address space ([[tour:25]]):
+      which addresses are already taken, and by what? Pick an address for the per-process page,
+      and check it against everything else that can place memory in a user address space. What
+      else in the kernel has to learn about your choice?
+    hints:
+      - "Read the layout comment in [[kernel/memlayout.h:54]]-[[kernel/memlayout.h:63]] and what grows: the heap, through [[growproc]] and the lazy branch of [[sys_sbrk]] ([[kernel/proc.c:243]], [[kernel/sysproc.c:60]])."
+      - "Text, data and the stack sit at the bottom and are placed by [[kexec]]; the heap grows up from there, and today it may grow all the way to [[TRAPFRAME]]. A fixed page anywhere in that range collides with a large enough heap."
+      - "Take the pages directly below [[TRAPFRAME]] (`TRAPFRAME - PGSIZE`, then one more for the shared page) and lower the heap's ceiling to the lowest of them, in both places that enforce it."
+    answer: |
+      The reference uses `USYSCALL = TRAPFRAME - PGSIZE` = `0x3fffffd000` and, one page lower,
+      `USHARED` = `0x3fffffc000`. The top of the address space is already reserved for
+      kernel-managed pages ([[TRAMPOLINE]], [[TRAPFRAME]]), and the bottom belongs to the
+      program. Between them only the heap can grow, and it used to be allowed to grow up to
+      [[TRAPFRAME]]. So the new pages lower the ceiling: `MAXHEAP = USHARED`, checked in
+      [[growproc]] and in [[sys_sbrk]]'s lazy branch.
+
+      Forgetting the ceiling is clinic 6. Lazily, the heap's `p->sz` could cover the new pages;
+      eagerly, [[uvmalloc]] would try to map a page where one is already mapped. `usertests
+      lazy_sbrk` does exactly that: it grows the heap to the ceiling and then asks for one more
+      byte, and the kernel panics with `mappages: remap`. Worse, `sbrk(-n)` would then call
+      [[uvmdealloc]] over the pages and *free* them, the shared page included.
+
+      The ceiling is not what keeps user stores out: [[vmfault]] refuses a fault on these pages
+      twice over, because the address is at or above `p->sz` ([[kernel/vm.c:463]]) and because
+      the page is already mapped ([[kernel/vm.c:466]]); the second test refuses even if `p->sz`
+      covered the pages (clinic 6 shows it). What the ceiling does is keep `p->sz` from covering
+      them at all. Otherwise the kernel's own reads would treat them as process memory (a later
+      question), eager `sbrk` would panic in [[mappages]], and `sbrk(-n)` would free the shared
+      page while every process maps it.
+
+      One existing test encodes the old ceiling: `lazy_sbrk` expects the last heap page at
+      `TRAPFRAME - PGSIZE` ([[user/usertests.c:2793]]). The reference changes that expected value
+      to `MAXHEAP - PGSIZE`; it is the only change to `usertests`.
+    checks:
+      - id: lab10-03
+        level: 1
+        type: number
+        q: |
+          [[MAXVA]] is `1L << 38`, [[TRAMPOLINE]] is `MAXVA - PGSIZE` and [[TRAPFRAME]] is
+          `TRAMPOLINE - PGSIZE`. What is `USYSCALL = TRAPFRAME - PGSIZE`, in hex?
+        code: kernel/memlayout.h:46-63
+        answer: "0x3fffffd000"
+        wrong:
+          "0x3fffffe000": |
+            That is [[TRAPFRAME]] itself. `USYSCALL` is one page (0x1000) lower.
+          "0x7fffffd000": |
+            You may have used 2^39, the full Sv39 range. xv6 uses one bit less
+            ([[kernel/riscv.h:417]]) to avoid sign-extended addresses, so MAXVA is
+            0x4000000000.
+          "0x3ffffff000": |
+            That is [[TRAMPOLINE]], the very top page.
+        why_wrong: "0x4000000000 - 0x1000 = 0x3ffffff000 (TRAMPOLINE); minus 0x1000 = 0x3fffffe000 (TRAPFRAME); minus 0x1000 again = 0x3fffffd000."
+        explain: |
+          Counting down from [[MAXVA]] = 0x4000000000: trampoline, trapframe, usyscall, ushared.
+          The test output confirms it: the store fault on the page reports
+          `stval=0x3fffffd000`.
+      - id: lab10-04
+        level: 2
+        type: choice
+        q: |
+          You map the two pages but leave the heap ceiling at [[TRAPFRAME]] in [[growproc]] and
+          [[sys_sbrk]]. `usertests lazy_sbrk` grows the heap lazily to `0x3fffffb000`, adds one
+          page eagerly with `sbrk(4096)` so that `p->sz` is `0x3fffffc000`, then calls
+          `sbrk(1)`. What happens?
+        code: kernel/proc.c:236-254
+        options:
+          - text: "growproc lets it through, uvmalloc tries to map 0x3fffffc000, and mappages panics: mappages: remap."
+            correct: true
+            why: |
+              `sz + 1` is still below [[TRAPFRAME]], so [[uvmalloc]] runs, and [[mappages]] finds
+              the shared page's valid PTE there ([[kernel/vm.c:167]]). Clinic 6 shows exactly
+              this panic.
+          - text: "sbrk(1) returns -1, because uvmalloc notices the page is already mapped and fails cleanly."
+            why: |
+              You may have expected [[uvmalloc]] to check first, as [[vmfault]] does with
+              [[ismapped]]. It does not: it calls [[mappages]], which treats an existing valid
+              PTE as a kernel bug and panics.
+          - text: "It succeeds, and the process now has a writable heap page at 0x3fffffc000."
+            why: |
+              That would need [[mappages]] to overwrite the existing PTE. It never does; a
+              remap is always a panic in xv6.
+          - text: "The process is killed with scause 0xf."
+            why: |
+              A kill needs a user instruction that faults. Here nothing faults: the kernel
+              itself is asked to map a page over an existing mapping, inside the system call.
+        explain: |
+          Two independent parts of the kernel decide what lives at an address: the code that
+          maps fixed pages and the heap's ceiling. Adding a fixed page means lowering the
+          ceiling in every place that enforces it, or the two collide. See [[tour:26]] for the
+          eager and lazy `sbrk` paths.
+  - title: Which bits in the PTE, and what does a store do?
+    q: |
+      Choose the permission bits for the two new PTEs. Then predict, step by step, what happens
+      when a user program executes `*(int *)USYSCALL = 1234;`. Which `scause`? Which kernel
+      function is asked to deal with it first, and what must it decide? Could it end up giving
+      the process a fresh writable page at that address?
+    hints:
+      - "Look at the PTE bits in [[kernel/riscv.h:395]]-[[kernel/riscv.h:399]], at how [[uvmalloc]] maps heap pages ([[kernel/vm.c:234]]), and at the fault branch of [[usertrap]] ([[kernel/trap.c:71]])."
+      - "On every user access the hardware checks the PTE: `V` and `U` always, then `R` for a load, `W` for a store, `X` for a fetch. A failed store is a store page fault, `scause` 15, whatever the reason. In this tree [[usertrap]] gives every load or store page fault to [[vmfault]] before giving up."
+      - "`PTE_R | PTE_U`: no `W`, no `X`. Then read [[vmfault]]'s first two tests ([[kernel/vm.c:463]], [[kernel/vm.c:466]]) with `va = 0x3fffffd000` and the process's `p->sz`."
+    answer: |
+      The PTEs get `PTE_R | PTE_U` (plus `PTE_V`, which [[mappages]] adds). `U` makes the page
+      reachable from user mode, `R` lets loads succeed, and the missing `W` and `X` forbid
+      stores and execution. Recorded on the branch, pid 3's page-table entry for
+      `USYSCALL` is `0x21fd4413`: physical page `0x87f51`, flags `0x13` = `V|R|U`.
+
+      The store: the hart finds `W` clear and raises a store/AMO page fault, `scause` = 15, with
+      `stval` = `0x3fffffd000` and `sepc` at the store. [[uservec]] and [[usertrap]] run as for
+      any trap; the fault branch calls [[vmfault]] ([[kernel/trap.c:71]]). Its first test is
+      `va >= psz`, and here `va` is `0x3fffffd000` while `p->sz` was `0x5000` in the recorded
+      run, so it returns 0 at once. [[usertrap]] prints `unexpected scause 0xf` and kills the
+      process.
+
+      Could [[vmfault]] ever allocate a page there? Only if both of its tests passed: the
+      address below `p->sz` (impossible once the heap's ceiling is `USHARED`), and the page not
+      mapped (never true: the page is always mapped). Either test alone is enough. The ceiling test in `vdsotest` checks the worst case: with `p->sz` at its
+      maximum, `0x3fffffc000`, gdb recorded [[vmfault]] declining `va 0x3fffffd000` against
+      `psz 0x3fffffc000`, and the child was killed.
+
+      With `PTE_W` left on (clinic 2) the store simply succeeds: any process can rewrite the pid
+      that its own library reports, and, worse, the shared page, which every other process
+      reads.
+    checks:
+      - id: lab10-05
+        level: 2
+        type: bits
+        q: |
+          gdb read this PTE for `USYSCALL` in `vdsotest`'s page table, after the program had
+          called `ugetpid()`. Decode the flag bits.
+        value: "0x21fd4453"
+        fields:
+          - label: "U (bit 4)"
+            options: ["0", "1"]
+            answer: "1"
+            why: "0x53 = 0101 0011: bit 4 (0x10) is set. Without it, every user access would fault (clinic 1)."
+          - label: "W (bit 2)"
+            options: ["0", "1"]
+            answer: "0"
+            why: "The low nibble 0x3 is bits 0 and 1 (V, R). W is clear, so a user store faults."
+          - label: "A (bit 6)"
+            options: ["0", "1"]
+            answer: "1"
+            why: "0x40 is set. The kernel mapped it as 0x13; the hardware set A when ugetpid loaded from the page, because this tree enables hardware A/D updates (Svadu)."
+          - label: "Physical page number (bits 10 and up)"
+            options: ["0x87f51", "0x21fd4", "0x3fffffd"]
+            answer: "0x87f51"
+            why: "Shift right by 10, not 12: 0x21fd4453 >> 10 = 0x87f51, the page at physical address 0x87f51000, which is p->usyscall for this process."
+        explain: |
+          Flags `0x53` = `V` (1) + `R` (2) + `U` (0x10) + `A` (0x40). The kernel wrote `0x13`;
+          the `A` (accessed) bit appeared after the first user load, set by the hardware because
+          [[kernel/start.c:41]] turns on hardware A/D updates ([[g:svadu]]). See [[g:pte]].
+      - id: lab10-06
+        level: 2
+        type: choice
+        q: |
+          `vdsotest`'s child executes `*(volatile int *)USYSCALL = 1234;` with `p->sz` =
+          `0x5000`. Which statement describes what the kernel does?
+        code: kernel/trap.c:69-79
+        options:
+          - text: "scause is 15; vmfault returns 0 because 0x3fffffd000 >= p->sz; usertrap prints the message and kills the child."
+            correct: true
+            why: |
+              That is the recorded path: gdb stopped in [[vmfault]] at the `va >= psz` test
+              with `va 0x3fffffd000 psz 0x5000`, and the console showed
+              `unexpected scause 0xf pid=4`.
+          - text: "scause is 13, because the page is read-only and so the access counts as a load fault."
+            why: |
+              You may have mixed up the page's permission with the access type. The cause
+              depends on the access: a store is 15 (store/AMO page fault), a load 13.
+          - text: "vmfault allocates a zeroed page at 0x3fffffd000 and the store is retried."
+            why: |
+              That needs `va < p->sz` and an unmapped page. Both tests fail here: the address
+              is far above `p->sz`, and the page is mapped ([[ismapped]]).
+          - text: "The kernel panics in walk, because 0x3fffffd000 is an invalid address."
+            why: |
+              [[walk]] panics only for `va >= MAXVA` (0x4000000000). `0x3fffffd000` is a valid
+              user address; it just is not writable.
+        explain: |
+          The hardware decides *that* the store faults; the kernel decides *what it means*. In
+          this tree a store fault first goes to lazy allocation ([[tour:26]]), so [[vmfault]]
+          must refuse it. It does, twice over: the address is above `p->sz`, and the page is
+          already mapped ([[ismapped]]).
+  - title: Who owns the page, and when does it live?
+    q: |
+      The per-process page needs a physical page and a mapping. Decide when the physical page is
+      allocated, when the pid is written into it, when it is mapped, unmapped and freed. Walk
+      the life of a process that the shell forks and that then `exec`s a program: does your
+      design give the `exec`'d program the page? What happens to the page table `exec` throws
+      away?
+    hints:
+      - "The [[g:trapframe]] is the model: another per-process page at a fixed address near the top of the user address space. Find every line that touches `p->trapframe` or `TRAPFRAME` in `proc.c` and `exec.c`, and note which function each one is in."
+      - "Two lifetimes: the physical page must live as long as the process slot is in use (fork to wait), but `exec` builds a whole new page table and discards the old one ([[kernel/exec.c:138]]), and [[freewalk]] panics if a page table still holds a leaf when it is freed ([[kernel/vm.c:276]])."
+      - "Allocate the page (and write the pid) next to the trapframe's allocation, free it next to the trapframe's free. Map it in the one function that creates every user page table, so `fork` and `exec` both get it; unmap it, without freeing, in that function's mirror."
+    answer: |
+      Like the trapframe, the page has two separate lifetimes:
+
+      | | physical page | mapping |
+      |---|---|---|
+      | created | [[allocproc]], right after the trapframe, which also writes `p->pid` into it | [[proc_pagetable]], after the trapframe's mapping |
+      | destroyed | [[freeproc]], next to `kfree(p->trapframe)` | [[proc_freepagetable]], `uvmunmap(..., USYSCALL, 1, 0)`: unmap, do not free |
+      | how many | one per process slot in use | one per page table that exists |
+
+      [[proc_pagetable]] is called in two places: by [[allocproc]] for a new process, and by
+      [[kexec]] for the new image ([[kernel/exec.c:56]]). Mapping the page there gives both the
+      page automatically. During `exec` two page tables map the same physical page for a
+      moment; when [[kexec]] commits, [[proc_freepagetable]] removes the mapping from the old one
+      ([[kernel/exec.c:138]]). That unmap must not free the page, which the new image is using.
+      Recorded on the branch: `sh` (pid 3) built the new table on hart 2 and dropped the old
+      one on hart 0, both mapping physical page `0x87f51000`.
+
+      What goes wrong otherwise:
+
+      - Map it somewhere only [[allocproc]] reaches (clinic 5): the first program `exec`'d by
+        the shell has no page, and its first `ugetpid()` is a load fault.
+      - Forget to unmap it (clinic 3): [[uvmfree]] only removes the pages below `sz`, and
+        [[freewalk]] finds a leaf PTE at index 509 and panics with `freewalk: leaf`, at the
+        very first `exec`, during boot.
+      - Unmap it with `do_free` = 1 (clinic 4): `exec` frees a page the process still maps, and
+        [[freeproc]] frees it a second time. The free list is corrupted.
+    checks:
+      - id: lab10-07
+        level: 2
+        type: order
+        q: |
+          The shell forks pid 3, which `exec`s `vdsotest`, which exits and is reaped by the
+          shell. Put these events for pid 3's usyscall page in order.
+        items:
+          - text: "allocproc allocates the page and writes 3 into it"
+            why: "Nothing can be mapped before the physical page exists; allocproc runs inside kfork, before the child exists for anyone else."
+          - text: "proc_pagetable maps it into the child's first page table"
+            why: "allocproc calls proc_pagetable after allocating the page, because the mapping needs its physical address."
+          - text: "kexec's call to proc_pagetable maps the same page into the new image's page table"
+            why: "exec builds the complete new page table before it commits to it."
+          - text: "proc_freepagetable unmaps it from the old page table, without freeing it"
+            why: "kexec drops the old page table only after p->pagetable points at the new one (exec.c:133-138)."
+          - text: "freeproc, in the shell's wait, frees the page and removes the last mapping"
+            why: "Only the parent's wait frees a zombie's resources; an exiting process cannot free the page tables it is still running on."
+        why_wrong: "Allocation and the pid come first, then a mapping per page table: the fork's, then exec's new one; exec then drops the old one; freeproc ends the page's life."
+        explain: |
+          The page belongs to the slot from [[allocproc]] to [[freeproc]]; each page table gets its
+          own mapping from [[proc_pagetable]] and loses it in [[proc_freepagetable]]. See
+          [[tour:20]] and [[tour:22]] for where those calls sit in `fork` and `exec`.
+      - id: lab10-08
+        level: 3
+        type: choice
+        q: |
+          You add `uvmunmap(pagetable, USYSCALL, 1, 0)` to [[proc_pagetable]]'s error paths but
+          forget it in [[proc_freepagetable]]. When does the kernel first notice?
+        code: kernel/vm.c:262-290
+        options:
+          - text: "During boot: the first process's exec of /init frees its first page table, and freewalk panics with freewalk: leaf."
+            correct: true
+            why: |
+              The first process starts with a page table from [[userinit]]'s [[allocproc]] and
+              immediately `exec`s `/init` in [[forkret]]; [[kexec]] frees the old table, and
+              [[freewalk]] finds the `USYSCALL` leaf. Clinic 3 recorded exactly that, before
+              `init: starting sh`.
+          - text: "When the first process exits, because exit frees the page table."
+            why: |
+              You may have forgotten that `exec` frees a page table too, and that every program
+              is started by `exec`. The first free happens long before any exit.
+          - text: "Never: uvmfree removes all user pages, including this one."
+            why: |
+              [[uvmfree]] unmaps only `[0, sz)` ([[kernel/vm.c:288]]); the page is far above
+              `sz`. Then [[freewalk]] insists that no leaf remains.
+          - text: "Only when the page is freed twice, much later."
+            why: |
+              That is a different bug (unmapping *with* `do_free`). Here nothing is freed
+              twice; the walk refuses to free a table that still maps something.
+        explain: |
+          [[freewalk]] is a safety net: it frees page-table pages and panics if it finds a valid
+          leaf, because that would mean a mapping was forgotten, and the physical page behind it
+          would leak or stay reachable. Every page mapped outside `[0, sz)` must be unmapped
+          explicitly, which is why [[proc_freepagetable]] lists [[TRAMPOLINE]] and
+          [[TRAPFRAME]] by name.
+  - title: What do fork and exec give the new image?
+    q: |
+      After your answer to the previous question, check two cases by reading code, not by
+      assumption. A forked child must see *its* pid, not its parent's: is there any way the
+      parent's page, or its contents, could end up in the child? And after `exec`, could the new
+      image see a stale value?
+    hints:
+      - "Read [[kfork]] ([[kernel/proc.c:258]]) and the loop in [[uvmcopy]] ([[kernel/vm.c:299]]): which virtual addresses does it copy?"
+      - "[[uvmcopy]] copies the pages in `[0, sz)` only. Everything above `sz` in the child's page table was put there by [[proc_pagetable]] when [[allocproc]] built it."
+      - "The child's page is new and was filled in by [[allocproc]] with the child's pid. `exec` keeps the same `struct proc` and therefore the same page and the same pid."
+    answer: |
+      [[kfork]] calls [[allocproc]] first, which allocates a fresh page and writes the child's
+      pid into it (gdb recorded pid 3's page at `0x87f51000` while the shell, pid 2, had
+      `0x87f52000`), then maps it in the child's new page table. [[uvmcopy]] copies only
+      `[0, p->sz)` ([[kernel/proc.c:271]]), far below `USYSCALL`, so the parent's page is never
+      copied or shared. That is also why the mapping must not be made by copying the parent's
+      PTE: the child would then read the parent's pid.
+
+      `exec` does not create a process; [[kexec]] reuses `p`, so `p->usyscall` and the pid in it
+      are unchanged, and the new page table maps the same page. `vdsotest`'s fork and exec
+      checks confirm both: the child, and a child that `exec`s `vdsotest exec`, compare
+      `ugetpid()` with `getpid()` and exit 0.
+
+      The shared page is the opposite case on purpose: every page table maps the *same*
+      physical page, so a forked child and its parent read the same `ticks`.
+    checks:
+      - id: lab10-09
+        level: 2
+        type: tf
+        q: |
+          True or false: in the reference design, [[uvmcopy]] copies the parent's usyscall page
+          into the child, and [[kfork]] then overwrites the pid in the copy.
+        answer: false
+        why_tf: |
+          You may have assumed that fork copies the whole address space. It copies `[0, sz)`;
+          the pages above, like the trapframe, are created per process.
+        reasons:
+          - text: "The child's page is a new page from allocproc, mapped by proc_pagetable; uvmcopy never sees addresses above p->sz."
+            correct: true
+            why: |
+              Right. The child's pid is written in [[allocproc]] before [[uvmcopy]] runs at all.
+          - text: "uvmcopy skips the page because it has no PTE_W."
+            why: |
+              You may be thinking of copy-on-write designs. [[uvmcopy]] in this tree copies
+              read-only pages too (text has no `W`); it skips this page because of its address,
+              not its flags.
+          - text: "uvmcopy skips the page because it is unmapped in the parent."
+            why: |
+              The page is mapped in the parent. [[uvmcopy]] never reaches it because its loop
+              stops at `sz`.
+        explain: |
+          The address space has two parts: `[0, sz)`, which is the program's memory and is
+          copied by `fork` and replaced by `exec`, and the fixed pages at the top, which
+          [[proc_pagetable]] creates for every page table. See [[tour:25]].
+  - title: The kernel reads and writes user memory too
+    q: |
+      Your pages are mapped and read-only. Now a program passes their address to a system call:
+      `read(fd, (char *)USYSCALL, 8)` asks the kernel to write the page, and
+      `write(fd, (char *)USHARED, 8)` asks it to read it. The kernel does not use the user's PTE
+      the way the hardware does. What happens to each call? Is either result a problem? Run
+      `usertests -q` at this point if you have built that far.
+    hints:
+      - "The kernel copies with [[copyout]] and [[copyin]]. Both translate the user address with [[walkaddr]] ([[kernel/vm.c:122]]) and then use `memmove` on a physical address, through the kernel's [[g:direct-map]] of RAM."
+      - "[[walkaddr]] checks only `PTE_V` and `PTE_U`. [[copyout]] adds a software check for `PTE_W` ([[kernel/vm.c:364]]); [[copyin]] adds nothing. Now read `usertests lazy_copy` ([[user/usertests.c:2712]]-[[user/usertests.c:2738]]), and look at which addresses it lists."
+      - "Find the rule xv6 already applies to user pointers in other places (how does the kernel decide whether an address is part of the process's memory?), and make the copy routines that read user memory apply it too."
+    answer: |
+      `read` into `USYSCALL` fails: [[copyout]] finds the page through [[walkaddr]], then sees
+      that `PTE_W` is clear and returns -1. Good.
+
+      `write` from `USHARED` succeeds: [[copyin]] finds a valid `PTE_U` page and copies from it.
+      Reading a read-only page is not dangerous in itself, but it changes behaviour that a test
+      relies on. `usertests lazy_copy` lists `0x3fffffc000` and `0x3fffffd000` among
+      addresses that `read` and `write` must reject, because nothing used to be mapped there.
+      With the pages mapped, the test fails, from commit 3 on (recorded at commit 4):
+
+      ```text
+      $ usertests lazy_copy
+      usertests starting
+      test lazy_copy: write succeeded
+      FAILED
+      SOME TESTS FAILED
+      ```
+
+      The fix states a rule the kernel already half-follows: a system call may only touch the
+      process's memory, below `p->sz`. [[fetchaddr]] enforces it byte by byte and [[vmfault]]
+      for faults; the reference adds `if (va0 >= psz) return -1;` to [[copyin]] and
+      [[copyinstr]]. That test is page-granular: it refuses pages that start at or above
+      `p->sz` (below `PGROUNDUP(p->sz)` everything is as before, including the bytes between
+      `sz` and the end of its page). [[copyout]] needs no
+      change because its `PTE_W` test already refuses both pages. Every caller of [[copyin]]
+      passes the calling process's own `sz` (even [[pipewrite]], which names it `pr`,
+      [[kernel/pipe.c:96]]), so nothing below `sz` is affected.
+
+      (Linux makes the opposite choice: its vDSO pages may be passed to `write`. Either is
+      consistent; this tree's tests encode the stricter one.)
+    checks:
+      - id: lab10-10
+        level: 2
+        type: match
+        q: |
+          Before the [[copyin]] fix, match each access to the new pages with what happens.
+        pairs:
+          - left: "a user store to USYSCALL"
+            right: "store page fault; vmfault declines; the process is killed"
+            why: "The hardware checks PTE_W on a user store. Only the kernel's own copies bypass that check."
+          - left: "read(fd, USYSCALL, 8)"
+            right: "copyout sees no PTE_W and returns -1"
+            why: "copyout writes through the direct map, so nothing faults; its software test of PTE_W is what refuses."
+          - left: "write(fd, USHARED, 8)"
+            right: "copyin copies 8 bytes; write returns 8"
+            why: "copyin asks walkaddr only for V and U, both present. That is what usertests lazy_copy catches."
+          - left: "a user load from USHARED"
+            right: "succeeds: the hardware finds V, R and U"
+            why: "That is the point of the page: a load needs R and U, nothing more."
+        explain: |
+          Two different checkers look at the same PTE: the hardware on user accesses, and the
+          kernel's own code in [[copyin]] and [[copyout]], which access memory through the
+          kernel page table. A design has to be right for both. See [[tour:28]].
+  - title: One page for everyone, read with no lock
+    q: |
+      `uptime()` returns `ticks`, which [[clockintr]] increments on hart 0 under `tickslock`, and
+      [[sys_uptime]] reads under the same lock. For `uuptime()` the kernel copies `ticks` into
+      one page shared by all processes, and user code reads it with no lock at all (it could
+      not take a kernel spinlock anyway). Where does the page come from, and who may free it?
+      Then the hard part: on three harts, can a reader see a value that was never written? Can
+      the compiler or the hardware make the read return something stale forever?
+    hints:
+      - "Read [[clockintr]] ([[kernel/trap.c:166]]-[[kernel/trap.c:180]]) and [[sys_uptime]]. Who writes `ticks`, on which hart, under which lock? Look at the concept page on [[concept:locks#unlocked|shared data with no lock]]."
+      - "A RISC-V load or store of a naturally aligned 32-bit word is single-copy atomic: another hart sees the whole old value or the whole new one. But a compiler may keep a value it has already loaded in a register, unless the access is `volatile` (or atomic). And two separate words can be seen in any mix of old and new."
+      - "Allocate one page at boot (after the allocator exists, before the first process), never free it, map it in every user page table, and in [[clockintr]] store the new `ticks` into it inside the existing critical section. Read it in user code through a `volatile` pointer."
+    answer: |
+      **The page.** [[trapinit]] runs on hart 0 during boot, after [[kinit]] and before
+      [[userinit]]; the reference allocates the page there with [[kalloc]] and zeroes it
+      (recorded: `0x87f59000`). Every user page table maps that same physical page at `USHARED`.
+      Nobody owns it, so nobody frees it: [[proc_freepagetable]] unmaps it with `do_free` = 0.
+      Freeing it when one process exits would put a page on the free list that every other
+      process still maps and that [[clockintr]] still writes, ten times a second.
+
+      **The write.** [[clockintr]] adds `ushared->ticks = ticks;` right after `ticks++`, inside
+      `tickslock`. The lock is not needed against readers (they take none), but [[clockintr]]
+      already holds it and there is only one writer, hart 0. In this build the store is one
+      `sw a5,0(a4)` at `0x8000267c`.
+
+      **The read.** `uuptime()` compiles to one `lw`. RVWMO makes an aligned 32-bit load or
+      store single-copy atomic, so a reader on hart 1 sees either the old count or the new
+      one, never two halves. Staleness is bounded too: the store becomes visible to other harts
+      in finite time, and each call of `uuptime()` loads again because the pointer is
+      `volatile`. Without `volatile`, a loop like `while (uuptime() == t0)` may be compiled
+      into one load followed by an endless loop (here `uuptime` is a separate function in
+      `ulib.c`, which hides the problem; inline it and it may appear). The strictly portable C
+      would use `__atomic_store_n` and `__atomic_load_n` with `__ATOMIC_RELAXED`.
+
+      **When this is not enough.** A single value is consistent by itself. Two values that must
+      agree (ticks and a timestamp of the last tick, or a 64-bit counter written as two 32-bit
+      halves) can be read half-updated. That needs a sequence counter: the writer increments it
+      before and after the update, and the reader retries if it saw an odd value or a change.
+      That is how the Linux vDSO publishes the time.
+
+      **Ordering against uptime().** `vdsotest` checks `uptime() <= uuptime() <= uptime()`.
+      [[clockintr]] stores the copy before [[release]], whose `fence rw,w` publishes it with
+      `ticks`; a later [[sys_uptime]] acquires `tickslock` after that release, so the first
+      `uptime()` is never ahead of the copy. Conversely, a value the reader saw was stored inside
+      a critical section, and the following [[sys_uptime]] acquires the lock after that
+      section's release, so the second `uptime()` is never behind it. The check passed in every
+      recorded run.
+    checks:
+      - id: lab10-11
+        level: 2
+        type: multi
+        q: |
+          `uuptime()` reads the shared page with no lock while [[clockintr]] on hart 0 writes it.
+          Which statements are true for this tree on RISC-V?
+        options:
+          - text: "A reader can never see half of an old value and half of a new one."
+            correct: true
+            why: |
+              `ticks` is a naturally aligned 32-bit word, written by one `sw` and read by one
+              `lw`; RVWMO makes such accesses single-copy atomic.
+          - text: "Without volatile, the compiler may reuse a value it loaded earlier, so a waiting loop could spin forever."
+            correct: true
+            why: |
+              Nothing in the C code tells the compiler that memory at `USHARED` changes, so it
+              may keep the first load in a register. `volatile` forces a load on every read.
+          - text: "Readers must take tickslock, or they could read a value that was never written."
+            why: |
+              You may be applying the rule "shared data needs a lock" mechanically. A lock is
+              needed to keep several updates consistent or to make read-modify-write atomic.
+              Here there is one writer and one word, and the readers only read.
+          - text: "If the page also held the time of the last tick, a reader could pair a new ticks with an old time."
+            correct: true
+            why: |
+              Two separate words are not updated atomically together. That is when a sequence
+              counter (or a lock) becomes necessary.
+          - text: "The hardware may tear the load into two 16-bit halves when another hart writes at the same moment."
+            why: |
+              You may be thinking of misaligned or multi-word accesses. An aligned 32-bit `lw`
+              on RISC-V is one single-copy-atomic access.
+        explain: |
+          Correctness without a lock rests on three facts here: one writer, one aligned word, and
+          a `volatile` read. Change any of them (two writers doing `++`, two words, a packed
+          struct) and you need a lock or atomics. See [[concept:locks#unlocked]] and
+          [[tour:19]].
+      - id: lab10-12
+        level: 1
+        type: choice
+        q: |
+          [[proc_freepagetable]] unmaps the shared page. Which `do_free` argument is right, and
+          why?
+        options:
+          - text: "0: the page is mapped by every process and written by clockintr; it must never return to the free list."
+            correct: true
+            why: |
+              Right. It is allocated once in [[trapinit]] and lives until the machine stops.
+          - text: "1: the last process to exit should free it."
+            why: |
+              You may be thinking of reference counting. Nothing counts the mappings, so the
+              very first [[proc_freepagetable]] (init's `exec` of `/init`, during boot) would
+              free it, and the page always has a user: [[clockintr]].
+          - text: "1, because uvmunmap ignores do_free for pages that other page tables map."
+            why: |
+              [[uvmunmap]] knows nothing about other page tables. With `do_free` = 1 it calls
+              [[kfree]] on whatever physical page the PTE names.
+          - text: "It does not matter: kfree refuses pages that are still mapped."
+            why: |
+              [[kfree]] only checks alignment and range ([[kernel/kalloc.c:51]]). It cannot know
+              whether any page table still maps the page.
+        explain: |
+          Shared and per-process pages differ in exactly this: a per-process page dies with its
+          owner, a shared page with nobody. Clinic 4 shows how a page freed while still mapped
+          corrupts the allocator's free list.
+  - title: How do you measure the difference?
+    q: |
+      You want numbers: how long one `getpid()` takes versus one `ugetpid()`. The best clock is
+      the `time` CSR, which [[clockintr]] reads with `rdtime`. Can a user program execute
+      `rdtime` in this tree? If not, what clock can you use from user mode, and how many calls
+      must you make for the answer to be meaningful?
+    hints:
+      - "Read [[timerinit]] ([[kernel/start.c:56]]-[[kernel/start.c:66]]): which counter-enable register is written, and for which mode? Is any other one written anywhere?"
+      - "Each privilege mode needs its own permission: `mcounteren` lets S-mode read the counters, `scounteren` lets U-mode. A disallowed `rdtime` is an illegal instruction, `scause` 2."
+      - "Use ticks. A tick is about 0.1 s (`1000000` counts of the `time` CSR, which runs at 10 MHz on QEMU's virt machine), so count how many calls fit into, say, 20 ticks, and read the clock with `uuptime()` so that the timing loop itself makes no system call."
+    answer: |
+      No. [[timerinit]] sets bit 1 (`TM`) of [[g:csr-mcounteren]] so that S-mode may read `time`
+      ([[kernel/start.c:62]]), but nothing writes `scounteren`, so U-mode may not. `vdsotest
+      time` checks it: its child executes `rdtime` and is killed with `scause 0x2` (illegal
+      instruction) and `stval=0xc01027f3`, the instruction's own encoding (`rdtime a5`).
+
+      So the measurement counts calls per tick: 1,000 calls at a time until `uuptime()` has
+      advanced 20 ticks (about 2 seconds). Results from a recorded run on 3 harts:
+      `getpid()` 175,000 calls (about 11,400 ns each), `ugetpid()` 88,831,000 calls (about
+      22 ns each). The resolution is one tick in 20, 5%, plenty for a 500-fold difference.
+
+      These are QEMU numbers. Counting instructions per iteration of the timing loop (the
+      loop's own `jalr`, `addiw`, `bnez` included): 1,109 for `getpid` against 15 for
+      `ugetpid`, a factor of about 74. The remaining factor of about 7 is time per
+      instruction: QEMU spends far longer per instruction on the kernel path. Translation-cache
+      flushes are a large share of that: an experiment that removed the four
+      `sfence.vma` from the trampoline (an experiment only; real hardware needs them) cut
+      `getpid` by about a third, from about 11,700-12,300 ns to about 7,900-8,200 ns, with
+      `ugetpid` unchanged. We did not measure the rest. Real hardware has different ratios,
+      but a trap with two page-table switches is expensive everywhere.
+    checks:
+      - id: lab10-13
+        level: 2
+        type: choice
+        q: |
+          A user program on this kernel executes `rdtime a5` (as `vdsotest time`'s probe does). What happens?
+        code: kernel/start.c:54-66
+        options:
+          - text: "An illegal-instruction exception (scause 2); usertrap kills the process."
+            correct: true
+            why: |
+              U-mode access to `time` needs `scounteren.TM`, which nobody sets. Recorded:
+              `usertrap(): unexpected scause 0x2` with `stval=0xc01027f3`, the encoding of
+              `rdtime a5`.
+          - text: "It reads the time, because mcounteren.TM is set in start.c."
+            why: |
+              You may have read `mcounteren` as "counters for everyone". It grants access to
+              the next lower mode, S. U-mode needs S-mode's `scounteren` as well.
+          - text: "It traps to the kernel, which emulates the instruction and returns the time."
+            why: |
+              Some kernels do emulate such instructions; xv6 does not. Its [[usertrap]] kills
+              the process for any cause it does not recognize.
+          - text: "It returns 0, because the counter is disabled."
+            why: |
+              A disabled counter is not read as 0; the access itself is illegal and raises an
+              exception.
+        explain: |
+          Counter access is delegated mode by mode: M-mode's `mcounteren` decides what S-mode may
+          read, S-mode's `scounteren` what U-mode may read. Setting `scounteren.TM` would let
+          user code time itself precisely, and a real vDSO uses exactly that for
+          `clock_gettime`. See [[g:csr-time]].
+build: |
+  **Start.**
+
+  ```text
+  git checkout -b my-vdso 06aad25
+  ```
+
+  Write the test first: copy the spec's checks into `user/vdsotest.c` and add
+  `$U/_vdsotest\` to `UPROGS` in the `Makefile`. Until the library functions exist it will not
+  link; that is fine, it tells you what to build.
+
+  **Milestones, in an order that keeps the system bootable after each one.**
+
+  1. **The layout.** `USYSCALL`, `USHARED`, the two structs and the heap's new ceiling in
+     `kernel/memlayout.h`; use the ceiling in [[growproc]] and [[sys_sbrk]]; update the one
+     expected value in `usertests lazy_sbrk`. Guard the structs with `#ifndef __ASSEMBLER__`:
+     `trampoline.S` includes `memlayout.h`. Test: `usertests -q`.
+  2. **The physical page.** A `struct usyscall *usyscall` field in `struct proc`; allocate,
+     zero and fill it in [[allocproc]], free it in [[freeproc]]. Test: `usertests -q` (the page
+     exists but nothing maps it; a leak would show in the free-page checks).
+  3. **The mapping.** Map it read-only in the function that builds user page tables, unmap it
+     in the one that frees them, and undo it in the error path. Test: boot. If the kernel
+     panics before the shell prompt, read clinic 3. From here until milestone 5, `usertests
+     -q` fails at `lazy_copy` (`write succeeded`); that is expected.
+  4. **The shared page.** Allocate it in [[trapinit]], update it in [[clockintr]], map and
+     unmap it like the per-process page (but never free it).
+  5. **The kernel's copies.** Run `usertests -q`: `lazy_copy` fails with `write succeeded`.
+     Make [[copyin]] and [[copyinstr]] refuse addresses at or above `psz`. Test: `usertests -q`.
+  6. **The library and the test.** `ugetpid` and `uuptime` in `user/ulib.c`, prototypes in
+     `user/user.h`. Test: `vdsotest`, then `usertests -q`, then `vdsotest` again.
+
+  **Debugging advice.** To catch anything during boot (clinic 3 panics before the shell
+  starts), start QEMU halted with `make qemu-gdb` (it adds `-S` and a gdb port of its own,
+  which it writes into `.gdbinit`), run `${TOOLPREFIX}gdb kernel/kernel` in another
+  terminal, and set breakpoints before the first `continue`. `TOOLPREFIX` is your RISC-V
+  toolchain's prefix, the same one xv6's Makefile detects (`riscv64-unknown-elf-`,
+  `riscv64-linux-gnu-` or `riscv64-elf-`); set it with `export
+  TOOLPREFIX=riscv64-unknown-elf-` or whichever you have. On Debian/Ubuntu/WSL,
+  `gdb-multiarch` also works as the debugger.
+
+  - `usertrap(): unexpected scause 0xd ... stval=0x3fffffd000` at the first `ugetpid()`: the
+    load faulted. Print the PTE. From a kernel breakpoint (for example on [[setkilled]]), walk
+    `myproc()->pagetable` for `0x3fffffd000` by hand: indices 255, 511 and 509 at levels 2, 1
+    and 0, each PTE's physical page number shifted left by 12 to reach the next table (the
+    kernel's direct map lets gdb read those physical addresses directly). No PTE means the page was not mapped in *this* page table (was it
+    `exec`'d?); a PTE without `0x10` means `PTE_U` is missing.
+  - `panic: freewalk: leaf` while booting: some page above `sz` is still mapped when a page
+    table is freed. `bt` shows which free ([[kexec]] or [[freeproc]]); `p i` in the innermost
+    [[freewalk]] frame gives the index, 509 for `USYSCALL`, 508 for `USHARED`.
+  - `panic: mappages: remap` from [[growproc]]: the heap reached the new pages.
+  - Strange pids or a crash in [[kalloc]]: a page was freed while still mapped, or twice.
+    Break on [[kfree]] with the condition `pa == <the page's address>` and look at each `bt`.
+  - To see user code from gdb, set breakpoints on user addresses from `user/vdsotest.asm`
+    and condition them (the same address exists in every program); `x/i $pc` shows the
+    instruction.
+clinic:
+  - bug: The PTE has no PTE_U
+    change: |
+      The usyscall mapping copies the trapframe's mapping and drops `PTE_W`, leaving `PTE_R`
+      only:
+
+      ```diff
+         if (mappages(pagetable, USYSCALL, PGSIZE, (uint64)(p->usyscall),
+      -               PTE_R | PTE_U) < 0) {
+      +               PTE_R) < 0) {
+      ```
+    symptom: |
+      $ vdsotest
+      usertrap(): unexpected scause 0xd pid=3
+                  sepc=0x980 stval=0x3fffffd000
+      $ usertests -q
+      usertests starting
+      [...]
+      ALL TESTS PASSED
+
+      # gdb, breakpoint on setkilled (rerun):
+      setkilled: {'hart': 0, 'noff': 0, 'intena': 0, 'sie': 0, 'pid': 3, 'name': 'vdsotest'} scause 0xd stval 0x3fffffd000 sepc 0x980
+        frames ['setkilled', 'usertrap', '0x3ffffff09c']
+        p->usyscall 0x87f51000 pid in page 3
+        pagetable 0x87f21000
+        PTE for 0x3ffffff000: 0x2000184b
+        PTE for 0x3fffffe000: 0x21fcfcc7
+        PTE for 0x3fffffd000: 0x21fd4403
+        PTE for 0x3fffffc000: 0x21fd6413
+    why: |
+      `vdsotest`'s first check calls `ugetpid()`, whose `lw` at `0x980` loads from
+      `0x3fffffd000`. The PTE exists and the pid is correct in the page (gdb read 3), but its
+      flags are `0x03` = `V|R`: without `U`, a user-mode access faults whatever the other bits
+      say. A load fault is `scause` 13 (`0xd`). [[usertrap]] hands it to [[vmfault]], which
+      declines because the address is above `p->sz`, and kills the process before it prints a
+      single line.
+
+      `usertests` passes: nothing in it reads the new page. The trapframe and trampoline are
+      mapped without `PTE_U` on purpose, because only S-mode code uses them; this page exists
+      only for user mode.
+  - bug: PTE_W is left on
+    change: |
+      Both pages are mapped like the trapframe, with `PTE_W`, plus `PTE_U`:
+
+      ```diff
+         if (mappages(pagetable, USYSCALL, PGSIZE, (uint64)(p->usyscall),
+      -               PTE_R | PTE_U) < 0) {
+      +               PTE_R | PTE_W | PTE_U) < 0) {
+      [...]
+         if (mappages(pagetable, USHARED, PGSIZE, (uint64)ushared,
+      -               PTE_R | PTE_U) < 0) {
+      +               PTE_R | PTE_W | PTE_U) < 0) {
+      ```
+
+      To see the effect we added a small program, `forge` (not part of the branch), that stores
+      1 at `USYSCALL` and 1000000 at `USHARED`.
+    symptom: |
+      $ forge
+      forge: getpid() 3, ugetpid() 3
+      forge: after the store, ugetpid() 1
+      forge: uptime() 1, uuptime() 1000000
+      $ vdsotest
+      vdsotest: pid: OK
+      vdsotest: uptime agrees: OK
+      vdsotest: uptime advances: OK
+      vdsotest: usyscall read-only: FAIL
+      vdsotest: ushared read-only: FAIL
+      vdsotest: read() into usyscall fails: FAIL
+      vdsotest: write() from ushared fails: OK
+      vdsotest: pid unchanged: FAIL
+      vdsotest: heap ceiling: FAIL
+      vdsotest: fork: FAIL
+      vdsotest: exec: OK
+      vdsotest: 20 children: OK
+      vdsotest: SOME TESTS FAILED
+      $ usertests -q
+      usertests starting
+      [...]
+      test lazy_copy: read succeeded
+      FAILED
+      SOME TESTS FAILED
+    why: |
+      With `W` set, user stores just succeed. `forge` makes its own `ugetpid()` report pid 1,
+      and its store to the shared page makes `uuptime()` report 1,000,000 ticks, in *every*
+      process, until hart 0's next [[clockintr]] overwrites it. A per-process page that the
+      process can write is merely useless; a writable shared page lets any process lie to all
+      the others.
+
+      The kernel is fooled as well. [[copyout]]'s only defence is its `PTE_W` test
+      ([[kernel/vm.c:364]]), so `read(fd, USYSCALL, 8)` now succeeds and writes 8 bytes of
+      `README` over the pid: `read() into usyscall fails: FAIL`, and from then on
+      `pid unchanged` and `fork` (which compares the parent's `ugetpid()` with `getpid()`)
+      fail too. `heap ceiling` fails because the child's final store survives. `usertests
+      lazy_copy` catches the same `read`.
+  - bug: The page is not unmapped in proc_freepagetable
+    change: |
+      The page is mapped in [[proc_pagetable]], but its mirror forgets it:
+
+      ```diff
+       proc_freepagetable(pagetable_t pagetable, uint64 sz)
+       {
+         uvmunmap(pagetable, TRAMPOLINE, 1, 0);
+         uvmunmap(pagetable, TRAPFRAME, 1, 0);
+      -  uvmunmap(pagetable, USYSCALL, 1, 0);
+         uvmunmap(pagetable, USHARED, 1, 0); // shared: never free it
+         uvmfree(pagetable, sz);
+       }
+      ```
+    symptom: |
+      xv6 kernel is booting
+
+      hart 2 starting
+      hart 1 starting
+      panic: freewalk: leaf
+
+      # gdb, breakpoint on panic (rerun):
+      #0  panic (s=s@entry=0x80007138 "freewalk: leaf") at kernel/printk.c:139
+      #1  0x000000008000137c in freewalk (pagetable=0x87f51000) at kernel/vm.c:276
+      #2  0x000000008000139a in freewalk (pagetable=0x87f52000) at kernel/vm.c:273
+      #3  0x000000008000139a in freewalk (pagetable=pagetable@entry=0x87f53000) at kernel/vm.c:273
+      #4  0x00000000800013c8 in uvmfree (pagetable=pagetable@entry=0x87f53000, sz=sz@entry=0) at kernel/vm.c:289
+      #5  0x0000000080001b98 in proc_freepagetable (pagetable=0x87f53000, sz=sz@entry=0) at kernel/proc.c:248
+      #6  0x0000000080004c1a in kexec (path=path@entry=0x80007180 "/init", argv=argv@entry=0x3fffffdfd0) at kernel/exec.c:138
+      #7  0x0000000080001990 in forkret () at kernel/proc.c:566
+      [...]
+        frame freewalk {'i': '0x1fd', 'pagetable': '0x87f51000', '$s0': '0x3fffffdd10', '$s1': '0x87f51fe8', '$s2': '0x87f52000', '$s3': '0x87f51000', '$a0': '0x80007138'}
+        frame freewalk {'i': '0x1ff', 'pagetable': '0x87f52000', '$s0': '0x3fffffdd40', '$s1': '0x87f52ff8', '$s2': '0x87f53000', '$s3': '0x87f52000', '$a0': '0x80007138'}
+        frame freewalk {'i': '0xff', 'pagetable': '0x87f53000', '$s0': '0x3fffffdd70', '$s1': '0x87f537f8', '$s2': '0x87f54000', '$s3': '0x87f53000', '$a0': '0x80007138'}
+    why: |
+      The kernel never reaches the shell. The very first process is created by [[userinit]]
+      with an empty user image (`sz` 0) and, in [[forkret]], `exec`s `/init`. [[kexec]] builds
+      the new page table and frees the old one with [[proc_freepagetable]] (frame #6). The old
+      table still maps `USYSCALL`. [[uvmfree]] removes only the pages in `[0, sz)`, none here,
+      and then [[freewalk]] descends the three levels (frames #3, #2, #1, following index 255,
+      then 511, then 509) and at index `0x1fd` = 509 of the level-0 table finds a valid leaf:
+      `USYSCALL` is `0x3fffffd000`, whose level-0 index is `(0x3fffffd000 >> 12) & 0x1ff` =
+      509. It panics rather than free a table through which a page is still reachable.
+
+      The panic is a feature: without it the page-table pages would be freed with a live
+      mapping inside, and the physical page would be unreachable for the rest of the
+      process's life. Every page outside `[0, sz)` has to be unmapped by name, as
+      [[TRAMPOLINE]] and [[TRAPFRAME]] already are.
+  - bug: The page is freed twice
+    change: |
+      [[proc_freepagetable]] unmaps the page with `do_free` = 1, while [[freeproc]] still frees
+      `p->usyscall` itself:
+
+      ```diff
+         uvmunmap(pagetable, TRAPFRAME, 1, 0);
+      -  uvmunmap(pagetable, USYSCALL, 1, 0);
+      +  uvmunmap(pagetable, USYSCALL, 1, 1);
+      ```
+    symptom: |
+      $ vdsotest
+      vdsotest: pid: FAIL
+      vdsotest: uptime agrees: OK
+      vdsotest: uptime advances: OK
+      usertrap(): unexpected scause 0xf pid=4
+                  sepc=0x14 stval=0x3fffffd000
+      vdsotest: usyscall read-only: OK
+      usertrap(): unexpected scause 0xf pid=5
+                  sepc=0x2e stval=0x3fffffc000
+      vdsotest: ushared read-only: OK
+      vdsotest: read() into usyscall fails: OK
+      vdsotest: write() from ushared fails: OK
+      vdsotest: pid unchanged: FAIL
+      scause=0xd sepc=0x80000b2e stval=0x800e022e4061141
+      panic: kerneltrap
+
+      # gdb (rerun, same console output), breakpoints on the unmap in proc_freepagetable,
+      # on freeproc's kfree, on sys_getpid and on panic:
+      [...]
+      allocproc: {'hart': 0, 'noff': 1, 'intena': 0, 'sie': 0} pid 1 p->usyscall 0x87f54000
+      unmap-free USYSCALL: {'hart': 0, 'noff': 0, 'intena': 0, 'sie': 0, 'pid': 1, 'name': 'init'} pagetable 0x87f53000 PTE 0x21fd5013 frames ['proc_freepagetable', 'kexec', 'forkret', 'myproc']
+      allocproc: {'hart': 0, 'noff': 1, 'intena': 1, 'sie': 0, 'pid': 1, 'name': 'init'} pid 2 p->usyscall 0x87f52000
+      unmap-free USYSCALL: {'hart': 0, 'noff': 0, 'intena': 1, 'sie': 1, 'pid': 2, 'name': 'sh'} pagetable 0x87f51000 PTE 0x21fd4813 frames ['proc_freepagetable', 'kexec', 'sys_exec', 'syscall', 'usertrap', '0x3ffffff09c']
+      allocproc: {'hart': 1, 'noff': 1, 'intena': 1, 'sie': 0, 'pid': 2, 'name': 'sh'} pid 3 p->usyscall 0x87f51000
+      unmap-free USYSCALL: {'hart': 1, 'noff': 0, 'intena': 1, 'sie': 1, 'pid': 3, 'name': 'vdsotest'} pagetable 0x87f54000 PTE 0x21fd4413 frames ['proc_freepagetable', 'kexec', 'sys_exec', 'syscall', 'usertrap', '0x3ffffff09c']
+      sys_getpid: {'hart': 1, 'noff': 0, 'intena': 1, 'sie': 1, 'pid': 3, 'name': 'vdsotest'} p->usyscall 0x87f51000 first 8 bytes 0x87f19000 next 8 0x101010101010101
+      allocproc: {'hart': 0, 'noff': 1, 'intena': 1, 'sie': 0, 'pid': 3, 'name': 'vdsotest'} pid 4 p->usyscall 0x87f54000
+      freeproc kfree: {'hart': 0, 'noff': 2, 'intena': 1, 'sie': 0, 'pid': 3, 'name': 'vdsotest'} p->pid 4 p->usyscall 0x87f54000 frames ['freeproc', 'kwait', 'sys_wait', 'syscall', 'usertrap', '0x3ffffff09c']
+      unmap-free USYSCALL: {'hart': 0, 'noff': 2, 'intena': 1, 'sie': 0, 'pid': 3, 'name': 'vdsotest'} pagetable 0x87f47000 PTE 0x21fd5013 frames ['proc_freepagetable', 'freeproc', 'kwait', 'sys_wait', 'syscall', 'usertrap', '0x3ffffff09c']
+      [...]
+      panic: {'hart': 1, 'noff': 2, 'intena': 1, 'sie': 0, 'pid': 3, 'name': 'vdsotest'} frames ['panic', 'kerneltrap', 'kernelvec']
+      #0  panic (s=s@entry=0x80007390 "kerneltrap") at kernel/printk.c:139
+      #1  0x000000008000289c in kerneltrap () at kernel/trap.c:159
+      #2  0x0000000080005728 in kernelvec () at kernel/kernelvec.S:38
+      Backtrace stopped: frame did not save the PC
+      interrupted: sepc 0x80000b2e kalloc + 32 in section .text s1 0x800e022e4061141 fp 0x3fffff9e90
+        saved ra 0x80000b24 kalloc + 22 in section .text
+        ra 0x80000fb8 walk + 122 in section .text
+        ra 0x8000105a mappages + 72 in section .text
+        ra 0x8000144a uvmcopy + 100 in section .text
+        ra 0x80001da6 kfork + 44 in section .text
+        ra 0x80002a9e sys_fork + 12 in section .text
+        ra 0x80002a2e syscall + 58 in section .text
+        ra 0x800027b4 usertrap + 166 in section .text
+        ra 0x3ffffff09c No symbol matches 274877903004.
+      kmem.freelist 0x800e022e4061141
+    why: |
+      Two different mistakes come out of one line.
+
+      **At `exec`, from boot on.** Every `exec` frees the running process's own page, while the
+      process keeps mapping and owning it. It starts before the shell prompt: init's `exec` of
+      `/init` freed `0x87f54000` (`PTE 0x21fd5013`), and the shell's `exec` freed `0x87f52000`.
+      When the shell then `exec`s `vdsotest` (pid 3), [[kexec]] frees pid 3's page,
+      `p->usyscall` = `0x87f51000`, which the *new* page table maps too. [[kfree]] fills a
+      freed page with `0x01` bytes and stores the free-list link in its first 8 bytes: gdb read
+      exactly that in pid 3's page (`0x87f19000`, then `0x0101...`). `ugetpid()` returns the low
+      32 bits of a kernel pointer: `pid: FAIL`. Freed pages get reused while still mapped: after
+      serving as pid 3's first page table, init's page `0x87f54000` was handed to pid 4 by
+      [[allocproc]] as its usyscall page, while init still maps it as its own `USYSCALL`. Two
+      processes now share one pid page, and the kernel has no idea.
+
+      **At wait.** For each child `vdsotest` reaps, [[freeproc]] calls `kfree(p->usyscall)` and
+      then [[proc_freepagetable]] frees the same page again (both records show pid 4's page,
+      `PTE 0x21fd5013` = physical `0x87f54000`). A page freed twice makes the free list
+      point at itself: `X.next = X`. [[kalloc]] hands `X` out (most likely to a `fork`, whose
+      [[uvmcopy]] copies a code page into it), then, because the head still says `X`, hands out
+      `X` again and sets the head to `X`'s first 8 bytes, now *program code*:
+      `0x0800e022e4061141` is the little-endian form of `41 11 06 e4 22 e0 00 08`, the
+      instructions `addi sp,sp,-16; sd ra,8(sp); sd s0,0(sp); addi s0,sp,16`. The next
+      [[kalloc]], from [[walk]] inside a later [[uvmcopy]] (noff 2: the child's `p->lock`
+      and `kmem.lock`), loads `r->next` through that "pointer": a load page fault in the
+      kernel (`scause 0xd` at `kalloc+32`), and [[kerneltrap]] panics.
+
+      The general rule: every physical page has exactly one owner that frees it. For the usyscall
+      page that is [[freeproc]]; page tables only borrow it.
+  - bug: The mapping is made outside the page-table builder, so exec loses it
+    change: |
+      The page is mapped in [[allocproc]], right after [[proc_pagetable]] returns, instead of
+      inside it (the unmap in [[proc_freepagetable]] stays):
+
+      ```diff
+         p->pagetable = proc_pagetable(p);
+         if (p->pagetable == 0) {
+           freeproc(p);
+           release(&p->lock);
+           return 0;
+         }
+      +
+      +  // map the usyscall page, read-only for user code.
+      +  if (mappages(p->pagetable, USYSCALL, PGSIZE, (uint64)(p->usyscall),
+      +               PTE_R | PTE_U) < 0) {
+      +    freeproc(p);
+      +    release(&p->lock);
+      +    return 0;
+      +  }
+      ```
+    symptom: |
+      $ vdsotest
+      usertrap(): unexpected scause 0xd pid=3
+                  sepc=0x980 stval=0x3fffffd000
+      $ usertests -q
+      usertests starting
+      [...]
+      ALL TESTS PASSED
+
+      # gdb, breakpoint on setkilled (rerun):
+      setkilled: {'hart': 2, 'noff': 0, 'intena': 0, 'sie': 0, 'pid': 3, 'name': 'vdsotest'} scause 0xd stval 0x3fffffd000 sepc 0x980
+        frames ['setkilled', 'usertrap', '0x3ffffff09c']
+        p->usyscall 0x87f51000 pid in page 3
+        pagetable 0x87f21000
+        PTE for 0x3ffffff000: 0x2000184b
+        PTE for 0x3fffffe000: 0x21fcfcc7
+        PTE for 0x3fffffd000: no PTE (level-0 entry 509 is 0x0)
+        PTE for 0x3fffffc000: 0x21fd6413
+    why: |
+      The console shows exactly what clinic 1 showed: the first `ugetpid()` load faults. Only
+      the page table tells them apart. Here the physical page exists and holds the right pid,
+      but the page table of the `exec`'d `vdsotest` has no entry at all for it: [[kexec]] built
+      that table with [[proc_pagetable]] ([[kernel/exec.c:56]]), and the mapping now lives in
+      [[allocproc]], which `exec` never calls. A forked child that does *not* `exec` would read
+      its pid fine, but in practice every program a user runs is started by `exec`, so the page
+      is missing in all of them.
+
+      The fix is to map fixed pages in the one function every user page table comes from. The
+      trapframe has always been mapped there for the same reason.
+  - bug: The heap's ceiling stays at TRAPFRAME
+    change: |
+      Everything else as in the reference, but the old limit is kept in both places:
+
+      ```diff
+      -    if (sz + n > MAXHEAP) {
+      +    if (sz + n > TRAPFRAME) {
+      [...]
+      -    if (addr + n > MAXHEAP)
+      +    if (addr + n > TRAPFRAME)
+      ```
+    symptom: |
+      # one boot:
+      $ vdsotest
+      [...]
+      vdsotest: pid unchanged: OK
+      vdsotest: heap ceiling: FAIL
+      vdsotest: fork: OK
+      vdsotest: exec: OK
+      vdsotest: 20 children: OK
+      vdsotest: SOME TESTS FAILED
+      $ usertests lazy_sbrk
+      usertests starting
+      test lazy_sbrk: panic: mappages: remap
+
+      # a second boot, gdb attached, breakpoint on panic, `usertests lazy_sbrk`:
+      #0  panic (s=s@entry=0x80007108 "mappages: remap") at kernel/printk.c:139
+      #1  0x00000000800010ac in mappages (pagetable=pagetable@entry=0x80023000, va=va@entry=274877890560, size=size@entry=4096, pa=<optimized out>, pa@entry=2147725312, perm=perm@entry=22) at kernel/vm.c:167
+      #2  0x0000000080001302 in uvmalloc (pagetable=0x80023000, oldsz=274877890560, newsz=274877890561, xperm=xperm@entry=4) at kernel/vm.c:234
+      #3  0x0000000080001d4a in growproc (n=1) at kernel/proc.c:281
+      #4  0x0000000080002b28 in sys_sbrk () at kernel/sysproc.c:51
+      #5  0x0000000080002a2e in syscall () at kernel/syscall.c:146
+      #6  0x00000000800027b4 in usertrap () at kernel/trap.c:74
+      [...]
+
+      # two more boots with a probe program (ceilprobe, not on the branch) whose children
+      # grow p->sz lazily to 0x3fffffe000, over both new pages:
+      $ ceilprobe store
+      ceilprobe: sz 0x0000003FFFFFE000, storing to USYSCALL
+      usertrap(): unexpected scause 0xf pid=4
+                  sepc=0x9e stval=0x3fffffd000
+      ceilprobe: store child status -1
+      ceilprobe: sz 0x0000003FFFFFE000, write(USHARED) returns 8
+      $
+      [...]
+      $ ceilprobe shrink
+      ceilprobe: sz 0x0000003FFFFFE000, sbrk(-8192)
+      usertrap(): unexpected scause 0xd pid=4
+                  sepc=0x490 stval=0x3fffffc000
+      ceilprobe: shrink child status -1, uuptime 3
+      $ ceilprobe store
+      usertrap(): unexpected scause 0xf pid=5
+                  sepc=0xa70 stval=0x0
+      $ vdsotest
+      usertrap(): unexpected scause 0xf pid=6
+                  sepc=0xa70 stval=0x0
+    why: |
+      `vdsotest heap ceiling` notices first, without any damage: its child's `sbrklazy(1)` beyond
+      `0x3fffffc000` succeeds, so by the code the child exits with status 3 instead of being
+      killed, and `p->sz` now covers the shared page.
+
+      `usertests lazy_sbrk` turns the same hole into a panic. It grows the heap lazily up to
+      `MAXHEAP - PGSIZE`, maps the last page eagerly with `sbrk(4096)`, and then asks for one
+      byte more, expecting -1. [[growproc]] compares with the old ceiling, so it calls
+      [[uvmalloc]] from `oldsz` = `274877890560` = `0x3fffffc000`: the address of `USHARED`.
+      [[mappages]] finds the shared page's PTE there and panics ([[kernel/vm.c:167]]).
+
+      The probe runs show what the ceiling really protects. A store to `USYSCALL` with `p->sz`
+      covering it is still killed: [[vmfault]] declines because [[ismapped]] finds the page.
+      But [[copyin]]'s new test is bypassed, so `write` from `USHARED` returns 8. And
+      `sbrk(-8192)` from `0x3fffffe000` makes [[uvmdealloc]] unmap both pages with `do_free` =
+      1: the child's next `uuptime()` faults on the now-unmapped `0x3fffffc000`, and the shared
+      page, which every other process still maps and [[clockintr]] still writes, is on the
+      free list. From then on every new program died at once (`scause 0xf`, `stval=0x0`), even
+      `vdsotest`. We did not trace that last failure further; a shared page freed while in use
+      is enough to explain a broken system.
+reveal:
+  - title: Two new pages at the top of the address space
+    commit: 1
+    file: kernel/memlayout.h
+    lines: 46-82
+    focus: 54-70
+    diff: true
+    state:
+      hart: any
+      proc: "(definitions: used by the kernel and, through ulib.c, by user programs)"
+      locks: []
+    note: |
+      The story of this tour: the machine boots on three harts, you type `vdsotest`, the shell
+      (pid 2) forks pid 3, which `exec`s `vdsotest`; `vdsotest` forks children that read their
+      pid, store to the pages and are killed, and are reaped. The states come from gdb runs on
+      the finished branch (`ext/10-vdso`, 8 commits), started halted with breakpoints set first.
+
+      Commit 1 is a contract. User code must find the pages without asking, so their addresses
+      are compile-time constants that both the kernel and `user/ulib.c` include. Counting down
+      from [[MAXVA]] (`0x4000000000`):
+
+      | address | page | `PTE_U` |
+      |---|---|---|
+      | `0x3ffffff000` | [[TRAMPOLINE]] | no |
+      | `0x3fffffe000` | [[TRAPFRAME]] | no |
+      | `0x3fffffd000` | `USYSCALL`, this process's pid | yes, read-only |
+      | `0x3fffffc000` | `USHARED`, the tick count, one page for all | yes, read-only |
+
+      `MAXHEAP` names the heap's new ceiling. The structs are what the pages contain; the
+      `#ifndef __ASSEMBLER__` guard matters because [[kernel/trampoline.S:14]] includes this
+      header and the assembler does not understand C structs (GCC defines `__ASSEMBLER__` for
+      `.S` files).
+  - title: The heap stops below the new pages
+    commit: 1
+    file: kernel/sysproc.c
+    lines: 39-65
+    focus: 54-63
+    diff: true
+    state:
+      hart: any
+      mode: S
+      proc: vdsotest (the heap-ceiling child)
+      intr: "on"
+      satp: kernel
+      locks: []
+      irq: 0
+      stack: [usertrap, syscall, sys_sbrk]
+      sp: {"on": kernel, detail: "the child's kernel stack, with only these three frames"}
+    note: |
+      Two places enforce the heap's ceiling: the lazy branch here, and [[growproc]] for eager
+      growth and shrinking ([[kernel/proc.c:243]], changed the same way). Before this commit the
+      heap could grow to [[TRAPFRAME]]; now it stops at `MAXHEAP` = `USHARED`.
+
+      If `p->sz` could cover the new pages, three things would break (clinic 6): [[uvmalloc]]
+      would try to map over them (`panic: mappages: remap`), `sbrk(-n)` would unmap and free
+      them, the shared page included, and the kernel's own reads, which commit 5 limits to the
+      process's memory below `p->sz`, would accept them. User stores are not among the three:
+      [[vmfault]]'s [[ismapped]] test refuses those even without the ceiling.
+
+      The state is reasoned from the code, not recorded: `vdsotest`'s ceiling check runs in a
+      child that calls `sbrklazy` in 1 GiB steps until `p->sz` is exactly `0x3fffffc000`, then
+      `sbrklazy(1)`, which line 60 refuses. A system call runs with interrupts on (after
+      [[usertrap]]'s `intr_on`) and no lock held: `p->sz` is private to the running process.
+  - title: The one test that knew the old ceiling
+    commit: 1
+    file: user/usertests.c
+    lines: 2778-2826
+    focus: 2793-2805
+    diff: true
+    state:
+      hart: any
+      mode: U
+      proc: usertests (the lazy_sbrk child)
+      intr: "on"
+      satp: user
+      locks: []
+      stack: [main, run, lazy_sbrk]
+      sp: {"on": user}
+    note: |
+      `lazy_sbrk` walks the heap to the very top in 1 GiB lazy steps, maps the last page eagerly
+      and checks that one more byte is refused. It names the ceiling by value: the last heap
+      page was `TRAPFRAME - PGSIZE`, which is now `USYSCALL`. The commit changes the expected
+      value to `MAXHEAP - PGSIZE` (`0x3fffffb000`) and nothing else; the test still checks the
+      same three things: that the heap reaches the ceiling, that the last page is zero-filled,
+      and that `sbrk(1)` and `sbrklazy(1)` fail there.
+
+      Changing a test is a decision to make consciously. Here the behaviour "the heap may grow up
+      to `TRAPFRAME`" is exactly what the lab has to give up, one page per fixed mapping.
+      Every other test is unchanged, including `lazy_copy`, which will force commit 5.
+  - title: allocproc gives every process its own page
+    commit: 2
+    file: kernel/proc.c
+    lines: 109-159
+    focus: 135-142
+    diff: true
+    state:
+      hart: 1
+      mode: S
+      proc: sh (pid 2), creating pid 3
+      intr: "off"
+      satp: kernel
+      locks: ["p->lock (the new proc, pid 3)"]
+      irq: {noff: 1, intena: 1}
+      stack: [usertrap, syscall, sys_fork, kfork, allocproc]
+      sp: {"on": kernel, detail: "pid 2's kernel stack (base `0x3fffffb000`), `sp` = `0x3fffffbf50`"}
+    note: |
+      You typed `vdsotest`; the shell (pid 2) forks on hart 1. [[allocproc]] has found an
+      `UNUSED` slot, holds its `p->lock` (line 115), has taken pid 3 from [[allocpid]] and the
+      trapframe from [[kalloc]]. Now the new page: one more [[kalloc]] (gdb: `0x87f51000`),
+      zeroed, and the pid written at offset 0.
+
+      Why zero it? [[kalloc]] fills pages with `0x05` junk ([[kernel/kalloc.c:80]]); the user
+      will see the whole page, and zeroes are a better promise for the bytes after `pid`. No
+      kernel data can leak through it either way, since nothing else is ever stored there.
+
+      The pid can be written once and forgotten: it never changes while the slot is in use. If
+      [[kalloc]] fails, [[freeproc]] undoes whatever was allocated so far (it tests each pointer
+      before freeing it).
+
+      gdb recorded noff 1, intena 1, SIE 0: the one lock is the new process's `p->lock`, and
+      the `intr_on` in [[usertrap]] had turned interrupts on before [[acquire]] saved that
+      in `intena`.
+    others: |
+      Another hart scanning `proc[]` in its own [[allocproc]] (a `fork` on hart 0) skips this
+      slot: it must acquire `p->lock` to look at `state`, and by then the state is `USED`. The
+      scheduler on hart 2 cannot run pid 3 either: it only runs `RUNNABLE` processes, and pid 3
+      becomes runnable only at the end of [[kfork]]. The usyscall page is therefore private to
+      this hart until the child first runs.
+  - title: freeproc frees it, and only freeproc
+    commit: 2
+    file: kernel/proc.c
+    lines: 161-183
+    focus: 167-175
+    state:
+      hart: 0
+      mode: S
+      proc: vdsotest (pid 3), reaping pid 4
+      intr: "off"
+      satp: kernel
+      locks: [wait_lock, "p->lock (pid 4, the zombie)"]
+      irq: {noff: 2, intena: 1}
+      stack: [usertrap, syscall, sys_wait, kwait, freeproc]
+      sp: {"on": kernel, detail: "pid 3's kernel stack, `sp` = `0x3fffff9f30`"}
+    note: |
+      Jump ahead: pid 4, `vdsotest`'s first child, stored to `USYSCALL`, was killed and is a
+      zombie. `vdsotest` (pid 3) reaps it in [[kwait]] on hart 0, holding `wait_lock` and the
+      zombie's `p->lock` (gdb: noff 2, intena 1), and [[freeproc]] releases its resources.
+
+      The usyscall page is freed right next to the trapframe, with the same pattern: free if
+      allocated, then clear the pointer. Recorded: pid 4's page was `0x87f47000`.
+
+      This is the only place the per-process page is freed. Page tables will map it (commit 3)
+      but never free it. Its life is the slot's life, from [[allocproc]] to [[freeproc]], and
+      the order here does not matter: the zombie is not running, and nothing else uses its page
+      table, which [[proc_freepagetable]] on line 174 tears down next.
+    others: |
+      While pid 3 holds `wait_lock` and pid 4's `p->lock`, no other hart can be reaping pid 4 or
+      reparenting it, and [[kfree]] takes `kmem.lock` briefly underneath (noff 3 for a few
+      instructions), the same nesting as in the original [[kwait]] ([[concept:locks#nesting]]).
+  - title: proc_pagetable maps it read-only
+    commit: 3
+    file: kernel/proc.c
+    lines: 185-227
+    focus: 216-224
+    diff: true
+    state:
+      hart: 1
+      mode: S
+      proc: sh (pid 2), creating pid 3
+      intr: "off"
+      satp: kernel
+      locks: ["p->lock (the new proc, pid 3)"]
+      irq: {noff: 1, intena: 1}
+      stack: [usertrap, syscall, sys_fork, kfork, allocproc, proc_pagetable]
+      sp: {"on": kernel, detail: "pid 2's kernel stack, `sp` = `0x3fffffbf30`"}
+    note: |
+      Back in the fork of pid 3: [[allocproc]] calls [[proc_pagetable]] for the child's page
+      table (`0x87f47000` in the recorded run). Three fixed pages now, top down: the
+      trampoline (`R|X`, no `U`), the trapframe (`R|W`, no `U`), and the usyscall page
+      (`R|U`).
+
+      The flags are the whole design. `U`: a user-mode access is allowed at all (the other two
+      pages deliberately lack it; only S-mode code on the trampoline uses them). `R`: loads
+      succeed. No `W`: a user store faults (`scause` 15), [[vmfault]] declines because the
+      address is above `p->sz`, and the process is killed. No `X`: the page cannot be executed.
+
+      The error path unmaps what was mapped before, in reverse order, then frees the page-table
+      pages with `uvmfree(pagetable, 0)`. It does not free the usyscall page: when [[proc_pagetable]]
+      returns 0, [[allocproc]] calls [[freeproc]] (line 147), which frees it with everything
+      else.
+    others: |
+      The child's page table is not yet visible to any hart: no `satp` holds it, and the child
+      is not `RUNNABLE`. So building it needs no lock of its own; `p->lock` is held only because
+      [[allocproc]] returns with it.
+  - title: exec gets the page for free
+    commit: 3
+    file: kernel/proc.c
+    lines: 185-227
+    focus: 216-226
+    state:
+      hart: 2
+      mode: S
+      proc: pid 3 (still named sh), exec'ing vdsotest
+      intr: "on"
+      satp: kernel
+      locks: ["vdsotest's ip->lock (sleep-lock)"]
+      irq: 0
+      stack: [usertrap, syscall, sys_exec, kexec, proc_pagetable]
+      sp: {"on": kernel, detail: "pid 3's kernel stack (base `0x3fffff9000`), `sp` = `0x3fffff9ba0`"}
+    note: |
+      Same lines, second caller. pid 3 now runs on hart 2 and calls `exec("vdsotest")`.
+      [[kexec]] builds the new image's page table with this very function
+      ([[kernel/exec.c:56]]), so the new table (`0x87f21000`) maps `USYSCALL` to the same
+      physical page, `p->usyscall` = `0x87f51000`, holding pid 3. Mapping fixed pages here,
+      rather than in [[allocproc]], is what makes `exec` work; clinic 5 maps the page in
+      [[allocproc]] instead, and the first `exec`'d program dies at its first `ugetpid()`.
+
+      State: no spinlock (gdb: noff 0, SIE 1), but [[kexec]] holds the executable's inode
+      sleep-lock from [[ilock]] ([[kernel/exec.c:46]]) until [[iunlockput]] at line 79, and it
+      is inside a file-system transaction (`begin_op`). Sleep-locks do not turn interrupts off,
+      so a timer interrupt may preempt pid 3 here.
+
+      For a moment, two page tables map `0x87f51000`: the old one (`0x87f47000`, still in
+      `p->pagetable`) and this new one.
+  - title: proc_freepagetable unmaps it, without freeing
+    commit: 3
+    file: kernel/proc.c
+    lines: 229-238
+    focus: 232-237
+    diff: true
+    state:
+      hart: 0
+      mode: S
+      proc: vdsotest (pid 3)
+      intr: "on"
+      satp: kernel
+      locks: []
+      irq: 0
+      stack: [usertrap, syscall, sys_exec, kexec, proc_freepagetable]
+      sp: {"on": kernel, detail: "pid 3's kernel stack, `sp` = `0x3fffff9ba0`"}
+    note: |
+      [[kexec]] has committed: `p->pagetable` is the new table and the name is `vdsotest`. Now
+      it frees the old table ([[kernel/exec.c:138]]). gdb recorded this on hart 0, while the
+      previous step ran on hart 2: pid 3 gave up its hart in between (most likely sleeping on a
+      disk read of the ELF file) and was resumed by another hart's scheduler.
+
+      The old table's top entries, read by gdb at this line (on the finished branch, so
+      `USHARED` is there too):
+
+      | page | PTE | flags |
+      |---|---|---|
+      | [[TRAMPOLINE]] | `0x2000184b` | `V R X A` |
+      | [[TRAPFRAME]] | `0x21fcfcc7` | `V R W A D` |
+      | `USYSCALL` | `0x21fd4413` | `V R U`, physical `0x87f51000` |
+      | `USHARED` | `0x21fd6413` | `V R U`, physical `0x87f59000` |
+
+      All three fixed pages are unmapped with `do_free` = 0: the trampoline is kernel code, the
+      trapframe and the usyscall page belong to the slot and are still mapped by the new table.
+      Then [[uvmfree]] frees `[0, sz)` and the page-table pages. Without line 236, [[freewalk]]
+      finds the usyscall leaf at index 509 and panics (clinic 3); with `do_free` = 1, the page
+      the new image is reading goes back on the free list (clinic 4).
+  - title: One page for the whole system, allocated at boot
+    commit: 4
+    file: kernel/trap.c
+    lines: 1-29
+    focus: 20-29
+    diff: true
+    state:
+      hart: 0
+      mode: S
+      proc: none (boot)
+      intr: "off"
+      satp: kernel
+      locks: []
+      irq: 0
+      stack: [main, trapinit]
+      sp: {"on": boot, detail: "hart 0's slice of `stack0`, `sp` = `0x80008870`"}
+    note: |
+      The second page holds something that changes: the tick count. It is the same for every
+      process, so one physical page serves all of them. [[trapinit]] runs once, on hart 0, in
+      [[main]] after [[kinit]] (so [[kalloc]] works) and before [[userinit]] (so the first
+      page table can map it). gdb: `ushared` = `0x87f59000`, paging on (the kernel page table),
+      interrupts off, still on the boot stack.
+
+      Nobody owns this page. It is never freed, and that is the one rule to keep in mind when
+      writing its unmap in commit 4's change to [[proc_freepagetable]] (`do_free` = 0).
+
+      Why [[kalloc]] and not a `static` variable? A variable smaller than a page would share its
+      page with other kernel data, and mapping that page with `PTE_U` would show that data to
+      every process. A page from [[kalloc]] contains nothing else.
+    others: |
+      Harts 1 and 2 are still spinning on `started` in [[main]]; no process exists. The global
+      `ushared` pointer is written here and only read afterwards, by [[clockintr]] and
+      [[proc_pagetable]] on any hart, after [[main]]'s release store to `started` has published
+      it ([[tour:19]]).
+  - title: clockintr publishes ticks
+    commit: 4
+    file: kernel/trap.c
+    lines: 172-187
+    focus: 175-181
+    state:
+      hart: 0
+      mode: S
+      proc: none (scheduler)
+      intr: "off"
+      satp: kernel
+      locks: [tickslock]
+      irq: {noff: 1, intena: 0}
+      stack: [kernelvec, kerneltrap, devintr, clockintr]
+      sp: {"on": scheduler, detail: "hart 0's slice of `stack0` (`sp` = `0x800086c0`), with a `kernelvec` frame on top"}
+    note: |
+      Only hart 0 counts ticks. One line is added inside the existing critical section: the new
+      value goes to the shared page right after `ticks++`. gdb stopped here with `ticks` 1, 2, 3
+      during boot, each time taken in hart 0's scheduler loop (no process: the interrupt landed
+      in [[scheduler]]'s `intr_on` window), noff 1, intena 0.
+
+      In this build the line is one `sw a5,0(a4)` at `0x8000267c`: a single naturally aligned
+      32-bit store. That is what makes a lock-free reader safe: under RVWMO an aligned word
+      access is single-copy atomic, so a reader sees the old value or the new one, never a mix.
+      `tickslock` protects `ticks` against [[sys_uptime]] and [[sys_pause]]; it does not
+      protect the copy from user readers, who take no lock, and it does not need to.
+
+      The copy lives at the moment [[release]] runs its `fence rw,w`: everything before it,
+      including this store, is visible to any hart that later acquires `tickslock`. That gives
+      the first half of `vdsotest`'s `uptime() <= uuptime() <= uptime()`. The second half holds
+      too: a reader that saw the value stored inside some critical section of [[clockintr]] makes
+      its next [[sys_uptime]] call afterwards, and that call's [[acquire]] of `tickslock` comes
+      after the release ending that section, so it reads `ticks` at least as large.
+    others: |
+      Recorded at the second stop: hart 1 in [[pop_off]], hart 2 in [[scheduler]]. Later, with
+      `vdsotest` running, a reader on another hart executes `lw` on the same word:
+
+      | time | hart 0 (clockintr) | hart 1 (`uuptime()` in user mode) |
+      |---|---|---|
+      | 1 | `ticks++` → 42 | `lw` → 41 (old) |
+      | 2 | `sw` 42 into the shared page | |
+      | 3 | `release(&tickslock)` | `lw` → 41 or 42 |
+      | 4 | | `lw` → 42 (eventually, and for good) |
+
+      No row can show a value that was never stored. If the page held *two* fields updated
+      together, a reader between two stores could pair a new one with an old one; that would
+      need a sequence counter.
+  - title: The shared page in every page table
+    commit: 4
+    file: kernel/proc.c
+    lines: 212-250
+    focus: 226-235
+    diff: true
+    state:
+      hart: 1
+      mode: S
+      proc: sh (pid 2), creating pid 3
+      intr: "off"
+      satp: kernel
+      locks: ["p->lock (the new proc, pid 3)"]
+      irq: {noff: 1, intena: 1}
+      stack: [usertrap, syscall, sys_fork, kfork, allocproc, proc_pagetable]
+      sp: {"on": kernel}
+    note: |
+      The same pattern as `USYSCALL`, one page lower, but with a global physical address: every
+      page table ever built maps `ushared`. gdb read the `USHARED` PTE in every page table it
+      looked at (pids 1, 2, 3 and `vdsotest`'s children): always physical page `0x87f59000`, and
+      `0x21fd6413` (flags `V R U`) as the kernel wrote it. (The state shown is the fork of pid 3 a few lines after the
+      previous fork step; it is reasoned, not a separate stop.)
+
+      The error path now unwinds four mappings. And [[proc_freepagetable]] (line 248) unmaps the
+      shared page with `do_free` = 0 and a comment, because this is the one place where a slip
+      of one character frees a page that the whole system is using.
+
+      One more detail gdb showed: after `vdsotest` first called `uuptime()`, its `USHARED` PTE
+      read `0x21fd6453`: the hardware had set `A` (`0x40`). This tree enables hardware A/D
+      updates in [[kernel/start.c:41]] ([[g:svadu]]), so the accessed bit is set per page
+      table, even for a page that is shared.
+    others: |
+      While pid 2 maps the page here, hart 0 may be storing a new tick into it and processes on
+      hart 2 may be reading it. Mapping changes only pid 3's page table, which nobody uses yet;
+      the page's contents are not touched. Shared data, private mappings.
+  - title: copyin keeps system calls below p->sz
+    commit: 5
+    file: kernel/vm.c
+    lines: 383-409
+    focus: 387-392
+    diff: true
+    state:
+      hart: 1
+      mode: S
+      proc: vdsotest (pid 3)
+      intr: "on"
+      satp: kernel
+      locks: ["vdsojunk's ip->lock (sleep-lock)", "b->lock (sleep-lock, the file's data block)"]
+      irq: 0
+      stack: [usertrap, syscall, sys_write, filewrite, writei, either_copyin, copyin]
+      sp: {"on": kernel, detail: "pid 3's kernel stack"}
+    note: |
+      From commit 3 on (one `PTE_U` page at `0x3fffffd000` is enough), `usertests -q` failed
+      with `test lazy_copy: write succeeded`. The kernel reads user memory through [[walkaddr]], which asks only for `V` and
+      `U`; [[copyout]] adds a software `PTE_W` test, but [[copyin]] adds nothing. So `write(fd,
+      USHARED, n)` copied the shared page into a file, and `lazy_copy` lists exactly
+      `0x3fffffc000` and `0x3fffffd000` as addresses that must fail.
+
+      The new lines apply, page by page, the rule that [[fetchaddr]] ([[kernel/syscall.c:15]])
+      and [[vmfault]] already follow: a system call may touch only the process's memory, below
+      `p->sz` (precisely: no page that starts at or above it). gdb recorded the refusal in
+      `vdsotest`'s `write() from ushared` check: `va0 0x3fffffc000`, `psz 0x5000`, `len 8`,
+      called from [[writei]] through [[either_copyin]]. [[copyinstr]] gets the same test, so
+      `open((char *)USYSCALL, ...)` fails too.
+
+      State: [[filewrite]] holds the inode's sleep-lock and [[writei]] the buffer's
+      ([[kernel/fs.c:560]] copies into `bp->data`); neither is a spinlock, so interrupts stay on
+      (gdb: noff 0, SIE 1). The test returns before anything is copied, and `write` returns -1.
+  - title: "ugetpid: a system call that is a load"
+    commit: 6
+    file: user/ulib.c
+    lines: 158-181
+    focus: 165-172
+    diff: true
+    state:
+      hart: any
+      mode: U
+      proc: vdsotest (pid 3)
+      intr: "on"
+      satp: user
+      locks: []
+      stack: [main, pidtest, ugetpid]
+      sp: {"on": user}
+    note: |
+      The whole feature, seen from user mode. `ulib.c` includes `kernel/memlayout.h` for the
+      address and the struct, and the function compiles to (from `user/vdsotest.asm`):
+
+      ```text
+      970: addi sp,sp,-16      978: lui  a5,0x4000
+      972: sd   ra,8(sp)       97c: addi a5,a5,-3      # 0x3fffffd
+      974: sd   s0,0(sp)       97e: slli a5,a5,0xc     # 0x3fffffd000
+      976: addi s0,sp,16       980: lw   a0,0(a5)      # the pid
+                               982..988: restore, ret
+      ```
+
+      gdb single-stepped it: 12 instructions from entry to `ret`, all in U-mode, with `satp` on
+      the user page table throughout. The `lw` at `0x980` is the instruction that faulted with
+      `scause 0xd` in clinics 1 and 5. Compare `getpid()`: `li a7,11; ecall; ret` in user mode,
+      and 1,103 instructions between `ecall` and `sret`.
+
+      No `volatile` here: the pid never changes, so a compiler that keeps it in a register is
+      right.
+  - title: "uuptime: volatile, because the kernel writes behind your back"
+    commit: 6
+    file: user/ulib.c
+    lines: 158-181
+    focus: 174-181
+    state:
+      hart: any
+      mode: U
+      proc: vdsotest (pid 3)
+      intr: "on"
+      satp: user
+      locks: []
+      stack: [main, uptimetest, uuptime]
+      sp: {"on": user}
+    note: |
+      Same shape, different promise. The value at `USHARED` changes ten times a second without
+      this program doing anything, and C has no way to know that unless the access is `volatile`.
+      Without it, a caller that inlines `uuptime` into `while (uuptime() == t0) ;` could load once
+      and spin forever. With it, every call performs a fresh `lw`, one load, like `ugetpid`.
+
+      The load is a plain 32-bit `lw` of an aligned word, matched by the kernel's single `sw`:
+      single-copy atomic, no lock. A user program could not take a kernel spinlock anyway; the
+      only synchronization available across the user/kernel boundary here is the atomicity of
+      one memory access.
+    others: |
+      While this hart loads, hart 0 may be storing the next tick into the same physical page. The
+      load returns the old or the new count; `vdsotest`'s `uptime advances` check pauses 2
+      ticks and sees the copy at least 2 higher.
+  - title: A store to the page, from the test's point of view
+    commit: 7
+    file: user/vdsotest.c
+    lines: 42-83
+    focus: 64-83
+    diff: true
+    state:
+      hart: 0
+      mode: U
+      proc: vdsotest (pid 4, a child)
+      intr: "on"
+      satp: user
+      locks: []
+      stack: [main, readonlytest, inchild, store_usyscall]
+      sp: {"on": user}
+    note: |
+      `vdsotest` runs each dangerous check in a child (`inchild`) and decides from the exit
+      status alone: -1 means the kernel killed it ([[kexit]]`(-1)` after `setkilled`), 0 means the
+      store survived and the function returned. So the final `ALL OK` does not depend on reading
+      the console; the `usertrap()` lines are printed by the kernel for each expected kill.
+
+      pid 4 executes `sw` at `0x14` (inside `store_usyscall`), with the address
+      `0x3fffffd000`. The hart finds the PTE: `V`, `R`, `U` set, `W` clear. The store does not
+      happen; a store page fault is raised instead.
+  - title: "usertrap: vmfault refuses, the process dies"
+    commit: 7
+    file: kernel/trap.c
+    lines: 49-95
+    focus: 77-85
+    state:
+      hart: 0
+      mode: S
+      proc: vdsotest (pid 4)
+      intr: "off"
+      satp: kernel
+      locks: []
+      irq: 0
+      stack: [usertrap]
+      sp:
+        "on": kernel
+        switched: "`ld sp, 8(a0)` in [[uservec]] ([[kernel/trampoline.S:76]]), after the store page fault"
+        detail: "pid 4's kernel stack (base `0x3fffff7000`), `sp` = `0x3fffff7fe0`: only `usertrap`'s frame"
+    note: |
+      gdb, at the kill: `scause 0xf`, `stval 0x3fffffd000`, `sepc 0x14`, hart 0, noff 0, SIE 0
+      (a fault leaves interrupts off; only the system-call branch calls `intr_on`).
+
+      The fault branch (lines 77-79, unchanged by this lab) calls [[vmfault]] with
+      `p->sz` = `0x5000`. gdb stopped inside it at the first test: `va 0x3fffffd000 >= psz
+      0x5000`, return 0. So the `else` branch prints the two lines and [[setkilled]] marks the
+      process; line 87 calls [[kexit]].
+
+      The same run shows the worst case. In the ceiling check (pid 6), `p->sz` was raised to the
+      maximum, `0x3fffffc000`, before the store; gdb recorded [[vmfault]] declining
+      `va 0x3fffffd000` against `psz 0x3fffffc000`. Because the ceiling is `USHARED`, no
+      process can make `p->sz` cover these pages, but the refusal does not depend on that:
+      [[vmfault]]'s second test, [[ismapped]], refuses any mapped page. A probe on a kernel
+      without the ceiling (clinic 6) grew `p->sz` over both pages and its store was still
+      killed.
+  - title: Fork, exec, and twenty children at once
+    commit: 7
+    file: user/vdsotest.c
+    lines: 134-196
+    focus: 134-168
+    state:
+      hart: any
+      mode: U
+      proc: vdsotest (pid 3) and its children
+      intr: "on"
+      satp: user
+      locks: []
+      stack: [main, forktest]
+      sp: {"on": user}
+    note: |
+      `forktest`: the child compares `ugetpid()` with `getpid()` and with the parent's pid; the
+      parent checks its own page afterwards. `exectest`: a child `exec`s `vdsotest exec`, whose
+      `main` checks `ugetpid() == getpid()` in the new image and exits with the answer. Together
+      they cover both callers of [[proc_pagetable]]: [[allocproc]] and [[kexec]].
+
+      `manytest` forks 20 children that run on all three harts at once, each loading its own
+      `USYSCALL` 100,000 times. Every child has the same virtual address and a different physical
+      page; nothing is shared, so nothing can interfere. (In the recorded runs, gdb saw `vdsotest`'s
+      earlier children, pids 4 to 7 from the read-only, ceiling and fork checks, get pages
+      `0x87f47000`, `0x87f44000`, `0x87f23000` and `0x87f27000`: pages are recycled as children
+      are reaped. The `manytest` children's pages were not recorded.)
+
+      Run order in the test matters for debugging: `pid` first, so a missing mapping (clinics 1
+      and 5) kills `vdsotest` before it prints anything at all.
+  - title: Measuring the trap
+    commit: 8
+    file: user/vdsotest.c
+    lines: 198-240
+    focus: 206-226
+    diff: true
+    state:
+      hart: any
+      mode: U
+      proc: vdsotest time (pid 3)
+      intr: "on"
+      satp: user
+      locks: []
+      stack: [main, measure, timeit]
+      sp: {"on": user}
+    note: |
+      `userrdtime` first: U-mode may not read `time` here (only `mcounteren.TM` is set, in
+      [[kernel/start.c:62]]), and the child is killed with `scause 0x2`. So `timeit` counts calls
+      per tick, using `uuptime()` as its clock so that the loop adds no system calls of its own.
+
+      Recorded on 3 harts (`vdsotest time`, after `usertests -q`):
+
+      | call | calls in 20 ticks | about |
+      |---|---|---|
+      | `getpid()` | 175,000 | 11,428 ns |
+      | `ugetpid()` | 88,831,000 | 22 ns |
+      | `uptime()` | 169,000 | 11,834 ns |
+      | `uuptime()` | 89,029,000 | 22 ns |
+
+      About 500 times faster. The instruction counts explain a factor of about 74 (1,109
+      versus 15 per loop iteration, see Measure); the remaining factor of about 7 is time per
+      instruction. Removing the four `sfence.vma` (an experiment only) made `getpid` about a
+      third faster, so QEMU's translation-cache flushes are a large share of it; the rest was
+      not measured. On real hardware the ratio is
+      different, but the cost has the same parts: the trap, the register save, the page-table
+      switch and the work around it. That is the price this lab stops paying for two values
+      the process may simply know.
+verify: |
+  On the branch (`ext/10-vdso`, 8 commits, every commit builds), built with the project
+  toolchain and run on 3 harts (`-smp 3 -m 128M`):
+
+  ```text
+  $ vdsotest
+  vdsotest: pid: OK
+  vdsotest: uptime agrees: OK
+  vdsotest: uptime advances: OK
+  usertrap(): unexpected scause 0xf pid=4
+              sepc=0x14 stval=0x3fffffd000
+  vdsotest: usyscall read-only: OK
+  usertrap(): unexpected scause 0xf pid=5
+              sepc=0x2e stval=0x3fffffc000
+  vdsotest: ushared read-only: OK
+  vdsotest: read() into usyscall fails: OK
+  vdsotest: write() from ushared fails: OK
+  vdsotest: pid unchanged: OK
+  usertrap(): unexpected scause 0xf pid=6
+              sepc=0xd2 stval=0x3fffffd000
+  vdsotest: heap ceiling: OK
+  vdsotest: fork: OK
+  vdsotest: exec: OK
+  vdsotest: 20 children: OK
+  vdsotest: ALL OK
+  $ usertests -q
+  usertests starting
+  test copyin: OK
+  test copyout: OK
+  [...]
+  test nowrite: usertrap(): unexpected scause 0xf pid=6590
+  [...]
+  test lazy_copy: OK
+  test lazy_copyinstr: OK
+  test lazy_sbrk: OK
+  test partial_write: OK
+  test unlinkcwd: OK
+  ALL TESTS PASSED
+  $ vdsotest
+  [...]
+  vdsotest: ALL OK
+  ```
+
+  The three `usertrap()` lines in `vdsotest` are the expected kills of the read-only and
+  ceiling checks; the test verifies each from the child's exit status. `usertests -q` passing
+  shows that the rest of the system is unchanged: `lazy_copy` (system calls refuse the
+  addresses of the new pages), `lazy_sbrk` (the heap reaches its new ceiling and no further),
+  `nowrite` (stores to `TRAPFRAME` and above still kill), and the free-page counts that
+  `usertests` compares. `vdsotest` passes again after `usertests`.
+
+  For comparison, at commit 4 (both pages mapped, [[copyin]] not yet changed) `usertests -q`
+  stops at `test lazy_copy: write succeeded`, `FAILED`.
+measure: |
+  **Time per call**, from `vdsotest time` on 3 harts (QEMU 10.2.1; a tick is about 0.1 s,
+  20 ticks per measurement; times on QEMU depend on the computer and on what else it is
+  doing, so yours will differ):
+
+  | | calls in 20 ticks | about | ratio |
+  |---|---|---|---|
+  | `getpid()` | 175,000 | 11,428 ns | |
+  | `ugetpid()` | 88,831,000 | 22 ns | 508× |
+  | `uptime()` | 169,000 | 11,834 ns | |
+  | `uuptime()` | 89,029,000 | 22 ns | 527× |
+
+  Two earlier runs gave 174,000 / 168,000 `getpid()` and 89,731,000 / 87,894,000 `ugetpid()`
+  calls: the numbers are stable to a few percent.
+
+  **Instructions per call**, single-stepped with gdb (QEMU's single-step with interrupts
+  masked, one hart locked):
+
+  | | user mode | kernel and trampoline | `csrw satp` | `sfence.vma` |
+  |---|---|---|---|---|
+  | `ugetpid()` | 12 | 0 | 0 | 0 |
+  | `getpid()` | 3 (`li a7,11`, `ecall`, `ret`) | 1,103 (first instruction of [[uservec]] to `sret`) | 2 | 4 |
+
+  Where the 1,103 go: 83 in the trampoline ([[uservec]] 44, [[userret]] 39), 392 in
+  [[mycpu]], 144 in [[push_off]], 118 in [[pop_off]], 84 in [[myproc]], 86 in [[acquire]] and
+  [[holding]], 34 in [[release]], 38 in [[killed]], 43 in [[usertrap]], 42 in
+  [[prepare_return]], 29 in [[syscall]] and 10 in [[sys_getpid]]. Most of the cost is
+  bookkeeping around the trap: finding the current process four times and checking `killed`
+  twice, each under `p->lock`. The answer itself is one load in both cases.
+
+  **Instructions against time.** The timing loop adds 3 instructions per call (`jalr s2`,
+  `addiw`, `bnez` at `0x53c`-`0x540` in `user/vdsotest.asm`), so one iteration is 1,109
+  instructions with `getpid` (3 + 3 + 1,103) and 15 with `ugetpid` (3 + 12): a factor of about
+  74. The measured factor is about 508, so each instruction on the `getpid` path costs about 7
+  times as much time. A run with the four `sfence.vma` removed from `trampoline.S`
+  (not valid on hardware; on QEMU the `satp` writes still flush): `getpid` went from 11,695 and
+  12,269 ns to 8,230 and 7,874 ns, `ugetpid` stayed at 21-24 ns. Translation-cache flushes are
+  therefore a large share of the extra time per instruction; the rest was not measured.
+
+  **Memory.** One page per process (the usyscall page, allocated next to the trapframe) and one
+  page in total for `USHARED`. Two pages of user virtual address space are taken from the top
+  of the heap's range.
+further: |
+  - **A real vDSO clock.** Set `scounteren.TM` in the kernel so that user code may execute
+    `rdtime`, and publish in the shared page what is needed to convert `time` to seconds. Then
+    `uuptime` can report fractions of a tick. You will need two values that must agree, and so
+    a sequence counter; it teaches the reader-retry protocol that Linux uses.
+  - **More per-process facts.** Publish the parent's pid, or a per-process count of system
+    calls that the kernel updates on every trap. Which of them need `volatile`, which need
+    ordering, and which can only be written by the process's own hart?
+  - **Map code, not just data.** Put a small function in a page shared by all processes,
+    mapped `R|X|U`, and let user programs call it at a fixed address. This is what a real vDSO
+    is: an ELF image the kernel maps into every process. It teaches position-independent code
+    and why the kernel must never let that page be writable.
+  - **Measure on real hardware.** Run the branch on a RISC-V board and compare the
+    `getpid` / `ugetpid` ratio with QEMU's. The instruction counts stay the same; the cost of a
+    trap and of `sfence.vma` will not.

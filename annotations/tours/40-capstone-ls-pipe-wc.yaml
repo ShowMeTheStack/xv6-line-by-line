@@ -1,0 +1,1038 @@
+title: "Capstone: the shell running ls | wc"
+group: Devices and putting it all together
+prerequisites: [5, 20, 21, 22, 37, 39]
+summary: |
+  You type seven characters and press Enter:
+
+  ```
+  $ ls | wc
+  24 96 608
+  $
+  ```
+
+  Less than a second later the answer is on the screen. In that second, xv6 used almost
+  everything it has: the UART and the [[g:plic|PLIC]], interrupts on all three harts, the
+  console's line editor, five processes, three `fork`s and two `exec`s, a [[g:pipe]], the
+  path-name lookup, the inode table, the buffer cache, the virtio disk, the scheduler on
+  every hart, processes going to [[g:sleep-wakeup|sleep]] more than a dozen times (and `wakeup`
+  called hundreds of times), and nearly 800
+  system calls. Every other tour on this site is a close-up of one stretch of this road.
+
+  This tour drives the whole road once, at a steady speed, in 25 stops. It follows not one
+  process but five, so watch the machine-state display: at every step it says which
+  process we are following, on which hart, in which mode, holding which locks. The story
+  jumps between processes and harts the way the machine does, and each jump is a place
+  where the kernel had to make sharing safe.
+
+  All the numbers are real. We ran this command on this build of xv6 with a tracing kernel
+  and recorded which process ran where, every disk read, and every pipe read. Where the
+  run could have gone differently (which hart wins a race), the tour says so.
+cast: |
+  The machine has three [[g:hart|harts]]. xv6 has just booted, and this is the first
+  command. When the tour starts:
+
+  | Hart | What it is doing |
+  |---|---|
+  | 0 | Running the shell `sh` (pid 2), which has just printed `$ ` |
+  | 1 | Idle in its [[kernel:scheduler]], waiting in `wfi` |
+  | 2 | Idle in its [[kernel:scheduler]], waiting in `wfi` |
+
+  `init` (pid 1) is asleep in [[kernel:kwait]], as it will be for the whole tour. The cast
+  of processes, in order of appearance:
+
+  | pid | Program | Role |
+  |---|---|---|
+  | 2 | `sh` | the interactive shell; reads the line, forks, waits |
+  | 3 | `sh` (copy) | parses the line, builds the pipe, forks both sides, waits for both |
+  | 4 | `sh` → `ls` | the left side: writes the directory listing into the pipe |
+  | 5 | `sh` → `wc` | the right side: counts what comes out of the pipe |
+steps:
+  - title: "sh (pid 2): the prompt, and a read that will wait"
+    file: user/sh.c
+    lines: 134-143
+    focus: 137-139
+    state:
+      hart: 0
+      mode: U
+      proc: sh (pid 2)
+      intr: on
+      satp: user
+      locks: []
+      stack: [main, getcmd]
+      sp: user
+    note: |
+      The shell has printed `$ ` with `write(2, "$ ", 2)`, a trip through the system-call
+      path of [[tour:5]]: `ecall`, the [[g:trampoline]], [[kernel:usertrap]],
+      [[kernel:consolewrite]], [[kernel:uartwrite]], and back. Now it clears its 100-byte
+      `buf` and calls [[user:gets]], which calls `read(0, &c, 1)`: one byte per system call.
+
+      Descriptor 0 is the console, opened by `init` at boot and inherited. One
+      `struct file` is shared by `init`'s descriptors 0, 1, 2 and the shell's 0, 1, 2:
+      reference count **6**. Keep counting it; by the end of the tour it will have been
+      as high as 15.
+    others: |
+      Harts 1 and 2 have nothing to run. Their schedulers loop through the process table,
+      find nothing `RUNNABLE`, and stop in `wfi` until an interrupt arrives
+      ([[kernel/proc.c:467]]).
+
+  - title: "sh (pid 2): nothing typed yet, so sleep on &cons.r"
+    file: kernel/console.c
+    lines: 87-108
+    focus: 99-104
+    state:
+      hart: 0
+      mode: S
+      proc: sh (pid 2)
+      intr: off
+      satp: kernel
+      locks: [cons.lock]
+      irq: {noff: 1, intena: 1, note: "`cons.lock` from a system call (intena 1); [[sleep_prepare]] adds `p->lock` for a moment"}
+      stack: [usertrap, syscall, sys_read, fileread, consoleread]
+      sp: {"on": kernel, switched: "`ld sp, 8(a0)` in `uservec` ([[kernel/trampoline.S:76]]) when the shell executed `ecall`", detail: "sh's kernel stack, slot 1 (0x3fffffb000)"}
+    note: |
+      [[fileread]] routed the read through `devsw[CONSOLE]` to [[consoleread]], which took
+      `cons.lock` (interrupts off) and found the input buffer empty: `r == w`.
+
+      So the shell registers on the channel `&cons.r` with [[sleep_prepare]], *while still
+      holding* `cons.lock`, then releases the lock and calls [[sleep]]. Registering before
+      releasing is the rule that prevents lost wakeups everywhere in this version of xv6;
+      you will see it at every sleep in this tour.
+
+      The shell is now `SLEEPING`. Hart 0's scheduler finds nothing else to run and joins
+      the others in `wfi`. **All three harts are idle**, and the whole machine waits for
+      your fingers. [[tour:37]] follows this wait, and your keystrokes, in detail.
+
+      Keep an eye on the "running on" strip: this tour visits every kind of stack
+      ([[concept:stacks]]). Here hart 0 is on the shell's **kernel stack**, the page of its
+      process slot (slot 1, at 0x3fffffb000 in this build), which `uservec` pointed `sp` at
+      ([[kernel/trampoline.S:76]]). When the shell sleeps, its frames (`usertrap` …
+      `consoleread`, `sleep`, `sched`) stay on that page and `swtch` moves hart 0 to its
+      scheduler stack ([[kernel/swtch.S:26]]). From then on, all three harts' `sp`s point into
+      their scheduler stacks, the three 4 KiB slices of `stack0`.
+    others: |
+      A keystroke can be handled on any hart. If one arrived on hart 2 right now, its
+      handler would spin on `cons.lock` until hart 0 releases it on line 105, and by then
+      the shell is registered: its wakeup cannot be lost.
+
+  - title: "No process: you press Enter, and hart 2 commits the line"
+    file: kernel/console.c
+    lines: 146-190
+    focus: 179-184
+    state:
+      hart: 2
+      mode: S
+      proc: none (scheduler)
+      intr: off
+      satp: kernel
+      locks: [cons.lock]
+      irq: {noff: 1, intena: 0, note: "`cons.lock` taken inside the trap handler, SIE already off: intena 0 ([[concept:locks#handlers]])"}
+      stack: [scheduler, kernelvec, kerneltrap, devintr, uartintr, consoleintr]
+      sp: {"on": scheduler, detail: "hart 2's slice of stack0, with a `kernelvec` frame on top"}
+    note: |
+      You type `l`, `s`, space, `|`, space, `w`, `c`. Each key is its own UART interrupt,
+      claimed through the PLIC by whichever hart gets there first (in our trace, a mix of
+      all three). Each time, [[consoleintr]] echoes the character with
+      [[uartputc_sync]] and appends it to `cons.buf`, but does **not** commit it: the shell
+      sleeps on.
+
+      Then Enter. Your terminal sends `\r`; hart 2 claims the interrupt. `\r` becomes `\n`,
+      it is echoed and stored, and line 182 commits the whole line: `w = e = 8`. Then
+      `wakeup(&cons.r)` walks the process table, taking each `p->lock`, finds the shell, and
+      makes it `RUNNABLE`.
+
+      This step belongs to no process. Hart 2 was idle; the interrupt arrived in its
+      scheduler loop. The kernel did all of this, echoing and line editing, before any
+      program saw a single byte.
+
+      Which stack does a keystroke run on? Whatever the claiming hart was using: `kernelvec`
+      pushes its 256-byte frame onto the current stack ([[kernel/kernelvec.S:14]]), and xv6 has
+      no separate interrupt stack. Here every hart is idle, so it is a scheduler stack. When
+      we replayed this command under gdb, all eight keystrokes (on harts 2, 0, 2, 0, 1, 1, 2, 0)
+      entered `consoleintr` on the claiming hart's scheduler stack with `sp` 496 bytes below the
+      top of its slice. Had a hart been running a process, the same handler would have run on that
+      process's kernel stack ([[tour:37]]).
+    others: |
+      Lock order: `cons.lock` then each `p->lock`. The shell took them in the same order
+      (in `sleep_prepare`), so the two harts cannot deadlock. And because the shell's
+      `p->lock` is taken for the check, the wakeup finds the shell either registered and
+      running or fully asleep, never halfway ([[tour:16]]).
+
+  - title: "sh (pid 2): awake on hart 1, eight reads later"
+    file: user/ulib.c
+    lines: 69-85
+    focus: 75-83
+    state:
+      hart: 1
+      mode: U
+      proc: sh (pid 2)
+      intr: on
+      satp: user
+      locks: []
+      stack: [main, getcmd, gets]
+      sp: {"on": user, switched: "`ld sp, 48(a0)` in `userret` ([[kernel/trampoline.S:118]]) and `sret` ([[kernel/trampoline.S:153]])", detail: "sh's user stack, the page at 0x4000"}
+    note: |
+      No hart is *told* that the shell is runnable; each scheduler notices on its next scan.
+      Hart 1 woke from `wfi` and found it first. The shell resumes inside [[kernel:sleep]],
+      on a different hart from the one it fell asleep on. Nothing in its kernel stack cares.
+
+      [[kernel:consoleread]] retakes `cons.lock`, takes `l`, copies it to the user with
+      [[kernel:copyout]], and returns 1. [[user:gets]] loops. The line costs eight one-byte
+      reads in all: the first is the one that slept in step 2 and now returns `l`; the
+      other seven find committed bytes and return at once.
+
+      `buf` now holds `"ls | wc\n"`. Hart 0 is idle; hart 2 is back in its scheduler.
+
+      Two stack switches brought the shell here. Hart 1's scheduler `swtch`ed onto the shell's
+      kernel stack, at the `sched` frame saved in step 2 ([[kernel/swtch.S:26]]), so the frames
+      hart 0 left behind were resumed by hart 1. Then the read returned and `userret` loaded the
+      shell's user `sp` from the trapframe ([[kernel/trampoline.S:118]]), leaving the kernel stack
+      empty.
+    others: |
+      While the shell reads, `cons.lock` is taken and released eight times on hart 1. A
+      key typed now (on any hart) would be appended after the newline, as the start of the
+      *next* command. This command's reads stop at the newline and never see it; the shell
+      reads it after the next prompt.
+
+  - title: "sh (pid 2): fork a child to do the work, then wait"
+    file: user/sh.c
+    lines: 145-176
+    focus: 160-174
+    state:
+      hart: 1
+      mode: U
+      proc: sh (pid 2)
+      intr: on
+      satp: user
+      locks: []
+      stack: [main]
+      sp: user
+    note: |
+      The line is not `cd`, so the shell calls [[user:fork1]] and the child runs
+      `runcmd(parsecmd(cmd))`. The parent goes straight to `wait(0)`.
+
+      Notice who parses: the **child**. Parsing allocates a tree with [[user:malloc]] and
+      writes `\0`s into `buf`. Done in the child, all of that vanishes when the child exits;
+      the shell itself never parses, never allocates and never frees, so it can run
+      forever without leaking. `cd` is the exception (line 166) because changing directory
+      in a child would change only the child's directory.
+
+      `fork` returns twice. We follow the kernel side first.
+
+  - title: "sh (pid 2): kfork copies memory and shares open files"
+    file: kernel/proc.c
+    lines: 256-305
+    focus: 284-292
+    state:
+      hart: 1
+      mode: S
+      proc: sh (pid 2)
+      intr: off
+      satp: kernel
+      locks: ["pid 3's p->lock (np->lock)"]
+      irq: {noff: 1, intena: 1, note: "`np->lock`, held since [[allocproc]]; [[filedup]] and [[idup]] add `ftable.lock` / `itable.lock` for a moment (2)"}
+      stack: [usertrap, syscall, sys_fork, kfork]
+      sp: {"on": kernel, switched: "`ld sp, 8(a0)` in `uservec` ([[kernel/trampoline.S:76]]) for `fork`", detail: "sh's kernel stack"}
+    note: |
+      [[kfork]] ([[tour:20]]) has already built pid 3: a slot from [[allocproc]], a
+      trapframe page, a new page table with a full copy of the shell's memory
+      ([[uvmcopy]]), and a copy of the shell's registers with `a0 = 0` so the child sees
+      `fork()` return 0.
+
+      Lines 285-288 are where the pipeline's plumbing will later come from. The child gets
+      the parent's descriptor *table* copied, but the open files themselves are shared:
+      [[filedup]] increments each `struct file`'s reference count. The console's count goes
+      from 6 to **9**. The child also shares the shell's current directory, the root inode,
+      through [[idup]].
+
+      Then pid 3 is made `RUNNABLE` and `fork` returns 3 to the shell. The shell calls
+      `wait`, and [[kwait]] finds no exited child, registers on its own `struct proc` as
+      a channel, and sleeps. Hart 1's scheduler takes the next `RUNNABLE` process in table
+      order: pid 3.
+
+      The stacks of pid 3 are made in two different ways. Its **user** stack is part of the
+      memory [[uvmcopy]] copies: same virtual addresses (the page at 0x4000 in this build), a
+      different physical page, with the shell's frames in it, so the child returns from `fork`
+      into the same `main`. Its **kernel** stack is not copied at all. pid 3 gets slot 2, whose
+      stack page (0x3fffff9000) was mapped at boot, and [[allocproc]] set
+      `context.sp` to its top and `context.ra` to [[forkret]] ([[kernel/proc.c:147]]): an empty
+      stack, waiting for a first `swtch`.
+    others: |
+      [[filedup]] takes `ftable.lock` for each increment, since other harts may be opening
+      or closing files at the same time. Linking the child to its parent takes `wait_lock`
+      ([[kernel/proc.c:296]]), so a parent in [[kwait]] on another hart never sees a
+      half-linked child.
+
+  - title: "sh (pid 3): parsecmd builds a PIPE tree"
+    file: user/sh.c
+    lines: 367-378
+    focus: 372-376
+    state:
+      hart: 1
+      mode: U
+      proc: sh (pid 3)
+      intr: on
+      satp: user
+      locks: []
+      stack: [main, parsecmd, parseline, parsepipe]
+      sp: {"on": user, switched: "`ld sp, 48(a0)` in `userret` ([[kernel/trampoline.S:118]]) and `sret` ([[kernel/trampoline.S:153]]), reached from [[forkret]]", detail: "pid 3's user stack, a copy of the shell's"}
+    note: |
+      pid 3 starts life returning from `fork` with 0 and calls [[user:parsecmd]], a small
+      recursive-descent parser ([[g:recursive-descent]]). [[user:parsepipe]] parses one
+      command with [[user:parseexec]] (`ls`), sees `|`, and recurses for the right side
+      (`wc`). The result:
+
+      ```
+      pipecmd
+      ├── left:  execcmd  argv = {"ls", 0}
+      └── right: execcmd  argv = {"wc", 0}
+      ```
+
+      The `argv` strings are not copied. They point into `buf` itself, and
+      [[user:nulterminate]] writes a `\0` after each word, turning `"ls | wc\n"` into
+      `"ls\0| wc\0"`. This is pid 3's private copy of `buf`; the shell's is untouched.
+
+      The first [[user:malloc]] asks the kernel for memory with `sbrk`: 64 KiB, allocated
+      eagerly, a few hundred bytes of which hold this tree.
+
+      On the stacks, pid 3's first run went: hart 1's scheduler `swtch`ed to it and landed on
+      the **empty** top of its kernel stack (0x3fffffa000 when we checked under gdb), in
+      [[forkret]]; `forkret` went straight to `userret`, whose `ld sp` switched to pid 3's copy
+      of the user stack, usable from the `sret` on. pid 3 never ran a line of `usertrap` before its first instruction in
+      user mode.
+
+  - title: "sh (pid 3): pipe() creates the channel"
+    file: user/sh.c
+    lines: 101-123
+    focus: 102-104
+    state:
+      hart: 1
+      mode: U
+      proc: sh (pid 3)
+      intr: on
+      satp: user
+      locks: []
+      stack: [main, runcmd]
+      sp: user
+    note: |
+      [[user:runcmd]] sees `PIPE`. `pipe(p)` enters the kernel, where [[pipealloc]] claims
+      two `struct file`s from the global table (under `ftable.lock`) and one 4096-byte page
+      from [[kalloc]] (under `kmem.lock`) to hold a `struct pipe`: a spinlock, a 512-byte
+      ring buffer, two counters (`nread`, `nwrite`) and two open flags (`readopen`,
+      `writeopen`). [[sys_pipe]] installs the read end as descriptor 3 and
+      the write end as descriptor 4, the lowest free slots, and copies `{3, 4}` into `p`.
+
+      Tour [[tour:39]] takes this apart byte by byte. Here, remember three facts: the pipe
+      holds 512 bytes; a reader of an empty pipe sleeps until a write *or* until every
+      write end is closed; and "every write end" is counted in `struct file` references,
+      which `fork` is about to multiply.
+
+  - title: "sh (pid 3): two forks, and descriptors rewired"
+    file: user/sh.c
+    lines: 101-123
+    focus: 105
+    state:
+      hart: 1
+      mode: U
+      proc: sh (pid 3)
+      intr: on
+      satp: user
+      locks: []
+      stack: [main, runcmd]
+      sp: user
+    note: |
+      pid 3 forks pid 4 (left side, `ls`) at line 105 and pid 5 (right side, `wc`) at line
+      112. Lines 106–110 and 113–117 then run in the children, not in pid 3. Each fork dups
+      all five open files: the console's count rises to 12, then **15** (in our trace both
+      forks happened before either child ran, so nothing had been closed yet).
+
+      The children rearrange their descriptors with the "close, then dup into the lowest
+      free slot" idiom:
+
+      | pid | runs | `close` | `dup` lands in | then closes |
+      |---|---|---|---|---|
+      | 4 | `ls` | 1 (console) | **1** ← write end | 3, 4 |
+      | 5 | `wc` | 0 (console) | **0** ← read end | 3, 4 |
+
+      After this, `ls`'s standard output *is* the pipe and `wc`'s standard input *is* the
+      pipe. When the children `exec`, the descriptor table survives ([[tour:22]]), so
+      `ls` and `wc` inherit the wiring without knowing it exists. This is the whole trick
+      of Unix pipelines: the shell connects programs by arranging descriptors 0 and 1
+      before `exec`.
+
+      In our trace all three forks ran on hart 1. pid 4 and pid 5 are now `RUNNABLE`, but
+      harts 0 and 2 are in `wfi` and will not notice until their next interrupt.
+    others: |
+      The children's `close` and `dup` calls run concurrently with pid 3's, possibly on
+      other harts. Each changes only its own process's `ofile[]` (no lock needed: only the
+      process itself touches its table) and the shared reference counts (always under
+      `ftable.lock`). However they interleave, each pipe end finishes with exactly one
+      holder: `ls` holds the write end, `wc` the read end.
+
+  - title: "sh (pid 3): close both ends, then wait"
+    file: kernel/proc.c
+    lines: 369-419
+    focus: 407-414
+    state:
+      hart: 1
+      mode: S
+      proc: sh (pid 3)
+      intr: off
+      satp: kernel
+      locks: [wait_lock]
+      irq: {noff: 1, intena: 1, note: "`wait_lock`; [[sleep_prepare]] adds `p->lock` for a moment, and line 415 drops it to 0 before `sleep()`"}
+      stack: [usertrap, syscall, sys_wait, kwait]
+      sp: {"on": kernel, switched: "`ld sp, 8(a0)` in `uservec` ([[kernel/trampoline.S:76]]) for `wait`", detail: "pid 3's kernel stack"}
+    note: |
+      pid 3 closes `p[0]` and `p[1]` ([[user/sh.c:119]]). It must: if it kept the write end
+      open, `wc` could never see end of file, and pid 3 would wait for `wc` forever while
+      `wc` waited for pid 3. [[tour:39]] shows this classic bug in full.
+
+      Then `wait(0)`. [[kwait]] takes `wait_lock` (a [[g:spinlock]]: interrupts off), scans
+      the table for children of pid 3, finds pids 4 and 5 alive, and registers on the
+      channel `p` (its own `struct proc`) with [[sleep_prepare]], still holding `wait_lock`.
+      Then it releases the lock and sleeps.
+
+      Three processes now sleep, each on a different channel: `init` and the shell on their
+      own `struct proc`s, pid 3 on its own. Hart 1 is free, and its scheduler picks the
+      next `RUNNABLE` process in table order: pid 4.
+    others: |
+      `wait_lock` closes the window between "no zombie child yet" and "registered": a child
+      exiting on another hart calls [[kexit]], which takes `wait_lock` before its
+      `wakeup(p->parent)`. So the child's exit happens either before pid 3's scan (and the
+      scan finds a zombie) or after pid 3 registered (and the wakeup finds it).
+      [[tour:21]] walks through it.
+
+  - title: "ls (pid 4): exec loads the program from disk"
+    file: kernel/exec.c
+    lines: 39-80
+    focus: 48-50
+    state:
+      hart: 1
+      mode: S
+      proc: ls (pid 4)
+      intr: on
+      satp: kernel
+      locks: ["ls's inode lock (sleep-lock)"]
+      irq: 0
+      stack: [usertrap, syscall, sys_exec, kexec]
+      sp: {"on": kernel, switched: "`ld sp, 8(a0)` in `uservec` ([[kernel/trampoline.S:76]]) when pid 4 called `exec`", detail: "pid 4's kernel stack, slot 3 (0x3fffff7000)"}
+    note: |
+      pid 4 calls `exec("ls", argv)` ([[user/sh.c:79]]). [[kexec]] ([[tour:22]]) looks up
+      `ls` in the current directory (the root) and finds inode 10, locks it, and reads its ELF header with
+      [[readi]].
+
+      This is the first time anything touches the **disk**. `ls`'s header is in block 301
+      of the disk image, and it is not in the buffer cache. [[bread]] calls
+      [[virtio_disk_rw]], which queues the request for the virtio disk and sleeps until
+      the disk's completion interrupt ([[tour:29]]). Then the code segment, at file offset
+      `0x1000` and `0xb89` bytes long, comes from blocks 305, 306 and 307.
+
+      In our trace, those four blocks were the **only** disk reads `ls` caused in the
+      whole command. The directory, the inode blocks and everything else were already in
+      the buffer cache. (`ls` is 40,256 bytes on disk, but `exec` loads only 2,953 bytes
+      of it; most of the rest is debugging information, symbol tables and page-alignment
+      padding, which `exec` never reads.)
+
+      When `kexec` returns, pid 4 is no longer a shell. Its name is `ls`, its memory is
+      `ls`'s, and its descriptors are untouched: 0 console, 1 pipe, 2 console.
+
+      `kexec` runs entirely on pid 4's kernel stack, and it is what gives `ls` a new **user**
+      stack. It builds it in a brand-new page table (one page at 0x3000 in this build, with a
+      guard page below it), copies the argument string `"ls"` and the `argv` array onto it, and
+      sets `trapframe->sp` to point at them ([[kernel/exec.c:137]]). Only then does it free the
+      old image, including the shell's user stack that pid 4 had been running on
+      ([[kernel/exec.c:138]]).
+    others: |
+      While `ls` sleeps for the disk, hart 1 runs something else, and the disk interrupt
+      may arrive at any hart; `ls` may finish `exec` on a different hart than it started.
+      Meanwhile `wc` (pid 5) is being exec'd too, on another hart, reading its own blocks
+      777 and 781–783. The two `exec`s share the buffer cache (`bcache.lock`), the log
+      ([[begin_op]] counts them as two outstanding operations), and the disk queue.
+
+  - title: "wc (pid 5): reads an empty pipe, and sleeps"
+    file: kernel/pipe.c
+    lines: 111-128
+    focus: 119-124
+    state:
+      hart: 2
+      mode: S
+      proc: wc (pid 5)
+      intr: off
+      satp: kernel
+      locks: [pi->lock]
+      irq: {noff: 1, intena: 1}
+      stack: [usertrap, syscall, sys_read, fileread, piperead]
+      sp: {"on": kernel, switched: "`ld sp, 8(a0)` in `uservec` ([[kernel/trampoline.S:76]]) when `wc` executed `ecall`", detail: "wc's kernel stack, slot 4 (0x3fffff5000)"}
+    note: |
+      Now we follow `wc`, on hart 2. Its `exec` finished, and with no arguments it calls
+      `wc(0, "")`, reading descriptor 0: `read(0, buf, 512)` ([[user/wc.c:16]]).
+      [[fileread]] sees `FD_PIPE` and calls [[piperead]].
+
+      Take the simplest case: `wc` gets here **before** `ls` has written a byte. (In other
+      traced runs `ls` was usually 72–299 bytes ahead by the time `wc`
+      first found the pipe empty; sooner or later `wc` always does.) The pipe is empty
+      (`nread == nwrite == 0`) and the write end is open (`ls` holds it), so
+      `wc` must wait: [[sleep_prepare]]`(&pi->nread)` while holding `pi->lock`, release,
+      [[sleep]].
+
+      `wc` has no idea it is reading from `ls`. Had you typed `wc` alone, the same
+      `read(0, …)` would have gone to [[consoleread]] and waited for your keystrokes.
+
+      When `wc` sleeps, its frames (`usertrap`, `syscall`, `sys_read`, `fileread`,
+      `piperead`, `sleep`, `sched`) stay on its kernel stack and hart 2 returns to its scheduler
+      stack. [[tour:39]] draws that stack.
+    others: |
+      `ls` on hart 1 will soon call [[pipewrite]], which needs `pi->lock`. Because `wc`
+      registered before releasing the lock, a byte written at any moment after this is
+      seen by its `wakeup(&pi->nread)`, and a byte written before it would have been seen
+      by `wc`'s check. No lost wakeup.
+
+  - title: "ls (pid 4): open the current directory"
+    file: user/ls.c
+    lines: 27-46
+    focus: 35-46
+    state:
+      hart: 1
+      mode: U
+      proc: ls (pid 4)
+      intr: on
+      satp: user
+      locks: []
+      stack: [main, ls]
+      sp: {"on": user, switched: "`ld sp, 48(a0)` in `userret` ([[kernel/trampoline.S:118]]) and `sret` ([[kernel/trampoline.S:153]]) at the end of `exec`", detail: "ls's new user stack, the page at 0x3000"}
+    note: |
+      Back to `ls`, in user mode on hart 1. With no arguments, `main` calls
+      `ls(".")`. A directory is a file, so `ls` opens it like any other file and asks
+      [[user:fstat]] what it is: `T_DIR`.
+
+      `open(".")` returns descriptor **3**, the lowest free slot (0, 1 and 2 are taken).
+      Do not confuse it with pid 3's old descriptor 3: `ls` closed that one before
+      `exec`. Descriptor numbers are per process; the same number can mean different files
+      in different processes.
+
+      The kernel side of this `open` is the next stop.
+
+  - title: "ls (pid 4): namex resolves \".\" to inode 1"
+    file: kernel/fs.c
+    lines: 692-728
+    focus: 703-716
+    state:
+      hart: 1
+      mode: S
+      proc: ls (pid 4)
+      intr: on
+      satp: kernel
+      locks: ["root inode's lock (sleep-lock)"]
+      irq: 0
+      stack: [usertrap, syscall, sys_open, namei, namex]
+      sp: {"on": kernel, switched: "`ld sp, 8(a0)` in `uservec` ([[kernel/trampoline.S:76]]) for `open`", detail: "ls's kernel stack"}
+    note: |
+      [[sys_open]] starts a log transaction with [[begin_op]] (a lookup may drop the last
+      reference to an inode, which can write the disk) and calls [[namei]]. `"."` does not
+      start with `/`, so [[namex]] begins at the process's current directory, the root
+      inode, inherited through every `fork` since `init`.
+
+      [[skipelem]] extracts the element `"."`. [[ilock]] locks the root inode, a
+      [[g:sleeplock]] (no need to read it from disk: it is cached and valid).
+      [[dirlookup]] reads the directory's entries and finds `"."` in the very first one,
+      pointing at inode **1**, the root itself. `"."` is an ordinary directory entry that
+      [[mkfs/mkfs.c|mkfs]] wrote; the kernel has no special case for it. [[tour:34]] covers path lookup
+      in depth.
+
+      Back in [[sys_open]]: a `struct file` of type `FD_INODE` with offset 0, readable
+      only.
+    others: |
+      The root inode's sleep-lock serializes this lookup with anything else that locks
+      the root directory, on any hart: another `ls`, an `open` creating a file. A
+      sleep-lock, because holding it may mean waiting for the disk. The in-memory inode
+      table itself is protected by `itable.lock`, taken briefly in [[iget]] and
+      [[idup]] ([[tour:33]]).
+
+  - title: "ls (pid 4): reading a directory entry through the buffer cache"
+    file: kernel/fs.c
+    lines: 505-534
+    focus: 525-530
+    state:
+      hart: 1
+      mode: S
+      proc: ls (pid 4)
+      intr: on
+      satp: kernel
+      locks: ["root inode's lock (sleep-lock)", "block 47's buffer lock (sleep-lock)"]
+      irq: 0
+      stack: [usertrap, syscall, sys_read, fileread, readi]
+      sp: {"on": kernel, switched: "`ld sp, 8(a0)` in `uservec` ([[kernel/trampoline.S:76]]) for each `read`", detail: "ls's kernel stack, refilled from empty for every call"}
+    note: |
+      `ls` reads the directory 16 bytes at a time, one `struct dirent` per
+      `read(fd, &de, sizeof(de))` ([[user/ls.c:60]]). Each goes [[fileread]] →
+      [[ilock]] → [[readi]].
+
+      The root directory is 1024 bytes: 64 slots, all in one disk block. [[bmap]] maps
+      offset 0 to block **47**. [[bread]] returns that block locked; readi copies 16 bytes
+      straight from the cached block into `ls`'s `de` with [[either_copyout]], releases the
+      block with [[brelse]], and [[fileread]] advances the file offset by 16.
+
+      So `ls` makes 65 `read` calls on this directory: 64 slots, then a 65th that
+      returns 0 at offset 1024. 40 of the slots are empty (`inum == 0`) and are skipped; 24
+      are real entries, from `.` to `console`.
+    others: |
+      Two sleep-locks are held, and interrupts are on. If another process wanted the root
+      directory right now (say, `wc`'s `exec` looking up `wc`), it would sleep in [[ilock]]
+      on the root inode's sleep-lock, before ever reaching block 47; a process that reached
+      block 47 another way would sleep in [[bget]] on the buffer's lock. Either way it
+      sleeps rather than spins. The inode lock also protects the file
+      offset update on the shared `struct file`.
+
+  - title: "ls (pid 4): a cache hit in bget"
+    file: kernel/bio.c
+    lines: 57-88
+    focus: 64-68
+    state:
+      hart: 1
+      mode: S
+      proc: ls (pid 4)
+      intr: off
+      satp: kernel
+      locks: ["root inode's lock (sleep-lock)", bcache.lock]
+      irq: {noff: 1, intena: 1, note: "`bcache.lock`; the root inode's sleep-lock adds no level"}
+      stack: [usertrap, syscall, sys_read, fileread, readi, bread, bget]
+      sp: kernel
+    note: |
+      [[bget]] takes `bcache.lock` (a spinlock: interrupts off) and walks the list of 30
+      buffers ([[NBUF]]) looking for device 1, block 47. Block 47 was read at boot (when
+      `init` looked up `/init`) and used for every lookup since, including `exec`'s
+      lookups of `sh`, `ls` and `wc`. It is there: `refcnt++`, release `bcache.lock`, then
+      take the buffer's own sleep-lock.
+
+      In our trace there was no disk read for block 47 or for the inode blocks during the
+      whole command. Had the block been evicted, `b->valid` would be 0 and [[bread]] would
+      read it from the disk, sleeping in [[virtio_disk_rw]], as `exec` did for `ls`'s code
+      ([[tour:29]], [[tour:30]]).
+    others: |
+      `bcache.lock` guards the identity of every buffer (`dev`, `blockno`, `refcnt`) and
+      the LRU list. Without it, two harts missing on the same block could each recycle a
+      different buffer for it, and the cache would hold two copies of block 47 that
+      disagree. It is released *before* the sleep-lock is taken, because a spinlock may
+      not be held while sleeping.
+
+  - title: "ls (pid 4): stat every entry, and print it a byte at a time"
+    file: user/ls.c
+    lines: 52-71
+    focus: 60-69
+    state:
+      hart: 1
+      mode: U
+      proc: ls (pid 4)
+      intr: on
+      satp: user
+      locks: []
+      stack: [main, ls]
+      sp: {"on": user, switched: "`ld sp, 48(a0)` in `userret` ([[kernel/trampoline.S:118]]) and `sret` ([[kernel/trampoline.S:153]])"}
+    note: |
+      For each of the 24 entries, `ls` builds the path `./README`, `./cat`, … and calls
+      [[user:stat]], which is three system calls: `open`, `fstat`, `close`. Each `open` is
+      another path lookup through block 47; each `close` runs [[fileclose]] → [[iput]]
+      inside a log transaction. That is 72 system calls just to learn the types, inode
+      numbers and sizes.
+
+      Then [[user:printf]] prints a line like
+
+      ```
+      README         2 2 2441
+      ```
+
+      and user `printf` makes one `write(1, &c, 1)` per character ([[tour:38]]). The 24
+      lines total **608 bytes**, so `ls` makes 608 `write` calls. Every one goes to
+      descriptor 1, which is the pipe.
+    others: |
+      `ls` reads the directory with no lock held across `read` calls. If another process
+      created a file in `/` right now, `ls` might or might not list it, depending on whether
+      its slot had been read yet. Each 16-byte read is consistent (the inode lock is held
+      for it), but the listing as a whole is not a snapshot.
+
+  - title: "ls (pid 4): pipewrite stores a byte and wakes wc"
+    file: kernel/pipe.c
+    lines: 76-109
+    focus: 94-105
+    state:
+      hart: 1
+      mode: S
+      proc: ls (pid 4)
+      intr: off
+      satp: kernel
+      locks: [pi->lock]
+      irq: {noff: 1, intena: 1, note: "`pi->lock`; the [[wakeup]] on line 105 adds each `p->lock` in turn (2)"}
+      stack: [usertrap, syscall, sys_write, filewrite, pipewrite]
+      sp: {"on": kernel, switched: "`ld sp, 8(a0)` in `uservec` ([[kernel/trampoline.S:76]]) for each one-byte `write`", detail: "ls's kernel stack, about 320 of its 4096 bytes in use (about 400 during copyin)"}
+    note: |
+      [[filewrite]] sees `FD_PIPE` and calls [[pipewrite]]. Under `pi->lock`: the read end
+      is open, the pipe is not full, so [[copyin]] fetches the byte `.` from `ls`'s memory
+      and stores it at `data[0]`; `nwrite` becomes 1.
+
+      Then `wakeup(&pi->nread)`. `wc` is registered on that channel, asleep, so it becomes
+      `RUNNABLE`. This happens at the end of **every** `pipewrite` call, whether or not
+      anyone is waiting: 608 walks of the process table for 608 bytes.
+
+      Could `ls` fill the pipe? It writes 608 bytes into 512 slots, so if `wc` read nothing
+      until byte 513, `ls` would sleep on `&pi->nwrite` until `wc` made room. In our runs
+      `wc` kept up and `ls` never slept here.
+
+      **Stack census.** At this moment five processes exist, and every one of them owns two
+      stacks; each hart owns one more. Values from our gdb run of this build:
+
+      ```text
+                      user stack                     kernel stack (slot page)
+      pid 1 init      page 0x3000: main, in wait     0x3fffffd000: usertrap … kwait, sleep, sched
+      pid 2 sh        page 0x4000: main, in wait     0x3fffffb000: usertrap … kwait, sleep, sched
+      pid 3 sh        page 0x4000: main, runcmd,     0x3fffff9000: usertrap … kwait, sleep, sched
+                      in wait
+      pid 4 ls        page 0x3000: main, ls (with    0x3fffff7000: usertrap … filewrite, pipewrite
+                      buf[512]), printf … putc                     ◄─ hart 1's sp
+      pid 5 wc        page 0x3000: main, wc          0x3fffff5000: usertrap … piperead, sleep, sched
+
+      hart 0  scheduler stack, stack0 slice 0 (top 0x80008890): start, main, scheduler, in wfi  ◄─ sp
+      hart 1  scheduler stack, stack0 slice 1 (top 0x80009890): start, main, scheduler;
+              its sp is parked in cpus[1].context while ls runs
+      hart 2  scheduler stack, stack0 slice 2 (top 0x8000a890): start, main, scheduler, in wfi  ◄─ sp
+      ```
+
+      Thirteen stacks, and only three `sp` registers: at any instant at most three of them are
+      being used. Everything else is a stack *waiting*, either a user stack whose `sp` is saved
+      in the trapframe, or a kernel stack whose `sp` is saved in `p->context`, or, for hart 1's
+      scheduler stack, in `cpus[1].context`. Notice that the
+      user stacks share virtual addresses (three at 0x3000, two at 0x4000) yet are five different
+      physical pages, one per page table, while the kernel stacks all live in the one kernel page
+      table and so must have different addresses. The other 59 slots' kernel stacks exist too,
+      mapped at boot and empty.
+    others: |
+      From now on, `ls` on hart 1 and `wc` on hart 2 use the pipe at the same time. Every
+      access to the counters and the ring is under `pi->lock`, so whichever hart arrives
+      second spins for the few microseconds the other holds it. Lock order:
+      `pi->lock` → `p->lock` (in `wakeup`), the same on both sides.
+
+  - title: "wc (pid 5): wakes on hart 2 and drains what is there"
+    file: kernel/pipe.c
+    lines: 111-143
+    focus: 129-140
+    state:
+      hart: 2
+      mode: S
+      proc: wc (pid 5)
+      intr: off
+      satp: kernel
+      locks: [pi->lock]
+      irq: {noff: 1, intena: 1}
+      stack: [usertrap, syscall, sys_read, fileread, piperead]
+      sp: {"on": kernel, switched: "`ld sp, 8(a1)` in [[swtch]] ([[kernel/swtch.S:26]]), in hart 2's scheduler", detail: "wc's kernel stack, the frames from step 12 intact"}
+    note: |
+      Hart 2's scheduler picks `wc` up. It retakes `pi->lock`, sees bytes, and copies as
+      many as are there (up to 512) into its `buf` with [[copyout]], advancing `nread`.
+      Then `wakeup(&pi->nwrite)` for any writer waiting for room, and it returns.
+
+      `ls` keeps writing while `wc` works, so each `read` gets whatever has piled up. In
+      eight traced runs `wc` needed between 5 and 17 data reads, for example **244**,
+      **238**, **2**, **80**, **22**, **22**, then **0**; another run had a stretch of
+      1-byte reads, `wc` and `ls` alternating byte by byte. The split is timing; the
+      total, 608, is not.
+    others: |
+      | Time | Hart 0 | Hart 1 (ls) | Hart 2 (wc) |
+      |---|---|---|---|
+      | t1 | idle / `wfi` | `pipewrite`: holds `pi->lock`, byte 248 | `acquire(&pi->lock)`: spins |
+      | t2 | idle / `wfi` | releases | gets it, copies bytes 1–248… |
+      | t3 | idle / `wfi` | next `pipewrite`: spins | … `nread = 248`, releases |
+      | t4 | idle / `wfi` | stores byte 249 | returns 248 to user |
+
+      Without `pi->lock`, the torn read it prevents:
+
+      | Time | Hart 1 (ls) | Hart 2 (wc) |
+      |---|---|---|
+      | t1 | `nwrite++` (now 249) | |
+      | t2 | | sees `nwrite == 249`, copies `data[248]`: still the old garbage |
+      | t3 | stores the byte into `data[248]`, too late | |
+
+      (The real code stores before incrementing, but without the lock neither the compiler
+      nor the CPU is bound to keep that order visible to another hart, [[tour:19]].)
+
+      (Illustrative: the exact split differs each run.) The bytes are never torn or
+      duplicated, because the check of `nwrite` and the copy happen in one critical section.
+
+  - title: "wc (pid 5): counting, in user mode"
+    file: user/wc.c
+    lines: 8-34
+    focus: 16-28
+    state:
+      hart: 2
+      mode: U
+      proc: wc (pid 5)
+      intr: on
+      satp: user
+      locks: []
+      stack: [main, wc]
+      sp: {"on": user, switched: "`ld sp, 48(a0)` in `userret` ([[kernel/trampoline.S:118]]) and `sret` ([[kernel/trampoline.S:153]])"}
+    note: |
+      Back in user mode, `wc` counts: every byte (`c`), every `\n` (`l`), and every
+      transition from whitespace to non-whitespace (`w`). This is the only computation in
+      the whole command that the user asked for, and it is a few tens of thousands of instructions.
+      Everything else in this tour is the operating system moving data and coordinating
+      processes.
+
+      Each line of `ls`'s output has four words (name, type, inode number, size), so 24
+      lines give 96 words. After its last data read, `wc` has seen all 608 bytes, but it
+      does not know that. It calls `read` again. Had `ls` still been running, the pipe
+      would be empty with the write end open, and `wc` would sleep once more; only the
+      write end being closed can tell it the data is over.
+    others: |
+      In user mode `wc` holds no locks and can be preempted by the timer at any
+      instruction, then resumed on another hart ([[tour:11]]). Its counters live in its
+      registers and stack, which the kernel saves and restores, so it never notices.
+
+  - title: "ls (pid 4): exit closes the write end"
+    file: kernel/proc.c
+    lines: 325-365
+    focus: 357-358
+    state:
+      hart: 1
+      mode: S
+      proc: ls (pid 4)
+      intr: off
+      satp: kernel
+      locks: [wait_lock, "ls's p->lock"]
+      irq: {noff: 2, intena: 1, note: "`wait_lock` and ls's own `p->lock`; line 360 releases `wait_lock` so that [[sched]] sees exactly 1 ([[concept:locks#unusual]])"}
+      stack: [usertrap, syscall, sys_exit, kexit]
+      sp: {"on": kernel, switched: "`ld sp, 8(a0)` in `uservec` ([[kernel/trampoline.S:76]]) for `exit`", detail: "ls's kernel stack, its last: kexit never returns to user mode"}
+    note: |
+      `ls` has printed everything and calls `exit(0)`. [[kexit]] ([[tour:21]]) first closes
+      every descriptor. Descriptor 1 holds the pipe's write end with reference count 1:
+      `ls` is the last writer. [[fileclose]] drops it to 0 and calls [[pipeclose]], which,
+      under `pi->lock`, sets `writeopen = 0` and calls `wakeup(&pi->nread)`. If `wc` is
+      asleep on the pipe, it becomes `RUNNABLE`.
+
+      Then the current directory is released ([[iput]] in a transaction), and under
+      `wait_lock` `ls` hands any children to `init` (it has none), wakes its parent pid 3
+      (asleep in [[kwait]]), and here, holding both `wait_lock` and its own `p->lock`,
+      records its exit status and becomes a [[g:zombie]]. Line 360 then lets go of
+      `wait_lock` (`noff` 2 → 1), because [[sched]] refuses to switch with any spinlock but
+      `p->lock` held ([[concept:locks#unusual]]). [[sched]] switches away for the
+      last time. Its memory and slot remain until pid 3 collects them.
+
+      `ls` is standing on its own kernel stack through all of this, up to the last `swtch`
+      ([[kernel/swtch.S:26]]), which moves hart 1 to its scheduler stack for good. Nothing frees
+      that stack, and nothing needs to: it belongs to slot 3, not to `ls`. What `ls` leaves for
+      its parent to free is the trapframe and the user page table, with its user stack in it.
+    others: |
+      Why hold `p->lock` while becoming `ZOMBIE` and switching away? A parent on another
+      hart, inspecting this child in [[kwait]], takes the child's `p->lock`. It must not
+      see `ZOMBIE`, call [[freeproc]] and mark the slot `UNUSED` while `ls` is still
+      executing on hart 1: a `fork` on a third hart could then claim the slot and start a
+      new process on the very kernel stack `ls` is still running on (kernel stacks belong to
+      slots, not to processes). The scheduler releases the lock only after `ls` has stopped
+      using its stack.
+
+  - title: "wc (pid 5): end of file, and the answer"
+    file: user/wc.c
+    lines: 8-34
+    focus: 29-33
+    state:
+      hart: 2
+      mode: U
+      proc: wc (pid 5)
+      intr: on
+      satp: user
+      locks: []
+      stack: [main, wc]
+      sp: {"on": user, switched: "`ld sp, 48(a0)` in `userret` ([[kernel/trampoline.S:118]]) and `sret` ([[kernel/trampoline.S:153]]), as `read` returned 0"}
+    note: |
+      Suppose `ls` has already exited when `wc` makes its final read:
+      [[kernel:piperead]] took `pi->lock`, found `nread == nwrite` with `writeopen == 0`,
+      skipped the sleep loop and returned **0** at once. (Had `ls` still been running, `wc`
+      would have slept, and `ls`'s [[kernel:pipeclose]] would have woken it.) To `wc` that
+      is end of file, exactly as from a disk file or a control-D at the console. The loop
+      ends.
+
+      Line 33 prints `"24 96 608 \n"`: 24 lines, 96 words, 608 bytes, and an empty name
+      (hence the trailing space). That is 11 bytes, and with user `printf` it is **11**
+      `write` system calls on descriptor 1, which for `wc` is the console.
+
+      If `ls` exits before `wc` has taken everything, the leftover bytes still come out
+      first, from a pipe whose writer is already gone. Data written to a pipe survives the
+      writer.
+    others: |
+      If pid 3 had not closed its copy of the write end in step 10, `writeopen` would still
+      be 1 here, and `wc` would sleep forever on an empty pipe. Everything about end of
+      file rests on reference counts reaching zero.
+
+  - title: "wc (pid 5): eleven bytes to the screen"
+    file: kernel/uart.c
+    lines: 76-96
+    focus: 84-93
+    state:
+      hart: 2
+      mode: S
+      proc: wc (pid 5)
+      intr: on
+      satp: kernel
+      locks: [tx_lock (sleep-lock)]
+      irq: 0
+      stack: [usertrap, syscall, sys_write, filewrite, consolewrite, uartwrite]
+      sp: {"on": kernel, switched: "`ld sp, 8(a0)` in `uservec` ([[kernel/trampoline.S:76]]) for each `write`", detail: "wc's kernel stack"}
+    note: |
+      Each of the 11 `write`s takes [[tour:5]]'s road: [[filewrite]] sees `FD_DEVICE`,
+      [[consolewrite]] copies the byte in, and [[uartwrite]] takes `tx_lock`, a
+      [[g:sleeplock]], checks that the UART's transmitter is idle, and writes the byte to
+      the `THR` register. QEMU passes it to your terminal.
+
+      `tx_lock` is what keeps output from different processes from mixing finer than one
+      batch. Here nobody competes: no other process is writing to the console. But had `cat`
+      been printing on another hart, its 32-byte batches and `wc`'s single bytes would
+      have interleaved; [[tour:38]] shows exactly that, from a real run.
+    others: |
+      Interrupts are on while `tx_lock` is held: a sleep-lock does not disable them. If the
+      UART were busy, `wc` would sleep on `tx_chan` and the UART's interrupt (on any hart)
+      would wake it. Meanwhile, `wc`'s exit is coming, and with it the closing of the
+      read end, the last reference to the pipe: [[pipeclose]] sees both ends closed and
+      returns the page to [[kfree]].
+
+  - title: "sh (pid 3): two waits reap two children"
+    file: kernel/proc.c
+    lines: 369-405
+    focus: 386-398
+    state:
+      hart: 1
+      mode: S
+      proc: sh (pid 3)
+      intr: off
+      satp: kernel
+      locks: [wait_lock, "child's p->lock"]
+      irq: {noff: 2, intena: 1, note: "`wait_lock` and the child's `p->lock`; inside [[freeproc]], [[kfree]]'s `kmem.lock` makes 3 ([[concept:locks#nesting]])"}
+      stack: [usertrap, syscall, sys_wait, kwait]
+      sp: {"on": kernel, switched: "`ld sp, 8(a1)` in [[swtch]] ([[kernel/swtch.S:26]]), in hart 1's scheduler", detail: "pid 3's kernel stack, resumed in kwait"}
+    note: |
+      `ls`'s `wakeup(p->parent)` made pid 3 `RUNNABLE`; hart 1, free since `ls` became a
+      zombie, picks it up. It resumes in [[kwait]], retakes
+      `wait_lock`, and scans again. For each child it takes the child's `p->lock`. pid 4 is
+      a `ZOMBIE`: [[freeproc]] frees its trapframe, page table and user memory, and marks the
+      slot `UNUSED`. `wait` returns 4.
+
+      Back in user mode, the second `wait(0)` ([[user/sh.c:122]]). `wc` may not be done:
+      if `wc` is still running, `kwait` finds no zombie, sleeps again, and is woken by
+      `wc`'s exit, possibly on another hart (in our trace the two reaps ran on different
+      harts). Then `runcmd` calls `exit(0)`, and pid 3 itself becomes a
+      zombie, waking the shell.
+
+      Once pid 3 has exited too, the console's reference count, which peaked at 15, is back
+      to **6**: each exit closed
+      its process's console descriptors.
+
+      pid 3 resumed on the kernel stack it slept on in step 10. The [[freeproc]] it calls frees
+      `ls`'s trapframe and user page table, so `ls`'s user stack page goes back to [[kfree]] here.
+      Slot 3's kernel stack stays mapped, empty, for the next process that gets the slot.
+    others: |
+      Two locks, in a fixed order: `wait_lock`, then the child's `p->lock`. [[kexit]] takes
+      them in the same order, so a parent reaping on one hart and a child exiting on another
+      cannot deadlock. `wait_lock` is one global lock for all parent-child links, which is
+      simple and correct, and serializes all exits and waits in the system.
+
+      Inside the reap, [[freeproc]] returns `ls`'s pages with [[kfree]], which takes
+      `kmem.lock` under the other two: `noff` 3, the path on which an instrumented kernel
+      reached its deepest nesting most often ([[concept:locks#nesting]]).
+
+  - title: "sh (pid 2): the next prompt"
+    file: user/sh.c
+    lines: 145-176
+    focus: 160-174
+    state:
+      hart: 1
+      mode: U
+      proc: sh (pid 2)
+      intr: on
+      satp: user
+      locks: []
+      stack: [main]
+      sp: {"on": user, switched: "`ld sp, 48(a0)` in `userret` ([[kernel/trampoline.S:118]]) and `sret` ([[kernel/trampoline.S:153]]), as `wait` returned 3"}
+    note: |
+      The shell's `wait` returns 3. The loop goes around, [[user:getcmd]] writes `$ `, and
+      [[kernel:consoleread]] puts the shell to sleep on `&cons.r`, exactly as in step 2. The
+      machine is idle again, waiting for you.
+
+      What did `ls | wc` cost? From the trace and the code:
+
+      | | Count |
+      |---|---|
+      | processes created | 3 (pids 3, 4, 5), all reaped |
+      | `exec`s | 2 |
+      | system calls | about 800: 8 `read`s by the shell, 608 `write`s by `ls`, 72 for its `stat`s, 65 directory `read`s plus `open`/`fstat`/`close` of `.`, 6 to 18 `read`s (5 to 17 with data, then the final 0) and 11 `write`s by `wc`, and about 25 more for `fork`, `pipe`, `close`, `dup`, `exec`, `sbrk`, `wait`, `exit` and the prompts |
+      | disk reads | 8 blocks (4 for `ls`, 4 for `wc`); everything else hit the buffer cache |
+      | interrupts | one per keystroke, one per disk read, UART transmit-done interrupts as output drains, plus timer ticks |
+      | harts used | all 3, with processes moving between them |
+
+      And the ideas that made it safe: a spinlock around every shared counter (`cons`, the
+      pipe, `ftable`, `bcache`, the process table), sleep-locks where the holder may wait
+      (inodes, buffers, the UART), registering before releasing so no wakeup is lost, a
+      fixed lock order, and reference counts that decide when things end. Each of these has
+      its own tour; this one showed them working together. [[tour:49]] runs this same
+      `ls | wc` again and takes a census of every lock it touched.
+locks:
+  - lock: cons.lock (spinlock)
+    where: "[[consoleread]], [[consoleintr]]"
+    protects: "The console input buffer and its indices `r`, `w`, `e` ([[tour:37]])"
+  - lock: p->lock (spinlock)
+    where: "[[sleep_prepare]], [[sleep]], [[wakeup]], [[kfork]], [[kexit]], [[kwait]], the schedulers"
+    protects: "A process's `state` and `chan`; held across the final switch of an exiting process"
+  - lock: wait_lock (spinlock)
+    where: "[[kfork]], [[kexit]], [[kwait]]"
+    protects: "Parent-child links; makes exit's wakeup and wait's sleep atomic with respect to each other"
+  - lock: ftable.lock (spinlock)
+    where: "[[filealloc]], [[filedup]], [[fileclose]]"
+    protects: "Reference counts of every open file, including the console (6 → 15 → 6) and both pipe ends"
+  - lock: kmem.lock (spinlock)
+    where: "[[kalloc]], [[kfree]]"
+    protects: "The free-page list: process memory, page tables, the pipe's page"
+  - lock: pi->lock (spinlock)
+    where: "[[pipewrite]], [[piperead]], [[pipeclose]]"
+    protects: "The pipe's ring and counters, `readopen`, `writeopen` ([[tour:39]])"
+  - lock: "inode lock (sleep-lock)"
+    where: "[[ilock]] in [[namex]], [[fileread]], [[kexec]]"
+    protects: "An inode's contents and a file's offset during a read; may be held across disk waits"
+  - lock: itable.lock (spinlock)
+    where: "[[iget]], [[idup]], [[iput]]"
+    protects: "The in-memory inode table's reference counts"
+  - lock: bcache.lock (spinlock)
+    where: "[[bget]], [[brelse]]"
+    protects: "Which block each buffer holds, their reference counts, the LRU list"
+  - lock: "buffer lock (sleep-lock)"
+    where: "[[bread]] to [[brelse]]"
+    protects: "One cached block's data while it is read or filled from disk"
+  - lock: tx_lock (sleep-lock)
+    where: "[[uartwrite]]"
+    protects: "The UART transmitter, one 32-byte batch at a time ([[tour:38]])"
+  - lock: pid_lock (spinlock)
+    where: "[[allocpid]], in each of the 3 forks"
+    protects: "`nextpid`, so no two processes get the same pid"
+  - lock: log.lock (spinlock)
+    where: "[[begin_op]], [[end_op]]: both `exec`s, every `open` and `close`, each exit's [[iput]] of its directory"
+    protects: "The log's count of outstanding operations and its committing state"
+  - lock: disk.vdisk_lock (spinlock)
+    where: "[[virtio_disk_rw]] and the disk interrupt, for the 8 disk reads"
+    protects: "The virtio descriptor ring and the disk's in-flight request bookkeeping"
+  - lock: tickslock (spinlock)
+    where: "[[clockintr]], on hart 0 only"
+    protects: "The global `ticks` counter, advanced by timer interrupts throughout"
+  - lock: "lk->lk inside each sleep-lock (spinlock)"
+    where: "[[acquiresleep]], [[releasesleep]]"
+    protects: "Each sleep-lock's `locked` flag and holder pid, for inode, buffer and `tx_lock` sleep-locks alike"
+  - lock: "ofile[] (no lock)"
+    where: "[[fdalloc]], [[sys_close]], [[sys_dup]]"
+    protects: "Changed only by the owning single-threaded process"
+quiz:
+  - q: "Why does the shell parse the command in the child (`runcmd(parsecmd(cmd))` after `fork1`) rather than before forking?"
+    a: "Parsing allocates the command tree with `malloc` and writes `\\0`s into `buf`. In the child, all of that disappears when the child exits, so the long-lived shell never leaks memory or needs to free anything."
+  - q: "`ls` writes to descriptor 1 and `wc` reads descriptor 0, and neither program mentions pipes. Which lines make that work, and why does it survive `exec`?"
+    a: "In the children, `close(1); dup(p[1])` and `close(0); dup(p[0])` ([[user/sh.c:106]], [[user/sh.c:113]]) put the pipe ends in the lowest free slots, 1 and 0. `exec` replaces memory and registers but keeps the descriptor table, so `ls` and `wc` inherit the wiring."
+  - q: "Suppose `wc` has read all 608 bytes while `ls` is still running, so its next `read` sleeps. What exactly wakes it, and why would it sleep forever if pid 3 had not closed `p[1]`?"
+    a: "`ls`'s exit closes the last write-end reference: `fileclose` calls `pipeclose`, which sets `writeopen = 0` and calls `wakeup(&pi->nread)`; `wc` then returns 0. If pid 3 still held the write end, its reference count would not reach 0, `writeopen` would stay 1, and pid 3 would be waiting for `wc` while `wc` waited for pid 3's write end."
+  - q: "In one traced run, `wc`'s reads returned 244, 238, 2, 80, 22, 22 and 0 bytes. Why not 512, 96 and 0?"
+    a: "A pipe read returns whatever is in the pipe when the reader runs, not a full buffer. `ls` writes one byte per call while `wc` runs concurrently on another hart, so each `read` gets the bytes that have accumulated since the last one; the split depends on scheduling."
+  - q: "Block 47 holds the root directory. Name three moments in this tour when some process locked that buffer, and explain why `bget` releases `bcache.lock` before taking the buffer's sleep-lock."
+    a: "`exec`'s lookups of `ls` and `wc`, `ls`'s `open(\".\")` and its 64 directory reads that return data, and each `stat` path lookup. `bcache.lock` is a spinlock; taking the sleep-lock may sleep (if another process holds the buffer, possibly waiting for the disk), and sleeping while holding a spinlock is forbidden."
+  - q: "`ls` becomes a zombie while holding both `wait_lock` and its own `p->lock`. What could go wrong on another hart if it released its `p->lock` before calling `sched()`?"
+    a: "pid 3's `kwait` on another hart could see `ZOMBIE` and call `freeproc`, marking the slot `UNUSED` while `ls` is still running on that slot's kernel stack on hart 1; a `fork` elsewhere could then reuse the slot and its stack at the same time. Holding `p->lock` until the scheduler releases it guarantees `ls` has stopped running first."

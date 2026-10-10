@@ -1,0 +1,705 @@
+title: From make qemu to a disk image and a kernel
+group: Boot and build
+prerequisites: []
+summary: |
+  Before xv6 can run a single instruction, two files must exist: `kernel/kernel`, the
+  program the three CPUs will execute, and `fs.img`, the disk they will read `init` and the
+  shell from. You type `make qemu`, about a hundred commands scroll past, and QEMU starts.
+  This tour slows that scroll down and reads it as a story.
+
+  You will watch [[g:make]] work out what must be built and in what order, see the real
+  command that turns one `.c` file into an [[g:object-file]] for a CPU your computer does
+  not have, assemble a `.S` file, and watch the [[g:linker]] place the kernel at
+  `0x80000000` according to [[kernel/kernel.ld]]. Then a small program, [[mkfs/mkfs.c|mkfs]], runs on
+  *your* computer and lays out a 2000-block file system, block by block. Finally QEMU is
+  told to build a machine with three CPUs and boot it.
+
+  Every number in this tour comes from a real build of this commit, with
+  GCC 15.2.0 for riscv64 and QEMU 11.0.0. Your addresses may differ by a few
+  bytes with another compiler; the layout will not.
+cast: |
+  Nothing is running yet. There are no [[g:hart|harts]], no processes and no locks: only
+  `make` on your computer, and later `mkfs`. But keep three harts in mind. The last command
+  of this tour, `-smp 3`, creates them, and many choices made at build time (one boot stack
+  per CPU, one kernel image shared by every CPU, global tables in `.bss`) exist because of
+  them.
+
+  | Hart | What it is doing |
+  |---|---|
+  | 0 | Does not exist yet. QEMU will create it at the end of this tour |
+  | 1 | Does not exist yet |
+  | 2 | Does not exist yet |
+steps:
+  - title: You ask for a running system
+    file: Makefile
+    lines: 182-183
+    focus: 182
+    state:
+      proc: make (on your computer)
+    note: |
+      `make qemu` names a *target*. Line 182 says what it depends on, and line 183 is the
+      one command that produces it. Before running that command, `make` must make sure that
+      every prerequisite exists and is up to date:
+
+      ```
+      qemu
+      ├── check-qemu-version         (QEMU at least 7.2)
+      ├── kernel/kernel              ← 27 object files + kernel/kernel.ld
+      │     ├── kernel/entry.o       ← kernel/entry.S
+      │     ├── kernel/start.o       ← kernel/start.c + headers
+      │     └── ... 25 more
+      └── fs.img                     ← mkfs/mkfs, README, 20 user programs
+            ├── mkfs/mkfs            ← mkfs/mkfs.c (compiled for YOUR machine)
+            └── user/_cat, _echo, _init, _sh, ...
+                  └── user/cat.o + the user library (ulib.o, usys.o, ...)
+      ```
+
+      `make` walks this graph from the leaves up. A file is rebuilt only if it is missing or
+      older than something it depends on. That is why a second `make qemu` starts QEMU
+      almost at once: everything is already newer than its sources.
+
+      `make` builds the prerequisites left to right: first the silent QEMU version check,
+      then the kernel, then the disk (`mkfs` before the user programs it will copy), and
+      finally it runs the emulator. This tour follows roughly that order.
+
+  - title: Finding a compiler for a CPU you do not have
+    file: Makefile
+    lines: 37-61
+    focus: 38-58
+    state:
+      proc: make (on your computer)
+    note: |
+      Your computer's CPU is probably an x86-64 or an ARM chip. xv6 runs on a 64-bit
+      RISC-V CPU. Your system's normal `gcc` produces the wrong machine code, so the kernel
+      must be built with a [[g:cross-compiler]]: a compiler that runs here but produces code
+      for RISC-V.
+
+      Lines 38–53 try the common names for such a toolchain until one answers, and set
+      `TOOLPREFIX` to its prefix: `riscv64-unknown-elf-`, `riscv64-linux-gnu-` or
+      `riscv64-elf-` are the usual ones, depending on how your toolchain was installed.
+      Lines 58–61 then set:
+
+      | Variable | Program |
+      |---|---|
+      | `CC` | `${TOOLPREFIX}gcc` |
+      | `LD` | `${TOOLPREFIX}ld` |
+      | `OBJDUMP` | `${TOOLPREFIX}objdump` |
+
+      This site writes every toolchain command that way: `${TOOLPREFIX}gcc`,
+      `${TOOLPREFIX}objdump`, `${TOOLPREFIX}readelf` and so on. `TOOLPREFIX` is your RISC-V
+      toolchain's prefix, the same one the Makefile detects; to run the commands yourself,
+      set it in your shell with `export TOOLPREFIX=riscv64-unknown-elf-` or whichever you
+      have. On Debian/Ubuntu/WSL, `gdb-multiarch` also works as the debugger. The commands
+      `make` prints below are shown the same way; on your screen they start with your prefix.
+
+      The test on each line runs that `objdump -i` and greps its list of file formats for
+      `elf64-big` (a RISC-V objdump lists `elf64-bigriscv`). In practice it asks "does a
+      tool by this name exist and run"; the prefix itself is what picks RISC-V.
+
+      Line 55 also fixes the emulator: `qemu-system-riscv64`, which pretends to be a
+      whole RISC-V computer, CPUs, memory and devices included ([[g:qemu]]).
+
+  - title: The kernel is 27 object files
+    file: Makefile
+    lines: 1-31
+    focus: 4-31
+    state:
+      proc: make (on your computer)
+    note: |
+      [[build:OBJS]] lists every piece of the kernel, one object file per source file. `make`
+      will build each from its `.c` or `.S` file and then link them into one program.
+
+      The order matters only once: `$K/entry.o` is first. The linker copies code into the
+      output in the order of its inputs, so the first instruction of [[kernel/entry.S]] lands
+      first, at `0x80000000`, where every hart will start. [[kernel/kernel.ld:13]] makes sure
+      of it a second way, by naming the file `kernel/entry.o`: with `entry.o` moved to the end
+      of the link, its code still lands first. (The `(_entry)` after the name asks for a
+      section called `_entry`, and there is none; [[kernel/entry.S]] puts `_entry` in plain
+      `.text`. It is the file name that does the work.)
+
+      Notice what is *not* here: no C library. There is no `printf` from your system, no
+      `malloc`, no `memcpy`. The kernel brings its own: [[printk]], [[kalloc]], and the
+      routines in [[kernel/string.c]]. A kernel cannot borrow a library that itself assumes
+      a kernel underneath.
+    others: |
+      These 27 files will become **one** program shared by all three harts. There is no
+      "copy for hart 1". Every hart will execute the same instructions from the same
+      physical memory, and every global variable in these files (the process table, the
+      free-page list, the buffer cache) will be one object that all three harts can touch.
+      That single fact is why xv6 needs locks, and you will meet the first one in
+      [[tour:3]].
+
+  - title: Compiling one C file, with the real flags
+    file: Makefile
+    lines: 63-89
+    focus: 66-81
+    state:
+      proc: make (on your computer)
+    note: |
+      There is no rule in the Makefile that says how to build `kernel/main.o` from
+      `kernel/main.c`. `make` has a built-in one: `$(CC) $(CFLAGS) -c -o $@ $<`. So the
+      command it prints is (shortened only where `...` shows):
+
+      ```
+      ${TOOLPREFIX}gcc -Wall -Werror -Wno-unknown-attributes -O -fno-omit-frame-pointer
+        -ggdb -gdwarf-2 -ffile-prefix-map=<your xv6 dir>=. -march=rv64gc -std=gnu99 -MD
+        -mcmodel=medany -ffreestanding -fno-common -nostdlib -fno-builtin-strncpy ...
+        -fno-builtin-vprintf -I. -fno-stack-protector -fno-pie -no-pie
+        -c -o kernel/main.o kernel/main.c
+      ```
+
+      The flags that make this a *kernel* compile:
+
+      - [[g:flag-march|-march=rv64gc]]: emit 64-bit RISC-V with the common extensions
+        (multiply, atomics, floating point, compressed 2-byte instructions). The atomic
+        instructions matter: `amoswap`, which every spinlock uses, is part of the `A` extension that `g` includes.
+      - [[g:flag-mcmodel|-mcmodel=medany]]: compute addresses relative to the current
+        instruction, so code can live at `0x80000000` and above.
+      - [[g:freestanding|-ffreestanding]] and the [[g:flag-fno-builtin|-fno-builtin-*]]
+        list: do not assume a hosted C library, and do not treat calls to `memset`,
+        `printf`, `strlen`… as the standard functions the compiler knows. xv6 has its own
+        versions with its own behavior ([[kernel/string.c]], [[printk]]). gcc may still emit
+        calls to `memset`/`memcpy` on its own (for example for struct copies), which is one
+        reason `string.c` defines them. ([[g:flag-nostdlib|-nostdlib]] only matters when
+        gcc links, and the kernel is linked by calling `ld` directly, so here it is just a
+        safeguard.)
+      - `-fno-stack-protector`, `-fno-pie -no-pie`: no hidden runtime support that a bare
+        machine cannot provide. Lines 81–89 add these only if this compiler understands
+        them.
+      - `-O -ggdb -fno-omit-frame-pointer`: optimize a little but keep the code
+        debuggable with `gdb`.
+
+  - title: What the compiler made of main.c
+    file: kernel/main.c
+    lines: 1-45
+    focus: 10-13
+    state:
+      proc: make (on your computer)
+    note: |
+      `kernel/main.o` is a RISC-V [[g:elf]] [[g:object-file]], not a program. Its code
+      starts at address **0**, because the compiler has no idea where the linker will put
+      it. And it is full of holes. Disassembling it (`${TOOLPREFIX}objdump -dr kernel/main.o`)
+      shows:
+
+      ```
+      0000000000000000 <main>:
+         0: 1141       addi sp,sp,-16
+         ...
+         8: 00000097   auipc ra,0x0
+                       8: R_RISCV_CALL_PLT  cpuid
+         c: 000080e7   jalr  ra
+        10: 00000717   auipc a4,0x0
+                       10: R_RISCV_PCREL_HI20  started
+      ```
+
+      `auipc ra,0x0` is a placeholder. The line below it is a **relocation**, a note to the
+      linker: "when you know where [[cpuid]] is, patch this instruction". `main.c` calls
+      [[cpuid]] but does not define it; `proc.o` does. Each object file is compiled alone,
+      knowing only the declarations in [[kernel/defs.h]].
+
+      The same happens to [[started]], the flag on line 7. In `main.o` its address is a
+      relocation too. Only after linking will it be a real address: `0x8000786c`, a single
+      4-byte variable that all three harts will read in [[tour:3]].
+
+  - title: -MD teaches make which headers matter
+    file: Makefile
+    lines: 154-157
+    focus: 157
+    state:
+      proc: make (on your computer)
+    note: |
+      The `-MD` flag in [[build:CFLAGS]] makes the compiler write a second file while it
+      compiles: `kernel/main.d`, a tiny Makefile fragment listing every header `main.c`
+      actually included:
+
+      ```
+      kernel/main.o: kernel/main.c kernel/types.h kernel/param.h \
+       kernel/memlayout.h kernel/riscv.h kernel/defs.h
+      ```
+
+      Line 157 pulls all those fragments into the Makefile (`-include` does nothing if
+      they do not exist yet, as on a first build; [[g:make-include]]). From the second build
+      on, `make` knows that changing [[kernel/param.h]], say `NCPU`, must recompile
+      `main.o` and every other file that includes it.
+
+      Without this, a header change would leave stale object files compiled against the
+      old definition. For a kernel, where two files must agree on the exact layout of
+      `struct proc` or `struct spinlock`, that is a recipe for corrupting memory in ways
+      that look like a concurrency bug.
+
+  - title: Assembling a .S file
+    file: kernel/entry.S
+    lines: 1-21
+    focus: 7-19
+    state:
+      proc: make (on your computer)
+    note: |
+      Four kernel files are assembly: `entry.S`, `swtch.S`, `trampoline.S` and `kernelvec.S`
+      (user programs add a fifth, the generated `usys.S`). [[kernel/entry.S]] is the first code any
+      hart runs. Its rule is [[Makefile:98]]:
+
+      ```
+      ${TOOLPREFIX}gcc -march=rv64gc -g -ffile-prefix-map=<dir>=. -c -o kernel/entry.o kernel/entry.S
+      ```
+
+      `gcc` runs the C preprocessor over a capital-`.S` file (so `#include` works, as in
+      `trampoline.S`) and then the assembler. The output has some surprises:
+
+      - `la sp, stack0` (line 12) is a [[g:pseudo-instruction]]. It becomes two real
+        instructions, `auipc sp` + `addi sp`, with relocations against [[stack0]].
+      - `li a0, 1024*4` becomes `lui a0,0x1`: the assembler does the multiplication.
+      - `call start` becomes `auipc ra` + `jalr ra`, 8 bytes, with a relocation.
+
+      The `.o` file is 32 bytes of code. After linking, `call start` has shrunk to a single
+      4-byte `jal 80000058 <start>`: the linker saw that [[start]] was close enough and
+      *relaxed* the call. That is why `spin` ends up at `0x8000001a`, not `0x8000001e`.
+    others: |
+      These instructions will soon be executed by all three harts at the same moment, and
+      they will compute three *different* stack pointers from the same code. The trick is
+      `csrr a1, mhartid` on line 14: each hart reads its own ID from its own register.
+      [[tour:2]] follows that in detail.
+
+  - title: The trampoline asks for a page of its own
+    file: kernel/trampoline.S
+    lines: 1-22
+    focus: 16-19
+    state:
+      proc: make (on your computer)
+    note: |
+      Most code goes into a [[g:section]] called `.text`. [[kernel/trampoline.S]] puts its
+      code in a section with a made-up name, `trampsec`. The name means nothing to the
+      assembler; it exists so that the linker script can find this code and treat it
+      specially.
+
+      Why special? The trampoline is the code that switches between user and kernel page
+      tables ([[g:trampoline]]). The kernel will map this one page at the same virtual
+      address, the highest page xv6 uses (`MAXVA - PGSIZE`), in the kernel's page table and in every
+      process's page table. To map it alone, it must start on a page boundary and fit in
+      one 4096-byte page, with nothing else sharing the page.
+
+      The assembler cannot guarantee that. It only knows about this one file. The linker,
+      which sees everything, will: next step.
+
+  - title: Linking 27 objects into one kernel
+    file: Makefile
+    lines: 91-96
+    focus: 93-96
+    state:
+      proc: make (on your computer)
+    note: |
+      Once every object exists, line 94 runs:
+
+      ```
+      ${TOOLPREFIX}ld -z max-page-size=4096 -T kernel/kernel.ld -o kernel/kernel
+                     kernel/entry.o kernel/start.o ... kernel/virtio_disk.o
+      ${TOOLPREFIX}ld: warning: kernel/kernel has a LOAD segment with RWX permissions
+      ```
+
+      The linker resolves every relocation: `main.o`'s call to [[cpuid]] is patched with
+      `cpuid`'s final address, and so on, thousands of times. It refuses to finish if a
+      function is called but defined nowhere.
+
+      The warning is real and harmless here. `kernel.ld` places code and data back to back
+      without asking for separate segments, so `ld` puts all of them in one loadable
+      segment marked read, write and execute. Nothing enforces those flags: QEMU just copies
+      the bytes into RAM, and paging is off at first. Protection comes later, from the kernel's own page table,
+      which maps code read-and-execute and data read-and-write ([[tour:24]]).
+
+      Lines 95–96 then write two files for humans: `kernel/kernel.asm`, the whole kernel
+      disassembled with the C source interleaved, and `kernel/kernel.sym`, one line per
+      symbol with its address. Every address in these tours comes from them.
+
+  - title: kernel.ld puts the code at 0x80000000
+    file: kernel/kernel.ld
+    lines: 1-21
+    focus: 10-20
+    state:
+      proc: make (on your computer)
+    note: |
+      The [[g:linker-script]] decides where everything goes. Line 10 starts at
+      `0x80000000` because on QEMU's `virt` machine, RAM starts there and the boot ROM
+      jumps there. In this build, from `kernel/kernel.sym`:
+
+      | Address | What |
+      |---|---|
+      | `0x80000000` | [[_entry]], the first instruction (`entry.o`'s `.text`) |
+      | `0x80000058` | [[start]] |
+      | `0x80000e5e` | [[main]] |
+      | `0x80006000` | [[trampoline]] (`uservec`), after `ALIGN(0x1000)` on line 15 |
+      | `0x8000609c` | [[userret]] |
+      | `0x80007000` | [[etext]]: the end of all code |
+
+      The kernel's ordinary code ends somewhere below `0x80006000`. Line 15 pads to the next
+      page, line 17 places `trampsec` there, line 18 pads again, and the `ASSERT` on line 19
+      stops the build if the trampoline ever outgrows its page. So the trampoline is
+      exactly one page, `0x80006000`–`0x80007000`, and `etext` is page-aligned.
+
+      That alignment is not cosmetic. [[kvmmake]] will map `KERNBASE`–`etext` as
+      read+execute and everything above as read+write, page by page. If `etext` fell in the
+      middle of a page, one page would have to be both.
+
+  - title: kernel.ld lays out the data, and marks the end
+    file: kernel/kernel.ld
+    lines: 23-45
+    focus: 23-44
+    state:
+      proc: make (on your computer)
+    note: |
+      After the code come the constants, the initialized data, and the zero-initialized
+      data ([[g:bss]]). In this build:
+
+      | Section | Starts | Size |
+      |---|---|---|
+      | `.rodata` | `0x80007000` | `0x848` (2,120 bytes) |
+      | `.data` | `0x80007848` | `0x18` (24 bytes) |
+      | `.bss` | `0x80007860` | `0x19350` (103,248 bytes) |
+      | [[end]] | `0x80020bb0` | first byte after the kernel |
+
+      Almost all of the kernel's data is in `.bss`. The biggest objects are the tables
+      every hart will share: [[bcache]] (`0x86c0` bytes at `0x800157e8`), [[stack0]]
+      (`0x8000` bytes at `0x80007890`: one 4 KiB boot stack for each of up to 8 CPUs, which
+      each hart keeps for good as its scheduler stack; see [[concept:stacks]]),
+      [[proc@kernel/proc.c|proc]] (64 processes, `0x5a00` bytes at `0x8000fdd0`), the inode
+      table, the file table, and [[cpus]].
+
+      `.bss` takes no space in the file: the program header records a memory size
+      (`0x20bb0`) larger than the file size (`0x7860`), and QEMU provides zeroed memory. So of `kernel/kernel`'s 287,512 bytes, only `0x7860` (30,816)
+      are code and data that get loaded; the rest is symbols and debugging information.
+
+      [[end]] is where the kernel stops and free memory begins. [[kinit]] will hand every
+      page from `end` (rounded up to `0x80021000`) to `0x88000000` to the page allocator.
+
+  - title: User programs, the user library and the system-call stubs
+    file: Makefile
+    lines: 104-115
+    focus: 104-115
+    state:
+      proc: make (on your computer)
+    note: |
+      The disk needs programs, and user programs are built differently from the kernel.
+
+      - Each is linked from its own object file plus [[build:ULIB]], the tiny user library:
+        `ulib.o` (string functions and [[user:start]]), `printf.o`, `umalloc.o`, and
+        `usys.o`.
+      - `usys.S` does not exist in the source tree. Lines 111–112 generate it by running the
+        Perl script [[user/usys.pl]], which prints one three-instruction
+        [[g:syscall-stub]] per system call: `li a7, SYS_<name>; ecall; ret`. Generating it
+        keeps the stubs in step with [[kernel/syscall.h]].
+      - The pattern rule on line 106 makes `user/_init` from `user/init.o`, linked with
+        [[user/user.ld]] instead of the kernel's script. The leading underscore keeps your
+        own system from confusing `user/_cat` with its `cat`.
+
+      The real link command for the first program in the list:
+
+      ```
+      ${TOOLPREFIX}ld -z max-page-size=4096 -T user/user.ld -o user/_cat
+                     user/cat.o user/ulib.o user/usys.o user/printf.o user/umalloc.o
+      ```
+
+  - title: Every user program starts at address 0
+    file: user/user.ld
+    lines: 1-39
+    focus: 3-5
+    state:
+      proc: make (on your computer)
+    note: |
+      The kernel is linked at `0x80000000`; every user program is linked at **0**. Two
+      programs at the same address cannot both live in physical memory there, and they do
+      not have to: each process will get its own page table that maps *its* virtual
+      address 0 to wherever its pages really are ([[tour:25]]).
+
+      For `user/_init` in this build (`${TOOLPREFIX}readelf -l`):
+
+      | Segment | Virtual address | Size in memory | Permissions |
+      |---|---|---|---|
+      | code + constants | `0x0` | `0xa01` | read, execute |
+      | data + bss | `0x1000` | `0x30` | read, write |
+
+      There is no `ENTRY` line, so `ld` uses the symbol `start` as the
+      [[g:entry-point]]: [[user:start]] in [[user/ulib.c]], at `0xbc` in `_init`. That
+      number will reappear in [[tour:4]] as the very first user-mode program counter.
+
+      The data segment starts on a fresh page (line 23) so that [[kexec]] can map the code
+      pages without write permission and the data pages with it.
+
+  - title: mkfs is compiled for your computer, not for RISC-V
+    file: Makefile
+    lines: 123-124
+    focus: 124
+    state:
+      proc: make (on your computer)
+    note: |
+      Look at the compiler on line 124: plain `gcc`, not `$(CC)`. The real command is
+
+      ```
+      gcc -Wno-unknown-attributes -I. -o mkfs/mkfs mkfs/mkfs.c
+      ```
+
+      [[mkfs/mkfs.c]] is not part of xv6. It is a tool that runs **now**, on your
+      computer, to write the disk image xv6 will boot from. It includes the kernel's own
+      [[kernel/fs.h]] and [[kernel/param.h]] (line 123 lists them as prerequisites), so
+      the disk it writes uses exactly the block size, inode layout and directory format the
+      kernel will expect. Change `struct dinode` in `fs.h`, and both sides rebuild.
+
+      One subtlety: the image must be in RISC-V byte order (little-endian), whatever your
+      computer uses. [[xint]] and [[xshort]] in `mkfs.c` put every multi-byte number into
+      that order explicitly ([[g:byte-order]]).
+
+  - title: fs.img depends on every user program
+    file: Makefile
+    lines: 132-155
+    focus: 154-155
+    state:
+      proc: make (on your computer)
+    note: |
+      [[build:UPROGS]] lists the 20 programs that will be on the disk. The rule on lines
+      154–155 says `fs.img` depends on `mkfs`, the `README`, and all of them, and the
+      command runs `mkfs` with the image name followed by every file to copy in:
+
+      ```
+      mkfs/mkfs fs.img README user/_cat user/_echo user/_forktest ... user/_sync
+      ```
+
+      The order on this command line becomes the order of files in the root directory and
+      the order of their inode numbers: `README` gets inode 2, `cat` 3, `echo` 4, and so
+      on, down to `sync` at 22. Root, the directory itself, is inode 1.
+
+      `mkfs` strips `user/` and the leading `_`, so `user/_sh` becomes `/sh`.
+      [[user/init.c:34]] runs it with `exec("sh", …)`, a path looked up from the root
+      directory.
+
+  - title: mkfs plans the disk
+    file: mkfs/mkfs.c
+    lines: 91-119
+    focus: 95-119
+    state:
+      proc: mkfs (on your computer)
+      stack: [main]
+    note: |
+      The [[g:disk-layout]] is decided by four constants: `FSSIZE` = 2000 blocks of
+      `BSIZE` = 1024 bytes, `LOGBLOCKS` = 30, and `NINODES` = 200 (line 23). The first thing
+      `mkfs` prints is the result:
+
+      ```
+      nmeta 47 (boot, super, log blocks 31, inode blocks 13, bitmap blocks 1) blocks 1953 total 2000
+      ```
+
+      | Blocks | Contents |
+      |---|---|
+      | 0 | boot block (unused by xv6) |
+      | 1 | [[g:superblock]], written by line 119 |
+      | 2–32 | the [[g:write-ahead-log]]: header at 2, 30 data blocks |
+      | 33–45 | inodes: 16 per block, 13 blocks for 200 inodes |
+      | 46 | the [[g:free-bitmap]]: one bit per block |
+      | 47–1999 | 1953 data blocks |
+
+      Line 114 first writes 2000 blocks of zeros, so `fs.img` is exactly
+      2000 × 1024 = 2,048,000 bytes. The superblock records `logstart = 2`,
+      `inodestart = 33`, `bmapstart = 46`. Those three numbers are all the kernel needs
+      to find everything else: the first thing the kernel's file system does at boot,
+      [[readsb]], is to read block 1 ([[tour:4]]).
+
+  - title: The root directory and the files
+    file: mkfs/mkfs.c
+    lines: 121-167
+    focus: 134-167
+    state:
+      proc: mkfs (on your computer)
+      stack: [main]
+    note: |
+      [[ialloc]] hands out inode numbers in order from 1, so the root directory gets
+      inode 1, as [[ROOTINO]] requires (line 122 checks). Its first two entries are `.` and
+      `..`, both pointing at itself.
+
+      Then each file on the command line gets the next inode, a directory entry in root
+      (a 16-byte [[g:directory]] record: 2-byte inode number, 14-byte name), and its bytes
+      copied in with [[iappend]]. What this build's `fs.img` contains:
+
+      | Inode | Name | Size (bytes) | First data block |
+      |---|---|---|---|
+      | 1 | `/` | 1024 | 47 |
+      | 2 | `README` | 2,441 | 48 |
+      | 7 | `init` | 37,296 | 189 |
+      | 13 | `sh` | 60,840 | 418 |
+      | 15 | `usertests` | 209,552 | 517 |
+      | 22 | `sync` | 36,256 | 969 |
+
+      Why is `init`, which is about 2.5 KB of code and data, 37 KB on disk? The programs are
+      compiled with `-ggdb`, and the debugging information is copied too. [[kexec]] will
+      load only the parts the ELF headers ask for.
+
+      Notice there is no `console` file. `mkfs` creates only directories and regular files.
+      The device file appears at first boot, when `init` finds it missing and creates it
+      ([[tour:4]]).
+
+  - title: iappend hands out blocks in order
+    file: mkfs/mkfs.c
+    lines: 258-300
+    focus: 271-297
+    state:
+      proc: mkfs (on your computer)
+      stack: [main, iappend]
+    note: |
+      [[iappend]] adds bytes to the end of a file. When the write crosses into a new block,
+      it takes the next free block number, `freeblock++`, starting at 47. There is no
+      allocator and no search: this is a fresh disk, and blocks are handed out like tickets.
+
+      The first 12 blocks of a file go straight into the inode's `addrs[0..11]`
+      ([[g:inode]]). Beyond that, `iappend` allocates an [[g:indirect-block]], a block
+      holding up to 256 more block numbers. For `init` (37,296 bytes = 37 blocks):
+
+      - blocks 189–200: the first 12 data blocks, listed in the inode;
+      - block 201: the indirect block;
+      - blocks 202–226: the remaining 25 data blocks.
+
+      `kill`, the next file, starts at 227. `usertests`, at 205 blocks, is the largest
+      file on the disk; even it fits within one indirect block.
+
+      Every block is read, changed and written back with [[rsect]] and [[wsect]], which
+      `lseek` in the image file to `block × 1024`. To `mkfs`, the disk is just an ordinary
+      file on your computer.
+
+  - title: Marking the used blocks
+    file: mkfs/mkfs.c
+    lines: 240-254
+    focus: 246-253
+    state:
+      proc: mkfs (on your computer)
+      stack: [main, balloc]
+    note: |
+      After the last file, `freeblock` is 1006. Back in [[mkfs:main]], line 176 calls
+      [[mkfs:balloc]], which sets bits 0 through 1005 of the bitmap and writes it to block
+      46:
+
+      ```
+      balloc: first 1006 blocks have been allocated
+      balloc: write bitmap block at sector 46
+      ```
+
+      Blocks 0–46 are the metadata and 47–1005 hold the root directory and 21 files, so
+      the kernel will find 994 free blocks (1006–1999) when a program creates a file.
+
+      `mkfs` exits, and `fs.img` is done. This 2-megabyte file on your computer *is* the
+      xv6 disk. When xv6 later writes a file, QEMU writes into it, and those changes
+      persist until `make clean` deletes it, or until `make` rebuilds it because `mkfs`,
+      `README` or a user program changed (the Makefile comment on lines 126–129 is about
+      keeping that from happening needlessly).
+
+      Note one thing `mkfs` can do that the kernel never can: it writes blocks in any order
+      with no thought for crashes or for other CPUs. It is a single program on an idle disk.
+      The kernel will need a log for crashes ([[tour:31]]) and locks for its three harts.
+
+  - title: The QEMU command line
+    file: Makefile
+    lines: 167-183
+    focus: 173-180
+    state:
+      proc: make (on your computer)
+    note: |
+      Everything is built. Line 183 runs (this build, all options expanded):
+
+      ```
+      qemu-system-riscv64 -machine virt -bios none -kernel kernel/kernel -m 128M -smp 3
+        -nographic -global virtio-mmio.force-legacy=false
+        -drive file=fs.img,if=none,format=raw,id=x0
+        -device virtio-blk-device,drive=x0,bus=virtio-mmio-bus.0
+      ```
+
+      | Option | What it builds |
+      |---|---|
+      | `-machine virt` | QEMU's generic RISC-V board: RAM at `0x80000000`, UART at `0x10000000`, PLIC at `0x0c000000` |
+      | `-bios none` | no firmware: the boot ROM jumps straight to `0x80000000` |
+      | `-kernel kernel/kernel` | QEMU copies the ELF's loadable bytes into RAM before any CPU starts |
+      | `-m 128M` | 128 MiB of RAM, `0x80000000`–`0x88000000`, matching [[PHYSTOP]] |
+      | `-smp 3` | **three harts**, from [[build:CPUS]] |
+      | `-nographic` | the UART is connected to your terminal |
+      | `-drive` / `-device` | `fs.img` becomes a [[g:virtio]] disk on the first virtio slot, `0x10001000` |
+
+      `force-legacy=false` selects the modern virtio interface, which
+      [[virtio_disk_init]] insists on (it checks for version 2). Try `make qemu CPUS=1`
+      and the same kernel boots on one hart; nothing in the kernel is compiled for a
+      particular count, up to [[NCPU]] = 8.
+
+  - title: What the build decided, and what it left to the harts
+    file: Makefile
+    lines: 177-183
+    focus: 182-183
+    state:
+      proc: qemu-system-riscv64
+    note: |
+      QEMU creates three harts and lets them go. From here on the story belongs to the
+      machine, starting at [[tour:2]].
+
+      Look back at what the build fixed in advance:
+
+      - **Addresses.** Every function and global has a final address (`main` at
+        `0x80000e5e`, [[started]] at `0x8000786c`). All three harts will use these same
+        addresses.
+      - **Sizes.** The process table holds 64 entries, the buffer cache 30 blocks, the boot
+        stacks 8 CPUs' worth. These are arrays in `.bss`, not allocated at run time.
+      - **The disk.** 2000 blocks, `init` at inode 7, `sh` at inode 13, block 47 holding the
+        root directory.
+
+      And what it could not fix: *which hart does what, and when*. The build produced one
+      kernel image and zero locks. In [[tour:2]] the three harts run the same first
+      instructions without any lock at all, because each touches only its own registers and
+      its own stack. In [[tour:3]], hart 0 starts writing the shared tables the linker
+      just laid out, creating the first [[g:spinlock|spinlocks]] (`cons.lock`, `pr.lock`,
+      `kmem.lock`, ...) as it goes, while harts 1 and 2 wait on a flag.
+    others: |
+      In about a second of host time, QEMU will be running three harts against the memory
+      you just filled: one copy of the kernel's code, one `.bss`, shared by all three. The
+      next three tours are about how they share it.
+locks:
+  - lock: "(none yet)"
+    where: "the build"
+    protects: "Nothing runs concurrently on the xv6 machine during the build. `make`, the compilers and `mkfs` run on your computer"
+  - lock: "(no lock, by design) mkfs's block writes"
+    where: "[[iappend]], [[wsect]]"
+    protects: "`mkfs` is one program writing an idle disk image, so it needs neither locks nor a log. The kernel will need both"
+  - lock: "Spinlocks are only data at this point"
+    where: "[[kernel/spinlock.h]], `.bss`"
+    protects: "Every `struct spinlock` in the kernel is a zeroed field in `.bss` (for example inside [[kmem]] and [[bcache]]). Zero already means \"unlocked, held by no CPU\"; [[initlock]] gives each lock its name at boot ([[tour:3]])"
+quiz:
+  - q: "Why can't the kernel be compiled with your computer's ordinary `gcc`, while `mkfs` must be?"
+    a: |
+      The kernel runs on a RISC-V CPU, so it needs RISC-V machine code from a
+      cross-compiler. `mkfs` runs on your computer during the build to write `fs.img`, so it
+      must be native code for your computer.
+  - q: "`main.o` contains `auipc ra,0x0` where `main` calls `cpuid`. Why is the offset 0, and who fixes it?"
+    a: |
+      When `main.c` is compiled, the address of `cpuid` (in `proc.c`) is unknown, so the
+      compiler emits a placeholder plus a relocation record. The linker fills in the real
+      offset when it places both functions in `kernel/kernel`.
+  - q: "What would go wrong if `ALIGN(0x1000)` before `*(trampsec)` in `kernel.ld` were removed?"
+    a: |
+      The build would stop. `_trampoline` would then be set to wherever the ordinary code
+      happens to end (about `0x80005bc0` in this build), the second `ALIGN(0x1000)` would
+      round up to `0x80006000`, and the `ASSERT` on line 19 would see `. - _trampoline` ≈
+      `0x440` instead of `0x1000` and fail with "error: trampoline larger than one page".
+      That ASSERT is the guard. Without it, the trampoline would share a page with ordinary
+      kernel code: mapping that one page at `TRAMPOLINE` would put unrelated kernel code into
+      every user page table, and the offsets from the page start that the trap path relies
+      on would be wrong.
+  - q: "You edit `NPROC` in `kernel/param.h` and run `make qemu`. Which object files are rebuilt, and how does `make` know?"
+    a: |
+      Every object whose `.c` file includes `param.h`, directly or indirectly. `make` knows
+      from the `.d` files the compiler wrote because of `-MD`, which the Makefile includes
+      on line 157. In this tree that is every kernel object except `string.o`, plus
+      `user/umalloc.o`, `user/grind.o` and `user/usertests.o`. Since `umalloc.o` is part of
+      the user library, every program is relinked and `fs.img` is rewritten, which discards
+      files created inside xv6. `mkfs` is rebuilt too, because line 123 lists
+      `kernel/param.h`.
+  - q: "`stack0` is 32 KiB, though QEMU only creates 3 harts. Why is the size fixed at build time, and what would happen with `make qemu CPUS=10`?"
+    a: |
+      The array is in `.bss`, sized `4096 * NCPU` with `NCPU = 8`, because each hart needs a
+      stack before any allocator exists. With 10 harts, harts 8 and 9 would compute stack
+      tops beyond the end of `stack0` (entry.S does not check) and would overwrite the
+      `.bss` variables that follow it: `cons`, `pr`, `tx_lock`, `kmem`, `pid_lock`,
+      `wait_lock`, `cpus` and the start of `proc[]`. Their `cpus[8]` and `cpus[9]` entries
+      would also be out of bounds.
+  - q: "`init` occupies blocks 189–226 on the disk, but only about 2.5 KB of it is code and data. What is the rest, and does the kernel load it?"
+    a: |
+      Mostly debugging information from `-ggdb`, plus ELF headers and symbol tables.
+      [[kexec]] loads only the `LOAD` segments described by the program headers, so the
+      rest stays on disk.

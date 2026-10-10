@@ -1,0 +1,738 @@
+title: The kernel page table and turning paging on
+group: Memory
+prerequisites: [3]
+summary: |
+  Until now, every address the kernel used went straight to physical memory. That cannot
+  last: user processes need their own private views of memory, kernel stacks need guard
+  pages, and the trampoline must appear at the same address in every address space. All of
+  that needs [[g:virtual-memory]], and virtual memory needs a [[g:page-table]].
+
+  This tour watches hart 0 build the kernel's page table during [[main]], one mapping at a
+  time, with real addresses and real page-table entries read out of memory with `gdb`. You
+  will see [[walk]] allocate the tree's pages as it goes (each one through `kmem.lock`),
+  the device registers, kernel code, RAM, the trampoline and 64 kernel stacks being mapped,
+  and then the single `csrw satp` that switches translation on, first on hart 0, later on
+  harts 1 and 2.
+
+  The page table that results is shared by all three harts and is never changed by
+  software again. Understanding why that makes it lock-free, and why each hart must still
+  flush its own [[g:tlb]], is the point of the tour.
+cast: |
+  | Hart | What it is doing |
+  |---|---|
+  | 0 | In [[main]], just past [[kinit]]: about to call [[kvminit]]. Paging off, interrupts off |
+  | 1 | Spinning on [[started]] with paging off ([[tour:3]]) |
+  | 2 | The same as hart 1 |
+
+  The free-page list holds every page from `0x80021000` to `0x88000000`, with `0x87fff000`
+  at its head.
+steps:
+  - title: The root of the tree
+    file: kernel/vm.c
+    lines: 11-28
+    focus: 21-27
+    state:
+      hart: 0
+      mode: S
+      intr: off
+      satp: bare
+      locks: []
+      irq: 0
+      stack: [main, kvminit, kvmmake]
+      sp: {"on": boot, switched: "`add sp, sp, a0` in `_entry` ([[kernel/entry.S:17]]), at power-on", detail: "hart 0's slice of stack0: 0x80007890–0x80008890"}
+    note: |
+      [[kvminit]] (line 69) calls [[kvmmake]], and `kvmmake` starts with one page from
+      [[kalloc]]: the **root** of the page table. It is the head of the free list,
+      `0x87fff000`, the highest page of RAM. Line 27 zeroes it: 512 entries, all invalid.
+
+      A page table on RISC-V is a tree of 4096-byte pages, each holding 512 eight-byte
+      page-table entries ([[g:pte|PTEs]]). The CPU's hardware walks this tree on every
+      memory access it cannot answer from its [[g:tlb]]. The kernel's job is only to fill
+      it in.
+
+      Paging is still off on hart 0 (`satp` is 0 since [[start]]), so `kvmmake` writes the
+      tree through physical addresses. Its own stack is physical too: hart 0 is still on the
+      **boot stack** that `_entry` set up, its 4 KiB slice of [[stack0]], a plain array in
+      the kernel's `.bss` ([[concept:stacks]]). That works because nothing is translated yet; later,
+      with paging on, it will keep working because the kernel maps physical memory at the
+      same addresses ([[g:direct-map]]).
+    others: |
+      Harts 1 and 2 are spinning on [[started]] and touch nothing else. Hart 0 can build
+      the tree with plain stores, no lock around it: no other hart can see it until hart 0
+      publishes it with the release store of `started` ([[tour:3]]).
+
+  - title: How Sv39 splits an address
+    file: kernel/riscv.h
+    lines: 389-417
+    focus: 395-417
+    state:
+      hart: 0
+      mode: S
+      intr: off
+      satp: bare
+      locks: []
+      irq: 0
+      stack: [main, kvminit, kvmmake]
+      sp: boot
+    note: |
+      xv6 uses [[g:sv39|Sv39]]: 39-bit virtual addresses, three levels. A virtual address
+      splits into three 9-bit indexes and a 12-bit offset, which [[PX]] extracts:
+
+      | Bits | Meaning | `0x10000000` (the UART) | `0x3ffffff000` (`TRAMPOLINE`) |
+      |---|---|---|---|
+      | 38–30 | index in the root (level 2) | 0 | 255 |
+      | 29–21 | index in a level-1 page | 128 | 511 |
+      | 20–12 | index in a level-0 page | 0 | 511 |
+      | 11–0 | byte in the page | 0 | 0 |
+
+      A PTE holds a physical page number in bits 53–10 ([[PA2PTE]], [[PTE2PA]]) and flags
+      in the low bits: `V` valid, `R` read, `W` write, `X` execute, `U` user. A valid PTE
+      with none of `R`, `W`, `X` points to the next level down; one with any of them is a
+      leaf. xv6 puts leaves only in level-0 pages, where each maps one 4 KiB page (a leaf
+      higher up would map a 2 MiB or 1 GiB "superpage", which xv6 never uses).
+
+      [[MAXVA]] is `1 << 38`, 256 GiB: xv6 uses only the lower half of the Sv39 space, to
+      avoid the sign-extension rule for addresses with bit 38 set. So the root index never
+      exceeds 255.
+
+  - title: mappages, one page at a time
+    file: kernel/vm.c
+    lines: 141-175
+    focus: 161-173
+    state:
+      hart: 0
+      mode: S
+      intr: off
+      satp: bare
+      locks: []
+      irq: 0
+      stack: [main, kvminit, kvmmake, kvmmap, mappages]
+      sp: boot
+    note: |
+      Every mapping in `kvmmake` goes through [[kvmmap]], which calls [[mappages]] and
+      panics on failure (at boot, failure means the machine is broken).
+
+      [[mappages]] maps a range page by page: for each page, [[walk]] finds (and if needed
+      creates) the level-0 PTE, and line 168 fills it with the physical page number, the
+      permissions and `PTE_V`. The `remap` panic on line 167 catches a kernel bug where two
+      mappings overlap.
+
+      There is no huge-page support here. The 128 MiB of RAM become 32,768 separate 4 KiB
+      mappings, written one by one. It costs a little memory and boot time and keeps
+      [[walk]] simple.
+
+  - title: walk grows the tree
+    file: kernel/vm.c
+    lines: 86-116
+    focus: 104-115
+    state:
+      hart: 0
+      mode: S
+      intr: off
+      satp: bare
+      locks: []
+      irq: 0
+      stack: [main, kvminit, kvmmake, kvmmap, mappages, walk]
+      sp: boot
+    note: |
+      [[walk]] descends from the root. At each level it reads the PTE for this address's
+      index. If it is valid, it follows it down. If not, and `alloc` is set, it takes a new
+      page from [[kalloc]], zeroes it, and points the PTE at it (with only `V` set: an inner
+      node).
+
+      The very first mapping, the UART at `0x10000000`, shows it from scratch. With `gdb`,
+      after `kvmmake` finished:
+
+      | Level | Table page | Index | PTE |
+      |---|---|---|---|
+      | 2 | `0x87fff000` (root) | 0 | `0x21fff801` → `0x87ffe000` |
+      | 1 | `0x87ffe000` | 128 | `0x21fff401` → `0x87ffd000` |
+      | 0 | `0x87ffd000` | 0 | `0x4000007`: page `0x10000000`, `R W V` |
+
+      The two lower pages, `0x87ffe000` and `0x87ffd000`, are the next two pages
+      [[kalloc]] handed out, allocated by `walk` for this mapping. The `VIRTIO0` mapping
+      that follows, at `0x10001000`, reuses both: same level-1 and level-0 pages, index 1.
+
+  - title: Every table page passes through kmem.lock
+    file: kernel/kalloc.c
+    lines: 65-82
+    focus: 74-76
+    state:
+      hart: 0
+      mode: S
+      intr: off
+      satp: bare
+      locks: [kmem.lock]
+      irq: {noff: 1, intena: 0, note: "boot: interrupts were already off at `acquire`'s push_off, so intena is 0 and `release` leaves them off"}
+      stack: [main, kvminit, kvmmake, kvmmap, mappages, walk, kalloc]
+      sp: boot
+    note: |
+      Each new table page comes from [[kalloc]], which pops the free list under
+      `kmem.lock`. By the end of [[kvmmake]] it will have done this 166 times: 102
+      page-table pages and 64 kernel-stack pages. The free list's head moves from
+      `0x87fff000` down to `0x87f59000`.
+
+      Here every one of those acquisitions succeeds on the first `amoswap`. Hart 0 is the
+      only hart running kernel code, and its interrupts are off, so nothing can compete for
+      the lock and nothing can interrupt the critical section. The lock is taken because
+      [[kalloc]] does not know it is being called at boot, and should not have to.
+      [[push_off]] copes with boot too: interrupts were already off when it ran, so it
+      records `intena` 0 and the `release` leaves them off ([[concept:locks#intena]]).
+
+      Note also line 80: [[kalloc]] fills each page with junk (`5` bytes) after taking it.
+      [[walk]] zeroes table pages itself (line 111), because a table full of `0x05` bytes
+      would be full of "valid" entries.
+    others: |
+      After boot, the same [[walk]] → [[kalloc]] path runs whenever a process's *user*
+      page table grows ([[uvmalloc]], [[uvmcopy]]), on any hart, at any time. Then
+      `kmem.lock` really matters: two harts each forking a process could otherwise pop the
+      same page, and two page tables would share a page-table page without knowing it
+      ([[tour:27]]).
+
+  - title: Devices first
+    file: kernel/vm.c
+    lines: 20-37
+    focus: 29-36
+    state:
+      hart: 0
+      mode: S
+      intr: off
+      satp: bare
+      locks: []
+      irq: 0
+      stack: [main, kvminit, kvmmake]
+      sp: boot
+    note: |
+      The first three mappings make the device registers reachable once paging is on, each
+      at the same virtual address as its physical address, readable and writable, not
+      executable:
+
+      | Device | Address | Size | Level-0 tables |
+      |---|---|---|---|
+      | UART | `0x10000000` | 1 page | `0x87ffd000` (shared with virtio) |
+      | virtio disk | `0x10001000` | 1 page | `0x87ffd000` |
+      | [[g:plic|PLIC]] | `0x0c000000` | 64 MiB = 16,384 pages | 32 tables, `0x87ffc000` down to `0x87fdd000` |
+
+      The PLIC is large because it has register blocks for many harts and many interrupt
+      sources; xv6 maps all of it rather than work out which pages it uses. Its range,
+      `0x0c000000`–`0x10000000`, covers level-1 indexes 96–127 of the first gigabyte, each
+      needing its own level-0 table.
+
+      Without these mappings, the first [[printk]] after paging was turned on would fault:
+      [[uartputc_sync]] writes to `0x10000000` with a plain store, and with paging on that
+      store is translated like any other.
+
+  - title: Kernel code read-execute, everything else read-write
+    file: kernel/vm.c
+    lines: 38-43
+    focus: 38-43
+    state:
+      hart: 0
+      mode: S
+      intr: off
+      satp: bare
+      locks: []
+      irq: 0
+      stack: [main, kvminit, kvmmake]
+      sp: boot
+    note: |
+      Then all of RAM, in two parts split at [[etext]] (`0x80007000`, page-aligned by the
+      linker script, [[tour:1]]):
+
+      | Range | Pages | Permissions | Sample PTE |
+      |---|---|---|---|
+      | `0x80000000`–`0x80007000` | 7 | `R X` | `0x2000000b` for `0x80000000` |
+      | `0x80007000`–`0x88000000` | 32,761 | `R W` | `0x20001c07` for `0x80007000` |
+
+      They need a new level-1 page for the third gigabyte (`0x87fdc000`) and 64 level-0
+      pages, `0x87fdb000` down to `0x87f9c000`.
+
+      Code is not writable, so a stray store into the kernel's instructions faults instead
+      of silently corrupting them. Data is not executable.
+
+      The second range is far more than the kernel's data. It is **every free page**:
+      everything [[kalloc]] will ever hand out, including the pages of this very page table.
+      The kernel can read and write any physical page through its own address, which is how
+      [[walk]] can follow `PTE2PA(*pte)` as an ordinary pointer once paging is on, and how
+      [[copyin]] reaches user pages ([[tour:28]]).
+
+  - title: The trampoline, mapped twice
+    file: kernel/vm.c
+    lines: 44-53
+    focus: 45-47
+    state:
+      hart: 0
+      mode: S
+      intr: off
+      satp: bare
+      locks: []
+      irq: 0
+      stack: [main, kvminit, kvmmake]
+      sp: boot
+    note: |
+      The trampoline page, physically at `0x80006000`, is already mapped at `0x80006000` by
+      the previous step. Line 47 maps it a **second** time, at [[TRAMPOLINE]] =
+      `0x3ffffff000`, the highest page below [[MAXVA]], read-execute. Its PTE is
+      `0x2000180b`, the same physical page as the `0x80006000` mapping.
+
+      Why twice? Every user page table maps the trampoline at `0x3ffffff000` too
+      ([[proc_pagetable]]). The trap code in the trampoline switches `satp` between a user
+      table and this one ([[tour:7]]). The instruction after the `csrw satp` is fetched
+      under the *new* table, so it must be at the same virtual address in both. The
+      direct-mapped copy at `0x80006000` does not exist in user tables; the one at
+      `0x3ffffff000` exists everywhere.
+
+      This mapping needs a new level-1 page (`0x87f9b000`, root index 255) and level-0 page
+      (`0x87f9a000`, index 511). The kernel stacks, next, will share that level-0 page.
+
+  - title: 64 kernel stacks with guard pages
+    file: kernel/proc.c
+    lines: 29-44
+    focus: 37-43
+    state:
+      hart: 0
+      mode: S
+      intr: off
+      satp: bare
+      locks: []
+      irq: 0
+      stack: [main, kvminit, kvmmake, proc_mapstacks]
+      sp: boot
+    note: |
+      [[proc_mapstacks]] gives each of the 64 process slots one page of kernel stack,
+      mapped just below the trampoline at [[KSTACK]]`(i)` = `TRAMPOLINE - (i+1) × 2 × 4096`:
+
+      | Slot | Virtual address | Physical page | Level-0 index |
+      |---|---|---|---|
+      | `proc[0]` | `0x3fffffd000` | `0x87f99000` | 509 |
+      | (gap) | `0x3fffffe000` | none: PTE is 0 | 510 |
+      | `proc[1]` | `0x3fffffb000` | `0x87f98000` | 507 |
+      | `proc[63]` | `0x3ffff7f000` | `0x87f5a000` | 383 |
+
+      Every other page is left **unmapped**, so each stack has an unmapped page directly
+      below it: for `proc[0]`, the gap at `0x3fffffc000` (which is also the gap above
+      `proc[1]`'s stack). Stacks grow down, so a kernel stack that overflows runs into that
+      page, and the access faults instead of silently overwriting a neighbor's data
+      ([[g:guard-page]]). (What happens after the fault is messier; see the quiz.) With a
+      direct-mapped stack, an overflow would silently overwrite whatever page happened to
+      be adjacent in physical memory.
+
+      These stacks are virtually contiguous and physically scattered: exactly what a page
+      table is for.
+
+      Some facts worth fixing in mind now, because every later tour depends on them:
+
+      - All 64 are allocated and mapped **here, once**, before any process exists. A stack
+        belongs to a slot of `proc[]`, not to a process: [[procinit]] records `p->kstack =
+        KSTACK(slot)` ([[kernel/proc.c:57]]), `fork` never allocates a kernel stack and
+        `exit` never frees one ([[tour:20]], [[tour:21]]).
+      - They exist only in **this** page table. No user page table maps them, which is why
+        [[uservec]] switches `satp` to the kernel table before the first push on the kernel
+        stack ([[tour:7]]).
+      - The stack this code runs on right now has **no** guard page. Hart 0 is on its slice
+        of [[stack0]], `0x80007890`–`0x80008890`, inside the direct-mapped RAM range. Below
+        hart 0's slice lie `ticks`, `initproc`, `kernel_pagetable` and `started`
+        (`kernel/kernel.sym`); below hart 1's slice lies hart 0's. An overflow there would
+        corrupt them silently. That slice becomes hart 0's scheduler stack later and stays
+        unguarded for the machine's whole life.
+    others: |
+      Harts 1 and 2 are not using any of these stacks; each is spinning on [[started]] on its
+      own slice of `stack0`, with its own `sp`. Later, each process's kernel stack is used by
+      one thread at a time, on whichever hart that process is running. Two harts never run on the same kernel stack, because a process
+      runs on at most one hart (its `p->lock` and `RUNNING` state see to that, [[tour:12]]).
+      So the stacks themselves need no lock.
+
+  - title: The finished table
+    file: kernel/memlayout.h
+    lines: 20-53
+    focus: 40-52
+    state:
+      hart: 0
+      mode: S
+      intr: off
+      satp: bare
+      locks: []
+      irq: 0
+      stack: [main, kvminit]
+      sp: boot
+    note: |
+      [[kvmmake]] returns the root, and line 69 stores it in the global
+      [[kernel_pagetable]] = `0x87fff000`. The root has exactly three valid entries:
+
+      | Root index | Covers | Level-1 page | What is mapped |
+      |---|---|---|---|
+      | 0 | `0x0`–`0x3fffffff` | `0x87ffe000` | PLIC, UART, virtio |
+      | 2 | `0x80000000`–`0xbfffffff` | `0x87fdc000` | kernel and all RAM |
+      | 255 | `0x3fc0000000`–`0x3fffffffff` | `0x87f9b000` | trampoline and kernel stacks |
+
+      In total: 102 page-table pages (1 root, 3 level-1, 98 level-0), which is 408 KiB,
+      holding 49,219 leaf entries (1 + 1 + 16,384 device pages, 7 + 32,761 RAM pages, 1
+      trampoline, 64 stacks), plus the 64 stack pages themselves. That matches the free
+      list's head moving from `0x87fff000` to `0x87f59000`: 166 pages.
+
+      Nothing here is mapped with `PTE_U`. User mode, if it somehow used this table, could
+      touch none of it.
+
+  - title: Building the value for satp
+    file: kernel/riscv.h
+    lines: 245-256
+    focus: 246-255
+    state:
+      hart: 0
+      mode: S
+      intr: off
+      satp: bare
+      locks: []
+      irq: 0
+      stack: [main, kvminithart]
+      sp: boot
+    note: |
+      Line 21 of [[main]] calls [[kvminithart]]. It writes [[g:csr:satp|satp]] with
+      [[MAKE_SATP]]`(kernel_pagetable)`:
+
+      | Bits | Field | Value |
+      |---|---|---|
+      | 63–60 | `MODE` | 8 = Sv39 ([[SATP_SV39]]) |
+      | 59–44 | `ASID` | 0 |
+      | 43–0 | `PPN`: root page number | `0x87fff000 >> 12` = `0x87fff` |
+
+      Together: `0x8000000000087fff`. The compiler turned this into a load of
+      `kernel_pagetable`, a right shift by 12, and an OR with `1 << 63`, just before the
+      `csrw` at `0x80000f2e`.
+
+      xv6 never uses the ASID field (address-space identifier). Because of that it must
+      flush the TLB on every `satp` change; with ASIDs, entries for different address spaces
+      could coexist in the TLB.
+
+  - title: The fence before the switch
+    file: kernel/vm.c
+    lines: 72-84
+    focus: 77-78
+    state:
+      hart: 0
+      mode: S
+      intr: off
+      satp: bare
+      locks: []
+      irq: 0
+      stack: [main, kvminithart, sfence_vma]
+      sp: boot
+    note: |
+      [[sfence_vma]] executes `sfence.vma zero, zero`. The comment says why: "wait for any
+      previous writes to the page table memory to finish". The page-table walker is a
+      separate part of the CPU that reads memory on its own. The RISC-V spec does not
+      promise that it sees this hart's earlier ordinary stores to the page table unless an
+      `sfence.vma` comes between them. Hart 0 just wrote tens of thousands of PTEs with
+      ordinary stores; the fence makes sure the walker will see all of them.
+
+      This instruction affects **only hart 0**. It orders hart 0's own stores against hart
+      0's own page-table walks. It says nothing to harts 1 and 2.
+
+  - title: The instant paging turns on
+    file: kernel/vm.c
+    lines: 72-84
+    focus: 80
+    state:
+      hart: 0
+      mode: S
+      intr: off
+      satp: kernel
+      locks: []
+      irq: 0
+      stack: [main, kvminithart]
+      sp: boot
+    note: |
+      `csrw satp, a5` at `0x80000f2e`. From the very next instruction on, every address hart
+      0 uses, for fetching instructions, for loads, for stores, goes through the tree.
+
+      The next instruction is at `0x80000f32`. Nothing in the program says "jump to the
+      virtual version of the kernel"; the program counter simply keeps counting. This works
+      only because the kernel is mapped at the address where it already is: virtual
+      `0x80000f32` translates (root index 2, level-1 index 0, level-0 index 0) to physical
+      `0x80000f32`. If the kernel had been mapped anywhere else, this fetch would get some
+      other bytes, or fault, and since `stvec` is not set yet the fault would go to whatever
+      address `stvec` held at reset.
+
+      The same holds for the stack: `sp` is in hart 0's slice of [[stack0]], just below
+      `0x80008890`, which is in the read-write range, so `kvminithart`'s `ret` and everything after keep working.
+      `sp` is not changed by `csrw satp`: the very same number simply starts being
+      translated, and the direct map translates it to itself. (The kernel stacks at
+      `KSTACK(i)` are the opposite case: their addresses are not physical addresses, so they
+      work only while this table is installed.)
+    others: |
+      For the moment, the three harts are in different worlds:
+
+      | Hart | `satp` | Addresses |
+      |---|---|---|
+      | 0 | `0x8000000000087fff` | translated through `kernel_pagetable` |
+      | 1 | 0 | physical, spinning on [[started]] |
+      | 2 | 0 | physical, spinning on [[started]] |
+
+      This is fine, because for every address they use, the two views agree: that is what
+      a direct map means. `started` at `0x8000786c` is the same byte whether you translate
+      it or not.
+
+  - title: Flushing hart 0's TLB
+    file: kernel/vm.c
+    lines: 72-84
+    focus: 82-83
+    state:
+      hart: 0
+      mode: S
+      intr: off
+      satp: kernel
+      locks: []
+      irq: 0
+      stack: [main, kvminithart, sfence_vma]
+      sp: boot
+    note: |
+      The second `sfence.vma` discards any cached translations in hart 0's
+      [[g:tlb|translation lookaside buffer]], the small per-hart cache of recent
+      virtual-to-physical lookups. Here there are none worth keeping (in Bare mode there
+      are no translations to cache), but the rule is: after changing `satp` or a page table,
+      fence before relying on the new translations. xv6 follows it every time it installs a
+      page table: here, and in the trampoline ([[kernel/trampoline.S:95]],
+      [[kernel/trampoline.S:112]]). The only `satp` write without fences is [[start]]'s
+      `w_satp(0)`, which turns translation off at reset, when nothing is cached.
+
+      From now on, hart 0's TLB will fill with kernel translations as it runs:
+      `0x80000f32` → `0x80000f32`, `0x10000000` → `0x10000000`, and so on. Each hart has its
+      own TLB. Nothing hart 0 caches is visible to hart 1, and nothing hart 0 flushes is
+      flushed for hart 1.
+
+  - title: Harts 1 and 2 are let in, still with paging off
+    file: kernel/main.c
+    lines: 29-45
+    focus: 35-38
+    state:
+      hart: [1, 2]
+      mode: S
+      intr: off
+      satp: bare
+      locks: []
+      irq: 0
+      stack: [main]
+      sp: {"on": boot, detail: "each hart its own slice of stack0: tops 0x80009890 and 0x8000a890"}
+    note: |
+      Much later in story time, after [[userinit]], hart 0 sets [[started]] with a release
+      store. Harts 1 and 2 see it with acquire loads, leave their loop, and each prints
+      `hart N starting` with [[printk]].
+
+      They are still in Bare mode here. The acquire load of `started`, the `printk` and the
+      UART store at `0x10000000` all use physical addresses, exactly as they did before
+      hart 0 built anything. That works because the kernel's page table maps every one of
+      those addresses to itself: the code is about to switch views, and both views agree.
+
+      The acquire is what matters for the next step. Hart 0's stores to the 102 table pages
+      and to `kernel_pagetable` happened before its release store of `started`, so once a
+      hart has seen `started == 1` with acquire ordering, it is guaranteed to see all of
+      them too ([[tour:3]]).
+    others: |
+      | Time | Hart 0 | Hart 1 | Hart 2 |
+      |---|---|---|---|
+      | t1 | builds the table, `satp` on | `started == 0` | `started == 0` |
+      | t2 | … [[userinit]]; `fence rw,w`; `started = 1` | | |
+      | t3 | [[scheduler]] | `started == 1`; `fence r,rw` | `started == 0` |
+      | t4 | | `printk("hart 1 starting")` (paging still off); `sfence.vma`; `csrw satp`; `sfence.vma` | `started == 1`; `fence r,rw` |
+      | t5 | | [[trapinithart]] … | `printk("hart 2 starting")` (paging still off); `sfence.vma`; `csrw satp`; `sfence.vma` |
+
+  - title: Harts 1 and 2 load the same table
+    file: kernel/vm.c
+    lines: 72-84
+    focus: 81-83
+    state:
+      hart: [1, 2]
+      mode: S
+      intr: off
+      satp: kernel
+      locks: []
+      irq: 0
+      stack: [main, kvminithart]
+      sp: {"on": boot, detail: "each hart its own slice of stack0, now reached through the direct map"}
+    note: |
+      Line 39 of [[main]]: each of harts 1 and 2 calls [[kvminithart]]: fence, `csrw satp`
+      with the same `0x8000000000087fff`, fence. The state above is after the `csrw`. Two things had to be true for this to be safe:
+
+      1. **They see a complete table.** The acquire in the previous step guarantees that
+         hart 0's page-table stores are visible to harts 1 and 2.
+      2. **Their own walkers see it.** The RISC-V spec says an `sfence.vma` orders every
+         store *already visible to the executing hart* before that hart's later page-table
+         walks. Thanks to the acquire, hart 0's page-table stores are already visible to
+         harts 1 and 2, so each hart's first `sfence.vma` guarantees its walker sees the
+         finished table.
+
+      Each hart flushes its **own** TLB. No hart can flush another's: `sfence.vma` is local.
+    others: |
+      All three harts now translate through the same physical pages of one page table, at
+      the same time. Each has its own `satp` register holding the same value, its own TLB,
+      which fills independently as that hart runs, and its own `sp`, pointing into its own
+      slice of `stack0`.
+
+  - title: One table, three walkers, no lock
+    file: kernel/vm.c
+    lines: 55-70
+    focus: 55-63
+    state:
+      hart: [0, 1, 2]
+      mode: S
+      intr: off
+      satp: kernel
+      locks: []
+      irq: {noff: 0, note: "shown at the scheduler's lines 441–444 or its `wfi`; for most of the loop each hart holds some `p->lock` (noff 1)"}
+      stack: [main, scheduler]
+      sp: {"on": scheduler, detail: "each hart on its own slice of stack0"}
+    note: |
+      Three harts use [[kernel_pagetable]] for the rest of the machine's life: every kernel
+      instruction fetch, every kernel load and store, on every hart. There is no lock around
+      it. Why that is safe:
+
+      - **Software never changes it after boot.** The comment on [[kvmmap]] says "only used
+        when booting", and indeed its only callers are [[kvmmake]] and [[proc_mapstacks]].
+        Even the kernel stacks of processes that come and go are mapped once, for all 64
+        slots, up front. Process creation and exit change only user page tables.
+      - Data that nobody writes can be read by any number of harts at once. A lock exists to
+        order a writer against readers; with no writer, there is nothing to order.
+
+      One honest qualification: the **hardware** may write it. [[start]] enabled
+      [[g:svadu|Svadu]], so when a hart uses a leaf PTE whose accessed (`A`) bit is clear, or
+      stores through one whose dirty (`D`) bit is clear, the hardware sets that bit in
+      memory. The PTEs above were written with
+      `A = D = 0` (`0x...07`, `0x...0b`). The RISC-V spec requires those updates to be
+      atomic, and xv6 never reads the `A` and `D` bits, so the concurrent hardware updates
+      do not need a software lock either.
+    others: |
+      Contrast this with a **user** page table. It is changed after creation, by
+      [[uvmalloc]] when a process grows, by [[uvmunmap]] when it shrinks, by [[kexec]] when
+      it is replaced. xv6 keeps those safe by a different argument: a user page table is
+      changed only by kernel code acting for its own process (its system calls and page
+      faults), or by its parent while the owner cannot be running (filling a new child's
+      table in [[kfork]], freeing a `ZOMBIE` child's in [[kwait]]). A process runs on one
+      hart at a time, and every switch to or from a user table flushes the whole TLB, so no
+      other hart can hold a stale translation for it ([[tour:25]]). If xv6 ever modified a page table that another hart might be using,
+      it would also need to make *that* hart flush its TLB, a "TLB shootdown", which xv6
+      never has to do.
+
+  - title: Every trap comes back to this table
+    file: kernel/trap.c
+    lines: 97-132
+    focus: 114-119
+    state:
+      hart: any
+      mode: S
+      intr: off
+      satp: kernel
+      locks: []
+      irq: 0
+      stack: [usertrap, prepare_return]
+      sp: {"on": kernel, detail: "the process's kernel stack, a KSTACK page mapped by this table"}
+    note: |
+      After boot, harts spend much of their time in user page tables. They return to the
+      kernel's table on every trap. [[prepare_return]] stores the current `satp`, the
+      kernel's, in each process's trapframe as `kernel_satp` (line 116), and [[uservec]]
+      in the trampoline loads it back into `satp`, with an `sfence.vma` on each side, on the
+      way into the kernel ([[tour:7]]).
+
+      Line 117 stores the other half of the pair: `kernel_sp = p->kstack + PGSIZE`, the top
+      of this process's `KSTACK` page. That address means something only under this table.
+      [[uservec]] loads it into `sp` ([[kernel/trampoline.S:76]]) while the user table is
+      still installed, but does not push anything until after `csrw satp` has brought this
+      table back; the first push is [[usertrap]]'s prologue.
+
+      So the value `0x8000000000087fff` circulates through every process's trapframe, and
+      any hart can switch to it at any moment. Because the table never changes, it does not
+      matter which hart saved it or when.
+
+      The price of xv6's simple design shows up here: every switch between a user table and
+      this one flushes the hart's whole TLB, so after each system call the kernel starts
+      with a cold TLB and refills it, one walk per page touched. Kernels that care more
+      about speed map the kernel into every user page table, or use ASIDs.
+
+  - title: What it cost, and what it bought
+    file: kernel/vm.c
+    lines: 20-53
+    focus: 26-52
+    state:
+      hart: [0, 1, 2]
+      mode: S
+      intr: off
+      satp: kernel
+      locks: []
+      irq: {noff: 0, note: "shown at the scheduler's lines 441–444 or its `wfi`; for most of the loop each hart holds some `p->lock` (noff 1)"}
+      stack: [main, scheduler]
+      sp: {"on": scheduler, detail: "each hart on its own slice of stack0"}
+    note: |
+      The kernel page table cost 166 pages from the allocator (102 table pages, 64 stacks),
+      about 49,000 `PTE` writes, 166 trips through `kmem.lock`, and one `csrw satp` plus two
+      `sfence.vma` on each hart: 3 `satp` writes that turn paging on (after the 3
+      `w_satp(0)` in [[start]] that turned it off) and 6 fences for the whole machine.
+
+      What it bought:
+
+      - **Protection** inside the kernel: code is not writable, data is not executable,
+        nothing is user-accessible, and the 64 kernel stacks have unmapped guard pages.
+        (The three harts' own boot-turned-scheduler stacks in `stack0` do not: they are
+        plain direct-mapped RAM.)
+      - **The trampoline** at one address shared with every user table, which makes trap
+        entry and exit possible at all.
+      - **A direct map** of all RAM, so the kernel can treat any physical address as a
+        pointer, which is how it reaches page tables and user pages.
+
+      And the concurrency lesson of this tour: build shared data on one hart, publish it
+      with a release/acquire pair, never modify it again, and it can be shared by every hart
+      with no lock at all. The only per-hart work left is the part that is truly per-hart:
+      each CPU's own `satp` and its own TLB.
+locks:
+  - lock: kmem.lock
+    where: "[[kalloc]], from [[kvmmake]] (the root), [[walk]] (101 table pages) and [[proc_mapstacks]] (64 stacks)"
+    protects: "The free-page list; uncontended at boot, but the same code runs on any hart later"
+  - lock: "started (release/acquire, not a lock)"
+    where: "[[main]]"
+    protects: "Makes hart 0's page-table stores visible to harts 1 and 2 before they load `satp`"
+  - lock: "(no lock) building the table"
+    where: "[[kvmmake]], [[mappages]], [[walk]]"
+    protects: "Only hart 0 runs kernel code during boot, and the table is unpublished until `started`"
+  - lock: "(no lock) kernel_pagetable after boot"
+    where: "every hart's page-table walker; [[kvminithart]]; [[uservec]]"
+    protects: "Never written by software after boot, so any number of harts can read it; hardware A/D updates are atomic"
+  - lock: "(no lock) satp and the TLB"
+    where: "[[kvminithart]], [[sfence_vma]]"
+    protects: "Per-hart: each hart writes its own `satp` and flushes its own TLB"
+quiz:
+  - q: "Why does the instruction right after `csrw satp` in `kvminithart` not crash, even though nothing jumps to a new address?"
+    a: |
+      The kernel's code is mapped at virtual addresses equal to its physical addresses
+      (`KERNBASE` to `etext`). The program counter's value means the same location before
+      and after translation is turned on, so the next fetch finds the next instruction.
+  - q: "Hart 0 executed `sfence.vma` after turning on paging. Why must harts 1 and 2 execute their own?"
+    a: |
+      `sfence.vma` acts only on the hart that executes it: it orders that hart's own
+      page-table accesses and flushes that hart's own TLB. Each hart has its own TLB and its
+      own walker, so each must fence for itself.
+  - q: "`walk` zeroes each new table page with `memset`, although `kalloc` already filled it. What would happen without that `memset`?"
+    a: |
+      `kalloc` fills pages with the byte `5`, so every PTE would read `0x0505050505050505`,
+      which has `V` set. In a fresh level-1 page, `walk` would follow that "valid" entry to
+      `PTE2PA(0x0505…)` = `0x1414141414141000`, which is not memory, and the next access
+      would fault. In a fresh level-0 page, `mappages` would find `V` already set and panic
+      with "remap".
+  - q: "The kernel page table is read by three harts' walkers concurrently with no lock. Why is this safe, and what would change if xv6 started adding kernel mappings after boot?"
+    a: |
+      After boot no software writes it, so there is nothing to order; readers cannot see a
+      half-made change. If xv6 added mappings later, it would need a lock to serialize
+      writers, and if it ever removed or changed a mapping, it would also have to make every
+      other hart flush its TLB (a TLB shootdown), since `sfence.vma` is local.
+  - q: "Why is the trampoline page mapped twice in the kernel page table?"
+    a: |
+      Once at `0x80006000` as part of the direct map of kernel code, and once at
+      `TRAMPOLINE` (`0x3ffffff000`), the address where every user page table also maps it.
+      The trap code switches between user and kernel page tables while executing in that
+      page, so it must be at the same virtual address in both.
+  - q: "What would happen if a kernel stack overflowed by a few hundred bytes?"
+    a: |
+      The first store below the stack lands in the unmapped guard page and raises a page
+      fault, so the overflow is not silent. xv6 does not recover cleanly, though.
+      [[kernelvec]] saves registers on the same overflowed stack, which faults again, 256
+      bytes lower each time, until `sp` reaches the next mapped page: the top of the
+      neighbouring slot's kernel stack. There the save succeeds and [[kerneltrap]] panics.
+      The guard page turns a silent overflow into a crash, but in xv6 it does not fully
+      protect the neighbour.

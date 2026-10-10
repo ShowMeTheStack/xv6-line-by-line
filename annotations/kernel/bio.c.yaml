@@ -1,0 +1,220 @@
+summary: |
+  The [[g:buffer-cache]]: a small, fixed set of in-memory copies of disk
+  [[g:block|blocks]]. Every disk access in the file system goes through it.
+
+  It does two jobs:
+
+  1. **Caching.** Reading a block that is already in memory costs no disk access.
+  2. **Synchronization.** There is at most one buffer per disk block, and each buffer has a
+     [[g:sleeplock]]. So when two processes want the same block, they get the same buffer
+     and take turns, and neither can see the other's half-finished changes.
+
+  The interface is [[bread]] (get a locked buffer holding a block), [[bwrite]] (write it to
+  disk; used only by the log), [[brelse]] (give it back), and [[bpin]]/[[bunpin]] (keep it
+  in the cache while the [[g:write-ahead-log|log]] still needs it).
+
+  Below the cache sits the disk driver, [[kernel/virtio_disk.c]]. Above it sit
+  [[kernel/log.c]] and [[kernel/fs.c]]. Note that the file system never calls [[bwrite]]: it
+  modifies a buffer and calls [[log_write]], and the log decides when the block reaches the
+  disk.
+
+  **Read before:** [[kernel/buf.h]]. **Read next:** [[kernel/log.c]].
+
+blocks:
+  - lines: 1-14
+    title: The interface, in the source's words
+    note: |
+      The rules here are the contract callers follow. "Do not use the buffer after calling
+      brelse" because once released it may be recycled for a different block at any time.
+      "Only one process at a time can use a buffer" because [[bread]] returns it locked, so
+      holding it for long makes every other process that needs that block wait.
+
+      The comment's step "after changing buffer data, call bwrite" is out of date for code
+      outside the log: the file system calls [[log_write]] instead, as [[bwrite]]'s own
+      comment (line 105) says.
+
+  - lines: 16-23
+    title: Headers
+    note: |
+      [[kernel/spinlock.h]] and [[kernel/sleeplock.h]] for the two kinds of lock, and
+      [[kernel/fs.h]] before [[kernel/buf.h]] because `struct buf` uses [[BSIZE]].
+
+  - lines: 25-33
+    title: The cache itself
+    note: |
+      [[bcache]] holds [[NBUF]] (30) buffers in a fixed array, and links them into a
+      circular doubly-linked list through their `prev`/`next` fields. `head` is a dummy
+      buffer that is never used for data; it marks the start and end of the list, so
+      inserting and removing never need special cases for an empty list.
+
+      The list is ordered by recency of use: `head.next` is the buffer most recently
+      released, `head.prev` the least recently released. [[bget]] uses both ends.
+
+      `lock` is a [[g:spinlock]] that protects the list, and every buffer's `dev`,
+      `blockno` and `refcnt`. It is held only for short searches and updates, never while
+      waiting for a disk.
+
+  - lines: 35-52
+    title: "binit(): build the list"
+    note: |
+      Called once at boot from [[main]] ([[kernel/main.c:27]]). It makes `head` point to
+      itself in both directions (an empty circular list), then inserts each buffer right
+      after `head`, and initializes each buffer's sleep lock.
+
+      Every buffer starts with `refcnt` 0, `valid` 0, `dev` 0 and `blockno` 0 (the
+      [[bcache]] array is in [[g:bss|.bss]], which is zeroed). They are all free, so the
+      first [[bget]] calls recycle them. A buffer with `dev` 0 never matches a real lookup
+      because xv6's disk is device 1 ([[ROOTDEV]]).
+
+  - lines: 54-62
+    title: "bget(): find or assign a buffer for a block"
+    note: |
+      The core of the cache. It returns a buffer that is assigned to block `blockno` of
+      `dev`, locked by the caller, with its `refcnt` counting the caller. It does not read
+      the disk; [[bread]] does that if needed.
+
+      The whole search, both the lookup and the recycling, runs while holding
+      [[bcache]]`.lock`. That makes "is it cached? if not, assign a buffer to it" a single
+      step that no other process can interleave with. Without that, two processes could both
+      miss and assign two different buffers to the same block; their changes would then be
+      made in two copies, and one would be lost. The invariant "at most one buffer per block"
+      depends on it.
+
+  - lines: 64-72
+    title: Cache hit
+    note: |
+      The search starts at `head.next`, the most recently used end, where a hit is most
+      likely. On a hit, `refcnt` is incremented *before* the spinlock is released: from then
+      on the buffer cannot be recycled for another block, even though the caller does not
+      yet hold its sleep lock.
+
+      Then the caller waits for the buffer's [[g:sleeplock]] with [[acquiresleep]], which may
+      sleep if another process is using the block. This must happen *after* releasing
+      `bcache.lock`: sleeping while holding a spinlock is not allowed, and it would block
+      every other cache lookup for as long as that other process keeps the buffer.
+
+  - lines: 74-88
+    title: "Cache miss: recycle the least recently used free buffer"
+    note: |
+      The search runs backwards from `head.prev`, the least recently used end, for a buffer
+      with `refcnt == 0`, meaning nobody is using it and the log has not pinned it. It is
+      reassigned to the new block, and `valid = 0` records that its `data` still holds the
+      old block's bytes, so [[bread]] must read the new block from the disk.
+
+      The old contents are discarded without being written back. That is safe only because
+      of an invariant the [[g:write-ahead-log|log]] maintains: a buffer whose data was
+      changed but has not yet been written to its home location on disk is pinned
+      ([[log_write]] calls [[bpin]]), so its `refcnt` is not 0 and it is never chosen here.
+
+      A buffer with `refcnt == 0` is also unlocked ([[brelse]] releases the sleep lock
+      before it decrements `refcnt`), so [[acquiresleep]] on line 83 does not wait.
+
+      If every buffer is in use, xv6 panics instead of waiting.
+
+  - lines: 90-102
+    title: "bread(): get a block's contents"
+    note: |
+      The function the file system uses to access a block. It gets the locked buffer from
+      [[bget]]; if the buffer does not already hold the block's data, it asks the disk
+      driver to read it ([[virtio_disk_rw]] with `write = 0`, which sleeps until the data
+      has arrived) and marks the buffer valid.
+
+      Checking and setting `valid` without [[bcache]]`.lock` is safe because the caller now
+      holds the buffer's sleep lock, which protects `valid` and `data`.
+
+      Callers use `b->data` and must eventually call [[brelse]].
+
+  - lines: 104-112
+    title: "bwrite(): write a buffer to disk now"
+    note: |
+      Writes the buffer's 1024 bytes to its block on disk and returns when the write is
+      complete. The caller must hold the buffer's sleep lock; [[holdingsleep]] checks that
+      the current process holds it, catching a bug that would let the disk read `data`
+      while someone else changes it.
+
+      As the comment says, only [[kernel/log.c]] calls this, to write log blocks, the log
+      header, and blocks being installed at their home locations. All other code calls
+      [[log_write]], so that no file system change reaches its home location before it is
+      safely in the log.
+
+  - lines: 114-137
+    title: "brelse(): give a buffer back"
+    note: |
+      The caller is done with the buffer. First the sleep lock is released, so a process
+      waiting for the same block in [[bget]] can proceed.
+
+      Then, under [[bcache]]`.lock`, the reference count drops. If it reaches 0, nobody is
+      using the buffer, and it is moved to the front of the list (right after `head`): the
+      two assignments on lines 128–129 unlink it, and the four on lines 130–133 insert it
+      after `head`. That makes it the *most* recently used buffer, the last candidate for
+      recycling. This move is the only thing that keeps the list in LRU order; a cache hit
+      in [[bget]] does not move the buffer.
+
+      The panic catches a caller releasing a buffer it does not hold.
+
+  - lines: 139-153
+    title: "bpin() and bunpin(): keep a buffer in the cache"
+    note: |
+      These adjust `refcnt` without touching the sleep lock. The [[g:write-ahead-log|log]]
+      uses them: [[log_write]] calls [[bpin]] the first time a transaction modifies a block,
+      and [[install_trans]] calls [[bunpin]] after the block has been written to its home
+      location. While pinned, `refcnt` stays at least 1 even after the modifying process
+      calls [[brelse]], so [[bget]] cannot recycle the buffer and throw away the change
+      before the log has written it.
+
+      Both take [[bcache]]`.lock`, because `refcnt` is protected by it.
+
+lines:
+  27: |
+    The buffers themselves, [[NBUF]] = 30 of them. [[NBUF]] is defined in
+    [[kernel/param.h]] as `MAXOPBLOCKS * 3`, the same as [[LOGBLOCKS]].
+  32: |
+    The dummy list head. Only its `prev` and `next` are used.
+  40: |
+    Initialize the spinlock that protects the list and the buffers' identities.
+  43-44: |
+    An empty circular list: `head` is its own predecessor and successor.
+  46-47: |
+    Insert `b` between `head` and the current first buffer. These two lines set `b`'s own
+    links; lines 49–50 make its neighbors point at it.
+  48: |
+    Each buffer gets its own sleep lock, named "buffer" for debugging.
+  49-50: |
+    Complete the insert: the old first buffer's `prev` and `head.next` now point at `b`.
+  62: |
+    Take the cache lock for the whole search, so the lookup and the recycle are one atomic
+    step with respect to other processes.
+  66: |
+    A hit: this buffer is already assigned to the requested block.
+  67: |
+    Count the new reference while still holding the cache lock, so the buffer cannot be
+    recycled after the lock is released.
+  69: |
+    Wait (sleeping if necessary) for exclusive use of the buffer.
+  77: |
+    Free: nobody holds it and the log has not pinned it.
+  78-81: |
+    Reassign the buffer: new identity, contents not yet valid, one reference (the caller).
+  87: |
+    All [[NBUF]] buffers are in use. xv6 treats this as fatal instead of waiting.
+  97-99: |
+    If the buffer does not hold the block yet, read it from the disk (this sleeps), and
+    remember that it now does.
+  109: |
+    The caller must hold the buffer's sleep lock.
+  111: |
+    Write the block and wait for the disk to finish.
+  122: |
+    Release the sleep lock first; another process may now use the buffer.
+  125: |
+    Drop the caller's reference, under the cache lock.
+  128-129: |
+    Unlink the buffer from its current position.
+  130-133: |
+    Re-insert it at the front of the list, right after `head`: it is now the most
+    recently used.
+  143: |
+    One more reference: the buffer cannot be recycled until [[bunpin]] runs.
+  151: |
+    Drop the log's reference. If no process is using the buffer, it becomes a candidate
+    for recycling (it stays where it is in the list).

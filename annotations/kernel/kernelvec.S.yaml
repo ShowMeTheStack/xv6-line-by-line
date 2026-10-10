@@ -1,0 +1,146 @@
+summary: |
+  The entry point for [[g:trap|traps]] that happen while the *kernel* is running: a timer
+  or device interrupt that arrives during a system call or in the scheduler's idle loop,
+  or (by mistake) an exception in kernel code. [[trapinithart]] points
+  [[g:csr:stvec|stvec]] here at boot, and [[usertrap]] points it here again each time a
+  process enters the kernel.
+
+  It is much simpler than [[kernel/trampoline.S]]. The hart is already in the kernel, with
+  the kernel page table, a valid kernel stack in `sp` and the hart ID in `tp`. So
+  [[kernelvec]] only has to push the registers that a C function is allowed to destroy,
+  call [[kerneltrap]] in [[kernel/trap.c]], pop them, and return with
+  [[g:insn:sret|sret]] to the interrupted kernel instruction.
+
+  **Read before:** [[kernel/trampoline.S]], for contrast. **Read next:** [[kerneltrap]].
+
+blocks:
+  - lines: 1-8
+    title: Traps while in supervisor mode
+    note: |
+      xv6's description of the file. "The current stack is a kernel stack": either the
+      [[g:kernel-stack]] of the process whose kernel code was interrupted, or, when the
+      interrupt arrives in the [[scheduler]] loop, the hart's boot stack in [[stack0]].
+      Either way it is a valid stack, which is why the registers can simply be pushed onto
+      it.
+
+  - lines: 9-12
+    title: Declare kernelvec
+    note: |
+      `.globl kernelvec` exports the label so that [[kernel/trap.c]] can take its
+      address (`w_stvec((uint64)kernelvec)`). `.globl kerneltrap` declares the C function
+      called on line 38, which is defined in `trap.c`. There is no `.section` directive, so
+      the code goes into the default `.text` section.
+
+      [[g:dir-align|.align 4]] places `kernelvec` at a multiple of 16 bytes (it is at
+      `0x800055b0` in `kernel/kernel.sym`). [[g:csr:stvec|stvec]] needs at least a 4-byte
+      aligned address, because its two low bits select the mode; with both 0, every trap
+      jumps directly to this address.
+
+  - lines: 13-14
+    title: Make room on the stack
+    note: |
+      Reserve 256 bytes below the current stack pointer, room for 32 eight-byte slots. 256
+      is a multiple of 16, so `sp` stays 16-byte aligned for the C call, as the
+      [[g:calling-convention]] requires.
+
+      The slot layout follows register numbering: register `x`*n* has the slot at offset
+      `8(n-1)`, so `ra` (x1) is at 0, `sp` (x2) at 8, `gp` (x3) at 16, `tp` (x4) at 24,
+      `t0` (x5) at 32, and so on up to `t6` (x31) at 240. The slots for `s0`–`s11` and for
+      the commented-out `sp` and `tp` are left unused.
+
+  - lines: 16-35
+    title: Save only the caller-saved registers
+    note: |
+      The interrupted kernel code was in the middle of something, and it must find every
+      register unchanged when it resumes. But this code does not save all of them, only
+      those that [[kerneltrap]] might change.
+
+      The reason is the [[g:calling-convention]]. `kerneltrap` is an ordinary compiled C
+      function, and C functions promise to preserve the *callee-saved* registers
+      `s0`–`s11` ([[g:reg:s0|saved registers]]) and `sp`: if they use one, they save and
+      restore it themselves. They are free to destroy the *caller-saved* ones: `ra`,
+      `t0`–`t6` and `a0`–`a7`. So those are the registers saved here, in slots 0, 32–48,
+      72–128 and 216–240.
+
+      Three registers are special:
+
+      - `sp` (commented out, line 18) is restored by arithmetic: line 61 adds back the 256
+        subtracted on line 14.
+      - `tp` (commented out, line 20) holds the hart ID; see line 44 for why it must *not*
+        be restored.
+      - `gp` is saved and restored although the kernel never uses it (no instruction in
+        `kernel/kernel.asm` other than these, and the trampoline's, touches `gp`). The save
+        is harmless.
+
+      No second interrupt can arrive while these registers are being saved: the hardware
+      cleared `sstatus.SIE` on trap entry, and nothing in this file sets it.
+      ([[kerneltrap]] checks this with [[intr_get]].)
+
+  - lines: 37-38
+    title: Handle the trap in C
+    note: |
+      [[kerneltrap]] reads [[g:csr:scause|scause]], handles a timer or device interrupt
+      (panicking on anything else), and may [[yield]] the CPU on a timer interrupt. A
+      plain [[g:insn:call|call]] works here, unlike in the trampoline, because this code
+      runs at the address the linker gave it.
+
+  - lines: 40-59
+    title: Restore the saved registers
+    note: |
+      The mirror image of lines 17–35, from the same slots.
+
+      The comment on line 44 matters. If the timer interrupt led to a [[yield]], this
+      kernel thread may have been suspended and later resumed by the [[scheduler]] on a
+      *different* hart. [[g:reg:tp|tp]] belongs to the hart, not the thread
+      ([[swtch]] does not save or restore it), so after a move `tp` correctly holds the
+      new hart's ID. Restoring the value saved on the old hart would make [[cpuid]] lie
+      from then on. That is why `tp` is neither saved nor restored.
+
+  - lines: 61-64
+    title: Pop the frame and resume the interrupted code
+    note: |
+      Line 61 releases the 256 bytes, so `sp` is back to the value it had when the trap
+      occurred.
+
+      [[g:insn:sret|sret]] then jumps to [[g:csr:sepc|sepc]] in the mode recorded in
+      `sstatus.SPP` (supervisor here), and sets `sstatus.SIE` from `SPIE`, so interrupts
+      are back on exactly if they were on when the trap occurred. [[kerneltrap]] wrote
+      `sepc` and `sstatus` back from its own saved copies before returning
+      ([[kernel/trap.c:162]]), because a [[yield]] in between could have taken other traps
+      that overwrote both CSRs.
+
+lines:
+  14: |
+    Grow the stack by 256 bytes ([[g:insn:addi|addi]] with a negative constant).
+
+    This is not a stack switch: the [[g:kernelvec-frame]] goes onto whatever stack is
+    active, the interrupted process's [[g:kernel-stack]] or, for an interrupt taken in the
+    scheduler loop, this hart's [[g:scheduler-stack]]. xv6 has no separate interrupt stack
+    ([[concept:stacks#same]]).
+  17: |
+    Save `ra`: the interrupted function's return address, which `call kerneltrap`
+    overwrites.
+  18: |
+    Not needed: `sp` is recovered by line 61. The commented-out line keeps the slot layout
+    visible.
+  20: |
+    Deliberately not saved; see the note on line 44.
+  24: |
+    Save the argument registers `a0`–`a7` (lines 24–31): any C function may overwrite
+    them.
+  32: |
+    Save `t3`–`t6` (lines 32–35), the last temporaries, at offsets 216–240.
+  38: |
+    Call [[kerneltrap]] in [[kernel/trap.c]].
+  44: |
+    `tp` holds the hart ID, which may have changed if [[kerneltrap]] yielded and this
+    thread now runs on another hart. Restoring the old value would be wrong.
+
+    The frame being restored sits on the process's kernel stack, which stayed with the
+    process while it was suspended: the stack travels with the thread, the hart ID does
+    not.
+  61: |
+    Undo line 14.
+  64: |
+    Return to the interrupted kernel instruction, re-enabling interrupts if they were
+    enabled before the trap.

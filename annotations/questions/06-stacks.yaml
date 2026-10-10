@@ -1,0 +1,739 @@
+title: The stacks
+summary: User stacks, kernel stacks and the boot-turned-scheduler stack, the four instructions that move sp between them, where interrupts push their frames, and the save areas that are not stacks.
+questions:
+  - id: stack-01
+    level: 1
+    type: choice
+    q: |
+      Where does a hart's **scheduler stack** come from?
+    code: kernel/main.c:9-45@44
+    options:
+      - text: "It is the hart's 4 KiB slice of stack0, the same memory it booted on; main calls scheduler, which never returns."
+        correct: true
+        why: |
+          [[kernel:main]] calls `scheduler()` as an ordinary function on the boot stack. Since
+          [[scheduler]] never returns, that slice of [[stack0]] is the scheduler's stack from then
+          on: same memory, new role.
+      - text: "It is a page inside struct cpu, next to the saved context."
+        why: |
+          You may have taken `cpus[i].context` for a stack. `struct cpu` holds only saved registers
+          (including a *pointer* into the stack), `proc`, `noff` and `intena`.
+      - text: "procinit allocates one page per hart for it with kalloc."
+        why: |
+          You may have expected every stack to be allocated. Nothing allocates a scheduler stack:
+          `stack0` is a global array in `.bss`, and [[procinit]] deals only with process slots.
+      - text: "Each hart borrows KSTACK(0), the first process slot's kernel stack."
+        why: |
+          You may have thought the scheduler runs on some process's kernel stack. It cannot: a
+          process's stack may be resumed by another hart at any moment. Kernel stacks belong to
+          slots, and the scheduler has its own memory.
+    explain: |
+      There are three kinds of stack: one user stack per process, one kernel stack per slot,
+      and one boot stack per hart that becomes the scheduler stack when `main` calls
+      `scheduler()` ([[kernel/main.c:44]]). See [[concept:stacks#scheduler]].
+
+  - id: stack-02
+    level: 1
+    type: number
+    q: |
+      How many kernel-stack pages does [[proc_mapstacks]] allocate at boot in this kernel?
+    code: kernel/proc.c:29-44
+    answer: 64
+    wrong:
+      3: |
+        You may have counted harts. Kernel stacks belong to process *slots*, not to CPUs; the
+        harts' own stacks are slices of `stack0`.
+      8: |
+        You may have used `NCPU`. The loop runs over `proc[0]` to `proc[NPROC-1]`, and `NPROC` is
+        64.
+      128: |
+        You may have counted the guard pages. `KSTACK` leaves a gap of one page below each stack,
+        but those pages are never allocated or mapped: only 64 pages come from `kalloc`.
+    why_wrong: "Look at the loop bounds in proc_mapstacks and the value of `NPROC` in param.h."
+    explain: |
+      One page per slot, `NPROC` = 64 slots, all allocated once and never freed. A process uses
+      the stack of whatever slot it gets ([[concept:stacks#kernel]]).
+
+  - id: stack-03
+    level: 1
+    type: tf
+    q: |
+      True or false: a child created by `fork` starts with a copy of its parent's kernel stack.
+    answer: false
+    why_tf: |
+      You may have assumed fork copies everything. It copies the *user* memory (user stack
+      included) and the trapframe, but not the kernel stack.
+    reasons:
+      - text: "The child runs on its own slot's kernel stack, which is empty when it first runs: allocproc sets context.sp to the top and context.ra to forkret."
+        correct: true
+        why: |
+          The child never returns through `sys_fork`, `syscall` or `usertrap`. It starts in
+          [[forkret]] on an empty stack and goes straight to user mode ([[kernel/proc.c:146-147]]).
+      - text: "Kernel stacks are allocated by fork and freed by exit, so there is nothing to copy from."
+        why: |
+          You may have thought stacks are per process. All 64 kernel stacks exist from boot and are
+          never freed. The child simply uses its slot's existing page.
+      - text: "The parent's kernel stack is shared with the child until one of them writes to it."
+        why: |
+          You may be thinking of copy-on-write, which this kernel does not do for anything. And a
+          kernel stack is never shared: each is used by at most one hart at a time.
+    explain: |
+      What the child inherits is its *user* state: user memory (via [[uvmcopy]]) and the
+      trapframe, with `a0` set to 0. Its kernel thread is forged fresh by [[allocproc]]
+      ([[concept:stacks#lifecycle]]).
+
+  - id: stack-04
+    level: 1
+    type: match
+    q: |
+      Match each instruction with what it does to the hart's active stack.
+    pairs:
+      - left: "`add sp, sp, a0` in _entry (entry.S:17)"
+        right: "nothing usable → this hart's boot stack"
+        why: "It finishes computing `stack0 + (hartid + 1) * 4096`, once per hart at power-on."
+      - left: "`ld sp, 8(a0)` in uservec (trampoline.S:76)"
+        right: "user stack → the process's kernel stack (usable after `csrw satp`, line 92)"
+        why: "It loads `trapframe->kernel_sp` on every trap from user mode."
+      - left: "`ld sp, 8(a1)` in swtch (swtch.S:26)"
+        right: "kernel stack ↔ the hart's scheduler stack"
+        why: "Called from `sched` it goes to the scheduler; called from `scheduler` it goes to a process."
+      - left: "`ld sp, 48(a0)` in userret (trampoline.S:118)"
+        right: "kernel stack → user stack (usable after `sret`, line 153)"
+        why: "It loads `trapframe->sp` on every return to user mode."
+      - left: "`addi sp, sp, -256` in kernelvec (kernelvec.S:14)"
+        right: "no switch: pushes a frame on whatever stack is current"
+        why: "xv6 has no interrupt stack. kernelvec makes room on the stack the hart was already using."
+    explain: |
+      Only four instructions move `sp` to a *different* stack. Everything else, including
+      [[kernelvec]], traps, `mret` and `sret`, either moves `sp` within one stack or leaves it
+      alone ([[concept:stacks#switches]]).
+
+  - id: stack-05
+    level: 2
+    type: number
+    q: |
+      In this build `stack0` is at `0x80007890`. What value does `sp` hold on **hart 2** right
+      after line 17 of entry.S? Give it in hex.
+    code: kernel/entry.S:7-21@11-17
+    answer: "0x8000a890"
+    wrong:
+      "0x80009890": |
+        You may have computed `stack0 + hartid * 4096`. The code adds 1 first: stacks grow down,
+        so a hart must start at the *top* of its slice, which is `(hartid + 1) * 4096` above
+        `stack0`.
+      "0x80007892": |
+        You may have added the hart number itself. Line 16 multiplies `hartid + 1` by `1024*4`
+        before line 17 adds it.
+      "0x8000f890": |
+        That is the end of the whole 32 KiB array (8 slices). Hart 2 uses the third slice.
+    why_wrong: "Compute `0x80007890 + (2 + 1) * 0x1000`."
+    explain: |
+      `0x80007890 + 3 * 0x1000` = `0x8000a890`, the top of hart 2's slice. Hart 0 starts at
+      `0x80008890` and hart 1 at `0x80009890`. Each hart computes its own value from `mhartid`,
+      with no coordination ([[concept:stacks#boot]], [[tour:42]]).
+
+  - id: stack-06
+    level: 1
+    type: line
+    q: |
+      In [[swtch]], click the line at which the hart stops running on the old thread's stack
+      and starts running on the new one's.
+    code: kernel/swtch.S:8-40
+    answer: 26
+    lines:
+      11: |
+        You may have picked the line that mentions `sp`. Line 11 *saves* the old `sp` into the
+        old context; the register itself does not change.
+      25: |
+        Line 25 loads the new `ra`, where `ret` will jump. That decides where execution
+        continues, but `sp` still points at the old stack until the next line.
+      40: |
+        You may have thought the switch happens at `ret`. By then `sp` already points at the new
+        stack; `ret` only jumps to the loaded `ra`.
+    why_wrong: Find the instruction that writes the `sp` register itself.
+    explain: |
+      Line 26, `ld sp, 8(a1)`, loads the new thread's saved `sp`. It is switch number 3 of the
+      four ([[concept:stacks#switches]]): from a process's kernel stack to the scheduler stack
+      (called from [[sched]]) or back (called from [[scheduler]]).
+
+  - id: stack-07
+    level: 2
+    type: state
+    q: |
+      A process is returning to user mode. The hart has just executed line 111 of [[userret]],
+      `csrw satp, a0`, and has not reached line 118 yet. What is its state?
+    code: kernel/trampoline.S:100-120@111
+    state:
+      mode: S
+      stack: none
+      satp: user
+      sie: "off"
+    why:
+      stack: |
+        `sp` still holds the kernel-stack address it had in C code, but the user page table just
+        installed does not map kernel stacks. Nothing may be pushed here, and still nothing after
+        line 118 loads the user `sp`, because supervisor code cannot use user pages; only `sret`
+        makes the user stack usable. The code here only loads registers from the trapframe.
+      mode: |
+        The hart drops to user mode only at `sret` (line 153). Until then it is in supervisor
+        mode, even though it is already using the user page table.
+      satp: Line 111 has just written the user page table's value into `satp`.
+      sie: |
+        [[prepare_return]] turned interrupts off (trap.c:108) before pointing `stvec` at the
+        trampoline; they come back on only through `sret`.
+    why_wrong: |
+      Ask three questions separately: which mode (only `sret` changes it), which page table (line
+      111 just changed it), and could the current `sp` be used under that page table?
+    explain: |
+      This is the first half of the second "no usable stack" stretch
+      (userret lines 111–118). On the way out `satp` changes before
+      `sp`, so for a few instructions `sp` is a kernel address under the user page table. The
+      trampoline code is written to use no stack there ([[concept:stacks#none]]).
+
+  - id: stack-08
+    level: 3
+    type: state
+    q: |
+      Hart 0's scheduler has just switched to `init` (pid 1) for the first time. The hart is at
+      the first instruction of [[forkret]], before line 520. What is its state?
+    code: kernel/proc.c:510-543@513
+    state:
+      mode: S
+      stack: kernel
+      satp: kernel
+      sie: "off"
+      noff: 1
+      intena: 0
+    why:
+      stack: |
+        `swtch` loaded `p->context.sp`, which [[allocproc]] set to the top of slot 0's kernel
+        stack. The hart is on `init`'s kernel stack, which is empty.
+      noff: |
+        The scheduler acquired `init`'s `p->lock` before `swtch` and nobody has released it yet:
+        `forkret`'s first job (line 520) is to release it. One spinlock, so noff is 1.
+      intena: |
+        The scheduler's `acquire` ran after line 442 turned interrupts off, so `push_off`
+        recorded 0. That is why releasing the lock in `forkret` leaves interrupts off.
+      sie: Interrupts were off when the scheduler took the lock and nothing has turned them on.
+      satp: The scheduler and `forkret` both run with the kernel page table; `init`'s page table is installed only in `userret`.
+    why_wrong: |
+      Follow the scheduler: intr_off, acquire `init`'s p->lock, swtch (which only changes `sp`,
+      `ra` and `s` registers). Then ask what the forged context pointed at.
+    explain: |
+      `forkret` starts on an empty kernel stack with `ra` pointing at itself, holding the
+      `p->lock` the scheduler took across [[swtch]], with `noff` 1 and `intena` 0. gdb in
+      [[tour:42]] read exactly this: `sp = 0x3fffffe000`, SIE 0, noff 1, intena 0
+      ([[concept:locks#handoff]]).
+
+  - id: stack-09
+    level: 1
+    type: choice
+    q: |
+      `sh` makes a `read` system call. Which stack do [[usertrap]], [[syscall]] and `sys_read`
+      run on?
+    options:
+      - text: "sh's own kernel stack, KSTACK of its slot"
+        correct: true
+        why: |
+          [[uservec]] loaded `sp` from `trapframe->kernel_sp` (trampoline.S:76), the top of `sh`'s
+          kernel stack. `usertrap`'s frame is the first one on it, and the system call's frames
+          go below.
+      - text: "sh's user stack"
+        why: |
+          You may have thought the kernel borrows the caller's stack, as a library function would.
+          It cannot trust a stack the user controls; [[uservec]] switches away from it before any C
+          code runs.
+      - text: "The hart's scheduler stack"
+        why: |
+          You may have thought kernel code always runs on the CPU's stack. The scheduler stack is
+          used only by the scheduler (and interrupts taken in its window). System calls run on
+          behalf of a process, on that process's kernel stack.
+      - text: "A single kernel stack shared by all system calls"
+        why: |
+          You may have imagined one kernel stack. There are 64, one per slot, so several
+          processes can be inside system calls on different harts at the same time.
+    explain: |
+      Every process has its own kernel stack because a system call may sleep halfway through,
+      and its frames must wait somewhere while other processes run
+      ([[concept:stacks#kernel]]).
+
+  - id: stack-10
+    level: 2
+    type: multi
+    q: |
+      Which of these are **save areas** (fixed slots for registers) rather than stacks?
+    options:
+      - text: "the trapframe"
+        correct: true
+        why: "Its own page with one fixed slot per user register, written by [[uservec]] and read by [[userret]]. Nothing is pushed or popped."
+      - text: "`p->context`"
+        correct: true
+        why: "Fourteen fixed slots (`ra`, `sp`, `s0`–`s11`) inside `struct proc`, written and read by [[swtch]]."
+      - text: "`cpus[i].context`"
+        correct: true
+        why: "The same 14 slots for hart *i*'s scheduler, inside `struct cpu`. It holds a pointer into the scheduler stack but is not that stack."
+      - text: "`sscratch`"
+        correct: true
+        why: "A CSR that holds the user's `a0` for a few dozen instructions in [[uservec]]."
+      - text: "hart 1's slice of `stack0`"
+        why: |
+          You may have thought it is only the place `cpus[1].context.sp` points to. It is a real
+          stack: `scheduler`, `kernelvec` and the functions they call push frames on it.
+      - text: "`KSTACK(5)`"
+        why: |
+          You may have mixed up a kernel stack with the context that points into it. `KSTACK(5)` is
+          a real stack page: C call frames grow down it.
+    explain: |
+      A stack grows and shrinks with calls; a save area has fixed slots that are overwritten
+      each time. Holding a value of `sp` (as `trapframe->sp` and `context.sp` do) does not make
+      something a stack ([[concept:stacks#save-areas]], [[g:save-area]]).
+
+  - id: stack-11
+    level: 1
+    type: choice
+    q: |
+      A process is in the middle of a system call, with interrupts on, when a timer interrupt
+      arrives. Where does [[kernelvec]] save the interrupted registers?
+    code: kernel/kernelvec.S:9-38@14
+    options:
+      - text: "In a 256-byte frame pushed onto the process's own kernel stack, below the system call's frames"
+        correct: true
+        why: |
+          A trap from S-mode does not change `sp`. kernelvec's `addi sp, sp, -256` makes room on
+          whatever stack is current, here the process's kernel stack.
+      - text: "On a separate interrupt stack belonging to the hart"
+        why: |
+          You may know kernels that switch to an interrupt stack. xv6 has none: kernelvec uses the
+          stack that is already active.
+      - text: "In the process's trapframe"
+        why: |
+          You may have confused the two trap paths. The trapframe is filled by [[uservec]] for traps
+          from *user* mode. A trap from the kernel goes to kernelvec, which never touches it.
+      - text: "On the hart's scheduler stack"
+        why: |
+          That happens only when the interrupt arrives while the hart is in the scheduler's
+          window. During a system call the hart is on the process's kernel stack, so that is where
+          the frame goes.
+    explain: |
+      In supervisor mode an interrupt borrows the current stack. During a system call that is
+      the process's kernel stack, which may then be suspended with the kernelvec frame in the
+      middle of it ([[concept:stacks#same]], [[tour:44]]).
+
+  - id: stack-12
+    level: 3
+    type: choice
+    q: |
+      [[kernelvec]] saves most caller-saved registers in its frame and restores them, but it
+      deliberately neither saves nor restores `tp` (lines 20 and 44). Why?
+    code: kernel/kernelvec.S:40-64@44
+    options:
+      - text: "If kerneltrap yields, the process may resume on a different hart, and tp must keep holding the number of the hart it is now on."
+        correct: true
+        why: |
+          `tp` is the hart's identity for [[cpuid]] and [[mycpu]]. After a `yield` the same kernel
+          stack, kernelvec frame included, can be resumed by another hart, whose `tp` already
+          holds its own number. Restoring the old value would make two harts share one `cpus[]`
+          entry.
+      - text: "tp is callee-saved, so kerneltrap preserves it automatically."
+        why: |
+          You may have thought `tp` is like `s0`–`s11`. The calling convention does not let C code
+          allocate `tp` at all; it is reserved as the thread pointer, and xv6 uses it for the hart
+          number. The reason it is skipped is about harts, not about the convention.
+      - text: "tp holds the user's thread pointer, which is already saved in the trapframe."
+        why: |
+          You may have confused kernelvec with [[uservec]]. In the kernel `tp` holds the hart
+          number; the user's `tp` is in the trapframe only for traps from user mode.
+      - text: "To save one store and one load, since kerneltrap never changes tp."
+        why: |
+          It is true that `kerneltrap` does not write `tp`, but the comment on line 44 gives the
+          real reason: "in case we moved CPUs". Restoring would be actively wrong, not merely
+          wasted.
+    explain: |
+      Everything on a kernel stack travels with the thread; registers stay with the hart. That
+      is why [[kerneltrap]] copies `sepc` and `sstatus` into locals before a possible `yield`
+      and writes them back afterwards ([[kernel/trap.c:162]]), but deliberately leaves `tp`
+      alone: after a move to another hart, `tp` must name the new hart. [[tour:44]] measured a thread that yielded on hart 1 and resumed on hart
+      0: `tp` was 0, as it must be ([[concept:stacks#same]]).
+
+  - id: stack-13
+    level: 2
+    type: choice
+    q: |
+      A timer interrupt arrives while hart 2 is in its scheduler's interrupt window (between
+      lines 441 and 442 of proc.c). Which stack does [[kerneltrap]] run on, and does it call
+      [[yield]]?
+    code: kernel/trap.c:134-164@157-158
+    options:
+      - text: "Hart 2's scheduler stack, with a kernelvec frame on it; no yield, because myproc() is 0."
+        correct: true
+        why: |
+          The trap does not move `sp`, so kernelvec pushes onto the scheduler stack. The scheduler
+          has set `c->proc = 0`, so line 157's `myproc() != 0` is false.
+      - text: "The kernel stack of the last process hart 2 ran; it yields that process."
+        why: |
+          You may have thought a hart stays "on" the last process's stack. `swtch` moved hart 2 to
+          its scheduler stack, and `c->proc` was cleared at line 460.
+      - text: "Hart 2's scheduler stack; it yields to let the scheduler pick a new process."
+        why: |
+          You may have thought every tick yields. [[yield]] needs a current process to mark
+          `RUNNABLE`. Here the scheduler *is* the thing that would run next, so there is nothing to
+          yield.
+      - text: "A fresh empty kernel stack loaded from kernel_sp; no yield."
+        why: |
+          You may have confused this with a trap from user mode. Only [[uservec]] loads
+          `kernel_sp`. A trap from S-mode goes to [[kernelvec]], which keeps the current stack.
+    explain: |
+      The scheduler stack is the third landing site for interrupts, after user mode and a
+      process in the kernel. The frame is pushed, the handler runs, and `sret` returns to the
+      `intr_off` at line 442 ([[tour:44]], [[concept:stacks#scheduler]]).
+
+  - id: stack-14
+    level: 2
+    type: multi
+    q: |
+      Which of these stacks have a **guard page** below them in this kernel?
+    options:
+      - text: "a process's user stack"
+        correct: true
+        why: "[[kexec]] allocates two pages and [[uvmclear]] clears `PTE_U` on the lower one: mapped, but a user-mode access faults."
+      - text: "a process's kernel stack (`KSTACK(slot)`)"
+        correct: true
+        why: "`KSTACK` spaces the stacks two pages apart, and the page below each one is never mapped in the kernel page table."
+      - text: "a hart's scheduler stack"
+        why: |
+          You may have assumed every stack is protected. The scheduler stack is a slice of
+          `stack0`, an ordinary `.bss` array; an overflow silently writes into the slice below, or,
+          for hart 0, into kernel globals.
+      - text: "a hart's boot stack, before main calls scheduler"
+        why: |
+          You may have thought the boot stack is separate memory. It is the same slice of `stack0`
+          as the scheduler stack, with no guard page at either time.
+    explain: |
+      User and kernel stacks have one guard page each, which turns gradual overflow into a fault
+      (a killed process, or a kernel panic). `stack0` has none; xv6 relies on the code that runs
+      there being short and fixed ([[concept:stacks#guards]], [[g:guard-page]]).
+
+  - id: stack-15
+    level: 2
+    type: number
+    q: |
+      How many registers does [[kernelvec]] store into its 256-byte frame?
+    code: kernel/kernelvec.S:12-38
+    answer: 17
+    wrong:
+      32: |
+        You may have divided 256 by 8. The frame has 32 slots, but most are left unused: `sp`,
+        `tp` and `s0`–`s11` are not saved.
+      31: |
+        You may be thinking of [[uservec]], which saves all 31 user registers in the trapframe.
+        Here the interrupted code is kernel C, so the callee-saved registers can be left to
+        [[kerneltrap]].
+      16: |
+        You may have counted only the caller-saved registers (`ra`, `t0`–`t6`, `a0`–`a7`). Line 19
+        also saves `gp`.
+    why_wrong: Count the `sd` instructions between line 14 and the call; commented-out lines don't count.
+    explain: |
+      `ra`, `gp`, `t0`–`t2`, `a0`–`a7` and `t3`–`t6`: 17 stores. `s0`–`s11` are callee-saved, so any
+      C function that uses them saves them itself; `sp` is restored by the matching `addi`; `tp`
+      must not be restored ([[g:kernelvec-frame]], [[concept:stacks#same]]).
+
+  - id: stack-16
+    level: 2
+    type: number
+    q: |
+      `TRAMPOLINE` is `0x3ffffff000` and `PGSIZE` is `0x1000`. What address is the **top** of
+      slot 4's kernel stack, the value `uservec` loads into `sp` for the process in `proc[4]`?
+      Give it in hex.
+    code: kernel/memlayout.h:46-52@52
+    answer: "0x3fffff6000"
+    wrong:
+      "0x3fffff5000": |
+        That is `KSTACK(4)` itself, the *bottom* of the page. A stack starts at its top, because
+        it grows down: [[prepare_return]] stores `p->kstack + PGSIZE`.
+      "0x3fffffb000": |
+        You may have dropped the factor 2: `TRAMPOLINE - 5 * PGSIZE` plus one page. Each stack is
+        followed by an unmapped guard page, so slots are two pages apart.
+      "0x3fffff4000": |
+        You may have stepped one page too far down, below the stack into its guard page.
+    why_wrong: |
+      Compute `KSTACK(4) = TRAMPOLINE - (4 + 1) * 2 * PGSIZE`, then add one page for the top.
+    explain: |
+      `0x3ffffff000 - 10 * 0x1000` = `0x3fffff5000` is the bottom of the page; its top is
+      `0x3fffff6000`. [[tour:11]] and [[tour:44]] measured exactly this value in `sp` when a
+      process in slot 4 trapped ([[concept:stacks#kernel]]).
+
+  - id: stack-17
+    level: 2
+    type: bits
+    q: |
+      gdb shows `sp = 0x3fffff9ee0` on a hart in supervisor mode. Decode this address using
+      `KSTACK(i) = 0x3ffffff000 - (i + 1) * 0x2000`.
+    value: "0x3fffff9ee0"
+    fields:
+      - label: "Kind of stack"
+        options: ["a process's kernel stack", "a user stack", "a scheduler stack (stack0)"]
+        answer: "a process's kernel stack"
+        why: "Addresses just below the trampoline (`0x3f…`) in the kernel page table are kernel stacks. User stacks sit just above the program at small addresses, and `stack0` is near `0x80007890`."
+      - label: "Which slot"
+        options: ["2", "1", "3", "4"]
+        answer: "2"
+        why: "`KSTACK(2)` = `0x3ffffff000 - 3 * 0x2000` = `0x3fffff9000`, and `0x3fffff9ee0` lies in `0x3fffff9000`–`0x3fffff9fff`."
+      - label: "Page table that maps it"
+        options: ["the kernel page table only", "the process's user page table only", "both"]
+        answer: "the kernel page table only"
+        why: "Kernel stacks are mapped only in the kernel page table; that is why [[uservec]] must switch `satp` before it can use one."
+      - label: "Bytes in use, from sp up to the top"
+        options: ["288", "3808", "256"]
+        answer: "288"
+        why: "The top is `0x3fffffa000`; `0x3fffffa000 - 0x3fffff9ee0` = `0x120` = 288 bytes. (3808 counts from the bottom instead.)"
+    explain: |
+      This is the value [[tour:44]] measured at site B: 32 bytes of `usertrap`'s frame plus the
+      256-byte [[kernelvec]] frame on `usertests`' kernel stack in slot 2
+      ([[concept:stacks#kernel]]).
+
+  - id: stack-18
+    level: 2
+    type: choice
+    q: |
+      While [[kexec]] copies the argument strings onto the new program's user stack
+      (exec.c lines 101–119), which stack is the hart running on?
+    code: kernel/exec.c:89-119@101-108
+    options:
+      - text: "The process's kernel stack; kexec's sp is a C variable, and the strings reach the new page through copyout."
+        correct: true
+        why: |
+          `kexec` is ordinary kernel C inside a system call. The variable `sp` describes the future
+          user stack; the hart's `sp` register reaches it only at [[userret]], after
+          `trapframe->sp` is set on line 137.
+      - text: "The new user stack, since sp has been set to its top"
+        why: |
+          You may have read the local `sp` as the register. It is a `uint64` variable; nothing in
+          `kexec` moves the hart's `sp`.
+      - text: "The old program's user stack"
+        why: |
+          You may have thought the kernel runs on the caller's stack. The old user stack is not
+          even mapped in the kernel page table at its user address; the kernel never runs on it.
+      - text: "The hart's scheduler stack"
+        why: |
+          `exec` runs on behalf of a process, inside a system call, so it uses that process's
+          kernel stack. The scheduler stack is only for the scheduler.
+    explain: |
+      Building a stack is not using it. The new user stack is filled through the new page table
+      with [[copyout]], and even `ustack[]` is a local array on the kernel stack. The register
+      switches only at [[userret]]'s `ld sp, 48(a0)` ([[concept:stacks#user]]).
+
+  - id: stack-19
+    level: 3
+    type: order
+    q: |
+      Process A, running in user mode on hart 1, is interrupted by the timer. Hart 1 then runs
+      process B, which had been preempted the same way earlier. Put hart 1's stacks in the
+      order `sp` visits them.
+    items:
+      - text: "A's user stack"
+        why: The story starts in user mode, where `sp` is whatever A's program left in it.
+      - text: "A's kernel stack, loaded by `ld sp, 8(a0)` in uservec"
+        why: The trap itself does not move `sp`; uservec loads `kernel_sp` before any C code (`usertrap`, `yield`, `sched`) runs.
+      - text: "hart 1's scheduler stack, loaded by `ld sp, 8(a1)` in swtch called from sched"
+        why: A process never switches straight to another process; it first goes to its hart's scheduler.
+      - text: "B's kernel stack, at the point inside sched where B stopped, loaded by swtch called from scheduler"
+        why: The scheduler picks B and switches to B's saved `context.sp`, deep inside B's kernel stack.
+      - text: "B's user stack, loaded by `ld sp, 48(a0)` in userret"
+        why: B returns through `sched`, `yield`, `usertrap` and then userret, which loads B's user `sp` from its trapframe.
+    why_wrong: |
+      Every switch from one process to another passes through the hart's scheduler stack, and
+      each user stack is reached only through that process's own kernel stack.
+    explain: |
+      User → kernel (switch 2) → scheduler (switch 3) → other kernel stack (switch 3) → other
+      user stack (switch 4). Five stacks, four `sp`-loading instructions, all on one hart
+      ([[concept:stacks#switches]], [[tour:11]]).
+
+  - id: stack-20
+    level: 3
+    type: choice
+    q: |
+      [[kexit]] marks the process `ZOMBIE` and calls [[sched]], never to return. What happens to
+      the kernel stack it was running on?
+    code: kernel/proc.c:355-364
+    options:
+      - text: "Nothing: it stays mapped and allocated, because kernel stacks belong to slots and are never freed; the slot's next process will reuse it."
+        correct: true
+        why: |
+          [[freeproc]] (run by the parent in [[kwait]]) frees the trapframe and user memory but
+          never touches `kstack`. A process could not free the stack it stands on anyway, and it
+          needs it until `swtch` has moved away.
+      - text: "freeproc frees it when the parent calls wait."
+        why: |
+          You may have thought every per-process resource is freed by `freeproc`. It frees the
+          trapframe and the user page table (with the user stack); the kernel stack is not
+          mentioned.
+      - text: "The scheduler frees it right after swtch returns."
+        why: |
+          You may have reasoned that the scheduler is the first code not standing on it. True, but
+          [[scheduler]] frees nothing; and freeing it would only force [[allocproc]] to allocate a
+          new one, which this kernel never does.
+      - text: "kexit frees it just before calling sched."
+        why: |
+          You may have forgotten that `kexit` is still running on that stack, and so is `sched`,
+          and so is `swtch` until line 26. Freeing it first would let the page be reused while it
+          is still in use.
+    explain: |
+      xv6 sidesteps "who frees the stack I'm standing on" by never freeing kernel stacks: all
+      64 are made by [[proc_mapstacks]] at boot. The zombie's frames simply stay there until a
+      new process in the same slot starts again from the top ([[concept:stacks#lifecycle]]).
+
+  - id: stack-21
+    level: 2
+    type: choice
+    q: |
+      A scheduler switches to a fork child for the very first time. What does `swtch`'s
+      `ld sp, 8(a1)` load, and what is on that stack?
+    code: kernel/proc.c:143-149
+    options:
+      - text: "The top of the child's own slot's kernel stack; the stack is empty, and ret jumps to forkret."
+        correct: true
+        why: |
+          [[allocproc]] forged the context: `sp = p->kstack + PGSIZE`, `ra = forkret`, everything
+          else 0. [[forkret]] starts with nothing above it.
+      - text: "The parent's saved sp; the stack holds a copy of the parent's frames down to sys_fork."
+        why: |
+          You may have thought the child resumes where the parent was. Only user-side state is
+          copied. The child never returns through `sys_fork`; it starts fresh in `forkret`.
+      - text: "The child's user sp, copied from the parent's trapframe"
+        why: |
+          You may have confused `p->context.sp` with `trapframe->sp`. The user `sp` is loaded only
+          later, in [[userret]].
+      - text: "The scheduler's own sp, because a new process starts on the scheduler stack"
+        why: |
+          The scheduler saves its own `sp` with the *first* half of `swtch`; the load at line 26
+          reads the child's context, not the scheduler's.
+    explain: |
+      A new kernel thread has no history, so [[allocproc]] writes one by hand: an empty stack
+      and a return address. `forkret` then releases `p->lock`, calls [[prepare_return]], and
+      jumps to [[userret]] ([[concept:stacks#lifecycle]], [[tour:42]]).
+
+  - id: stack-22
+    level: 3
+    type: choice
+    q: |
+      When process A gives up hart 1, why does [[sched]] switch to the **scheduler stack**
+      instead of picking process B and switching directly from A's kernel stack to B's?
+    code: kernel/proc.c:479-497@495
+    options:
+      - text: "Once A's p->lock is released, another hart may resume A on A's stack; hart 1 must already be standing on memory no other hart can use, which is its own scheduler stack."
+        correct: true
+        why: |
+          Any code hart 1 runs after giving up A needs a stack. It cannot be A's (another hart may
+          take it over) and it cannot be a stack nobody owns. The per-hart scheduler stack is the
+          one memory that is always valid and always private to hart 1.
+      - text: "Because swtch can only load contexts stored in struct cpu."
+        why: |
+          You may have thought `swtch` is special-purpose. It takes any two `struct context`
+          pointers; the scheduler uses it to load `p->context`, a field of `struct proc`.
+      - text: "Because the scheduler stack is the only one mapped in the kernel page table."
+        why: |
+          You may have thought kernel stacks are mapped only while their process runs. All 64 are
+          mapped in the kernel page table from boot, so any hart can use any of them.
+      - text: "Because a direct switch would need two page-table changes."
+        why: |
+          You may have thought kernel stacks live in user page tables. A kernel-to-kernel switch
+          involves no `satp` change at all; the user page tables are installed only in
+          [[userret]].
+    explain: |
+      The scheduler stack exists so that a hart always has somewhere safe to stand between
+      processes. There is also a locking reason: a direct A-to-B switch would hold A's lock
+      while acquiring B's, and two harts doing A→B and B→A could deadlock ([[tour:44]],
+      [[concept:stacks#harts]]).
+
+  - id: stack-23
+    level: 1
+    type: tf
+    q: |
+      True or false: while a process is running in user mode, its kernel stack still holds the
+      frames of its last system call.
+    answer: false
+    why_tf: |
+      You may have thought the kernel keeps its frames around for the next trap. They were all
+      popped on the way out, and the next trap starts at the top again.
+    reasons:
+      - text: "Every trap from user mode loads sp from kernel_sp, which prepare_return always sets to the top (p->kstack + PGSIZE); the frames above it were popped as the system call returned."
+        correct: true
+        why: |
+          [[usertrap]] returns into [[userret]], so by the time the process is in user mode every
+          kernel frame is gone. Whatever bytes remain in the page are stale and are overwritten by
+          the next trap ([[kernel/trap.c:117]]).
+      - text: "The kernel stack is freed whenever the process returns to user mode."
+        why: |
+          You may have thought stacks are allocated per system call. The page stays allocated and
+          mapped for the life of the slot; it is only *empty*.
+      - text: "Kernel stacks are only used for interrupts, never for system calls."
+        why: |
+          You may have confused the two trap paths. System calls run on the process's kernel stack
+          too; they just leave nothing behind when they return.
+    explain: |
+      A process in user mode has an empty kernel stack, which is why [[uservec]] can always start
+      from the top without looking. Stale bytes do not matter, because no code reads below its
+      own `sp` ([[concept:stacks#kernel]]).
+
+  - id: stack-24
+    level: 3
+    type: multi
+    q: |
+      Hypothetically, hart 0's scheduler stack overflows by 32 bytes: some code on it pushes
+      32 bytes below the bottom of hart 0's slice of `stack0` (`0x80007890`). Which of these
+      would be overwritten? (In this build `kernel_pagetable` is at `0x80007870`, `initproc` at
+      `0x80007878`, `ticks` at `0x80007880`, and `cpus` at `0x8000f9d0`.)
+    options:
+      - text: "`kernel_pagetable`"
+        correct: true
+        why: "It occupies `0x80007870`–`0x80007877`, inside the 32 bytes below `0x80007890`."
+      - text: "`initproc`"
+        correct: true
+        why: "It occupies `0x80007878`–`0x8000787f`, inside the overflowed range."
+      - text: "`ticks`"
+        correct: true
+        why: "It sits at `0x80007880`, inside the overflowed range."
+      - text: "hart 1's scheduler frames"
+        why: |
+          You may have thought the overflow spills into the next hart's slice. Hart 1's slice is
+          *above* hart 0's (`0x80008890`–`0x80009890`), and stacks grow down, so hart 0's overflow
+          never reaches it. (Hart 1's own overflow would hit the top of hart 0's slice.)
+      - text: "`cpus[0].context`"
+        why: |
+          You may have thought the scheduler stack lives in `struct cpu`. `cpus` is at
+          `0x8000f9d0`, above the whole of `stack0`, so a downward overflow cannot reach it.
+      - text: "nothing: a guard page makes the push fault first"
+        why: |
+          You may have assumed all stacks have guard pages. `stack0` is an ordinary array in `.bss`;
+          the memory below it is mapped and writable kernel data, so nothing faults.
+    explain: |
+      The 32 bytes from `0x80007870` to `0x8000788f` hold `kernel_pagetable`, `initproc` and
+      `ticks` (plus padding). Nothing would fault; the damage would show up later, somewhere
+      else ([[concept:stacks#guards]]).
+
+  - id: stack-25
+    level: 2
+    type: line
+    q: |
+      In [[prepare_return]], click the line that decides where `sp` will point when this process
+      next traps in from user mode.
+    code: kernel/trap.c:100-132
+    answer: 117
+    lines:
+      116: |
+        You may have picked the line that sets up the kernel side for the next trap. Line 116
+        records the kernel page table (`satp`), which [[uservec]] installs; it says nothing about
+        `sp`.
+      119: |
+        Line 119 records the hart number, which [[uservec]] loads into `tp`, not `sp`.
+      131: |
+        You may have thought `sepc` is related to the stack. It is the user program counter that
+        `sret` will jump to.
+      118: |
+        Line 118 records where [[uservec]] will jump (`usertrap`), not the stack it will use.
+    why_wrong: Look for the trapframe field that uservec's `ld sp, 8(a0)` reads.
+    explain: |
+      Line 117 sets `p->trapframe->kernel_sp = p->kstack + PGSIZE`. On the next trap from user
+      mode, [[uservec]]'s `ld sp, 8(a0)` ([[kernel/trampoline.S:76]]) loads exactly this value:
+      always the top of the process's kernel stack, which is why that stack is empty whenever
+      the process is in user mode ([[concept:stacks#kernel]]).

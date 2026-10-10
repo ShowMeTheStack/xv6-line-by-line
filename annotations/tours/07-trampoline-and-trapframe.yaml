@@ -1,0 +1,917 @@
+title: The trampoline and the trapframe
+group: Traps and system calls
+prerequisites: [5]
+summary: |
+  [[tour:5]] crossed the user/kernel border twice and moved on quickly. This tour stays at
+  the border. It is 83 instructions long, written in assembly, and runs while the hart
+  belongs to nobody: no longer the user program, not yet the kernel. It owns no stack, no
+  free register, and for part of the time no page table that maps what it needs.
+
+  We follow the first process, `init` (pid 1), through the first border crossings the
+  machine ever makes: out of the kernel into user mode for the very first time, then back in
+  when `init` makes its first system call, `open("console", O_RDWR)`. Every number on the way
+  comes from this build and from a gdb session on QEMU with three harts: the `satp` values,
+  the page-table entries, the physical address of `init`'s [[g:trapframe]], even the junk
+  left in its registers. (Our run used an `fs.img` that had been booted before, so `console`
+  already existed; on a brand-new image the first `open` fails, and `init` runs
+  `mknod("console", …)` and opens it again.)
+
+  Two ideas carry the whole design. The [[g:trampoline]] is **one physical page with the same
+  virtual address in every page table**, so the code survives the moment `satp` changes
+  under it. The trapframe is **one page per process at the same virtual address in every
+  user page table**, so the same instructions save each process's registers into that
+  process's own page. At the end, three harts run the trampoline at the same instant, and
+  you will see why they need no lock.
+cast: |
+  The machine has three [[g:hart|harts]]. When the tour starts, hart 0 is finishing boot in
+  [[main]] and harts 1 and 2 are spinning, waiting for it to set `started`. Later:
+
+  | Hart | What it is doing |
+  |---|---|
+  | 0 | Builds the kernel, creates `init`; later returns `init` to user mode and takes its first trap |
+  | 1 | Its [[kernel:scheduler]] loops, finding nothing else to run |
+  | 2 | Its scheduler picks `init` first, starts it in [[forkret]], and loses it when it sleeps on the disk |
+
+  In our gdb run, `init` started in the kernel on hart 2, slept while [[fsinit]] read the
+  disk, and woke up on hart 0. Which hart wins is a race; the rest of the story does not
+  depend on it.
+steps:
+  - title: One page, two virtual addresses in the kernel
+    file: kernel/vm.c
+    lines: 20-53
+    focus: 38-47
+    state:
+      hart: 0
+      mode: S
+      proc: none (booting)
+      intr: off
+      satp: bare
+      locks: []
+      stack: [main, kvminit, kvmmake]
+      sp: {"on": boot, detail: "hart 0's slice of `stack0`; no process stack exists yet"}
+      irq: 0
+    note: |
+      The story starts at boot, when hart 0 builds the kernel page table. The trampoline code
+      ([[kernel/trampoline.S]]) was placed by the linker on a page of its own:
+      [[kernel/kernel.ld:15|kernel.ld]] aligns the `trampsec` section to a page boundary,
+      pads after it, and asserts it fits in exactly one page. In this build that page is at
+      physical address `0x80006000` (`kernel/kernel.sym`), the last page of kernel text,
+      just below `etext = 0x80007000`. The code inside it is only `0x124` = 292 bytes.
+
+      [[kvmmake]] maps that page **twice**:
+
+      - line 39 maps all kernel text at its own address, so `0x80006000` → `0x80006000`;
+      - line 47 maps it again at [[TRAMPOLINE]] = `MAXVA - PGSIZE` = `0x3ffffff000`, the
+        highest page of the 256 GiB address space ([[MAXVA]] is 2³⁸).
+
+      The kernel itself never runs the trampoline at `0x80006000`. The second name is the one
+      that matters, because it is the one every *user* page table will also have. In gdb, the
+      leaf entry for `0x3ffffff000` in this table is `0x2000180b`: physical page number
+      `0x80006`, flags `0x0b` = `V | R | X`. Readable, executable, not writable, and no
+      `PTE_U`.
+    others: |
+      Harts 1 and 2 are spinning in [[main]] waiting for `started`. They will load this same
+      table into their own `satp` in [[kvminithart]] without any lock: hart 0 finishes
+      building it before the release-store of `started`, and nobody modifies it afterwards.
+
+  - title: The same page in init's page table, plus a private one
+    file: kernel/proc.c
+    lines: 173-205
+    focus: 185-202
+    state:
+      hart: 0
+      mode: S
+      proc: init (pid 1), being created
+      intr: off
+      satp: kernel
+      locks: ["init's p->lock"]
+      stack: [main, userinit, allocproc, proc_pagetable]
+      sp: boot
+      irq: {noff: 1, intena: 0}
+    note: |
+      [[userinit]] creates `init`. [[allocproc]] has already taken a free page for its
+      trapframe ([[kernel/proc.c:129]]), and now [[proc_pagetable]] builds its first page
+      table with exactly two pages in it, before any user memory exists:
+
+      | Virtual address | Physical page | Flags | gdb leaf PTE |
+      |---|---|---|---|
+      | `TRAMPOLINE` `0x3ffffff000` | `0x80006000`, the shared trampoline | `R X` | `0x2000180b` |
+      | `TRAPFRAME` `0x3fffffe000` | `0x87f56000`, init's own trapframe | `R W` | `0x21fd5807` |
+
+      The trampoline entry is bit-for-bit the one in the kernel table: same page, same
+      address, same permissions. The trapframe entry points to a page that belongs to `init`
+      alone. Every process gets this same pair: the trampoline row identical in all of them,
+      the trapframe row pointing somewhere different each time.
+
+      Neither has `PTE_U`. In user mode, any access to a page without `PTE_U` faults, so
+      `init` can neither read the kernel's trap code nor scribble on its own saved registers.
+      The [[user:nowrite]] test in usertests checks exactly this, by storing to
+      `0x3fffffe000` and `0x3ffffff000` and expecting the child to be killed. Conversely,
+      RISC-V forbids supervisor mode from *executing* a `PTE_U` page, so the trampoline must
+      not have `PTE_U` for the kernel to run it.
+    others: |
+      `init`'s `p->lock` is held (taken in [[allocproc]]), so no hart's scheduler can pick
+      this half-built process. Harts 1 and 2 are still waiting for `started` anyway. The
+      page-table pages come from [[kalloc]], which takes `kmem.lock` for a moment each time,
+      because the free list is shared by every hart.
+
+  - title: The trapframe, field by field
+    file: kernel/proc.h
+    lines: 31-77
+    focus: 40-77
+    state:
+      hart: 0
+      mode: S
+      proc: init (pid 1), being created
+      intr: off
+      satp: kernel
+      locks: ["init's p->lock"]
+      stack: [main, userinit, allocproc]
+      sp: boot
+      irq: {noff: 1, intena: 0}
+    note: |
+      A [[kernel:trapframe|struct trapframe]] is 36 `uint64`s, 288 bytes, at the start of a
+      4096-byte page. It has two parts with two different owners:
+
+      | Offsets | Fields | Written by | Read by |
+      |---|---|---|---|
+      | 0, 8, 16, 32 | `kernel_satp`, `kernel_sp`, `kernel_trap`, `kernel_hartid` | [[prepare_return]], before each return to user | [[uservec]], on the next trap |
+      | 24 | `epc` | [[usertrap]] (`sepc`), [[kexec]] (entry point) | `prepare_return` (into `sepc`) |
+      | 40–280 | the 31 user registers, `ra` … `t6` | `uservec`; also [[syscall]] (`a0`), `kexec` (`sp`, `a1`), [[kfork]] (whole copy) | [[userret]]; [[argraw]] |
+
+      The four `kernel_*` fields are a message from the kernel to its future self: "when this
+      process next traps, here is my page table, its kernel stack, where to jump and which
+      hart you are on". The trampoline cannot compute any of them, because it has no stack and
+      cannot call C. It can only load them from a fixed address.
+
+      `zero` is missing because it is always 0. The registers are stored in register-number
+      order, so `a0` (x10) sits at 112 between `s1` and `a1`; [[uservec]] skips that slot and
+      fills it last, because `a0` is the base register it is storing through.
+
+      The page came from [[kalloc]], which fills new pages with the byte `0x05`. Nothing ever
+      clears the user-register part for `init`, and gdb shows it: when `init` first enters
+      user mode, `gp`, `tp`, `s0`… `t6` all hold `0x0505050505050505`. Harmless (the C
+      runtime does not read them before writing them), and a good reminder that "the
+      registers a program starts with" are just whatever is in this page.
+
+  - title: init's first trip out begins in forkret
+    file: kernel/proc.c
+    lines: 510-543
+    focus: 540-542
+    state:
+      hart: 0
+      mode: S
+      proc: init (pid 1)
+      intr: off
+      satp: kernel
+      locks: []
+      stack: [forkret]
+      sp: {"on": kernel, detail: "init's `KSTACK(0)`: `forkret`'s frame, `sp = 0x3fffffdfd0`"}
+      irq: 0
+    note: |
+      A process normally reaches user mode by *returning* from a trap: [[usertrap]] returns
+      into [[userret]]. `init` has never trapped, so there is nothing to return from.
+      [[forkret]] fakes the ending of a trap instead.
+
+      In our run, hart 2's scheduler started `init` here. [[fsinit]] and [[kexec]] had to
+      read the disk, so `init` slept, and hart 0's scheduler resumed it. Whichever hart runs
+      it, `forkret` runs on init's own kernel stack, `KSTACK(0)`: the first [[swtch]] loaded
+      `sp = 0x3fffffe000` (the empty top) and `ra = forkret`, both put in `p->context` by
+      [[allocproc]]. By now only `forkret`'s 48-byte frame is on it (`sp = 0x3fffffdfd0`). `kexec("/init")`
+      loaded the program and wrote three trapframe fields: `epc = 0xbc`, the address of
+      [[user:start]] in `user/init.sym`, `sp = 0x3fe0`, the top of the new user stack with
+      `argv` on it, and `a1 = 0x3fe0`, the address of `argv`. The return value `1` (`argc`) went into `trapframe->a0` on line 532.
+
+      Lines 539–542 are the three things `usertrap` would have done on its way out:
+
+      1. [[prepare_return]] sets up the trapframe and CSRs (the next three steps);
+      2. [[MAKE_SATP]] turns init's page-table address `0x87f52000` into the `satp` value
+         `0x8000000000087f52` (mode 8 = [[g:sv39]] in the top four bits, page number below);
+      3. a call through a [[g:function-pointer]] to `TRAMPOLINE + (userret - trampoline)` =
+         `0x3ffffff09c`, with that `satp` as its argument in `a0`.
+
+      Why call `userret` through its `0x3ffffff09c` name and not as `userret()`? Because the
+      code is about to change `satp`, and only the `TRAMPOLINE` name stays valid afterwards.
+    others: |
+      Interrupts are off here, and stay off until `sret`. Harts 1 and 2 meanwhile loop in
+      their schedulers. They `acquire` init's `p->lock` on each pass and see `RUNNING`, so
+      they skip it. In our gdb run, the moment hart 2 entered `forkret`, harts 0 and 1 were
+      both caught spinning in [[acquire]] on `proc[0].lock`, `init`'s lock, still held by
+      hart 2 across the [[swtch]] (released on line 520).
+
+  - title: "prepare_return: point stvec at the trampoline, with interrupts off"
+    file: kernel/trap.c
+    lines: 97-112
+    focus: 110-112
+    state:
+      hart: 0
+      mode: S
+      proc: init (pid 1)
+      intr: off
+      satp: kernel
+      locks: []
+      stack: [forkret, prepare_return]
+      sp: kernel
+      irq: 0
+    note: |
+      [[g:csr:stvec|stvec]] says where the *next* trap on this hart will go. While the kernel
+      runs, it is [[kernelvec]]. For user mode it must be [[uservec]], at its `TRAMPOLINE`
+      address: `0x3ffffff000 + (0x80006000 - 0x80006000)` = `0x3ffffff000`, since `uservec`
+      is the first byte of the page. gdb confirms `stvec = 0x3ffffff000` after this line.
+
+      From the instant `stvec` changes until `sret`, the hart is still running *kernel*
+      code, with the kernel stack and the kernel page table, but any trap would be sent to
+      `uservec`. `uservec` assumes the user page table is installed, that every register is
+      a user value, and that `TRAPFRAME` is mapped. None of that is true yet: under the
+      kernel page table, `0x3fffffe000` is unmapped. A timer interrupt here would save
+      garbage, fault inside the trampoline, trap to `uservec` again, and loop.
+
+      So line 108 turns interrupts off first. Exceptions cannot be switched off, so the code
+      between here and `sret` is written so that it cannot fault.
+    others: |
+      `stvec` is a per-hart CSR. Hart 0 writing it changes nothing for harts 1 and 2: their
+      `stvec` still points at `kernelvec`, because they are in the kernel. Every trap-related
+      CSR (`stvec`, `sepc`, `scause`, `sstatus`, `sscratch`, `satp`) exists once per hart,
+      which is what lets three harts cross the border independently.
+
+  - title: "prepare_return: the message to the next trap"
+    file: kernel/trap.c
+    lines: 113-120
+    focus: 114-119
+    state:
+      hart: 0
+      mode: S
+      proc: init (pid 1)
+      intr: off
+      satp: kernel
+      locks: []
+      stack: [forkret, prepare_return]
+      sp: kernel
+      irq: 0
+    note: |
+      Now the four kernel fields of the trapframe are filled. The kernel writes them through
+      `p->trapframe`, the page's [[g:direct-map|direct-mapped]] physical address
+      (`0x87f56000`); `uservec` will read them through `TRAPFRAME` (`0x3fffffe000`) in the
+      user page table. Same page, two names. The values from gdb:
+
+      | Field | Value | Meaning |
+      |---|---|---|
+      | `kernel_satp` | `0x8000000000087fff` | Sv39, kernel page table at `0x87fff000` |
+      | `kernel_sp` | `0x3fffffe000` | top of `KSTACK(0)` |
+      | `kernel_trap` | `0x800025ca` | [[usertrap]] |
+      | `kernel_hartid` | `0` | this hart |
+
+      The kernel page table sits at `0x87fff000`, the last page of RAM, because it was the
+      first page ever handed out: [[kinit]] frees pages in ascending order onto a stack-like
+      list, so the highest comes back first.
+
+      `kernel_sp` deserves a second look. It is the stack's *top*, not the current `sp`:
+      `forkret`'s frame is still on the stack, but [[userret]] never returns, so that frame is
+      abandoned and every trap from user mode starts on an empty kernel stack. `init` is
+      `proc[0]`, whose stack page is
+      `KSTACK(0) = 0x3fffffd000`. The stack grows down, so its *top* is one past the end,
+      `0x3fffffe000`, the same number as `TRAPFRAME`. That is a coincidence of layout, not a
+      sharing: in the kernel page table `0x3fffffe000` is an unmapped [[g:guard-page]] (gdb
+      reads its PTE as 0), and the first push lands at `0x3fffffdff8`, inside the stack.
+    others: |
+      No lock protects these writes, because only `init`'s own kernel thread ever touches
+      `init`'s trapframe, and that thread runs on one hart at a time. The kernel page table
+      and `usertrap`'s address are the same for every process. Only `kernel_sp` (one stack
+      per process slot) and `kernel_hartid` differ.
+
+  - title: "prepare_return: arm sret"
+    file: kernel/trap.c
+    lines: 121-132
+    focus: 124-131
+    state:
+      hart: 0
+      mode: S
+      proc: init (pid 1)
+      intr: off
+      satp: kernel
+      locks: []
+      stack: [forkret, prepare_return]
+      sp: kernel
+      irq: 0
+    note: |
+      [[g:insn:sret|sret]] takes all of its arguments from CSRs, and these lines set them:
+
+      - `sstatus.SPP` (bit 8) = 0: "the previous mode was user", so `sret` drops to user mode.
+      - `sstatus.SPIE` (bit 5) = 1: `sret` copies it into `SIE`. Strictly, once the hart is
+        in user mode, supervisor interrupts are enabled whatever `SIE` says (the spec always
+        enables interrupts of a higher privilege mode), so it is the drop to U-mode itself
+        that lets them in, at the same instant, never earlier.
+      - `sepc` = `trapframe->epc` = `0xbc`: where user execution continues.
+
+      gdb shows `sstatus = 0x8000000200006020` just before `sret`. Bit 5 is set, bits 8 and 1
+      (`SIE`) are clear. The other set bits describe the floating-point unit's state and that
+      user mode is 64-bit; xv6 leaves them alone.
+
+      Why not enable interrupts with [[intr_on]] before jumping to user code? Because then a
+      timer interrupt could arrive while still in the trampoline, with `stvec` already
+      pointing at `uservec`: exactly the disaster step 5 avoided. Keeping `SIE` off
+      until `sret` changes the mode closes that window entirely.
+
+  - title: Into the trampoline at its high address
+    file: kernel/trampoline.S
+    lines: 100-107
+    focus: 101-107
+    state:
+      hart: 0
+      mode: S
+      proc: init (pid 1)
+      intr: off
+      satp: kernel
+      locks: []
+      stack: [forkret, userret]
+      sp: {"on": kernel, detail: "`sp = 0x3fffffdfd0` in init's `KSTACK(0)`; `userret` pushes nothing"}
+      irq: 0
+    note: |
+      `forkret`'s function-pointer call lands at `pc = 0x3ffffff09c`, with `a0 =
+      0x8000000000087f52` and `ra = 0x800019ba`, a return address inside `forkret` that will
+      never be used: `userret` does not return.
+
+      The first instruction is [[g:insn:fence.i|fence.i]] (encoded `0000100f`). RISC-V does
+      not keep a hart's instruction fetch automatically in step with data stores. `init`'s
+      code was copied into memory by [[kexec]] using ordinary stores, possibly on another
+      hart, since `kexec` sleeps on each disk read and may wake up anywhere. Stores from
+      another hart become visible to hart 0 through the lock releases and acquires in
+      between; `fence.i` then makes hart 0's *instruction fetches* agree with what its data
+      accesses can see. Without it, hart 0 could execute stale bytes: whatever those physical
+      pages held before.
+
+      xv6 runs this on every return to user mode, not only the first. It is cheaper to be
+      always right than to track when it is needed.
+    others: |
+      Note the asymmetry: `fence.i` affects only the hart that executes it. If hart 1 later
+      runs `init`, its own `userret` executes its own `fence.i`. That is why the fence lives
+      on the path every hart takes into user mode, and not in `kexec`.
+
+  - title: Switching to init's page table
+    file: kernel/trampoline.S
+    lines: 109-114
+    focus: 111-112
+    state:
+      hart: 0
+      mode: S
+      proc: init (pid 1)
+      intr: off
+      satp: user
+      locks: []
+      stack: [forkret, userret]
+      sp: {"on": none, detail: "`sp` still `0x3fffffdfd0`, which init's page table does not map"}
+      irq: 0
+    note: |
+      `csrw satp, a0` installs `0x8000000000087f52`. The next instruction, at `0x3ffffff0a8`,
+      is fetched through **init's** page table, which maps `0x3ffffff000` to the same physical
+      page with the same `R X` permissions. The code does not notice the floor changing under
+      it. gdb, stepping four instructions from `userret`, shows `pc = 0x3ffffff0ac` and the new
+      `satp`.
+
+      The stack is not so lucky. gdb shows `sp = 0x3fffffdfd0` both before and after the
+      switch: still the address in init's kernel stack where `forkret` called `userret`. Under
+      init's table nothing is mapped there, so from this instruction until `ld sp` on line
+      118 the hart has **no usable stack** ([[concept:stacks]]). It does not need one: the
+      trampoline never pushes.
+
+      The two [[g:insn:sfence.vma|sfence.vma]]s matter because of the [[g:tlb]]. Each hart
+      caches recent translations, and xv6 gives every address space the same address-space
+      ID (the ASID field of `satp` is 0). Writing `satp` does not discard the cache. The
+      second fence does: without it, a cached *kernel* translation could shadow a user
+      mapping. Two examples from this layout:
+
+      - The kernel maps the UART at `0x10000000`. A user program with a heap that large has
+        its own page there. A stale kernel entry has no `PTE_U`, so the program's perfectly
+        legal store would take a page fault and the program would be killed.
+      - The same goes for a program large enough to reach `0x80000000`, where the kernel
+        maps RAM.
+
+      The spec asks for an `sfence.vma` after a `satp` write when the new tables were
+      modified or an ASID is reused, and only in some cases before it; nothing in xv6's use
+      strictly needs the first one. xv6 puts a fence on each side as a conservative pattern;
+      the source comment says the first is so that earlier memory operations finish under
+      the old table.
+    others: |
+      Each hart has its own `satp` and its own TLB, and `sfence.vma` flushes only the
+      executing hart's TLB. Hart 0 switching to init's table changes nothing on harts 1 and
+      2, which keep running with the kernel table. (xv6 never needs a "TLB shootdown" to
+      other harts, because a user page table is only installed on the one hart running that
+      process, and the kernel table never changes after boot.)
+
+  - title: "li a0, TRAPFRAME: an absolute address"
+    file: kernel/trampoline.S
+    lines: 114-149
+    focus: 114-117
+    state:
+      hart: 0
+      mode: S
+      proc: init (pid 1)
+      intr: off
+      satp: user
+      locks: []
+      stack: [forkret, userret]
+      sp: {"on": none, detail: "`sp` still `0x3fffffdfd0`, unmapped under init's page table"}
+      irq: 0
+    note: |
+      `li a0, TRAPFRAME` assembles to three instructions, `lui a0,0x2000`; `addiw a0,a0,-1`;
+      `slli a0,a0,0xd`, computing `0x1ffffff << 13` = `0x3fffffe000`. It is an absolute
+      constant on purpose: this code was linked at `0x80006000` but runs at `0x3ffffff000`,
+      so anything PC-relative would point 254 GiB off.
+
+      Meanwhile `sp` is in limbo. It still holds `0x3fffffdfd0`, the spot in init's kernel
+      stack where `forkret` made its call, but init's page table, just installed, does not
+      map kernel stacks. Nothing here pushes or pops, so the hart
+      can run without a usable stack, as it will until `sret`.
+
+  - title: "ld sp: init's user stack, and the rest of its registers"
+    file: kernel/trampoline.S
+    lines: 114-149
+    focus: 118-149
+    state:
+      hart: 0
+      mode: S
+      proc: init (pid 1)
+      intr: off
+      satp: user
+      locks: []
+      stack: [forkret, userret]
+      sp: {"on": none, switched: "`ld sp, 48(a0)` in [[userret]] ([[kernel/trampoline.S:118]]) loads the user's `sp`", detail: "`sp = 0x3fe0`, on `argv` near the top of init's user stack; supervisor code cannot use it"}
+      irq: 0
+    note: |
+      Now `TRAPFRAME` resolves, through init's page table, to physical page `0x87f56000`,
+      and thirty `ld`s pull the user registers out of it. For `init`, this first time, what
+      comes out is:
+
+      | Register | Value | Set by |
+      |---|---|---|
+      | `sp` | `0x3fe0` | [[kexec]]: points at the `argv` array it pushed (strings above it, stack top `0x4000`) |
+      | `a1` | `0x3fe0` | `kexec`: `argv` |
+      | `a0` | `1` (loaded last, line 149) | `forkret`: `argc`, the return value of `kexec` |
+      | `gp`, `tp`, `ra`, `s0`…`t6` | `0x0505050505050505` | [[kalloc]]'s junk fill |
+
+      `a0` is loaded last because it is the base register for every other load. Once it is
+      overwritten, the trapframe is out of reach until the next trap.
+
+      Line 118, `ld sp, 48(a0)`, is the last stack switch of this trip: it moves `sp` to
+      **init's user stack**. But from here until `sret` the hart is still in supervisor mode,
+      with init's page table, and supervisor code cannot use user pages, so there is still no
+      usable stack; the user stack becomes usable only when `sret` returns to user mode. The
+      kernel must never push onto a user stack, and nothing here does. What is
+      left behind on init's kernel stack (`forkret`'s frame) is abandoned: the next trap
+      will start at its top, `0x3fffffe000`, as step 6 arranged.
+
+  - title: sret, and init is alive
+    file: kernel/trampoline.S
+    lines: 148-153
+    focus: 151-153
+    state:
+      hart: 0
+      mode: S
+      proc: init (pid 1)
+      intr: off
+      satp: user
+      locks: []
+      stack: [forkret, userret]
+      sp: {"on": none, detail: "`sp = 0x3fe0`, init's user stack pointer, usable once `sret` changes the mode to user; `sret` does not touch `sp`"}
+      irq: 0
+    note: |
+      [[g:insn:sret|sret]] (`10200073`) does four things at once, all from CSRs that
+      [[prepare_return]] armed:
+
+      | Before (`0x3ffffff120`) | After (`0xbc`) |
+      |---|---|
+      | mode S | mode U (from `SPP = 0`) |
+      | `sstatus = …6020`: `SIE = 0`, `SPIE = 1` | `sstatus = …6022`: `SIE = 1`, `SPIE` set to 1 |
+      | `pc` in the trampoline | `pc = sepc = 0xbc` |
+
+      gdb reports `priv = 0 [User/Application]` and `pc = 0xbc`: the first instruction of
+      [[user:start]], `addi sp,sp,-16`. `init` is running.
+
+      From now until its first trap, the hart is completely in `init`'s hands. The kernel has
+      left behind only the things `uservec` will need: `stvec` pointing at the trampoline,
+      and a trapframe whose kernel fields describe hart 0, `init`'s kernel stack, and the
+      kernel page table.
+    others: |
+      Interrupts are on again on hart 0, and the timer is armed. If hart 0's timer fires
+      while `init` runs, the trap goes through exactly the path we follow next, and the
+      kernel may [[yield]] and later resume `init` on a different hart. Each time, the
+      `kernel_hartid` in the trapframe is rewritten by `prepare_return` to match.
+
+  - title: "init traps: open(\"console\") executes ecall"
+    file: user/usys.S
+    lines: 48-52
+    focus: 50-51
+    state:
+      hart: 0
+      mode: U
+      proc: init (pid 1)
+      intr: on
+      satp: user
+      locks: []
+      stack: [start, main, open]
+      sp: {"on": user, switched: "`sret` ([[kernel/trampoline.S:153]]) returned to user mode, making the user stack usable", detail: "`sp = 0x3fb0` in init's user stack; `ecall` does not touch it"}
+    note: |
+      `init`'s `main` starts with `open("console", O_RDWR)` ([[user/init.c:19]]). The stub
+      loads `a7 = 15` (`SYS_open`) at `0x3b2` and executes `ecall` at `0x3b4`. The hardware
+      does what [[tour:5]] described: supervisor mode, interrupts off, `sepc = 0x3b4`,
+      `scause = 8`, `pc = stvec = 0x3ffffff000`.
+
+      What matters for this tour is what the hardware does **not** do. At the first
+      instruction of [[uservec]], gdb sees:
+
+      | Register | Value | Still… |
+      |---|---|---|
+      | `satp` | `0x8000000000087f52` | init's page table |
+      | `sp` | `0x3fb0`, in init's user stack | a user pointer |
+      | `tp` | `0x0505050505050505` | init's junk, not a hart ID |
+      | `a0` | `0x970` | the address of the string `"console"` |
+      | `a1` | `2` | `O_RDWR` |
+      | `a7` | `15` | `SYS_open` |
+
+      Every one of the 31 registers is a value `init` will want back. The trampoline must
+      store them somewhere, but storing needs an address in a register, and every register
+      is taken.
+
+  - title: sscratch buys one free register
+    file: kernel/trampoline.S
+    lines: 16-38
+    focus: 30-37
+    state:
+      hart: 0
+      mode: S
+      proc: init (pid 1)
+      intr: off
+      satp: user
+      locks: []
+      stack: [uservec]
+      sp: {"on": none, detail: "init's user `sp`, `0x3fb0`; `uservec` never pushes"}
+      irq: 0
+    note: |
+      The way out is [[g:csr:sscratch|sscratch]], a 64-bit CSR that the hardware never reads
+      or writes on its own: it exists for trap handlers to stash one value. `csrw sscratch,
+      a0` (`14051073`) moves the user's `a0` (`0x970`) out of the way, and `a0` is free.
+
+      The next three instructions put `TRAPFRAME` into `a0`. They work for every process
+      without knowing which process trapped, because every user page table maps
+      `0x3fffffe000` to *that* process's own trapframe. The hardware's translation, through
+      the still-installed user `satp`, does the "which process?" lookup for free.
+
+      Other kernels use `sscratch` differently. Linux on RISC-V, for example, keeps a pointer
+      to per-thread kernel data in `sscratch` while user code runs and swaps it into a
+      register (into `tp`) with one `csrrw`. xv6 needs no such pointer, because the fixed `TRAPFRAME`
+      address plays that role; `sscratch` is only a parking spot for a few instructions.
+      (Its value is never cleared: during the whole system call, `sscratch` on hart 0 still
+      holds `0x970`.)
+    others: |
+      Interrupts went off with the `ecall` and stay off for all of `uservec`, so no
+      interrupt can arrive and overwrite `sscratch`, `sepc` or `scause` while they hold
+      values not yet saved. That is the only thing protecting them: there is no lock, and
+      none is needed, because each hart has its own copy of every one of these CSRs.
+
+  - title: Thirty-one stores into init's page
+    file: kernel/trampoline.S
+    lines: 39-74
+    focus: 40-73
+    state:
+      hart: 0
+      mode: S
+      proc: init (pid 1)
+      intr: off
+      satp: user
+      locks: []
+      stack: [uservec]
+      sp: {"on": none, detail: "init's user `sp`, `0x3fb0`, saved by `sd sp, 48(a0)` on line 41"}
+      irq: 0
+    note: |
+      Each `sd reg, offset(a0)` writes one register into physical page `0x87f56000`. The
+      assembler chose compact encodings where it could: `sd s0,96(a0)` is the 2-byte `f120`,
+      `sd ra,40(a0)` the 4-byte `02153423`. The whole of `uservec` is `0x9c` = 156 bytes.
+
+      Two orderings are forced:
+
+      - `t0` must be saved (line 44) before it is used as scratch on line 72 to bring the
+        user `a0` back from `sscratch`.
+      - All stores must happen before line 92 switches `satp`, because only the user page
+        table maps `TRAPFRAME`.
+
+      What if one of these stores faulted? `stvec` still points at `uservec`. The fault
+      would re-enter the trampoline, overwrite `sscratch` with the trapframe address, and
+      the user's `a0` would be lost, then fault again forever. That is why the trapframe is
+      mapped in [[proc_pagetable]] before the process ever runs, and every table the process
+      ever runs on maps it: [[proc_freepagetable]] unmaps it only from a table that will
+      never be installed again (the old one after `exec`, or the last one after `exit`). The code is correct
+      because it *cannot* fault, not because it handles faults.
+
+      At the end, the trapframe holds `a0 = 0x970`, `a1 = 2`, `a7 = 15`, `sp = 0x3fb0`. The
+      `epc` slot still says `0xbc` from `kexec`; the real trap PC `0x3b4` is still only in
+      `sepc`, and [[usertrap]] will copy it in C.
+
+  - title: Picking up the kernel's message
+    file: kernel/trampoline.S
+    lines: 75-86
+    focus: 76-85
+    state:
+      hart: 0
+      mode: S
+      proc: init (pid 1)
+      intr: off
+      satp: user
+      locks: []
+      stack: [uservec]
+      sp: {"on": none, detail: "after line 76, `sp` holds `0x3fffffe000`, the empty top of `KSTACK(0)`, but the user page table does not map it; it becomes usable after `csrw satp` on line 92"}
+      irq: 0
+    note: |
+      Now the four fields that [[prepare_return]] left read back in:
+
+      | Instruction | Loads | Value for init |
+      |---|---|---|
+      | `ld sp, 8(a0)` | kernel stack top | `0x3fffffe000` |
+      | `ld tp, 32(a0)` | hart ID | `0` |
+      | `ld t0, 16(a0)` | [[usertrap]] | `0x800025ca` |
+      | `ld t1, 0(a0)` | kernel `satp` | `0x8000000000087fff` |
+
+      Look at `sp`: `0x3fffffe000`. Under init's table that address is, by the coincidence
+      from step 6, init's own trapframe; the stack page below it, where pushes would land,
+      is not mapped at all. That is fine, because nothing pushes before the switch. Five
+      instructions later, at `csrw satp`, it becomes a perfectly good kernel address.
+
+      All four loads must come before the `satp` switch two instructions after the last of
+      them, because after it `TRAPFRAME` is no longer mapped; their order among themselves
+      does not matter. (In the kernel page table, as we saw, `0x3fffffe000` is a guard
+      page.)
+    others: |
+      These four values were written on whichever hart last returned `init` to user mode.
+      `kernel_hartid` is only right because a process in user mode never moves between
+      harts; see [[tour:5]]. The other three are the same no matter which hart reads them.
+
+  - title: The floor changes, the code keeps running
+    file: kernel/trampoline.S
+    lines: 87-98
+    focus: 92-95
+    state:
+      hart: 0
+      mode: S
+      proc: init (pid 1)
+      intr: off
+      satp: kernel
+      locks: []
+      stack: [uservec]
+      sp: {"on": kernel, switched: "`csrw satp` ([[kernel/trampoline.S:92]]) makes the stack loaded on line 76 reachable", detail: "`0x3fffffe000`, now mapped by the kernel page table"}
+      irq: 0
+    note: |
+      `sfence.vma` (`12000073`), `csrw satp, t1` (`18031073`), `sfence.vma`. This is the
+      mirror image of the switch in `userret`, and now the stale-TLB danger runs the other
+      way: the hart has been using init's translations, and the kernel must not see them.
+      Most of init's translations have `PTE_U`, and supervisor mode cannot use those (xv6
+      never sets `SUM`). If the kernel touched the UART at `0x10000000` while a stale user
+      entry for a large heap was cached, it would take a spurious page fault and panic. The
+      one stale entry the kernel *could* use is `TRAPFRAME`, which has no `PTE_U`: a stray
+      kernel access to `0x3fffffe000`, which should hit the unmapped page above init's
+      kernel stack and fault, would instead silently reach this process's trapframe.
+
+      Here is the address space before and after line 92, as seen from this hart:
+
+      | Virtual address | Under init's table | Under the kernel table |
+      |---|---|---|
+      | `0x0`–`0x3fff` | init's code, data, stack | unmapped |
+      | `0x80006000` | unmapped | trampoline (as kernel text) |
+      | `0x3fffffd000` | unmapped | init's kernel stack |
+      | `0x3fffffe000` | init's trapframe | unmapped (guard) |
+      | `0x3ffffff000` | **trampoline** | **trampoline** |
+
+      Only the last row survives the switch, and the `pc` is in it. That single row is the
+      whole reason the trampoline exists. The third row is what makes `sp` usable: the
+      `0x3fffffe000` loaded on line 76 is the top of a page that is mapped only under the
+      kernel table, so [[usertrap]]'s prologue can move `sp` to `0x3fffffdfe0` and store `ra`
+      at `0x3fffffdff8`, inside init's kernel stack.
+    others: |
+      The kernel page table this hart just installed is the same one harts 1 and 2 are
+      using: one table, three `satp` registers pointing at it. Sharing it without a lock is
+      safe because it is never modified after boot. Kernel stacks for all 64 process slots
+      were mapped into it once, by [[proc_mapstacks]], precisely so that it never has to
+      change when processes come and go.
+
+  - title: jalr t0 and the return address that is userret
+    file: kernel/trampoline.S
+    lines: 96-104
+    focus: 97-98
+    state:
+      hart: 0
+      mode: S
+      proc: init (pid 1)
+      intr: off
+      satp: kernel
+      locks: []
+      stack: [uservec]
+      sp: kernel
+      irq: 0
+    note: |
+      `jalr t0` is the 2-byte instruction `9282` at `0x3ffffff09a`. It jumps to
+      `0x800025ca` and stores the address of the next instruction in `ra`:
+      `0x3ffffff09a + 2` = `0x3ffffff09c`. That is [[userret]], at its trampoline address.
+      gdb, stopped at the first line of [[usertrap]], shows exactly `ra = 0x3ffffff09c`.
+
+      So `usertrap` is an ordinary C function called with an ordinary return address. When
+      it finishes with `return satp;`, its compiled `ret` jumps to `userret`, with the
+      return value in `a0` as the [[g:calling-convention]] says. No special exit code is
+      needed: the way back is set up by the way in.
+
+      Why not `call usertrap`? `call` assembles to a PC-relative `auipc`/`jalr` pair. The
+      linker computed the offset assuming this code runs at `0x80006000`; it runs at
+      `0x3ffffff000` instead, so the jump would land about 254 GiB above `usertrap`, at
+      `0x3fffffb5ca`, which happens to be inside `proc[1]`'s kernel stack. That page is not
+      executable, so the fetch would fault (and with `stvec` still pointing at `uservec`,
+      loop). Loading the absolute address from the trapframe works from any
+      location.
+
+      After checking that the trap came from user mode, `usertrap` points `stvec` at
+      [[kernelvec]]: from now on, traps on
+      this hart are kernel traps ([[tour:8]]).
+    others: |
+      `ra` is saved on init's *kernel stack* by `usertrap`'s prologue. If the system call
+      sleeps and `init` resumes on hart 2, the frame, and `ra = 0x3ffffff09c` in it, come
+      along. `userret` exists at that address on every hart, so the return works wherever
+      `usertrap` finishes.
+
+  - title: usertrap hands back the user satp
+    file: kernel/trap.c
+    lines: 80-95
+    focus: 90-94
+    state:
+      hart: 0
+      mode: S
+      proc: init (pid 1)
+      intr: off
+      satp: kernel
+      locks: []
+      stack: [usertrap]
+      sp: kernel
+      irq: 0
+    note: |
+      After [[sys_open]] returns (file descriptor 0, stored into `trapframe->a0`; on a
+      brand-new `fs.img` it would be -1, see the summary), `usertrap`
+      calls [[prepare_return]], which redoes the four kernel fields and arms `sret`, and
+      computes `MAKE_SATP(p->pagetable)`. The C `return` delivers it in `a0` to `userret`.
+
+      This is the trapframe's other half of the bargain. On the way in, the kernel fields
+      told `uservec` how to reach the kernel. On the way out, the user-register fields tell
+      `userret` what to give back, with three possible edits made in between: `epc`
+      advanced past the `ecall`, `a0` replaced by the result, and, after an `exec`,
+      `epc`, `sp`, `a1` and `a0` set for the new program (the other registers keep whatever
+      the old program had).
+
+      (`open` had to read `console`'s inode from disk, so `init` slept; it may finish this
+      system call on any hart. We show hart 0.)
+
+      Note why `satp` is computed *here*, at the end, and not saved at entry: a system call
+      can change the page table. After a successful `exec`, `p->pagetable` is a brand-new
+      table, and `userret` must switch to it, not to the one the process trapped from. The
+      trampoline and trapframe rows in the new table are the same as in the old one, so
+      `userret` still works.
+
+  - title: Three harts in the trampoline at once
+    file: kernel/trampoline.S
+    lines: 22-98
+    focus: 30-73
+    state:
+      hart: [0, 1, 2]
+      mode: S
+      proc: cat (pid 4), grep (pid 6), wc (pid 7)
+      intr: off
+      satp: user
+      locks: []
+      stack: [uservec]
+      sp: {"on": none, detail: "three different user `sp` values, one per hart, until each hart's `ld sp` at t4"}
+      irq: 0
+    note: |
+      Later, you type `cat README | grep the | wc`. If it is the first command since boot,
+      [[allocproc]] hands out process slots in order: `cat` (pid 4) is `proc[3]`, `grep`
+      (pid 6) is `proc[5]`, `wc` (pid 7) is `proc[6]`. All three are runnable, and each hart
+      runs one. At the same instant, `cat` calls `write`, a timer interrupt hits `grep`, and
+      `wc` calls `read`:
+
+      | Time | Hart 0 (`cat`) | Hart 1 (`grep`) | Hart 2 (`wc`) |
+      |---|---|---|---|
+      | t1 | `ecall` → `pc = 0x3ffffff000` | timer interrupt → `pc = 0x3ffffff000` | `ecall` → `pc = 0x3ffffff000` |
+      | t2 | `csrw sscratch, a0` (hart 0's) | `csrw sscratch, a0` (hart 1's) | `csrw sscratch, a0` (hart 2's) |
+      | t3 | `sd`s to `0x3fffffe000` → cat's page | `sd`s to `0x3fffffe000` → grep's page | `sd`s to `0x3fffffe000` → wc's page |
+      | t4 | `ld sp` = `0x3fffff8000` | `ld sp` = `0x3fffff4000` | `ld sp` = `0x3fffff2000` |
+      | t5 | `satp` ← kernel table | `satp` ← kernel table | `satp` ← kernel table |
+      | t6 | `usertrap`: [[sys_write]] | `usertrap`: [[devintr]], [[yield]] | `usertrap`: [[sys_read]] |
+
+      Same instructions, same physical code page, same virtual addresses, no lock. Nothing
+      collides, because everything *written* is private: each hart's CSRs are its own, each
+      `0x3fffffe000` translates through a different page table to a different trapframe
+      page, and each `sp` is the top of a different kernel stack (`KSTACK(k) + PGSIZE` =
+      `0x4000000000 - 0x2000·(k+1)`).
+
+      The highlighted lines are t2 and t3, before any `ld sp`: each hart's `sp` still holds
+      its own process's user stack pointer, three different values in three different
+      registers, and none of them is used. At t4 each hart moves to its own process's empty
+      kernel stack. Each hart has its own `sp`, so even the stack switch needs no
+      coordination.
+
+      Imagine instead a single global save area, as a naive design might use:
+
+      | Time | Hart 0 (`cat`) | Hart 1 (`grep`) |
+      |---|---|---|
+      | t1 | saves cat's registers into the area | |
+      | t2 | | saves grep's registers into the same area |
+      | t3 | `usertrap` reads `a7`: grep's value | |
+      | t4 | returns to `cat` with grep's `sp` and `pc` | |
+
+      `cat` would run with `grep`'s registers. A lock around the save area would not rescue
+      the design: the area would have to stay locked from the trap until the return to user
+      mode, across every sleep in the system call, so only one process at a time could be in
+      the kernel. Per-process trapframes remove the shared data instead of protecting it:
+      nothing the trampoline writes is shared, so it needs no lock at all.
+    others: |
+      The first shared object on any of these paths appears only in C, at t6. `cat`'s
+      `write` takes the lock of the first pipe (`cat` → `grep`), and `wc`'s `read` takes the
+      lock of the second (`grep` → `wc`), so even these two do not contend; only `grep`
+      shares a pipe with each of them ([[tour:39]]). `grep`'s [[yield]] takes its own
+      `p->lock`. Everything in the
+      trampoline is lock-free by construction.
+
+      Could another hart touch `cat`'s trapframe meanwhile? Only `cat`'s own kernel thread
+      reads or writes it. [[kfork]] copies a parent's trapframe while the *parent* runs
+      `fork`, into a child that is not yet runnable. And the page is freed only by
+      [[freeproc]], after the process has become a zombie and stopped running anywhere.
+
+  - title: What the border costs, and why it is built this way
+    file: user/init.c
+    lines: 14-30
+    focus: 19-24
+    state:
+      hart: 0
+      mode: U
+      proc: init (pid 1)
+      intr: on
+      satp: user
+      locks: []
+      stack: [start, main]
+      sp: {"on": user, switched: "`ld sp, 48(a0)` in [[kernel:userret]] ([[kernel/trampoline.S:118]]) and `sret` ([[kernel/trampoline.S:153]])", detail: "init's user stack; its kernel stack is empty again"}
+    note: |
+      `init` gets back `a0 = 0` from `open` (on a brand-new `fs.img` it would get -1, create
+      the device with `mknod`, and open it again), and goes on to `dup` its console descriptor,
+      fork the shell, and wait ([[tour:4]]).
+
+      Count one round trip through the border: 2 privilege changes; 2 `satp` writes and 4
+      `sfence.vma`s, each wiping this hart's whole TLB, so the first accesses on each side
+      miss; 31 stores and 31 loads of user registers; 4 loads of kernel fields and 4 C
+      stores in [[prepare_return]] to refill them; 1 `fence.i`; 1 `sret`. In this build,
+      83 instructions run in the trampoline itself (44 in `uservec`, 39 in `userret`), and
+      the TLB misses afterwards can easily cost more than all of them.
+
+      The key ideas:
+
+      - **Same virtual address, same physical page, every table.** The trampoline is the
+        one place where the two worlds overlap, so `satp` can change mid-stream.
+      - **Same virtual address, different physical page, every process.** `TRAPFRAME` lets
+        identical code save into a per-process page with no lookup and no lock.
+      - **The kernel leaves itself a note.** Four fields written by `prepare_return` give a
+        stackless, registerless piece of assembly everything it needs.
+      - **Windows closed by ordering, not by locks.** Interrupts off before `stvec` changes,
+        `SIE` turned on by `sret` itself, stores before the `satp` switch, `a0` loaded last.
+
+      Where to go next: [[tour:8]] for traps that happen while already in the kernel (which
+      do not use this page at all), [[tour:9]] for device interrupts arriving through it,
+      [[tour:10]] for faults, and [[tour:25]] for the rest of a user address space.
+locks:
+  - lock: "trampoline page (no lock: read-only code)"
+    where: "[[uservec]], [[userret]] on every hart"
+    protects: "Nothing to protect: mapped `R X` and never written, so any number of harts run it at once"
+  - lock: "trapframe (no lock: one per process)"
+    where: "[[uservec]], [[usertrap]], [[prepare_return]], [[userret]], [[syscall]]"
+    protects: "A process's saved user registers and kernel fields; only that process's own thread touches it, and a thread runs on one hart at a time"
+  - lock: "sscratch, stvec, sepc, sstatus, satp, TLB (no lock: per-hart hardware)"
+    where: "[[uservec]], [[prepare_return]], [[userret]]"
+    protects: "Each hart has its own copy; writes on one hart are invisible to the others"
+  - lock: "interrupts off (not a lock, but the guard here)"
+    where: "`ecall`/trap until [[intr_on]] in [[usertrap]] (system calls only; for interrupts and faults they stay off until `sret`); [[prepare_return]] until `sret`"
+    protects: "`sscratch`, `sepc`, `scause` and the half-switched state from being overwritten by a nested interrupt"
+  - lock: "kernel_pagetable (no lock: never modified after boot)"
+    where: "[[kvmmake]] at boot; loaded into `satp` by [[uservec]] on every hart"
+    protects: "Shared read-only by all harts; kernel stacks for all slots are mapped once by [[proc_mapstacks]]"
+  - lock: "p->lock (spinlock)"
+    where: "[[allocproc]] while [[proc_pagetable]] maps the two pages; held by the scheduler across [[swtch]] into [[forkret]]"
+    protects: "A half-built or just-scheduled process from being picked by another hart's scheduler"
+  - lock: "pid_lock (spinlock)"
+    where: "[[allocpid]] from [[allocproc]]"
+    protects: "`nextpid`"
+  - lock: "kmem.lock (spinlock)"
+    where: "[[kalloc]] for the trapframe page and page-table pages"
+    protects: "The shared free-page list"
+quiz:
+  - q: "`uservec` is at physical address `0x80006000`, which the kernel page table also maps. Why does `prepare_return` put `0x3ffffff000` in `stvec` instead of `0x80006000`?"
+    a: "When the trap arrives, the user page table is still installed, and it maps the trampoline only at `0x3ffffff000` (and nothing at `0x80006000`). The first instruction must be fetchable under the user table, and the code must stay fetchable after `satp` switches to the kernel table, which `0x3ffffff000` is in both."
+  - q: "What would go wrong if `prepare_return` wrote `stvec` first and turned interrupts off afterwards?"
+    a: "A timer interrupt in between would vector to `uservec` while the kernel page table is installed and the registers hold kernel values. `uservec` would treat kernel registers as user state and store to `TRAPFRAME`, which is unmapped in the kernel table, faulting back into `uservec` repeatedly."
+  - q: "Two harts execute `sd ra, 40(a0)` with `a0 = 0x3fffffe000` at the same instant. Why do they not overwrite each other, and why is no lock needed?"
+    a: "Each hart is translating through a different process's page table (its own `satp`), in which `0x3fffffe000` maps to that process's own trapframe page. The stores go to different physical memory. Nothing written in the trampoline is shared: CSRs are per hart and trapframes are per process."
+  - q: "After `usertrap` handles a system call that slept and finished on a different hart, how does control get back to `userret`, and why does it still work?"
+    a: "`jalr t0` put `ra = 0x3ffffff09c` (`userret`'s trampoline address), which `usertrap`'s prologue saved on the process's kernel stack. That stack travels with the thread, and `0x3ffffff09c` is mapped in the shared kernel page table seen by every hart, so the `ret` lands in `userret` wherever it executes. `prepare_return` has meanwhile recorded the new hart in `kernel_hartid`."
+  - q: "Why does `userret` take the `satp` value as an argument from `usertrap`, rather than reading back the value `uservec` switched away from?"
+    a: "The system call may have replaced the page table: after a successful `exec`, `p->pagetable` is a new table, so the correct `satp` is only known at the end. Both tables map the trampoline and the trapframe at the same addresses, so `userret` continues to work after the switch."
+  - q: "xv6 uses ASID 0 for every address space. What could happen if the `sfence.vma` after `csrw satp` in `uservec` were removed?"
+    a: "The TLB could still hold init's translations, under the same ASID 0 as the kernel's. Most have `PTE_U`, which S-mode cannot use with `SUM` = 0: a kernel access that hit one (the UART at `0x10000000`, if the process's heap reaches that far) would take a spurious page fault and panic instead of reaching the device. The one stale entry without `PTE_U` is `TRAPFRAME`: a stray kernel access to `0x3fffffe000`, which should fault, would silently read or write this process's trapframe."

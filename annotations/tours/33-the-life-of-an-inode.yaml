@@ -1,0 +1,649 @@
+title: The life of an inode
+group: File system
+prerequisites: [17, 30, 31]
+summary: |
+  You type `cat README &; rm README`. Two programs start at once: `cat` opens `README` and
+  starts printing it, and on another hart `rm` deletes it. And yet `cat` prints the whole
+  file, to the last line. Only when `cat` closes it does the file's space go back to the
+  disk.
+
+  This tour follows one [[g:inode]], inode 2 (`README`, 2441 bytes in blocks 48, 49 and
+  50), through its whole life in memory: [[iget]] finds it a slot in the inode table,
+  [[ilock]] reads it from disk, the open file holds a reference while `cat` reads, `rm`
+  takes away its last name, and the final [[iput]] truncates it and frees it. On the way
+  you will see two counts that are easy to confuse: `ref`, how many pointers in memory
+  refer to the inode, and `nlink`, how many directory entries name it. A file dies only
+  when both reach zero.
+
+  Two of the interleavings here are real races: two harts looking up the same inode at the
+  same moment, and a bug in [[iput]] fixed in this very version of xv6 (commit `d7e85f1`).
+  Both are shown as timelines.
+cast: |
+  The machine has three [[g:hart|harts]]. The shell turned the command line into three
+  processes (on a fresh boot): `rm` is pid 3, an intermediate shell is pid 4, and `cat` is
+  pid 5. When the tour starts:
+
+  | Hart | What it is doing |
+  |---|---|
+  | 0 | Idle in its [[kernel:scheduler]] |
+  | 1 | Running `cat` (pid 5): the process this tour follows |
+  | 2 | Running `rm` (pid 3), which will delete `README` while `cat` reads it |
+
+  We traced a copy of the kernel running exactly this command, so the slot numbers and
+  transactions below are real.
+steps:
+  - title: cat asks for README by name
+    file: user/cat.c
+    lines: 24-43
+    focus: 34-39
+    state:
+      hart: 1
+      mode: U
+      proc: cat (pid 5)
+      intr: on
+      satp: user
+      locks: []
+      stack: [main]
+      sp: user
+    note: |
+      `cat` calls `open("README", O_RDONLY)`. It names the file, but the kernel works with
+      [[g:inode-number|inode numbers]]. Turning one into the other is [[tour:34]]'s
+      subject. This tour picks up the inode as soon as the name has been found, and
+      follows it until `close(fd)` on line 40.
+
+      Keep in mind what an inode is: the file itself, without its name. Its type, size,
+      [[g:link-count|link count]] and the list of its data blocks, 64 bytes on disk
+      ([[g:dinode]]), sixteen to a block. Inode 2 sits in block 33 (the first inode
+      block), next to the root directory's inode 1.
+
+  - title: dirlookup finds the entry and asks iget for the inode
+    file: kernel/fs.c
+    lines: 589-615
+    focus: 605-610
+    state:
+      hart: 1
+      mode: S
+      proc: cat (pid 5)
+      intr: on
+      satp: kernel
+      locks: ["inode 1 lock (sleep-lock)"]
+      irq: 0
+      stack: [usertrap, syscall, sys_open, namei, namex, dirlookup]
+      sp: {"on": kernel, switched: "`ld sp, 8(a0)` in `uservec` ([[kernel/trampoline.S:76]]) when `cat` executed `ecall`", detail: "cat's kernel stack, empty at the `ecall`"}
+    note: |
+      [[sys_open]] called [[namei]], which locked the root directory (inode 1) and called
+      [[dirlookup]] to search it for `README`. The third entry, at byte offset 32 of block
+      47, is `{2, "README"}`.
+
+      `dirlookup` does not return the entry. It returns an **inode pointer**, obtained from
+      [[iget]]`(1, 2)`: device 1, inode 2. Every new reference to an inode starts in
+      `iget` (only [[idup]] adds to a reference someone already holds), so there is
+      exactly one place where in-memory inodes are handed out.
+
+      Note what `cat` holds right now: the root directory's sleep-lock. Looking up a name
+      means reading the directory, and nobody may change the directory while it is being
+      read.
+
+      All of this runs on `cat`'s **kernel stack**, the one page of kernel memory that belongs to
+      its process slot ([[concept:stacks#kernel]]). It was empty when `cat` executed `ecall`:
+      `uservec` saved `cat`'s user `sp` in the trapframe and loaded the kernel stack's top
+      ([[kernel/trampoline.S:76]]). Every call since has pushed a frame, and two of them hold
+      the strings this lookup works with:
+
+      ```text
+      cat's kernel stack (one 4 KiB page)
+        top ─► usertrap
+               syscall
+               sys_open    path[128]: "README", copied in by argstr
+               namei       name[14]:  scratch for one path element
+               namex
+               dirlookup   ◄─ sp
+      ```
+
+      `cat`'s user stack, where `main` waits for `open` to return, is not touched until the
+      system call ends.
+
+  - title: iget gives inode 2 a slot, under itable.lock
+    file: kernel/fs.c
+    lines: 245-279
+    focus: 256-275
+    state:
+      hart: 1
+      mode: S
+      proc: cat (pid 5)
+      intr: off
+      satp: kernel
+      locks: ["inode 1 lock (sleep-lock)", itable.lock]
+      irq: {noff: 1, intena: 1, note: "only `itable.lock` is a push_off level; the inode 1 sleep-lock is not counted ([[concept:locks#sleep-locks]])"}
+      stack: [usertrap, syscall, sys_open, namei, namex, dirlookup, iget]
+      sp: kernel
+    note: |
+      The inode table ([[itable]]) is an array of [[NINODE]] = 50 `struct inode`s shared by
+      the whole kernel. [[iget]] takes `itable.lock` and scans it:
+
+      - An entry with `ref > 0` and the same device and number? Then inode 2 is already in
+        memory: `ref++` and return it.
+      - Otherwise remember the first entry with `ref == 0`.
+
+      Nobody is using inode 2, so it takes the first free entry. In our trace that was slot
+      2 (slot 0 holds the root directory, kept alive by every process's current
+      directory; slot 1 holds `console`, kept alive by the open console files). It writes
+      `dev = 1`, `inum = 2`, `ref = 1`, **`valid = 0`**, and releases the lock.
+
+      `iget` does **not** read the disk. It runs under a [[g:spinlock]], and reading the
+      disk means sleeping. So the entry it returns is a reservation: the right number, a
+      reference, and no contents yet.
+    others: |
+      `itable.lock` is held only for this scan, a few hundred instructions with interrupts
+      off. Any hart in any file system call that needs an inode passes through here, so
+      this is one of the most frequently taken locks in the file system. It protects
+      exactly three fields per entry: `ref`, `dev` and `inum` (see the comment at
+      [[kernel/fs.c:169]]). Everything else in the inode is protected by its sleep-lock.
+
+  - title: Two harts, one inode number
+    file: kernel/fs.c
+    lines: 245-279
+    focus: 257-265
+    state:
+      hart: 1
+      mode: S
+      proc: cat (pid 5)
+      intr: off
+      satp: kernel
+      locks: ["inode 1 lock (sleep-lock)", itable.lock]
+      irq: {noff: 1, intena: 1}
+      stack: [usertrap, syscall, sys_open, namei, namex, dirlookup, iget]
+      sp: kernel
+    note: |
+      Why must the scan and the claim happen under one lock? Suppose `wc README` on hart 0
+      calls `iget(1, 2)` at the same moment as `cat`. Without `itable.lock`:
+
+      | Time | Hart 1 (cat) | Hart 0 (wc) |
+      |---|---|---|
+      | t1 | scans: inode 2 not in the table | scans: inode 2 not in the table |
+      | t2 | picks slot 2 (first free) | picks slot 2 too, or slot 3 |
+      | t3 | sets `inum = 2`, `ref = 1` | sets `inum = 2`, `ref = 1` |
+
+      If both pick slot 2, its `ref` is 1 although two processes use it, and the first
+      `iput` frees the slot under the other's feet. If they pick different slots, there are
+      **two copies** of inode 2 in memory, each with its own sleep-lock. Locking one does
+      not exclude the other, and each [[iupdate]] would overwrite the other's changes on
+      disk.
+
+      With the lock, the scans are serialized:
+
+      | Time | Hart 1 (cat) | Hart 0 (wc) |
+      |---|---|---|
+      | t1 | `acquire(&itable.lock)` | `acquire`: spins |
+      | t2 | claims slot 2: `inum 2`, `ref 1`; `release` | |
+      | t3 | | gets the lock; finds slot 2 with `ref > 0`, `inum 2`: `ref = 2` |
+
+      One inode, one entry, one lock, and a `ref` that counts both users. That is the
+      invariant `iget` exists to keep.
+
+  - title: Back in namex, the directory is let go
+    file: kernel/fs.c
+    lines: 691-728
+    focus: 716-720
+    state:
+      hart: 1
+      mode: S
+      proc: cat (pid 5)
+      intr: on
+      satp: kernel
+      locks: ["inode 1 lock (sleep-lock)"]
+      irq: 0
+      stack: [usertrap, syscall, sys_open, namei, namex]
+      sp: kernel
+    note: |
+      [[namex]] now holds two references: one to the root (its `ip`) and one to `README`
+      (`next`), but it has locked only the root. It calls [[iunlockput]] on the root
+      (unlock, then [[iput]], which drops the root's `ref` by one: the processes' current
+      directories keep it far above zero) and returns `README`'s inode, **unlocked**.
+
+      This is the first sign of a design choice that runs through xv6: getting a reference
+      (`iget`) and locking (`ilock`) are separate. A reference says "this entry must stay
+      inode 2". A lock says "I am looking at or changing inode 2's contents now". You can
+      hold a reference for a long time, a lock only briefly. [[tour:34]] shows why the
+      lookup needs that separation to avoid deadlock.
+
+  - title: ilock locks the inode, and reads it the first time
+    file: kernel/fs.c
+    lines: 292-319
+    focus: 306-314
+    state:
+      hart: 1
+      mode: S
+      proc: cat (pid 5)
+      intr: on
+      satp: kernel
+      locks: ["inode 2 lock (sleep-lock)", "buf 33 (sleep-lock)"]
+      irq: 0
+      stack: [usertrap, syscall, sys_open, ilock]
+      sp: kernel
+    note: |
+      [[sys_open]] calls [[ilock]] ([[kernel/sysfile.c:354]]). It takes the inode's
+      [[g:sleeplock]] with [[acquiresleep]]; if another process held it, `cat` would sleep
+      here instead of spinning.
+
+      Now `valid` is 0, so `ilock` fills the entry in: [[bread]] block 33
+      (`IBLOCK(2, sb)` = 2/16 + 33), find the 64-byte [[dinode]] at index 2, and copy it:
+      `type = 2` (file), `nlink = 1`, `size = 2441`, `addrs = {48, 49, 50, 0, …}`. Then
+      `valid = 1`.
+
+      This is the right place for the disk read, for two reasons. The caller holds a
+      sleep-lock, so sleeping on the disk is allowed. And the lock makes sure only one
+      process loads the entry; a second process locking it afterwards sees `valid == 1`
+      and skips the read.
+
+      If the disk says `type == 0`, the inode is free, and someone is using a dangling
+      inode number. That is a kernel bug, and `ilock` panics (line 317).
+
+      If block 33 is not in the cache, [[bread]] sleeps in [[virtio_disk_rw]] until the disk
+      interrupt. Then `cat`'s frames, `usertrap` down to `ilock`, `bread`, `virtio_disk_rw`,
+      `sleep` and `sched`, simply stay where they are on `cat`'s kernel stack, and `swtch`
+      moves hart 1's `sp` to hart 1's scheduler stack ([[kernel/swtch.S:26]]). When the disk
+      wakes `cat`, whichever hart's scheduler runs it switches back onto this same kernel stack,
+      and `ilock` continues as if nothing happened.
+    others: |
+      If `wc` on hart 0 shares the entry (step 4), it calls `ilock` too and sleeps in
+      `acquiresleep` until `cat` unlocks. When it gets the lock, `valid` is already 1, so
+      it reads nothing. Block 33 is very likely in the [[g:buffer-cache]] anyway: the root
+      directory's inode lives in it.
+
+  - title: The open file keeps the reference, not the lock
+    file: kernel/sysfile.c
+    lines: 362-395
+    focus: 376-391
+    state:
+      hart: 1
+      mode: S
+      proc: cat (pid 5)
+      intr: on
+      satp: kernel
+      locks: ["inode 2 lock (sleep-lock)"]
+      irq: 0
+      stack: [usertrap, syscall, sys_open]
+      sp: kernel
+    note: |
+      [[sys_open]] allocates a [[g:open-file]] ([[filealloc]]) and a descriptor
+      ([[fdalloc]]: descriptor 3, the lowest free one), and stores the inode pointer in
+      `f->ip`. The reference that `iget` created now **belongs to the file**: it is not
+      taken again, and it will be given back by the `iput` in [[fileclose]].
+
+      Then [[iunlock]] on line 391. `cat` keeps the reference for as long as the file is
+      open, but holds the lock only inside each system call. If `open` kept the lock,
+      every other process touching `README` (another `cat`, `ls`, `rm`) would wait until
+      `cat` closed it.
+
+      State of inode 2 now: `ref = 1`, `valid = 1`, unlocked, `nlink = 1`.
+
+  - title: Each read locks it again, briefly
+    file: kernel/file.c
+    lines: 104-130
+    focus: 122-123
+    state:
+      hart: 1
+      mode: S
+      proc: cat (pid 5)
+      intr: on
+      satp: kernel
+      locks: ["inode 2 lock (sleep-lock)"]
+      irq: 0
+      stack: [usertrap, syscall, sys_read, fileread]
+      sp: {"on": kernel, switched: "`ld sp, 8(a0)` in `uservec` ([[kernel/trampoline.S:76]]), for a new system call", detail: "fresh: the open's frames are long gone"}
+    note: |
+      `cat` reads 512 bytes at a time. Each `read` comes to [[fileread]], which does
+      `ilock`, [[readi]], `iunlock`. `valid` is 1 now, so `ilock` reads no disk block for
+      the inode; it only waits for the sleep-lock if someone else holds it.
+
+      Inside the lock, `readi` uses `size` and `addrs[]` to find the data (block 48 for
+      offsets 0–1023) and copies it to `cat`'s buffer. The lock makes the read see a
+      consistent inode: no `size` from before a write and `addrs` from after it. The
+      details of reading are [[tour:36]].
+
+      2441 bytes take five reads with data (4 × 512 + 393) and a sixth that returns 0.
+
+      Between `open` and this `read`, `cat` returned to user mode, and its kernel stack emptied:
+      `sys_open`'s frames, `path` and `name` included, are gone, and this `read` starts again
+      at the top of the page. Nothing the kernel needs from one system call to the next can live
+      on a kernel stack. That is exactly why the reference is kept in the `struct file` (step 7),
+      not in a local variable.
+    others: |
+      Between two of `cat`'s reads, the inode is unlocked, and any process may lock it.
+      In this scenario that is exactly what `rm` on hart 2 is about to do.
+
+  - title: Meanwhile rm takes away the last name
+    file: kernel/sysfile.c
+    lines: 224-250
+    focus: 244-246
+    state:
+      hart: 2
+      mode: S
+      proc: rm (pid 3)
+      intr: on
+      satp: kernel
+      locks: ["inode 2 lock (sleep-lock)"]
+      irq: 0
+      stack: [usertrap, syscall, sys_unlink]
+      sp: kernel
+    note: |
+      `rm README` on hart 2 is in [[sys_unlink]]. Its [[dirlookup]] called [[iget]]`(1, 2)`
+      and found `cat`'s entry, so `ref` became **2**. It locked the root directory, then
+      inode 2 (it may have slept in `ilock` while `cat` was inside `readi`).
+
+      It clears the directory entry (16 zero bytes at offset 32 of block 47), unlocks the
+      root, and then:
+
+      - `nlink--`: 1 → **0**. No name refers to inode 2 any more.
+      - [[iupdate]] logs block 33 with `nlink = 0`.
+      - [[iunlockput]]: `iput` sees `ref == 2`, so this is not the last reference. It only
+        decrements `ref` to 1.
+
+      `rm`'s transaction commits blocks 47 and 33 (our trace: `commit pid 4 n=2: 47 33`, pid
+      4 because that run had one extra command before it). On disk, inode 2 is now
+      allocated, with zero links, its data still in blocks 48–50.
+    others: |
+      The two processes never touch inode 2's fields at the same time: both go through
+      its sleep-lock. And `ref` (2 → 1) is changed under `itable.lock`, never under the
+      sleep-lock, because `ref` must be readable by [[iget]] on any hart without sleeping.
+      If `ref` were protected only by the sleep-lock, `iget` would have to sleep to read it.
+
+      `rm` and `cat` run at the same moment on two harts, each with its own `sp` pointing into its
+      own kernel stack: `rm`'s frames (`usertrap`, `syscall`, `sys_unlink`) on one page,
+      `cat`'s on another. Nothing on either stack is shared. What they share is the inode table
+      entry and block 47, in global kernel memory, and that is why every access to them goes
+      through a lock.
+
+  - title: cat keeps reading a file with no name
+    file: kernel/fs.c
+    lines: 505-534
+    focus: 515-531
+    state:
+      hart: 1
+      mode: S
+      proc: cat (pid 5)
+      intr: on
+      satp: kernel
+      locks: ["inode 2 lock (sleep-lock)"]
+      irq: 0
+      stack: [usertrap, syscall, sys_read, fileread, readi]
+      sp: kernel
+    note: |
+      `cat`'s next `read` locks inode 2 and calls [[readi]] as if nothing had happened. And
+      for `cat`, nothing has: the inode's `size` and `addrs` are unchanged, and blocks 48–50
+      still hold the text. In our run, `cat` printed the rest of `README`, including its
+      last section, after `rm`'s transaction had committed.
+
+      This is the Unix rule: deleting removes a **name**. The file lives as long as
+      anything refers to it, which here is `cat`'s open file. `ref` (references in memory)
+      and `nlink` (names on disk) are counted separately because they answer different
+      questions:
+
+      | Count | Counts | Lives in | Protected by |
+      |---|---|---|---|
+      | `ref` | `struct file`s, current directories, temporary pointers | memory only | `itable.lock` |
+      | `nlink` | directory entries | disk (the [[dinode]]) and memory | the inode's sleep-lock |
+
+  - title: close drops the file, and the file drops the inode
+    file: kernel/file.c
+    lines: 58-83
+    focus: 78-81
+    state:
+      hart: 1
+      mode: S
+      proc: cat (pid 5)
+      intr: on
+      satp: kernel
+      locks: []
+      irq: 0
+      stack: [usertrap, syscall, sys_close, fileclose]
+      sp: {"on": kernel, switched: "`ld sp, 8(a0)` in `uservec` ([[kernel/trampoline.S:76]]), for `close`"}
+    note: |
+      `cat` reaches the end and calls `close(3)`. [[sys_close]] clears `ofile[3]` and calls
+      [[fileclose]]. Under `ftable.lock` the file's own `ref` drops from 1 to 0, so this
+      was the last descriptor using it; the entry is marked free and copied to `ff`.
+
+      Then, with no spinlock held, the file gives up its inode reference: [[begin_op]],
+      [[iput]], [[end_op]]. Why a transaction just to drop a reference? Because `iput` may
+      **delete the file**, and deleting writes the bitmap and the inode block. This `iput`
+      will.
+
+      (Had `rm` not run, this `iput` would see `nlink == 1`, simply drop `ref` to 0, and
+      the transaction would commit nothing. Slot 2 would become free while still holding
+      inode 2's data with `valid == 1`, but the next `iget(1, 2)` would not reuse it: `iget`
+      matches only entries with `ref > 0`. Our trace confirms it: every new command that
+      used directory `a` in our path experiments printed `ilock read inum 24` again. The
+      inode table holds inodes in use; it is not a cache of recently used ones.)
+
+  - title: iput sees the last reference to a nameless inode
+    file: kernel/fs.c
+    lines: 349-378
+    focus: 362
+    state:
+      hart: 1
+      mode: S
+      proc: cat (pid 5)
+      intr: off
+      satp: kernel
+      locks: [itable.lock, "inode 2 lock (sleep-lock)"]
+      irq: {noff: 1, intena: 1, note: "after line 362 returns. Inside `acquiresleep` noff reached 3: `itable.lock`, `lk->lk`, and `myproc()`'s push_off on [[kernel/sleeplock.c:32]] ([[concept:locks#unusual]])"}
+      stack: [usertrap, syscall, sys_close, fileclose, iput]
+      sp: kernel
+    note: |
+      [[iput]] takes `itable.lock` and decides: `ref == 1` (only `cat`'s reference),
+      `valid == 1`, `nlink == 0`. So `last = 1`. It also copies `dev` and `inum` into local
+      variables; step 14 explains why.
+
+      Line 362 then takes the inode's sleep-lock **while holding a spinlock**. Normally that
+      is forbidden: [[acquiresleep]] may sleep, and xv6 panics (`sched locks`,
+      [[kernel/proc.c:488]]) if a thread tries to sleep while holding any spinlock other
+      than its own `p->lock`. On a kernel without that check it could deadlock. Here it
+      cannot sleep. `ref == 1` means `cat` holds the only reference, and
+      no process can lock an inode without holding a reference. So the sleep-lock is free,
+      and `acquiresleep` takes it at once.
+
+      Why take it at all, if nobody can contend? Because the rule for every inode field
+      other than `ref`, `dev` and `inum` is "hold the sleep-lock" ([[kernel/fs.c:174]]), and
+      [[itrunc]] and [[iupdate]] are written for callers that follow it (their comments say
+      "Caller must hold ip->lock"; they do not check). `iput` follows the rule even where
+      it could get away without it.
+
+      (The state box shows the moment after line 362 returns. Inside [[acquiresleep]],
+      `cat` also briefly holds inode 2's inner spinlock `lk->lk`.) Count the levels in
+      there: `itable.lock`, then `lk->lk`, then the [[push_off]] in `myproc()` on
+      [[kernel/sleeplock.c:32]]: `noff` 3, one of only three paths on which an instrumented
+      kernel ever reached that depth ([[concept:locks#nesting]]). Had `acquiresleep` found
+      the lock taken, it would have released `lk->lk` and called `sleep` with `itable.lock`
+      still held, and [[sched]] would have panicked with `noff` 2 ([[concept:locks#unusual]]).
+    others: |
+      `cat` holds `itable.lock` here, so every other hart's [[iget]], [[idup]] and
+      [[iput]], for any inode, spins until line 363 releases it. That is why `iput` holds
+      it only for the decision and the uncontended `acquiresleep`, and drops it before the
+      slow part.
+
+  - title: Truncate, with only the sleep-lock held
+    file: kernel/fs.c
+    lines: 461-491
+    focus: 470-490
+    state:
+      hart: 1
+      mode: S
+      proc: cat (pid 5)
+      intr: on
+      satp: kernel
+      locks: ["inode 2 lock (sleep-lock)"]
+      irq: 0
+      stack: [usertrap, syscall, sys_close, fileclose, iput, itrunc]
+      sp: kernel
+    note: |
+      [[iput]] released `itable.lock` (line 363) before calling [[itrunc]], because
+      truncating reads and writes blocks, which sleeps.
+
+      `itrunc` walks `addrs[]`: blocks 48, 49 and 50 are freed in the bitmap with [[bfree]]
+      (all three bits are in block 46) and the pointers are zeroed. `README` has no
+      [[g:indirect-block]], so lines 477–487 do nothing. Then `size = 0` and [[iupdate]]
+      writes the emptied inode into block 33.
+
+      Back in `iput`, `valid = 0` (the entry no longer describes anything) and the
+      sleep-lock is released. Note that the on-disk `type` is still 2. The inode is
+      truncated but **not yet free**: no [[ialloc]] can take inode 2 yet.
+    others: |
+      Hart 0 might be running a process that creates a file, scanning for a free inode in
+      [[ialloc]]. It reads block 33 under that buffer's sleep-lock and sees inode 2 with
+      `type = 2`: in use. It moves on. That is deliberate, and the next two steps show what
+      happened when it was not so.
+
+  - title: Drop the reference, then free the number
+    file: kernel/fs.c
+    lines: 349-378
+    focus: 376-377
+    state:
+      hart: 1
+      mode: S
+      proc: cat (pid 5)
+      intr: on
+      satp: kernel
+      locks: []
+      irq: 0
+      stack: [usertrap, syscall, sys_close, fileclose, iput]
+      sp: kernel
+    note: |
+      `iput` re-takes `itable.lock`, decrements `ref` to 0 and releases it (lines
+      370–374). Slot 2 is free. Only then, on line 377, does [[ifree]] read block 33 and
+      write `type = 0` for inode 2, through the log. From this moment inode number 2 can be
+      allocated again.
+
+      `ifree` uses the local `dev` and `inum`, not `ip->dev` and `ip->inum`. Once `ref` is 0
+      and the lock released, another hart's [[iget]] may recycle slot 2 for a completely
+      different inode and overwrite those fields.
+
+      `cat`'s transaction commits blocks 46 (the bitmap) and 33 (the inode). Our trace:
+      `commit pid 6 n=2: 46 33` (pid 6 rather than 5, for the reason given in step 9).
+      Afterwards `ls README` prints `ls: cannot open README`, and the three blocks are
+      free.
+    others: |
+      The moment `itable.lock` is released on line 374, slot 2 has `ref == 0`, and any
+      other hart's [[iget]] may recycle it at once for a different inode, overwriting
+      `dev`, `inum` and `valid`. Nothing here touches the slot after that point, which is
+      why `ifree` works only from its local copies.
+
+  - title: The race this order prevents
+    file: kernel/fs.c
+    lines: 196-221
+    focus: 207-215
+    state:
+      hart: 2
+      mode: S
+      proc: a process creating a file
+      intr: on
+      satp: kernel
+      locks: ["inode 1 lock (sleep-lock)", "buf 33 (sleep-lock)"]
+      irq: 0
+      stack: [usertrap, syscall, sys_open, create, ialloc]
+      sp: kernel
+    note: |
+      Until xv6 commit `d7e85f1` (August 2026), `iput` wrote `type = 0` (via [[iupdate]])
+      **before** decrementing `ref`. From that moment, inode 2 looked free to anyone
+      reading block 33. The inode's sleep-lock, still held for a few more lines, did not
+      help, because [[ialloc]] and [[iget]] never take it. Then `iput` released the
+      sleep-lock and went to take `itable.lock`; for that last stretch it held no lock at
+      all and interrupts were on, so a timer interrupt could stretch the window to a whole
+      time slice ([[kerneltrap]] calls [[yield]] on a timer tick,
+      [[kernel/trap.c:157]]). Here is what `ialloc` on another hart could do in it:
+
+      | Time | Hart 1: P1 (`cat`'s close, old `iput`) | Hart 2: P2 (creating a file) |
+      |---|---|---|
+      | t1 | `iupdate`: `type = 0` for inode 2 in block 33's buffer; … release sleep-lock | |
+      | t2 | (preempted, or not yet at `acquire`) | `ialloc` sees inode 2 `type == 0`, claims it |
+      | t3 | | `iget(1, 2)`: finds slot 2 still with `ref == 1`: shares it, `ref = 2` |
+      | t4 | | the new file is unlinked; `iput` sees `ref == 2`: not last, `ref = 1` |
+      | t5 | `ref--`: 1 → 0 | |
+
+      Result: inode 2 is allocated on disk with `nlink == 0`, and nobody holds it. It is an
+      orphan on a running system, leaked until the next boot's [[ireclaim]] ([[tour:32]]).
+
+      The fix is the order you just saw: the number becomes allocatable ([[ifree]]) only
+      after `ref` is 0. Then at t3 `iget` cannot find a live entry for inode 2, takes a
+      fresh slot with `valid = 0`, and reads the inode from disk.
+    others: |
+      `ialloc` scans the inode blocks with only the buffer's sleep-lock: no inode lock, no
+      `itable.lock`. The on-disk `type` field, read under the buffer lock, is the
+      allocation bit. That is why its correctness depends on *when* `type` becomes 0, and
+      why the fix is about ordering rather than adding a lock.
+
+  - title: An inode's whole life, in four states
+    file: kernel/fs.c
+    lines: 126-176
+    focus: 130-149
+    state:
+      hart: 1
+      mode: S
+      proc: cat (pid 5)
+      intr: on
+      satp: kernel
+      locks: []
+      irq: 0
+      stack: []
+      sp: kernel
+    note: |
+      The source comment names four independent properties of an inode. In this tour you
+      saw each one change:
+
+      | Property | Recorded in | Turned on by | Turned off by |
+      |---|---|---|---|
+      | allocated | disk `type != 0` | `mkfs`, when it built the disk image (the kernel's [[ialloc]] does this for files created at run time) | [[ifree]], step 14 |
+      | referenced | `ref > 0`, under `itable.lock` | [[iget]], step 3 | last [[iput]], step 14 |
+      | valid | `valid`, under the sleep-lock | [[ilock]], step 6 | [[iput]] after [[itrunc]], step 13 |
+      | locked | the sleep-lock | [[ilock]] | [[iunlock]] |
+
+      Two locks divide the work. `itable.lock`, a spinlock, guards *which* inode an entry
+      holds and how many users it has; it is held for microseconds and never across a disk
+      access. The per-inode sleep-lock guards *what* the inode contains, and may be held
+      while the disk works. The file system's correctness, including the ordering fix in
+      [[iput]], rests on keeping those two jobs apart.
+
+      Cost of the whole life: one [[bread]] of block 33 for `ilock` (probably a buffer-cache
+      hit, since the root inode lives there too), a lock and unlock per
+      `read`, and two transactions for the deletion (one by `rm`, one by the last close).
+locks:
+  - lock: "itable.lock (spinlock)"
+    where: "[[iget]], [[idup]], [[iput]]"
+    protects: "Each entry's `ref`, `dev` and `inum`: which inode a slot holds and whether it is free"
+  - lock: "inode sleep-lock (`ip->lock`)"
+    where: "[[ilock]] / [[iunlock]]; inside [[iput]] for the last reference"
+    protects: "`valid` and the copy of the dinode: `type`, `nlink`, `size`, `addrs`"
+  - lock: "buffer sleep-lock (block 33)"
+    where: "[[ilock]], [[iupdate]], [[ialloc]], [[ifree]] through [[bread]]"
+    protects: "The on-disk inode block; the `type` field read under it is the allocation bit"
+  - lock: "ftable.lock (spinlock)"
+    where: "[[filealloc]], [[fileclose]]"
+    protects: "The open file's `ref`; the last close hands its inode reference to [[iput]]"
+  - lock: "log.lock (spinlock), taken by begin_op / end_op / log_write"
+    where: "[[fileclose]] around [[iput]]; [[sys_unlink]]; every [[log_write]]"
+    protects: "The log's counters and block list; the transaction makes the deletion (bitmap, inode block) atomic on disk ([[tour:31]])"
+  - lock: "inode 1 sleep-lock (root directory)"
+    where: "[[namex]] (via [[ilock]]), [[sys_unlink]]"
+    protects: "The directory's contents while dirlookup scans it and unlink clears the entry"
+  - lock: "bcache.lock (spinlock)"
+    where: "[[bget]], [[brelse]]"
+    protects: "The buffer cache's list and each buffer's `refcnt`, while a block is found or released"
+  - lock: "each sleep-lock's inner lk->lk (spinlock)"
+    where: "[[acquiresleep]], [[releasesleep]], [[holdingsleep]]"
+    protects: "The sleep-lock's own `locked` flag and holder pid, for a few instructions"
+  - lock: "no lock: ifree's dev and inum"
+    where: "[[iput]], line 358"
+    protects: "Copied into locals under `itable.lock`, because the slot may be recycled for another inode once `ref` is 0"
+quiz:
+  - q: "Why does `iget` not read the inode from disk, leaving that to `ilock`?"
+    a: "`iget` runs under `itable.lock`, a spinlock, and reading the disk means sleeping, which is forbidden while holding a spinlock. `ilock` holds the inode's sleep-lock, which may be held while sleeping, and it also guarantees that only one process loads the entry."
+  - q: "Hart 0 and hart 1 call `iget(1, 2)` at the same time and the table has no entry for inode 2. What would go wrong without `itable.lock`, and what happens with it?"
+    a: "Without it both could claim slots, creating two in-memory copies of inode 2 with separate sleep-locks (or one slot with `ref` 1 for two users). With it, one claims a slot first, and the other's scan finds that entry with `ref > 0` and increments `ref` to 2."
+  - q: "`rm README` ran while `cat` had it open. Why did `cat` still print the whole file?"
+    a: "`sys_unlink` removed the name and set `nlink` to 0, but `cat`'s open file still held a reference: `rm`'s `iput` saw `ref == 2` and only dropped it to 1, so it did not truncate the file. The blocks were freed only by the final `iput` when `cat` closed the file."
+  - q: "`iput` calls `acquiresleep` while holding `itable.lock`. Why can that not deadlock?"
+    a: "It happens only when `ref == 1`: the caller holds the only reference, and any process holding the sleep-lock would also hold a reference. So the lock is free and `acquiresleep` never sleeps."
+  - q: "In the old `iput`, `type` was set to 0 before `ref` was decremented. Trace how that leaked an inode."
+    a: "In the lock-free gap, another process's `ialloc` saw `type == 0`, claimed the inode, and its `iget` found the old entry with `ref == 1` and shared it (`ref = 2`). When the new file was unlinked, its `iput` saw `ref == 2` and did not free it; then the old `iput` decremented `ref` to 0. The inode stayed allocated with no links until the next boot."
+  - q: "Why does `fileclose` wrap a mere `iput` in `begin_op`/`end_op`?"
+    a: "If this is the last reference and `nlink == 0`, `iput` truncates and frees the inode, writing the bitmap and inode blocks. Every disk change must belong to a transaction, so the call has to be inside one, even when it turns out to write nothing."

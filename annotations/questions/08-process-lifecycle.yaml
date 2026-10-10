@@ -1,0 +1,758 @@
+title: fork, exec, exit, wait, kill
+summary: How a process is born as a copy, becomes a new program, dies in two halves as a zombie, is reaped by its parent, and is killed by a flag it checks itself.
+questions:
+  - id: life-01
+    level: 1
+    type: choice
+    q: |
+      After `fork`, parent and child run the same code from the same instruction. How does
+      `fork()` come to return 0 in the child but the child's pid in the parent?
+    code: kernel/proc.c:278-282
+    options:
+      - text: "[[kfork]] copies the parent's trapframe into the child's and then sets the child's saved `a0` to 0; the parent's `a0` receives `kfork`'s return value, the pid."
+        correct: true
+        why: |
+          `a0` carries a system call's return value to user mode. The child's copy is
+          overwritten with 0 at line 282; [[syscall]] stores the pid in the parent's own
+          trapframe when `kfork` returns.
+      - text: The child resumes at a different user instruction, one that loads 0 into `a0`.
+        why: |
+          You may have thought the child gets its own entry point. Line 279 copies the whole
+          trapframe, `epc` included, so the child resumes at exactly the parent's next
+          instruction. Only `a0` differs.
+      - text: "[[forkret]] sets `a0 = 0` for every new process before returning to user mode."
+        why: |
+          `forkret` writes `a0` only inside its `if (first)` block, for the very first process,
+          where `a0` gets `kexec`'s result. For a fork child it leaves the trapframe alone.
+      - text: The user-space `fork()` stub compares the returned pid with `getpid()` and returns 0 if they differ.
+        why: |
+          The stub is just `li a7, SYS_fork; ecall; ret`. It returns whatever the kernel put in
+          `a0`; all the difference is made by line 282.
+    explain: |
+      The child is a copy of the parent's user registers with one register changed. That one
+      value is how two otherwise identical programs tell themselves apart, as in the shell's
+      `if (fork1() == 0)` ([[tour:20]]).
+
+  - id: life-02
+    level: 1
+    type: tf
+    q: |
+      True or false: a fork child's kernel stack starts out as a copy of its parent's kernel
+      stack, so that the child can return through `sys_fork`, `syscall` and `usertrap` just
+      like the parent.
+    answer: false
+    why_tf: |
+      You may have assumed `fork` copies everything. It copies the *user* stack (as part of
+      user memory), but not the kernel stack.
+    reasons:
+      - text: The child runs on its slot's own kernel stack, empty, with a forged context (`ra = forkret`, `sp` = top), and `forkret` goes straight to user space.
+        correct: true
+        why: |
+          [[allocproc]] sets `context.ra` and `context.sp` ([[kernel/proc.c:146-147]]). The
+          child never made the `fork` call, so it has no kernel frames to return through;
+          [[forkret]] imitates the end of [[usertrap]] by calling [[prepare_return]] and
+          [[userret]].
+      - text: The child has no kernel stack at all until its first trap into the kernel.
+        why: |
+          Every slot's kernel-stack page was allocated and mapped at boot by
+          [[proc_mapstacks]]. The child uses it from its first instruction, in `forkret`.
+      - text: The child shares the parent's kernel stack until it calls `exec`.
+        why: |
+          Two threads can never share a kernel stack: both could be in the kernel at once, on
+          different harts, pushing over each other's frames. Each slot has its own.
+    explain: |
+      Kernel stacks belong to process-table slots, not to processes, and the child's is
+      empty when it starts. The only "stack work" `fork` does is the two stores into the
+      child's context ([[concept:stacks#lifecycle]], [[tour:20]]).
+
+  - id: life-03
+    level: 1
+    type: multi
+    q: |
+      A child process has called `exit` and is now a `ZOMBIE`; its parent has not called
+      `wait` yet. Which of these does the zombie still hold?
+    options:
+      - text: Its user memory and user page table
+        correct: true
+        why: "[[kexit]] does not free them; [[freeproc]], run by the parent in [[kwait]], calls [[proc_freepagetable]]."
+      - text: Its trapframe page
+        correct: true
+        why: Freed only by [[freeproc]] ([[kernel/proc.c:158-159]]).
+      - text: Its slot in `proc[]`, with its pid and exit status
+        correct: true
+        why: The parent needs `pid` and `xstate`; the slot becomes `UNUSED` only in [[freeproc]].
+      - text: Its open files
+        why: |
+          You may have thought all cleanup waits for the parent. [[kexit]] closes every file
+          itself (lines 334–340), because closing can matter to others now: the last write end
+          of a pipe tells the reader "end of file".
+      - text: Its reference to the current directory
+        why: |
+          [[kexit]] drops it with [[iput]] inside a transaction (lines 342–345), before it takes
+          any spinlock, since `iput` may write to the disk and sleep.
+      - text: Its `p->lock`, held until the parent reaps it
+        why: |
+          The lock is held only across the final switch: the zombie's hart's scheduler releases
+          it at [[kernel/proc.c:463]] right after `swtch`. The parent then acquires it in
+          [[kwait]] to inspect the zombie.
+    explain: |
+      `exit` releases what other processes may be waiting on (files, the directory), and
+      leaves a husk holding what only the parent should free ([[g:zombie]], [[tour:21]]).
+
+  - id: life-04
+    level: 2
+    type: order
+    q: |
+      `ls` (on hart 2) calls `exit(0)` while its parent, the shell, sleeps in [[kwait]]. Put
+      these events in the order they must happen.
+    items:
+      - text: "[[kexit]] closes `ls`'s open files and drops its current directory"
+        why: These may sleep (disk writes), so they come first, while no spinlock is held.
+      - text: "`kexit` acquires `wait_lock` and calls [[reparent]]"
+        why: The parent-child bookkeeping starts only after the slow work, under wait_lock.
+      - text: "`kexit` calls `wakeup(p->parent)`"
+        why: The wakeup happens under wait_lock but before ls takes its own p->lock, which wakeup would need.
+      - text: "`kexit` acquires its own `p->lock` and sets `state = ZOMBIE`"
+        why: ZOMBIE is written under p->lock, after the wakeup (wait_lock still held).
+      - text: "`kexit` releases `wait_lock` and calls [[sched]]"
+        why: The shell cannot scan until wait_lock is released, and by then ls is already a zombie.
+      - text: Hart 2's scheduler releases `ls`'s `p->lock`
+        why: The scheduler releases it only after swtch has moved hart 2 off ls's kernel stack.
+      - text: The shell's `kwait` acquires `ls`'s `p->lock`, sees `ZOMBIE` and calls [[freeproc]]
+        why: The shell needs ls's p->lock, which is free only after the scheduler's release.
+    why_wrong: Follow the two locks. Each step needs `wait_lock` or the child's `p->lock` in a particular state.
+    explain: |
+      The slow cleanup comes first with no spinlock held; then `wait_lock` orders the
+      family bookkeeping, and the child's `p->lock`, handed across `swtch`, guarantees the
+      parent frees nothing while the child is still on its kernel stack ([[tour:21]]).
+
+  - id: life-05
+    level: 1
+    type: choice
+    q: |
+      Process A is running in user mode on hart 1. On hart 0, another process calls
+      `kill(A's pid)`, and [[kkill]] finds A's slot. What does `kkill` do to A?
+    code: kernel/proc.c:597-622
+    options:
+      - text: It sets `A->killed = 1` under A's `p->lock`, and nothing else; A keeps running until its next trap.
+        correct: true
+        why: |
+          A is `RUNNING`, not `SLEEPING`, so line 612's test fails and A's state is untouched.
+          `kkill` leaves a flag that A itself will find in [[usertrap]].
+      - text: It sends an interrupt to hart 1 so that A stops at once.
+        why: |
+          You may have expected a signal to reach the victim's CPU immediately. xv6 sends no
+          inter-processor interrupts; hart 1 learns about the flag only when A next enters the
+          kernel (a tick at the latest).
+      - text: It calls [[kexit]] on A's behalf.
+        why: |
+          `kexit` always works on `myproc()`, the caller. Hart 0 is running the killer, not A,
+          and could not safely tear down A's files and locks from outside. A calls `kexit`
+          itself.
+      - text: It sets A's state to `ZOMBIE`.
+        why: |
+          Only [[kexit]] sets `ZOMBIE`, in the dying process's own thread. `kkill` changes
+          state only from `SLEEPING` to `RUNNABLE`.
+    explain: |
+      `kill` is a note, not a bullet: set a flag, and wake the victim if it sleeps. The
+      victim ends itself at a safe point, where it holds no locks ([[tour:23]]).
+
+  - id: life-06
+    level: 1
+    type: tf
+    q: |
+      True or false: after a successful `exec`, the process still has the same pid and the
+      same open file descriptors it had before.
+    answer: true
+    why_tf: |
+      You may have thought `exec` starts a new process. It replaces the program running in
+      the *same* process.
+    reasons:
+      - text: "[[kexec]] replaces only the user side (page table, size, the trapframe's `epc`, `sp` and `a1`, and the name); it never touches `pid`, `ofile`, `cwd` or `parent`."
+        correct: true
+        why: |
+          The commit at [[kernel/exec.c:133-137]] swaps the address space and registers. Open
+          files survive, which is how the shell's redirections reach the new program.
+      - text: "It is true because `exec` creates a new process that copies the pid and descriptors from the old one."
+        why: |
+          No new process is created: no [[allocproc]], same slot, same kernel stack. Creating
+          processes is `fork`'s job.
+      - text: "It is true because [[sys_exec]] duplicates each descriptor with `filedup` before calling `kexec`."
+        why: |
+          `sys_exec` only copies the path and argument strings into the kernel. The descriptors
+          are never touched, so no duplication is needed.
+    explain: |
+      `fork` makes a new process with the same program; `exec` keeps the process and changes
+      the program. Together they let a shell set up descriptors in the child and then run any
+      program in it ([[g:fork-exec]], [[tour:22]]).
+
+  - id: life-07
+    level: 1
+    type: number
+    q: |
+      After loading the program's segments, [[kexec]] calls [[uvmalloc]] on line 91. How many
+      pages does that call map in the new page table?
+    code: kernel/exec.c:86-97
+    answer: 2
+    wrong:
+      1: |
+        You may have counted only the stack (`USERSTACK` is 1). The call maps `USERSTACK + 1`
+        pages: the extra one becomes the guard page below the stack.
+      3: |
+        You may have added a guard page on each side. There is one guard page, below the
+        stack; above the stack's top is simply the end of the user image (`sz`).
+      0: |
+        You may have thought the guard page is left unmapped. It is mapped like the stack, then
+        [[uvmclear]] removes its `PTE_U` bit on line 95.
+    why_wrong: Evaluate `(USERSTACK + 1) * PGSIZE` with `USERSTACK` = 1, and remember `sz` was already page-aligned on line 89.
+    explain: |
+      Two pages: the lower one loses `PTE_U` and becomes the [[g:guard-page]], the upper one is
+      the one-page user stack, with `sp` starting at its top ([[tour:22]]).
+
+  - id: life-08
+    level: 1
+    type: line
+    q: |
+      In [[kfork]], click the line at which the child first becomes eligible to be run by a
+      scheduler on any hart.
+    code: kernel/proc.c:256-305
+    answer: 301
+    lines:
+      266: |
+        [[allocproc]] claims a slot but marks it `USED`, which every scheduler skips. A
+        half-built child must not run.
+      294: |
+        Releasing the child's lock lets schedulers *look* at the slot, but they see `USED` and
+        walk past.
+      297: |
+        Setting the parent is bookkeeping for `wait`; schedulers never look at `parent`.
+      304: |
+        By the time the parent returns the pid, the child may already be running on another
+        hart: it became runnable three lines earlier.
+    why_wrong: Schedulers run only processes whose state is one particular value. Find where it is set.
+    explain: |
+      `np->state = RUNNABLE`, under the child's lock, is the moment of publication. Everything
+      else is built first, and the [[release]] after it makes all those writes visible to the
+      hart that picks the child up ([[tour:20]]).
+
+  - id: life-09
+    level: 2
+    type: choice
+    q: |
+      Near its end, [[kfork]] releases the child's lock (line 294), takes `wait_lock` to set
+      `np->parent`, releases it, and only then re-acquires the child's lock. Why not keep the
+      child's lock and take `wait_lock` inside it?
+    code: kernel/proc.c:290-305
+    options:
+      - text: "The lock order is `wait_lock` before any `p->lock`. Taking them the other way round could deadlock with an exiting process that holds `wait_lock` and walks every `p->lock` in [[wakeup]]."
+        correct: true
+        why: |
+          [[kexit]] holds `wait_lock` and calls `wakeup(p->parent)`, which acquires every slot's
+          lock, including this child's. If `kfork` held the child's lock while waiting for
+          `wait_lock`, each hart would hold what the other needs, both spinning with interrupts
+          off ([[kernel/proc.c:26]]).
+      - text: So that a scheduler can start running the child while the parent sets `np->parent`.
+        why: |
+          The child is still `USED` at that point; no scheduler will run it until line 301.
+          Releasing the lock lets schedulers look, not run.
+      - text: Because no hart may hold `wait_lock` and a `p->lock` at the same time.
+        why: |
+          Both are held together routinely: [[kexit]] holds `wait_lock` and its own `p->lock`,
+          and [[kwait]] holds `wait_lock` and a child's. The rule is about the *order*, not
+          about holding both.
+      - text: Because `release` must run to publish the child's memory before its parent is set.
+        why: |
+          The publication that matters is the one at line 302, after `RUNNABLE`. The parent
+          field is protected by `wait_lock`, and nothing reads it before the child can run.
+    explain: |
+      Release-and-reacquire is the price of a fixed lock order: `wait_lock`, then `p->lock`,
+      everywhere. A fixed order makes a cycle of waiting, and so a deadlock, impossible
+      ([[tour:20]], [[concept:locks#order]]).
+
+  - id: life-10
+    level: 2
+    type: choice
+    q: |
+      Line 279 copies the parent's whole trapframe into the child's. What is in the child's
+      `trapframe->kernel_sp` right after that line, and why is it not a problem?
+    code: kernel/proc.c:270-282@279
+    options:
+      - text: The top of the *parent's* kernel stack; harmless, because [[prepare_return]] in [[forkret]] rewrites `kernel_sp` (and the other kernel fields) before the child can trap.
+        correct: true
+        why: |
+          The child's first trip to user mode goes through `forkret`, which calls
+          `prepare_return`, which sets `kernel_sp = p->kstack + PGSIZE` for the child
+          ([[kernel/trap.c:117]]). The child cannot trap before that.
+      - text: The top of the child's own kernel stack, which [[allocproc]] stored there.
+        why: |
+          `allocproc` sets `context.sp`, not `trapframe->kernel_sp`. And whatever was in the
+          child's trapframe, line 279 just overwrote it with the parent's values.
+      - text: Zero, because the trapframe page was freshly allocated.
+        why: |
+          A fresh page is not zero in xv6 ([[kfree]] fills pages with junk, and [[kalloc]] with
+          another pattern), and anyway line 279 copies the parent's 288 bytes over it.
+      - text: "The parent's kernel-stack top, and that is a real hazard: the child's first trap would land on the parent's kernel stack."
+        why: |
+          It would be, if the child could trap with that value in place. Every return to user
+          mode, including the child's first, passes through `prepare_return`, which fixes it.
+    explain: |
+      The trapframe copy brings the user registers the child needs and four kernel fields it
+      does not. Those four are rewritten on every return to user mode, so the stale values
+      never matter ([[tour:20]]).
+
+  - id: life-11
+    level: 2
+    type: choice
+    q: |
+      In [[kexit]], `wakeup(p->parent)` (line 353) comes *before* `acquire(&p->lock)` (line
+      355). Why can't `kexit` take its own lock first?
+    code: kernel/proc.c:347-365
+    options:
+      - text: "[[wakeup]] acquires every slot's `p->lock` in turn, including the exiting process's own; if this hart already held it, [[acquire]] would panic."
+        correct: true
+        why: |
+          `wakeup` loops over all of `proc[]` ([[kernel/proc.c:580-581]]). Reaching its own slot
+          while holding its own lock would be a double acquire on one hart:
+          `panic("acquire")`.
+      - text: So that the parent can see the child as a zombie the moment it wakes.
+        why: |
+          The parent cannot look at all until `kexit` releases `wait_lock` (line 360), and the
+          child is `ZOMBIE` by then. Waking early only lets the parent start moving sooner.
+      - text: Because the lock order requires `p->lock` to be taken only after every `wakeup`.
+        why: |
+          There is no such rule. The order is `wait_lock` before `p->lock`, which `kexit`
+          follows either way; the constraint here comes from what `wakeup` itself acquires.
+      - text: Because `wakeup` must run with interrupts on, and holding `p->lock` would turn them off.
+        why: |
+          `wait_lock` is already held at line 353, so interrupts are already off; `wakeup` is
+          called from interrupt handlers all the time.
+    explain: |
+      Wake first, then lock yourself. The early wakeup is safe because the parent still needs
+      `wait_lock`, which the child holds until it is fully a zombie ([[tour:21]]).
+
+  - id: life-12
+    level: 2
+    type: choice
+    q: |
+      [[kwait]] holds `wait_lock` from its scan until after [[sleep_prepare]], and releases it
+      only just before [[sleep]]. Why does it register *before* releasing `wait_lock`?
+    code: kernel/proc.c:376-419@413-416
+    options:
+      - text: An exiting child needs `wait_lock` to call `wakeup(p->parent)`, so it cannot wake the parent between the parent's scan and its registration; otherwise that wakeup could find nobody registered and be lost.
+        correct: true
+        why: |
+          If the parent released `wait_lock` before registering, a child could exit in the gap:
+          its `wakeup` would find `chan` still 0, and the parent would then sleep forever with a
+          zombie child. With this order, a wakeup arriving after line 415 clears `chan`, and
+          `sleep()` returns at once.
+      - text: Because [[sleep]] requires the caller to hold `wait_lock`, which it releases while sleeping.
+        why: |
+          That is the MIT book's `sleep(chan, lk)`. In this tree `sleep()` takes no lock
+          argument and releases nothing but `p->lock`; the caller releases `wait_lock` itself
+          on line 415.
+      - text: To stop other processes from creating new children for this parent while it sleeps.
+        why: |
+          Only the parent itself can create its children, by calling `fork`, and it is busy in
+          `wait`. `wait_lock` protects the `parent` fields, not the right to fork.
+      - text: Because [[sleep_prepare]] panics unless `wait_lock` is held.
+        why: |
+          `sleep_prepare` checks only that the channel is not 0. It knows nothing about
+          `wait_lock`.
+    explain: |
+      The general recipe: register for the wakeup while holding the lock the waker must take
+      to change the condition. Here the condition is "a child is a zombie", and the waker
+      ([[kexit]]) changes it under `wait_lock` ([[concept:locks#sleep-wakeup]], [[tour:21]]).
+
+  - id: life-13
+    level: 2
+    type: number
+    q: |
+      A process whose user memory is exactly 5 pages, all present, at virtual addresses
+      `0x0`–`0x4fff`, calls `fork`, and it succeeds. How many pages does the whole [[kfork]]
+      take from [[kalloc]] (directly or through the functions it calls)?
+    answer: 11
+    wrong:
+      5: |
+        You counted only the copies of the user pages. The child also needs a trapframe page
+        and page-table pages of its own.
+      6: |
+        You counted the 5 user pages and the trapframe, but the child's page table is built
+        from scratch: a root page plus two lower levels for each of the two regions in use.
+      9: |
+        You may have counted one page-table page per level (three). The trampoline and
+        trapframe sit at the top of the address space and user memory at the bottom, so
+        below the shared root each region needs its own level-1 and level-0 page: 5 in all.
+      10: |
+        You may have forgotten the child's trapframe page, which [[allocproc]] takes with
+        `kalloc` before anything else.
+    why_wrong: Count three groups, trapframe, page-table pages and user-page copies, and remember the trampoline and trapframe sit at the very top of the address space while user memory is at the bottom.
+    explain: |
+      1 trapframe ([[allocproc]]) + 5 page-table pages (the root; a level-1 and a level-0
+      page for the trampoline and trapframe at the top; another pair for user memory at the
+      bottom) + 5 user-page copies ([[uvmcopy]]) = 11, the 44 KiB [[tour:20]] measured.
+
+  - id: life-14
+    level: 3
+    type: number
+    q: |
+      [[allocproc]] claims `proc[4]`. What value does line 147 store in `p->context.sp`?
+      Use `KSTACK(p) = TRAMPOLINE - ((p) + 1) * 2 * PGSIZE`, `TRAMPOLINE = MAXVA - PGSIZE`,
+      `MAXVA = 1 << 38` and `PGSIZE = 4096`. Answer in hex.
+    code: kernel/proc.c:143-149@147
+    answer: "0x3fffff6000"
+    wrong:
+      "0x3fffff5000": |
+        That is `KSTACK(4)` itself, the *bottom* of the stack page. Stacks grow down, so the
+        initial `sp` is the top: `p->kstack + PGSIZE`.
+      "0x3fffff8000": |
+        You may have used `p * 2 * PGSIZE` instead of `(p + 1) * 2 * PGSIZE`. Slot 0 already
+        sits two pages below the trampoline, so slot 4 is ten pages below it.
+      "0x3fffffb000": |
+        You may have spaced the stacks one page apart. Each slot takes two pages of virtual
+        space: its stack and an unmapped guard page below it.
+    why_wrong: "Compute TRAMPOLINE = 0x4000000000 - 0x1000, subtract 5 × 2 pages to get KSTACK(4), then add one page for the top."
+    explain: |
+      `TRAMPOLINE` = `0x3ffffff000`; `KSTACK(4)` = `0x3ffffff000 - 10 × 0x1000` =
+      `0x3fffff5000`; the top is `0x3fffff6000`. A new process's first [[swtch]] loads this
+      as `sp`, so [[forkret]] starts on an empty stack ([[concept:stacks#kernel]]).
+
+  - id: life-15
+    level: 2
+    type: choice
+    q: |
+      Process P is asleep in [[piperead]] on an empty pipe whose write end is still open
+      (it slept at line 126). Another process calls `kill(P)`. The pipe stays empty. What
+      happens to P?
+    code: kernel/pipe.c:111-128
+    options:
+      - text: "[[kkill]] makes P `RUNNABLE`; P returns from `sleep()`, goes round the loop, finds `killed` set at line 120 and returns -1, and [[usertrap]] calls `kexit(-1)` on the way out."
+        correct: true
+        why: |
+          `kkill` sets `killed` and, because P is `SLEEPING`, sets `RUNNABLE`. When a scheduler
+          runs P, the loop condition still holds (empty, writer open), the `killed` check fires,
+          and the -1 travels back to `usertrap`, whose check at [[kernel/trap.c:81]] ends P.
+      - text: P stays asleep until someone writes to the pipe or closes it, and dies only then.
+        why: |
+          That would be true if `kkill` only set the flag. It also wakes `SLEEPING` processes
+          (line 612–614), precisely so that sleepers in loops like this one can notice.
+      - text: "`kkill` calls [[kexit]] for P, which frees P's resources right away."
+        why: |
+          `kexit` acts on the *calling* process. P must end itself, in its own kernel thread,
+          after leaving `piperead` with no locks held.
+      - text: P wakes, but `sleep()` reports that it was killed, so `piperead` returns -1 without re-checking.
+        why: |
+          `sleep()` returns nothing. The caller cannot tell why it woke, which is why the loop
+          re-checks both the pipe and `killed`.
+    explain: |
+      Kill = set the flag + wake if asleep. The victim's own sleep loop notices, unwinds
+      normally, and [[usertrap]] turns it into `kexit(-1)` ([[tour:23]]).
+
+  - id: life-16
+    level: 2
+    type: multi
+    q: |
+      Some sleep loops check [[killed]] each time round, so that a killed process does not
+      wait forever. Which of these do?
+    options:
+      - text: "[[kwait]], waiting for a child to exit"
+        correct: true
+        why: "`if (!havekids || killed(p))` at [[kernel/proc.c:408]]."
+      - text: "[[piperead]], waiting for data"
+        correct: true
+        why: Line 120 of `pipe.c`, before registering to sleep.
+      - text: "[[consoleread]], waiting for a line of input"
+        correct: true
+        why: Line 100 of `console.c`; a user might never type anything.
+      - text: "[[sys_pause]], waiting for ticks to pass"
+        correct: true
+        why: Line 79 of `sysproc.c`, on each pass of its `while`.
+      - text: "[[acquiresleep]], waiting for a sleep-lock"
+        why: |
+          You may have thought every sleep checks. Waiting for a sleep-lock ends soon by itself,
+          and a killed process must not abandon an operation half done; it dies at the next
+          trap boundary instead.
+      - text: "[[virtio_disk_rw]], waiting for the disk"
+        why: |
+          A disk request always completes. Abandoning it would leave a buffer locked and the
+          file system inconsistent, so the killed process finishes the I/O first.
+    explain: |
+      Loops that may wait indefinitely (for a child, a pipe, the keyboard, the clock) check
+      `killed`; waits for something that is sure to happen soon do not ([[tour:23]]).
+
+  - id: life-17
+    level: 2
+    type: line
+    q: |
+      Click the line at which the process's user address space becomes the new program's,
+      the commit point of [[kexec]].
+    code: kernel/exec.c:126-140
+    answer: 134
+    lines:
+      133: |
+        This only remembers the old page table so that it can be freed later; the process is
+        still using it.
+      136: |
+        Setting `epc` decides where the new program starts, but the address space was swapped
+        two lines earlier.
+      138: |
+        You may have thought freeing the old image is the switch. By line 138 the process
+        already points at the new page table; freeing the old one is cleanup.
+      130: |
+        Copying the name changes `p->name` early, but it is only for debugging; the memory is
+        unchanged until line 134.
+    why_wrong: The address space is whatever `p->pagetable` points to. Find the store to it.
+    explain: |
+      `p->pagetable = pagetable` swaps the whole user image in one store. Every failure
+      before it returns -1 to the old program, intact; after it there is nothing to return
+      to. The hart is on the kernel page table, so the swap does not pull memory from under
+      the running code ([[tour:22]]).
+
+  - id: life-18
+    level: 1
+    type: match
+    q: |
+      Match each process state with the code that sets it in the situation described.
+    pairs:
+      - left: "`USED`"
+        right: allocproc, when it claims an UNUSED slot
+        why: "Line 126: the slot is taken but the process is not ready, so schedulers skip it."
+      - left: "`RUNNABLE`, for a brand-new child"
+        right: kfork, after the child's memory, registers and files are complete
+        why: "Line 301: publication comes last, under the child's lock."
+      - left: "`ZOMBIE`"
+        right: kexit, holding wait_lock and its own p->lock
+        why: "Line 358: the dying process marks itself; only it can know it is done."
+      - left: "`UNUSED`, after a process has died"
+        right: freeproc, called by the parent in kwait
+        why: "Line 170: the parent dismantles the zombie and frees the slot."
+      - left: "`SLEEPING`"
+        right: sleep, if p->chan is still set
+        why: "Line 568: a process puts itself to sleep, never another process."
+    explain: |
+      Each transition is made by the one party that knows it is safe: the allocator, the
+      creator, the dying process itself, its parent, or the sleeper ([[g:process-state]],
+      [[tour:20]], [[tour:21]]).
+
+  - id: life-19
+    level: 2
+    type: state
+    q: |
+      `ls` called `exit(0)` (a system call). Its [[kexit]] has just executed line 358,
+      `p->state = ZOMBIE`. What is the state of the hart running it?
+    code: kernel/proc.c:347-365@358
+    state:
+      mode: S
+      stack: kernel
+      satp: kernel
+      sie: "off"
+      noff: 2
+      intena: 1
+    why:
+      noff: |
+        Two spinlocks are held: `wait_lock` (line 347) and `ls`'s own `p->lock` (line 355).
+        `wait_lock` is released only at line 360.
+      intena: |
+        `exit` is a system call, and [[usertrap]] turned interrupts on before calling
+        `syscall`. So when `kexit` took its outermost lock, `wait_lock`, interrupts were on:
+        intena 1.
+      stack: |
+        A zombie is still running on its own kernel stack, under `usertrap → syscall →
+        sys_exit → kexit`. It leaves only inside `swtch`, later.
+      sie: |
+        Spinlocks are held, so SIE is off.
+    why_wrong: Count the locks taken since line 347, and remember how a system call enters the kernel.
+    explain: |
+      The zombie is not gone yet: it is running kernel code on its own kernel stack, holding
+      two locks. It releases `wait_lock`, then [[sched]] (with `noff` = 1) carries its
+      `p->lock` across the final switch ([[tour:21]], [[concept:locks#noff]]).
+
+  - id: life-20
+    level: 3
+    type: tf
+    q: |
+      True or false: as soon as a process's state is `ZOMBIE`, no hart is executing on its
+      kernel stack any more.
+    code: kernel/proc.c:355-364
+    answer: false
+    why_tf: |
+      You may have read `ZOMBIE` as "dead and gone". It is written by the process itself, which
+      keeps running for a while afterwards.
+    reasons:
+      - text: "After setting `ZOMBIE`, `kexit` still runs `release(&wait_lock)`, [[sched]] and [[swtch]] on that stack; that is why its `p->lock` stays held until the scheduler, off the stack, releases it."
+        correct: true
+        why: |
+          The hart leaves the zombie's stack only at `swtch`'s `ld sp`. [[kwait]] acquires the
+          child's `p->lock` before inspecting it ("make sure the child isn't still in exit() or
+          swtch()", [[kernel/proc.c:383]]), so it never frees a process still on its stack.
+      - text: "False, because a zombie keeps running user code until its parent calls `wait`."
+        why: |
+          A zombie never runs user code again. No scheduler picks a `ZOMBIE`, so its `sched`
+          never returns.
+      - text: "False, because [[freeproc]] must run on the zombie's kernel stack to free it."
+        why: |
+          `freeproc` runs in the *parent's* thread, on the parent's kernel stack. And it does
+          not free the kernel stack at all: kernel stacks belong to slots and are never freed.
+    explain: |
+      A process cannot step off its own stack and announce it in the same instant. xv6 bridges
+      the gap with the `p->lock` hand-off: the lock is held from before `ZOMBIE` until the
+      hart is on its scheduler stack ([[concept:stacks#lifecycle]], [[tour:21]]).
+
+  - id: life-21
+    level: 2
+    type: multi
+    q: |
+      Process A is spinning in user mode on hart 1, making no system calls. On hart 0, another
+      process calls `kill(A's pid)`, and it returns 0. Which of these are true?
+    options:
+      - text: "[[kkill]] sets A's `killed` flag under A's `p->lock` and leaves A's state `RUNNING`."
+        correct: true
+        why: Only a `SLEEPING` victim has its state changed (to `RUNNABLE`); a running one gets just the flag.
+      - text: A keeps executing user instructions until its next trap into the kernel.
+        correct: true
+        why: Nothing reaches hart 1; A's code cannot see `killed`. Its timer forces a trap within about 0.1 s.
+      - text: At that trap, [[usertrap]] finds `killed` set and A calls `kexit(-1)`.
+        correct: true
+        why: Line 81 checks every trap from user mode (line 57 also checks before a system call), so A ends itself with status -1.
+      - text: Hart 0 sends hart 1 an interrupt so that A stops immediately.
+        why: |
+          You may have expected an immediate stop, as with a signal on other systems. xv6 has
+          no inter-processor interrupts; `kill` returning does not mean the victim is dead.
+      - text: "`kkill` sets A to `RUNNABLE` so that a scheduler can end it."
+        why: |
+          Schedulers never end processes; they only run them. And `kkill` changes the state
+          only of a `SLEEPING` victim.
+      - text: A's parent will see exit status 0 from `wait`.
+        why: |
+          A killed process exits through `kexit(-1)`, so the status its parent collects is -1.
+    explain: |
+      For a running victim, `kill` is a flag that waits for the victim's next trip into the
+      kernel; the timer guarantees one within a tick ([[tour:23]], [[tour:11]]).
+
+  - id: life-22
+    level: 3
+    type: choice
+    q: |
+      [[kexec]]'s argument loop writes `ustack[argc]` with no check that `argc < MAXARG`
+      (`ustack` has `MAXARG` = 32 entries, on the kernel stack). What stops a user program
+      from overflowing `ustack` by calling `exec` with 40 arguments?
+    code: kernel/exec.c:99-119
+    options:
+      - text: "[[sys_exec]] copies at most `MAXARG` pointers, including the terminating null, and fails with -1 otherwise; the only other caller, [[forkret]], passes one argument."
+        correct: true
+        why: |
+          `sys_exec`'s loop does `if (i >= NELEM(argv)) goto bad` ([[kernel/sysfile.c:471]]), so
+          `kexec` never sees more than 31 strings plus the null. The bound lives in the caller.
+      - text: The `sp < stackbase` check on line 104 stops the loop before `ustack` overflows.
+        why: |
+          You may have confused the two stacks. That check protects the *user* stack page in the
+          new page table. `ustack` is a kernel array; small arguments would pass the check long
+          after 32 entries.
+      - text: Nothing stops it; 40 arguments overflow `ustack` and corrupt `kexec`'s kernel stack.
+        why: |
+          That would be true if user code could call `kexec` directly. It can only reach it
+          through `sys_exec`, which rejects an `argv` with more than `MAXARG` entries.
+      - text: "[[copyout]] fails once more than 32 strings have been written to the new stack."
+        why: |
+          `copyout` knows nothing about argument counts; it fails only for an unmapped or
+          non-writable user page. Its limits are the user stack's, not `ustack`'s.
+    explain: |
+      The kernel trusts `kexec`'s callers to bound `argv`: [[sys_exec]] does, with its own
+      `argv[MAXARG]` array, and [[forkret]] passes `{"/init", 0}`. Bounds checks belong where
+      untrusted data enters the kernel ([[tour:22]]).
+
+  - id: life-23
+    level: 3
+    type: choice
+    q: |
+      Process P in [[piperead]] has passed the `killed` check on line 120 and called
+      `sleep_prepare` on line 124, but has not yet called `sleep()`. On another hart, `kill(P)`
+      runs to completion. Then the pipe's writer does nothing for an hour, keeping its end open.
+      What happens to P during that hour?
+    code: kernel/pipe.c:111-128@120-126
+    options:
+      - text: P goes to sleep anyway and stays asleep for the hour; it notices `killed` only after a real `wakeup(&pi->nread)` (a write or close) or a second `kill`.
+        correct: true
+        why: |
+          `kkill` saw P `RUNNING` (or `RUNNABLE`), so it changed nothing but `killed`, and it
+          does not clear `p->chan`. [[sleep]] sees `chan` still set and goes to sleep; it never
+          looks at `killed`.
+      - text: "`sleep()` returns at once, because `kkill` cleared `p->chan` the way [[wakeup]] does."
+        why: |
+          You may have thought `kkill` behaves like `wakeup`. It only sets `killed` and, for a
+          `SLEEPING` process, `RUNNABLE`; it never touches `chan`. Had it cleared `chan`, this
+          window would not exist.
+      - text: P goes to sleep, but `kkill` already made it `RUNNABLE`, so it is rescheduled at once.
+        why: |
+          `kkill` makes a process `RUNNABLE` only if it is `SLEEPING` *when `kkill` looks*. P was
+          not asleep yet, so `kkill` left its state alone, and the later `SLEEPING` stands.
+      - text: P exits immediately, because `kkill` made it a `ZOMBIE`.
+        why: |
+          Only [[kexit]], run by P itself, sets `ZOMBIE`. `kkill` never ends a process.
+    explain: |
+      `kkill` takes only P's `p->lock`, not `pi->lock`, so it can land between the check and
+      the sleep. The kill is delayed, not lost: the next real wakeup on the channel, or another
+      `kill`, lets the loop see the flag ([[tour:23]]).
+
+  - id: life-24
+    level: 3
+    type: tf
+    q: |
+      True or false: because `first` in [[forkret]] is a plain `static int`, read and cleared
+      with no lock and no atomic instruction, two harts could both run the `if (first)` block
+      and both call `fsinit`.
+    code: kernel/proc.c:510-536@516-524
+    answer: false
+    why_tf: |
+      You may have reasoned "shared variable, no lock, so a race". A race needs two threads
+      that can reach the code at the same time; here they cannot.
+    reasons:
+      - text: While `first` is 1, `init` is the only process in existence, and it clears `first` before any other process can be created.
+        correct: true
+        why: |
+          [[userinit]] creates only `init`. Every other process descends from `init`'s `fork`,
+          which `init` can call only after its `forkret` cleared `first` and returned to user
+          mode. The locks taken along the way (in [[kfork]], in the scheduler) order the write
+          before any later `forkret` reads it. Commit `fec683d` removed atomics here for this
+          reason ("no need for atomics for first in forkret()").
+      - text: "`forkret` runs only on hart 0."
+        why: |
+          Any hart's scheduler can switch to a new process, so `forkret` runs on every hart.
+          Even `init`'s first run may happen on hart 1 or 2.
+      - text: "`first` is protected by `p->lock`, which `forkret` still holds when it reads it."
+        why: |
+          `forkret` releases `p->lock` at line 520, before the `if (first)` test, and `p->lock`
+          is a per-process lock anyway: two processes would hold two different locks.
+    explain: |
+      Shared data needs a lock only when two threads can touch it concurrently. Here, by the
+      time a second process exists, `first` is already 0 for good ([[tour:4]]).
+
+  - id: life-25
+    level: 3
+    type: choice
+    q: |
+      Process P (a child of the shell) has a child Z that has already exited and is a
+      `ZOMBIE`; P never called `wait`. Now P itself calls `exit`. Who eventually calls
+      [[freeproc]] on Z?
+    code: kernel/proc.c:307-320
+    options:
+      - text: "`init`: P's [[reparent]] makes `init` Z's parent and calls `wakeup(initproc)`, and `init`'s [[kwait]] rescans, finds Z as its own zombie child, and frees it."
+        correct: true
+        why: |
+          `init` sleeps in `kwait` with its own `struct proc` as the channel, the value
+          `reparent` wakes. Its rescan looks for `pp->parent == initproc`, which now includes Z.
+      - text: The shell, when its `wait` collects P.
+        why: |
+          You may have thought a grandparent inherits grandchildren. [[kwait]] frees only
+          processes whose `parent` is the caller; the shell frees P, not Z. Z was handed to
+          `init` inside P's `kexit`.
+      - text: P, inside its own [[kexit]], before it becomes a zombie.
+        why: |
+          `kexit` frees nothing of its children; it only reparents them. All freeing of a
+          process that has run happens in its parent's `kwait`.
+      - text: Nobody; Z's slot leaks until the next reboot.
+        why: |
+          That would happen without [[reparent]]. Because `init` adopts every orphan and waits
+          forever (it may never exit), every zombie is eventually collected.
+    explain: |
+      Orphans go to `init`, and `init`'s loop does nothing but `wait`. That bounds the life of
+      every zombie ([[tour:21]]).

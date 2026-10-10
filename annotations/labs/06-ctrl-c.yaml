@@ -1,0 +1,1809 @@
+published: true
+title: "Ctrl-C: interrupting the foreground job"
+area: Traps and control flow
+stars: 3
+branch: ext/06-ctrl-c
+prerequisites: {tours: [9, 16, 21, 23, 37, 40, 44, 51], concepts: [locks, stacks]}
+summary: |
+  In this tree, Ctrl-C is just a byte. Type `cat`, press Ctrl-C, and the [[g:uart|UART]]
+  delivers `0x03` to [[consoleintr]], which stores it in the input buffer like any letter.
+  `cat` keeps waiting. A program that computes forever can only be stopped by rebooting. In
+  this lab you make Ctrl-C kill the shell's current foreground job, every process of a
+  pipeline, while the shell itself survives and prints a new prompt.
+
+  The keystroke arrives in an interrupt handler, on whichever [[g:hart]] the PLIC picked,
+  usually while some unrelated process or nobody at all is running there. That raises the
+  questions this lab is about. The console is shared by `init`, the shell and every job: who
+  is "in front", and who tells the console? What does "kill" mean in a kernel where a victim
+  can only die at certain checkpoints, and how long can it take for a process asleep in the
+  kernel, or one that never makes a system call? What may an interrupt handler do with a
+  [[g:spinlock]] already held, and which locks may it never take? A process asleep in
+  [[consoleread]] is waiting for exactly the device that is now interrupting it: does it wake?
+  And what happens at the edges: a `^C` at an empty prompt, a job that exits just as the key
+  is pressed, a job that forks at that very moment?
+
+  The reference solution is nine small commits: three small system calls, one new `case`
+  in [[consoleintr]], six lines in the shell, a `pause` command, an in-kernel test program
+  and a QEMU driver that types Ctrl-C from outside the machine.
+learn:
+  - "Can the console tell by itself which processes are \"in front\"? If not, who knows, and what is the smallest piece of state that describes a whole pipeline?"
+  - "What does `kill` actually do to a process in this kernel, and where does each kind of victim (asleep in the kernel, running in user mode) finally notice it?"
+  - "What may code running in an interrupt handler do: which locks may it take, in which order, and what happens on three harts if it gets the order wrong?"
+  - "Can a process be killed in the instant between deciding to sleep and actually sleeping, and what does it take for the kill to reach it anyway?"
+  - "How do `init` and the shell stay out of harm's way, and what can a field left behind in a freed process slot do to the next process born there?"
+  - "How do you test a feature that starts with a keystroke no program can type?"
+spec: |
+  **Behaviour.** Typing Ctrl-C at the console kills every process of the shell's current
+  foreground job: a single command, every process of a pipeline, a list. The shell itself
+  is not killed; as soon as the job's processes have exited it prints a new prompt.
+
+  - The console echoes `^C` (the two characters `^` and `C`) and a newline, and throws away
+    a half-typed line.
+  - A job asleep in the kernel (reading the console, reading a pipe, in `pause`, in `wait`)
+    must die promptly, without anyone pressing another key.
+  - A background job started with `&` is not killed, neither by a `^C` for the job that
+    started it nor by one for any later job.
+  - Ctrl-C at the prompt, with no job running, kills nothing and gives a fresh prompt.
+
+  ```text
+  $ cat
+  ^C
+  $ pause 1000
+  ^C
+  $ cat | grep x
+  ^C
+  $ (pause 30; echo survived) &
+  $ cat
+  ^C
+  $ survived
+  ^C
+  $ echo jun^C
+  $ echo clean
+  clean
+  ```
+
+  (`pause N` is a new command that sleeps for N ticks of 1/10 s, so `pause 1000` would take
+  100 seconds. In the line `echo jun^C`, `^C` is the kernel's echo; the half-typed
+  `echo jun` never reaches the shell.)
+
+  **Three new system calls**, which the shell and the test use:
+
+  - `int setpgid(int pid, int pgid)`: put process `pid` (0: the caller), which must be the
+    caller or one of its children, into process group `pgid` (0: a new group numbered
+    `pid`). Returns 0, or -1.
+  - `int killpg(int pgid)`: kill every process in group `pgid`. Returns 0, or -1 if the
+    group has no process or `pgid` is 0.
+  - `int setfg(int pgid)`: make `pgid` the console's foreground group, the one Ctrl-C kills
+    (0: none).
+
+  **What must not change.** `kill(pid)` and every existing program behave as before; `init`
+  is never killed by Ctrl-C (the kernel panics if `init` exits). **`usertests -q` must print
+  `ALL TESTS PASSED` on 3 harts.**
+
+  **The tests.** A Ctrl-C is a byte arriving at the UART, which no program inside xv6 can
+  produce, so there are two:
+
+  - `pgtest`, a user program, tests the kernel half through `killpg`: a group of four
+    processes asleep in four different places (in `wait`, in a pipe read, in `pause` and in
+    a console read) must all be gone within 3 seconds of one `killpg`, and a process in
+    another group must survive. Its last line says what it did not test:
+
+    ```text
+    $ pgtest
+    pgtest: setpgid on a process that is not our child fails: OK
+    pgtest: killpg(0), the group of init and the shell, is refused: OK
+    pgtest: killpg finds the group (wait, pipe read, pause, console read): OK
+    pgtest: every member exited: OK
+    pgtest: ...within 3 seconds, without the watchdog's kill(): OK
+    pgtest: the leader exited with status -1, like any killed process: OK
+    pgtest: a process in another group survives: OK
+    pgtest: ALL OK (the Ctrl-C keystroke itself is tested by ctrlc-test.py)
+    ```
+
+  - `ctrlc-test.py`, a Python driver run on the host, boots QEMU on 3 harts, types commands
+    and `\x03` bytes on its standard input (the UART), and checks the console for the
+    transcript above: 10 checks.
+think:
+  - title: Who should receive the Ctrl-C?
+    q: |
+      Ctrl-C arrives as one byte, `0x03`, in [[consoleintr]] ([[kernel/console.c:147]]),
+      called from an interrupt handler. You want it to kill "the program the user is
+      running". The spec has the shell call `setfg` to tell the console which processes
+      those are. Why must the kernel be told at all? While `cat | grep x` runs, which
+      processes have the console open, and which of them should die? Try every rule the
+      kernel could apply with what it already knows (open files, parent pointers, who is
+      reading the console) and find the case each one gets wrong. Then: what must the thing
+      the shell passes to `setfg` name, so that one call covers a whole pipeline?
+    hints:
+      - "Read [[user/init.c]] (it opens the console as fds 0, 1 and 2) and the shell's `main` and `runcmd` in [[user/sh.c]]: who forks whom for `cat | grep x`, and which fds does each process inherit?"
+      - "Every process descends from `init`, and every one of them has the console open unless it closed it. \"Has the console open\" and \"is reading the console\" both pick the wrong set: the first includes `init` and the shell, the second misses `grep` (reading a pipe) and anything that computes without reading. Only the shell knows where a job starts and ends."
+      - "Look for a label that every process of a job would carry without the shell having to visit each one, and that `init` and the shell themselves do not carry."
+    answer: |
+      For `cat | grep x` the shell (pid 2) forks one child for the whole command line; that
+      child runs `runcmd` for the pipe, creates the pipe and forks `cat` and `grep`, then
+      waits for both ([[user/sh.c:101]]-[[user/sh.c:123]]). So five processes have the
+      console open: `init`, the shell, the job's leader (a copy of the shell, asleep in
+      `wait`), `cat` (fd 0 and 2) and `grep` (fd 1 and 2). The right victims are exactly the
+      last three, the processes that descend from the shell's child.
+
+      The kernel cannot find that set from what it has:
+
+      - *Everyone with the console open* kills `init` and the shell: `panic: init exiting`.
+      - *Whoever is reading the console* is only `cat`; `grep` and its waiting parent would
+        survive, and a job that computes without reading could never be stopped.
+      - *The descendants of some process* needs the parent pointers, which are protected by
+        `wait_lock`. Walking them from an interrupt handler is the subject of a later
+        question (and of clinic 2).
+      - *Everyone but `init`* kills the shell too (clinic 1).
+
+      The design used by Unix, and by the reference, is a **process group**: a number in
+      every `struct proc`, copied by `fork`, so a job's processes share it automatically
+      however many times they fork. The shell creates a new group for each job and tells the
+      console which group is in front with a new system call; the console stores that one
+      number, the **foreground group**. Ctrl-C kills the processes of the foreground group.
+      `init` and the shell are in group 0, which means "no group", and the kernel refuses to
+      kill group 0.
+
+      A simpler model, a single "console owner" pid, works for one command but not for a
+      pipeline: the owner would have to be killed and then its children found some other way.
+    checks:
+      - id: lab06-01
+        level: 1
+        type: number
+        q: |
+          In the unmodified tree, you type `cat | grep x` and both programs are running. How
+          many processes have the console open on at least one file descriptor?
+        answer: 5
+        wrong:
+          2: |
+            You may have counted only `cat` and `grep`. Their parent, the shell's child that
+            ran `runcmd` for the pipe, still has fds 0, 1 and 2 open while it waits, and so do
+            the shell and `init`.
+          3: |
+            You may have counted the job (the pipe's parent, `cat`, `grep`) and forgotten
+            the shell and `init`, which keep the console open for their whole lives.
+          4: |
+            You may have forgotten either `init` (it opened the console first) or the
+            invisible copy of the shell that waits for `cat` and `grep`. All five hold it.
+        why_wrong: "Count init, the shell, the shell's child for the command line, cat and grep. Each has the console on at least one of fds 0-2."
+        explain: |
+          `init` opens the console as fd 0 and dups it to 1 and 2 ([[user/init.c]]); every
+          process after it inherits those through `fork`. The pipe replaces only `cat`'s fd 1
+          and `grep`'s fd 0. "Has the console open" therefore includes `init` and the shell:
+          it cannot be the rule for Ctrl-C.
+      - id: lab06-02
+        level: 2
+        type: choice
+        q: |
+          Suppose Ctrl-C killed every process whose file table contains the console. You type
+          `cat` and press Ctrl-C. What happens?
+        options:
+          - text: "init is killed with the others, and the kernel panics with init exiting."
+            correct: true
+            why: |
+              `init` has the console open, so it is marked killed. It is asleep in `wait`;
+              the kill wakes it, [[kwait]] returns -1, and on its way back to user space
+              [[usertrap]] calls [[kexit]], which panics for `init` ([[kernel/proc.c:330]]).
+          - text: "cat dies and the shell prints a new prompt."
+            why: |
+              You may have thought only the reader is affected. The shell and `init` also
+              have the console open and would be killed by this rule.
+          - text: "cat and the shell die; init starts a new shell."
+            why: |
+              That is what happens if `init` is spared (clinic 1). With this rule `init` is
+              not spared: it has the console open too.
+          - text: "Nothing, because a killed process only dies when it returns to user space, and init never does."
+            why: |
+              `init` is asleep in `wait`. A kill makes a sleeping process runnable, `kwait`
+              notices `killed` and returns, and the return to user space ends in [[kexit]].
+        explain: |
+          The console is shared by every process, so "has it open" is the wrong set. Clinic 4
+          shows the same panic from a different mistake: killing group 0, where `init` and the
+          shell live, with `panic: init exiting` on the console right after `^C`.
+  - title: How does a job get its group, and who decides?
+    q: |
+      You have decided on process groups and a foreground group. Now the mechanics. When does
+      a process get its group number? The shell forks one child per command line, and that
+      child may fork again (a pipeline) before or after the shell gets to run again: on three
+      harts the order is not fixed. Who should call your "set the group" system call, the
+      shell, the child, or both, so that every process of the job is in the group *before*
+      the shell makes that group the foreground one? What about a background job, `cmd &`?
+      And what should `init` and the shell's own group be?
+    hints:
+      - "[[kfork]] copies some fields of the parent into the child ([[kernel/proc.c:276]]-[[kernel/proc.c:290]]). A group number copied there reaches every descendant, so the job only needs to be put into its group once, at the top."
+      - "After `fork` returns, the parent and the child run in either order, possibly at the same time on two harts. If only the child sets the group, the shell may announce the group before it has a member. If only the shell does, the child may already have forked `cat` with the old group."
+      - "There are two windows: one before the group has a member, one before the job's first fork. Which two processes can each close one of them, and in what order must the shell's calls come relative to its `wait`?"
+    answer: |
+      The reference adds `int pgid` to `struct proc`, next to `pid` and `killed` (protected
+      by `p->lock`), and [[kfork]] copies the parent's value into the child just before
+      making it `RUNNABLE`. Then a job only has to be placed in its group at the top: every
+      `fork` below inherits it.
+
+      The shell does this for every command line:
+
+      ```c
+      pid = fork1();
+      if (pid == 0) {
+        setpgid(0, 0);       // the job gets a group of its own
+        runcmd(parsecmd(cmd));
+      }
+      setpgid(pid, pid);     // here too: whichever runs first
+      setfg(pid);            // ^C now interrupts this job
+      wait(0);
+      setfg(0);              // back at the prompt: no foreground job
+      ```
+
+      Why both calls: on three harts the child may run first and fork `cat` and `grep`
+      before the shell's `setpgid` runs; if the child did not set its own group first, they
+      would inherit group 0 and survive a Ctrl-C. And if only the child set it, the shell's
+      `setfg(pid)` could run before the child had run at all: a Ctrl-C in between would find
+      an empty group. With both, the group exists and contains the child before `setfg`, and
+      contains every process the child ever forks. (In the recorded run below, the shell's
+      call came first: pid 3 was still `RUNNABLE` when the shell set its group.)
+
+      One window remains, by design: between `fork1()` and `setfg(pid)` the foreground group
+      is still 0. A Ctrl-C there kills nothing and hands the reader an empty line, which the
+      new job (say `cat`) may then read. (Reasoned from the code, not observed.)
+
+      A group is named after its first member, the job's leader. Pids are never reused in
+      this tree ([[allocpid]] only counts up), so a group number never comes back.
+
+      `init` and the shell stay in group 0, which no job is ever in, and the kernel refuses
+      to kill group 0: Ctrl-C can never reach them. `setfg(0)` after `wait` means that at the
+      prompt there is no foreground job at all.
+
+      A background command `cmd &` is run by the job's leader, which forks the command and
+      exits at once ([[user/sh.c:125]]-[[user/sh.c:129]]). The forked process calls
+      `setpgid(0, 0)` first thing, leaving the job's group for one of its own that will never
+      be in front. (A Ctrl-C in the few microseconds before that call would still reach it.)
+    checks:
+      - id: lab06-03
+        level: 2
+        type: order
+        q: |
+          Put the shell's own steps (the parent side) for one command line in the order the
+          reference uses.
+        items:
+          - text: "fork1() creates the job's leader"
+          - text: "setpgid(pid, pid) puts the leader in a new group"
+            why: "The group must have a member before it becomes the foreground group, so this comes before setfg."
+          - text: "setfg(pid) makes that group the foreground one"
+            why: "Only after the group exists; a setfg first would let a Ctrl-C find an empty group."
+          - text: "wait(0) until the leader exits"
+          - text: "setfg(0): no foreground job at the prompt"
+            why: "If this came before wait, Ctrl-C would not reach the job while it runs."
+        why_wrong: "The group must exist before it is announced, and stay announced exactly as long as the shell is waiting."
+        explain: |
+          The child does its own `setpgid(0, 0)` independently; on three harts either call
+          may come first, and both set the same value.
+      - id: lab06-04
+        level: 3
+        type: tf
+        q: |
+          True or false: it would be enough for the shell's child to call `setpgid(0, 0)`
+          as its first action; the shell's own `setpgid(pid, pid)` is redundant.
+        answer: false
+        why_tf: |
+          You may have reasoned that the child's call alone covers all its descendants. It
+          does, but timing still matters for the shell's next step.
+        reasons:
+          - text: "The shell may reach setfg(pid) before the child has run at all; a Ctrl-C in that gap finds an empty group and the job escapes."
+            correct: true
+            why: |
+              Right. Without the shell's call there is a moment where the console's
+              foreground group has no member yet.
+          - text: "The child's call fails because a process may not change its own group."
+            why: |
+              `setpgid(0, 0)` changes the caller's own group, which is always allowed.
+          - text: "Children forked by the job would not inherit the group."
+            why: |
+              They do inherit it, as long as they are forked after the child's call, and the
+              child makes the call before it forks anything.
+        explain: |
+          Each call closes one window: the child's keeps the job's descendants in the group,
+          the shell's makes the group non-empty before it becomes the foreground group.
+  - title: What does "kill" mean here, and when does the victim notice?
+    q: |
+      You will mark the processes of the foreground group as killed from the interrupt
+      handler. Look at how this tree kills one process with `kill(pid)`. What exactly does it
+      change in the victim, and when does the victim actually stop running? Go through the
+      victims of a Ctrl-C one by one: `cat` asleep reading the console, `pause 1000` asleep
+      for 100 seconds, `grep` asleep reading an empty pipe, the pipeline's parent asleep in
+      `wait`, and a program that loops in user mode without ever making a system call. For
+      each one, where does it notice?
+    hints:
+      - "Read [[kkill]] ([[kernel/proc.c:600]]) and the comment above it, then every caller of [[killed]]: [[usertrap]] ([[kernel/trap.c:57]], [[kernel/trap.c:81]]), [[consoleread]], [[piperead]], [[sys_pause]], [[kwait]]."
+      - "A kill cannot stop a process in the middle of kernel code: it may hold locks or be halfway through updating something. So the kernel only marks it, and the victim checks the mark at safe points. A sleeping victim must also be made runnable, or it would never reach a check."
+      - "Whatever kills one process can be applied to every process that carries the job's label. For each victim in the list, find the loop or the return path that will look at the mark."
+    answer: |
+      [[kkill]] does two things under the victim's `p->lock`: it sets `p->killed = 1`, and if
+      the victim is `SLEEPING` it makes it `RUNNABLE` ([[kernel/proc.c:611]]-[[kernel/proc.c:615]]).
+      It never stops anything itself. The victim dies only when *it* runs into a check:
+
+      | victim | asleep in | notices at |
+      |---|---|---|
+      | `cat` | [[consoleread]], on `&cons.r` | the `killed` test at the top of its wait loop ([[kernel/console.c:100]]), returns -1 |
+      | `pause 1000` | [[sys_pause]], on `&ticks` | the loop's test ([[kernel/sysproc.c:79]]), returns -1 |
+      | `grep` | [[piperead]], on `&pi->nread` | the loop's test ([[kernel/pipe.c:120]]), returns -1 |
+      | the pipe's parent | [[kwait]], on itself | the `killed(p)` test before it sleeps again ([[kernel/proc.c:408]]), returns -1 |
+      | a loop in user mode | nowhere: it is running | [[usertrap]]'s test after its next trap of any kind ([[kernel/trap.c:81]]) |
+
+      In every case the system call then returns, and on the way back to user space
+      [[usertrap]] finds `killed` set and calls `kexit(-1)` ([[kernel/trap.c:81]]-[[kernel/trap.c:82]]).
+      So every killed process exits with status -1, from its own kernel stack, holding no
+      locks: that is why the kill is deferred.
+
+      A process that is running in user mode on another hart is not interrupted by the kill.
+      It is only flagged; it exits at its next trap, a timer interrupt at the latest (every
+      hart has its own timer), or sooner if any other trap comes first. In the measured runs a
+      looping program died within a millisecond of the Ctrl-C, at an external-interrupt trap:
+      the PLIC signals every hart, its own claim returned 0 because another hart handled the
+      UART, but the trap alone brought it to [[usertrap]]'s `killed` test (see the
+      measurements).
+
+      A process that is asleep in a **sleep-lock** ([[acquiresleep]], for disk I/O) is not
+      woken early: that loop never checks `killed`. It dies when the I/O finishes and its
+      system call returns. A **zombie** can be marked killed harmlessly.
+
+      The reference therefore adds a group version of [[kkill]], `killpgrp(pgid)`, that
+      loops over the process table and does exactly the two things above for every process
+      whose `pgid` matches, and returns how many it found. The `killpg` system call exposes
+      it to user programs (and to `pgtest`).
+    checks:
+      - id: lab06-05
+        level: 2
+        type: match
+        q: |
+          Match each victim of a Ctrl-C with the place where it first notices that it was
+          killed.
+        pairs:
+          - left: "cat, asleep waiting for a line"
+            right: "the killed test in consoleread's wait loop"
+            why: "cat sleeps on &cons.r inside consoleread; after being made RUNNABLE it goes round the loop and tests killed first."
+          - left: "pause 1000"
+            right: "the killed test in sys_pause's loop"
+            why: "pause sleeps on &ticks inside sys_pause; the loop tests killed before sleeping again."
+          - left: "grep, waiting for the pipe"
+            right: "the killed test in piperead's loop"
+            why: "grep sleeps on &pi->nread inside piperead, whose loop tests killed(pr)."
+          - left: "the pipeline's parent, in wait"
+            right: "kwait's !havekids || killed(p) test"
+            why: "The shell's child for the pipe sleeps in kwait waiting for cat and grep."
+          - left: "a program looping in user mode"
+            right: "usertrap's killed test after its next trap"
+            why: "It is never asleep and makes no system call; only a trap (an interrupt) brings it into the kernel."
+        explain: |
+          The kill only sets a flag (and wakes a sleeper); each kind of victim notices at its
+          own checkpoint, and then [[usertrap]] calls `kexit(-1)` on the way back to user
+          space. See [[tour:23]] for one `kill` followed all the way.
+      - id: lab06-06
+        level: 3
+        type: choice
+        q: |
+          A Ctrl-C arrives on hart 0 while `spin`, a program that loops forever in user mode
+          and never makes a system call, is running on hart 1. The handler sets `spin`'s
+          `killed` flag. What happens next?
+        options:
+          - text: "spin keeps running until hart 1 takes its next trap (a timer or device interrupt); usertrap then sees killed and calls kexit(-1)."
+            correct: true
+            why: |
+              Right. Nothing reaches into hart 1. The flag is read only when `spin` enters the
+              kernel, and an interrupt is the only way it does.
+          - text: "hart 0 sends hart 1 an interrupt so that spin stops at once."
+            why: |
+              You may be thinking of real kernels' inter-processor interrupts. This tree never
+              sends one; the kill only writes `p->killed`.
+          - text: "spin runs forever, because only a system call checks killed."
+            why: |
+              [[usertrap]] also checks `killed` after *any* trap from user mode, including
+              interrupts ([[kernel/trap.c:81]]), and every hart takes a timer interrupt
+              every tick.
+          - text: "hart 0 calls kexit on spin's behalf."
+            why: |
+              [[kexit]] must run on the dying process's own kernel stack, as that process; it
+              ends with `sched()`. No other hart can call it for `spin`.
+        explain: |
+          Killing is cooperative in this kernel. A running victim is bounded by its hart's
+          next timer interrupt (about 1/10 s). In the measured runs `spin` died sooner, within
+          a millisecond, at an external-interrupt trap on its own hart whose PLIC claim
+          returned 0 (another hart had handled the UART). Only the timer is guaranteed.
+  - title: The kill runs in an interrupt handler. What may it do there?
+    q: |
+      Your kill loop will be called from [[consoleintr]]. Trace how [[consoleintr]] is
+      reached and what is true at that moment: which locks are held, whether interrupts are
+      on, which stack, and which process (if any) is "current" on that hart. Then decide what
+      your loop may lock. It must look at every process's group number. Which lock protects
+      that field? Could it also take `wait_lock` (say, to walk parent pointers instead of
+      using groups)? Could it sleep, or wait for the victims to die?
+    hints:
+      - "Follow [[devintr]] → [[uartintr]] → [[consoleintr]] ([[kernel/uart.c:153]], [[kernel/console.c:149]]). Then read the lock-order rule written above `wait_lock` ([[kernel/proc.c:23]]-[[kernel/proc.c:27]]) and look at the order [[kwait]] takes its locks in."
+      - "In a trap handler SIE is off, and `cons.lock` is held from the top of [[consoleintr]]: noff 1, intena 0. Nothing here may sleep ([[sched]] would panic) or wait for something that needs this hart. [[consoleintr]] already calls [[wakeup]], which takes every `p->lock` one at a time: `cons.lock` → `p->lock` is an edge the kernel already has."
+      - "Take each `p->lock` alone, as [[wakeup]] does, read the group under it, mark and maybe wake, release. Never take `wait_lock` while holding a `p->lock`; the rest of the kernel takes them in the other order."
+    answer: |
+      The path is: UART receive interrupt → PLIC → whichever hart claims it → `kernelvec`
+      and [[kerneltrap]] (or [[uservec]] and [[usertrap]], if that hart was in user mode) →
+      [[devintr]] → [[uartintr]] → [[consoleintr]], which acquires `cons.lock` first. So the
+      handler runs with SIE off, noff 1 and intena 0, on whatever stack the interrupted code
+      was using. In the recorded runs, all five Ctrl-Cs landed on a hart that was idle in
+      [[scheduler]]: no current process, and the handler's frames sat on that hart's
+      scheduler stack on top of a `kernelvec` frame.
+
+      What follows from that:
+
+      - **No sleeping, no waiting for the victims.** There may be no process to put to
+        sleep, and holding `cons.lock` would make [[sched]] panic anyway. The handler marks
+        and returns; the victims die later, each on its own.
+      - **Locks.** The group number lives in `struct proc` and is protected by `p->lock`, like
+        `killed` and `state`. Taking each `p->lock` in turn under `cons.lock` adds no new
+        lock-order edge: [[consoleintr]] already does it through [[wakeup]]
+        ([[kernel/console.c:183]]), and [[tour:51]] measured `cons.lock` → `p->lock`. While a
+        `p->lock` is held, noff is 2 and intena still 0.
+      - **No `wait_lock` inside the loop.** The kernel's rule is `wait_lock` before any
+        `p->lock` ([[kernel/proc.c:26]]); [[kwait]] holds `wait_lock` and then takes each
+        child's `p->lock`. A handler that holds a `p->lock` and then asks for `wait_lock`
+        reverses that order, and two harts can deadlock. Clinic 2 does exactly that and hangs
+        6 of 9 boots at the first Ctrl-C. Taking `wait_lock` *before* the loop, in the
+        legal order, worked in 20 out of 20 tries: being in an interrupt handler is not the
+        problem, the order is. (It is still a poor idea: `wait_lock` is held for long scans in
+        [[kwait]], and the handler would spin with interrupts off.)
+
+      Is taking a `p->lock` in an interrupt handler safe on *this* hart? The handler can only
+      have been entered at noff 0 (interrupts are off whenever a spinlock is held,
+      [[concept:locks#invariant]]), so the interrupted code holds no `p->lock`, and the
+      handler cannot spin on a lock its own hart holds.
+    checks:
+      - id: lab06-07
+        level: 2
+        type: state
+        q: |
+          Hart 1 is idle in [[scheduler]] when you press Ctrl-C. It takes the UART interrupt,
+          and the reference's kill loop has just acquired the `p->lock` of the first victim.
+          Fill in the hart's state.
+        code: kernel/console.c:147-154
+        state:
+          mode: S
+          stack: scheduler
+          satp: kernel
+          sie: "off"
+          noff: 2
+          intena: 0
+        why:
+          stack: |
+            The interrupt arrived while the scheduler was running, so `kernelvec` pushed its
+            frame on the scheduler stack (this hart's slice of `stack0`) and everything
+            above it runs there. There is no current process, hence no kernel stack in use.
+          noff: |
+            Two spinlocks are held: `cons.lock` from [[consoleintr]] and the victim's
+            `p->lock`. gdb recorded noff 2 at this line in every kill.
+          intena: |
+            The outermost acquire (`cons.lock`) happened in a trap handler, with SIE already
+            off, so intena recorded 0.
+          sie: |
+            Off since the trap was taken; a held spinlock means off in any case.
+          satp: |
+            The scheduler runs on the kernel page table; so does every trap handler.
+        why_wrong: Follow scheduler → kernelvec → kerneltrap → devintr → uartintr → consoleintr (acquire cons.lock) → the kill loop (acquire p->lock).
+        explain: |
+          Recorded with gdb on the reference branch: hart 1, no current process, `sp` =
+          `0x80009640` inside hart 1's slice of `stack0`, noff 2, intena 0, SIE 0. See
+          [[tour:44]] for the three places an interrupt can land.
+      - id: lab06-08
+        level: 3
+        type: choice
+        q: |
+          Instead of groups, a learner kills "the foreground leader and all its
+          descendants": for each process it acquires `p->lock`, then `wait_lock` to follow the
+          `parent` pointers up, releases `wait_lock`, marks the process if the leader was
+          found, and releases `p->lock`. Run on 3 harts while the job forks and waits a lot,
+          what is the risk?
+        options:
+          - text: "A deadlock: the handler holds a p->lock and waits for wait_lock, while kwait on another hart holds wait_lock and waits for that p->lock."
+            correct: true
+            why: |
+              Right: the two orders are reversed. Clinic 2 shows it on a real run, with a
+              third hart stuck behind them.
+          - text: "A panic, because an interrupt handler may not take wait_lock."
+            why: |
+              Nothing in the kernel forbids it; [[acquire]] does not know it is in an
+              interrupt handler. Taking `wait_lock` first, before any `p->lock`, worked in all
+              20 tries.
+          - text: "None: interrupts are off, so no other hart can hold wait_lock."
+            why: |
+              Turning off SIE affects only this hart. The other two keep running and taking
+              locks.
+          - text: "A deadlock on this hart, because the interrupted code may hold wait_lock."
+            why: |
+              If this hart held any spinlock, its interrupts would be off and the interrupt
+              could not have been taken here ([[concept:locks#invariant]]).
+        explain: |
+          The lock-order rule is about pairs of harts, not about interrupt context:
+          `wait_lock` → `p->lock` everywhere, so taking them the other way round can close a
+          cycle with [[kwait]]. See [[tour:18]] and [[concept:locks#order]].
+  - title: Does the console reader wake up?
+    q: |
+      Now look at the victim that is waiting for this very device: `cat` in [[consoleread]].
+      Your kill loop does what [[kkill]] does: under `p->lock`, set `killed`, and make a
+      `SLEEPING` process `RUNNABLE`. Is that enough for a reader of the console? Look closely
+      at the steps between the reader's `killed` test and the moment it is really asleep.
+      Which locks does it hold at each step, and can your handler run in between? What does
+      the reader's state look like then, and what will it do next?
+    hints:
+      - "The reader's loop is [[kernel/console.c:99]]-[[kernel/console.c:108]]: test `killed`, [[sleep_prepare]], release `cons.lock`, [[sleep]]. Your handler holds `cons.lock`, so it runs either before the test or after the release."
+      - "After the release and before [[sleep]] takes `p->lock` again, the reader is still `RUNNING`, with `p->chan` = `&cons.r`. Marking it killed does not change its state, and [[sleep]] only skips sleeping when `p->chan` is 0 ([[kernel/proc.c:567]])."
+      - "What does [[sleep]] look at to decide whether to sleep, and which code, already in the kernel, changes that field from outside the process?"
+    answer: |
+      A reader fully asleep in [[consoleread]] is woken by the kill loop's `SLEEPING` →
+      `RUNNABLE`, and its loop then sees `killed`. That is the common case, and the recorded
+      runs all looked like it.
+
+      But there is a window. The reader tests `killed` under `cons.lock`, calls
+      [[sleep_prepare]] (`p->chan = &cons.r`), releases `cons.lock`, and only then calls
+      [[sleep]], which takes `p->lock` and goes to sleep if `p->chan` is still set. Because the
+      handler holds `cons.lock`, it can only run before the test (fine: the reader sees
+      `killed`) or after the release. In the second case:
+
+      | time | hart 0: `cat` in consoleread | hart 1: the Ctrl-C handler |
+      |---|---|---|
+      | 1 | `killed`? no; `sleep_prepare(&cons.r)`; release `cons.lock` | |
+      | 2 | | acquire `cons.lock`; kill loop: `cat` is `RUNNING`, so only `killed = 1` |
+      | 3 | [[sleep]]: `p->chan` is still `&cons.r`, so `SLEEPING`, [[sched]] | |
+      | 4 | asleep, killed, and nobody will wake it until a newline arrives | release `cons.lock` |
+
+      That is a lost wakeup ([[g:lost-wakeup]]), and a kill that only touches `killed` and
+      `state` cannot prevent it. What can is the mechanism the reader already relies on:
+      [[wakeup]] on its channel clears `p->chan`. So the reference calls `wakeup(&cons.r)`
+      after the kill loop, still under `cons.lock`. A reader in the window then finds `chan`
+      0 in [[sleep]] and returns at once; a reader fully asleep becomes `RUNNABLE` (a second
+      time, harmlessly). Either way it goes round the loop and returns -1.
+
+      Why keep the `RUNNABLE` in the kill loop too, then? Because the console reader is not
+      the only victim: `grep` in [[piperead]] or a parent in [[kwait]] sleep on other channels
+      that nobody may wake for a long time. `pgtest` checks a pipe reader and a console
+      reader woken by `killpg` alone; clinic 3 removes both wakeups and shows who gets stuck.
+      (The window itself was not caught in a recorded run; the table is reasoned from the
+      code. The same window exists for `kill(pid)` in the original kernel, where nothing closes
+      it.)
+
+      Be clear about what `wakeup(&cons.r)` does *not* fix: the same window exists for the
+      other victims. A `grep` killed between [[sleep_prepare]] and [[sleep]] in [[piperead]]
+      goes to sleep with `killed` set. In the cases tested it is rescued anyway (`cat`'s exit
+      closes the pipe, a child's exit wakes a parent in `wait`, ticks wake `pause`), but a
+      pipe reader whose writer is outside the job would stay asleep. A more general fix is
+      for the kill loop itself to clear `p->chan` under `p->lock`, which makes any
+      not-yet-begun [[sleep]] return at once; every sleep loop in this tree re-checks its
+      condition, so an early return is harmless. That variant was tried too
+      (with `wakeup(&cons.r)` kept only for the empty-line case): `ctrlc-test` 10 of 10,
+      `pgtest` OK twice, `usertests -q` passed. The reference keeps the narrower fix; the
+      general one is in "further".
+    checks:
+      - id: lab06-09
+        level: 3
+        type: choice
+        q: |
+          The handler's kill loop sets `killed` on `cat` while `cat` is between
+          `release(&cons.lock)` and `sleep()` in [[consoleread]]. Without the extra
+          `wakeup(&cons.r)`, what happens to `cat`?
+        code: kernel/console.c:96-108@104-106
+        options:
+          - text: "It goes to sleep anyway, because its chan is still set, and stays asleep with killed = 1 until the next line is typed."
+            correct: true
+            why: |
+              Right. Its state was `RUNNING`, so the kill loop changed only `killed`; [[sleep]]
+              looks only at `p->chan`.
+          - text: "It returns -1 at once, because sleep() checks killed."
+            why: |
+              You may have expected [[sleep]] to check `killed`. It does not
+              ([[kernel/proc.c:561]]-[[kernel/proc.c:572]]); only the callers' loops do.
+          - text: "The kill loop made it RUNNABLE, so it never sleeps."
+            why: |
+              The loop makes only `SLEEPING` processes `RUNNABLE`. At this moment `cat` is
+              `RUNNING` (it is executing these very lines).
+          - text: "It cannot happen, because the handler holds cons.lock and so does cat."
+            why: |
+              `cat` released `cons.lock` just before calling [[sleep]] (line 105). That
+              release is exactly what opens the window.
+        explain: |
+          The kill flag and the wait channel are separate. Clearing the channel with
+          [[wakeup]] is what makes [[sleep]] return early ([[tour:16]]); that is why the
+          reference calls `wakeup(&cons.r)` after the kill loop.
+      - id: lab06-10
+        level: 2
+        type: tf
+        q: |
+          True or false: if the kill loop only set `killed` (no `RUNNABLE`, no
+          `wakeup(&cons.r)`), a Ctrl-C would leave `pause 1000` running for the full 100
+          seconds.
+        answer: false
+        why_tf: |
+          You may have thought every sleeper needs the kill to wake it. `pause` is woken
+          anyway, ten times a second.
+        reasons:
+          - text: "clockintr calls wakeup(&ticks) every tick; sys_pause's loop then sees killed and returns -1 within a tick."
+            correct: true
+            why: |
+              Right. Clinic 3 shows it: with no wakeups at all, `pause 1000` still died without
+              anyone pressing a key, while `cat` stayed until Enter.
+          - text: "pause is not asleep; it polls killed in user mode."
+            why: |
+              `pause` sleeps in the kernel, in [[sys_pause]], on `&ticks`.
+          - text: "pause has no console open, so Ctrl-C reaches it differently."
+            why: |
+              The kill reaches it through its group, like any member; how it wakes is the
+              question.
+        explain: |
+          A sleeper whose channel is woken regularly (ticks) notices the kill anyway; one
+          waiting for an event that may never come (a line, a pipe write) needs the kill to
+          wake it.
+  - title: Keeping the shell and init alive, and Ctrl-C with no job
+    q: |
+      The shell must never die from a Ctrl-C, and `init` must not die at all. With the design
+      so far, which group is the foreground group while the shell sits at its prompt? What
+      should a Ctrl-C do then, and what should happen to a half-typed command line? Who
+      prints the newline and the next prompt after a job is killed: the kernel or the shell?
+      Can the shell tell, from `wait`, that its job died from a Ctrl-C?
+    hints:
+      - "Look at what `wait` reports for a killed job (the exit status is set by [[usertrap]]'s `kexit(-1)`) and at what else exits with -1. Then read [[consoleintr]]'s `^U` case ([[kernel/console.c:155]]) for how the line being edited is represented (`cons.w` to `cons.e`)."
+      - "Group 0 is where `init` and the shell are. The kill function must refuse it, and `setfg(0)` must mean \"nobody\". A shell that is blocked in `read` only prints a prompt after `read` returns something."
+      - "How does `^U` forget a line, and how does Enter hand one over to a reader? What would the shell do with a line that has nothing in it?"
+    answer: |
+      At the prompt the foreground group is 0 (the shell's `setfg(0)` after `wait`), and
+      group 0 is never killed: `killpgrp` returns 0 for it at once. That one test is all that
+      protects `init` and the shell. Remove it, and a Ctrl-C at the prompt kills both:
+      `panic: init exiting` (clinic 4).
+
+      Who prints what:
+
+      - The **kernel** echoes `^C` and a newline, as it echoes every other key, from the
+        handler ([[consputc]] writes the UART directly and is safe in interrupt context). It
+        also drops the line being edited: `cons.e = cons.w` forgets the characters typed since
+        the last newline, so `echo jun` then Ctrl-C does not leave `jun` for the shell.
+      - The **shell** needs no new code to print the prompt after a killed job: `wait`
+        returns, the loop calls `getcmd`, which prints `$ `. It also could not reliably say
+        "interrupted": a job killed by Ctrl-C and one killed by a bad memory access both exit
+        with status -1.
+      - With **no job** to kill, the kernel stores an empty line in the input buffer and
+        publishes it (`cons.w = cons.e`). The shell's `read` returns `"\n"`, the shell skips the
+        blank command ([[user/sh.c:164]]) and prints a new prompt: `$ ^C`, then `$ `.
+
+      The test for "no job" is "the kill loop found nobody", not "fg is 0". That also covers
+      a foreground group whose processes are all gone (see the last question), at the cost
+      of an occasional doubled prompt.
+    checks:
+      - id: lab06-11
+        level: 2
+        type: choice
+        q: |
+          A learner's kill loop forgets to refuse group 0. The shell resets the foreground
+          group to 0 after every job, as in the reference. You type `echo hi`, then press
+          Ctrl-C at the empty prompt. What happens?
+        options:
+          - text: "init and the shell are both killed, and the kernel panics with init exiting."
+            correct: true
+            why: |
+              Both have pgid 0, the foreground group is 0, so both are marked. `init` is
+              asleep in `wait`; the kill wakes it and it exits: [[kexit]] panics
+              ([[kernel/proc.c:330]]). Clinic 4 recorded exactly this.
+          - text: "Nothing: the foreground group is 0, which matches no process."
+            why: |
+              It matches every process that never joined a group: `init` and the shell.
+          - text: "Only the shell dies, and init starts a new one."
+            why: |
+              That would be the outcome if `init` were spared. Here `init` is in group 0 too.
+          - text: "The shell prints a new prompt, as in the reference."
+            why: |
+              That needs the kill loop to find nobody, which is what the refusal of group 0
+              guarantees.
+        explain: |
+          "0 means no group" only works if every user of the number agrees. One `if (pgid <= 0)`
+          in the kill loop keeps `init` and the shell out of every Ctrl-C.
+      - id: lab06-12
+        level: 1
+        type: multi
+        q: |
+          In the reference, what does a Ctrl-C typed at an empty prompt (no foreground job)
+          do?
+        options:
+          - text: "echoes ^C and a newline"
+            correct: true
+            why: "The handler always echoes them, job or no job."
+          - text: "drops the line being typed, if any"
+            correct: true
+            why: "cons.e = cons.w forgets the edited characters."
+          - text: "stores an empty line for the reader, so the shell prompts again"
+            correct: true
+            why: "Only when the kill loop found nobody; the shell skips the blank line and prints $ ."
+          - text: "kills the shell, which init then restarts"
+            why: "The shell is in group 0, which is never killed."
+          - text: "stores the byte 0x03 in the input buffer"
+            why: "That is the original kernel's behaviour. The reference handles C('C') in its own case and never stores it."
+        explain: |
+          Recorded: `$ ^C` followed by a fresh `$ `, and `echo jun^C` followed by a working
+          `echo clean`.
+  - title: What happens at the edges of a job's life?
+    q: |
+      Two races remain. First: the job exits just as you press Ctrl-C. The shell has reaped
+      it but not yet called `setfg(0)`, so the foreground group names a group whose processes
+      are gone. Can that number now belong to someone else? What about the process-table
+      slots those processes used, and the fields left in them? Second: the job's leader is in
+      the middle of `fork` when the Ctrl-C arrives. The kill loop visits the slots one at a
+      time. Can the new child escape?
+    hints:
+      - "Read [[allocpid]] (is a pid ever reused?), [[freeproc]] (which fields does it clear?) and [[allocproc]] (which does it set?). Which fields of a slot does the kill loop read?"
+      - "A kill that sets `killed` on a free slot is not harmless if nothing clears `killed` before the slot's next process runs. And in [[kfork]], the child is in the process table, `USED`, long before it gets its group number."
+      - "Which function already resets a slot for reuse? And for the fork: when exactly does the child become visible to the kill loop as a member, and what would have to be held so that the loop and the fork cannot interleave?"
+    answer: |
+      **The group number cannot come back.** Groups are named after pids, and [[allocpid]]
+      only counts up (`nextpid` is never decremented, [[kernel/proc.c:98]]-[[kernel/proc.c:99]]).
+      So "the foreground group" can at worst name a group that is empty or contains zombies;
+      it never names a later job. A Ctrl-C in that window finds nobody (or only zombies), and
+      the shell gets an empty line: a copy with the window artificially widened showed a
+      doubled prompt, `$ $ `, and nothing worse.
+
+      **The slots do come back.** If [[freeproc]] leaves the old `pgid` in a free slot, a
+      Ctrl-C that names that group marks the *free* slot killed. [[freeproc]] clears `killed`
+      only when a slot is freed, and [[allocproc]] does not clear it when the slot is reused,
+      so the next process born in that slot starts life killed and dies at its first system
+      call. Clinic 5 shows it: after `echo hi; cat` and a Ctrl-C, `ls | wc` prints `0 0 0`,
+      because the process that should have become `ls` died at its first `close`. The
+      reference clears `pgid` in [[freeproc]]; then a free slot (group 0) never matches.
+
+      **A fork in flight can escape.** In [[kfork]] the child exists (`USED`, in the table)
+      from [[allocproc]] on, but gets its group only at the end, just before `RUNNABLE` (line
+      307 of the branch's `proc.c`). If the kill loop reaches the child's slot before line 307,
+      the child is missed; the parent is killed whenever its own slot is visited, before or
+      after. The child then lives on with the group number, unkilled, as an orphan. The window
+      is all of [[kfork]] from [[allocproc]] to line 307: [[kfork]] holds the child's
+      `p->lock` through the copy, so a kill loop that gets there early waits until the release
+      at line 295 and then reads group 0. With the window made wide on purpose (a delay loop in
+      [[kfork]] before the child joins its group, only for processes in a job), a Ctrl-C
+      half a second after `cat | grep x` showed it: the job's leader died during its first
+      `fork`, `grep` was never started, and `cat` (pid 4, slot 3; the leader was in slot 2,
+      so the loop visited the parent first) survived and went on reading the console,
+      competing with the shell for the next line. A second experiment reproduced it with
+      the delay inside the locked part, before line 295. Without a delay it was never seen.
+
+      Closing that window needs one lock held both across the whole kill loop and across
+      "copy the parent's group, check whether the parent was killed" in [[kfork]], so that
+      either the child already has the group when the loop runs, or the parent's kill is
+      visible to the fork. The reference does not do this (it keeps the kill loop as simple as
+      [[kkill]]); it is the first item in "further".
+    checks:
+      - id: lab06-13
+        level: 2
+        type: tf
+        q: |
+          True or false: in this tree, after the processes of group 7 have all exited and been
+          reaped, a later job may also be given group number 7.
+        answer: false
+        why_tf: |
+          You may be thinking of kernels that recycle pids. This one never does.
+        reasons:
+          - text: "Group numbers are the leaders' pids, and allocpid only counts up, so 7 is never handed out again."
+            correct: true
+            why: Right; the reuse to worry about is of process-table slots, not of numbers.
+          - text: "freeproc clears pgid, so group 7 stops existing."
+            why: |
+              Clearing it stops free *slots* from matching group 7. It is not what prevents a
+              new job from being numbered 7; [[allocpid]] is.
+          - text: "setpgid refuses to create a group with a number that was used before."
+            why: |
+              `setpgid` checks nothing of the kind. The leader's pid is new, so the group
+              number is new.
+        explain: |
+          `nextpid` grows by one per process ([[kernel/proc.c:98]]-[[kernel/proc.c:99]]). What
+          *is* reused is the slot in `proc[]`, and with it every field [[freeproc]] forgets to
+          clear: clinic 5.
+      - id: lab06-14
+        level: 3
+        type: choice
+        q: |
+          The job's leader is inside [[kfork]], between [[allocproc]] and the line that copies
+          its group into the child, when the Ctrl-C handler's loop runs over the table. What
+          can happen in the reference?
+        options:
+          - text: "The leader is killed, but the child, which had no group yet when the loop passed its slot, survives with the job's group number."
+            correct: true
+            why: |
+              Right. The loop takes one `p->lock` at a time, so it is not atomic with respect
+              to `fork`. A widened-window experiment showed `cat` surviving this way.
+          - text: "Both die, because the child inherits killed from its parent."
+            why: |
+              [[kfork]] copies the group, not `killed`. (Copying `killed` alone would not close
+              the window either; the loop may visit the parent after the fork has read it.)
+          - text: "The handler deadlocks on the child's p->lock, which kfork holds."
+            why: |
+              [[kfork]] holds the child's lock through the copy, so the handler may spin, but
+              kfork releases it (line 295) without needing anything the handler holds. And
+              when it does, the handler reads group 0, because line 307 has not run yet: that
+              is the escape.
+          - text: "Nothing, because a process in kfork is RUNNING and cannot be killed."
+            why: |
+              Running processes are killed the same way: the flag is set, and the leader dies
+              when its `fork` system call returns.
+        explain: |
+          A scan that locks one slot at a time sees each slot at a different moment. For
+          membership that changes during the scan (a fork), only a lock covering both the
+          scan and the change makes the kill all-or-nothing.
+build: |
+  **Start.**
+
+  ```text
+  git checkout -b my-ctrl-c 06aad25
+  ```
+
+  Begin with the `pause` program (`user/pause.c`: `pause(atoi(argv[1]))`, add `$U/_pause\` to
+  `UPROGS`) so that you have a job that sleeps without reading the console. On the original
+  kernel, type `cat`, then Ctrl-C, then Enter, then Ctrl-D: `cat` prints the line holding the
+  `0x03` byte, and only Ctrl-D ends it. That is the behaviour you are replacing.
+
+  **Milestones, each one bootable.**
+
+  1. **The group field.** `int pgid` in `struct proc` (under `p->lock`); [[kfork]] copies it
+     from the parent into the child before making it `RUNNABLE`; [[freeproc]] clears it.
+     Test: boot and run `usertests -q` (nothing uses groups yet).
+  2. **`setpgid(pid, pgid)`.** The usual five places for a new system call (`syscall.h`,
+     `syscall.c`, `sysproc.c`, `user.h`, `usys.pl`; see lab 1). The target must be the caller
+     or a child: hold `wait_lock` to read `p->parent`, then the target's `p->lock`.
+  3. **The kill loop and `killpg`.** A group version of [[kkill]], refusing group 0. Write
+     `pgtest` now (four sleepers in four places, a watchdog, a survivor in another group) and
+     make it pass: everything below the keystroke is tested here.
+  4. **The foreground group.** A field in `cons` under `cons.lock`, and `setfg(pgid)`.
+  5. **The keystroke.** A `case C('C')` in [[consoleintr]]: drop the edited line, echo, kill,
+     `wakeup(&cons.r)`, and the empty line when nobody was found. Test by hand: Ctrl-C at the
+     prompt must give a new prompt (the shell does not set a group yet, so this is the only
+     case you can try).
+  6. **The shell.** `setpgid` on both sides of the `fork` in `main`, `setfg` around `wait`, and
+     `setpgid(0, 0)` in the background case. Now `cat`, `pause 1000` and `cat | grep x` can be
+     interrupted.
+  7. **The driver.** A script that boots QEMU with its standard input on a pipe and writes
+     `\x03` there (the reference's `ctrlc-test.py`). Run it, then `pgtest`, `usertests -q`,
+     `pgtest` again.
+
+  **Typing Ctrl-C into QEMU.** With `-nographic` and a terminal, Ctrl-C reaches xv6 (QEMU's
+  own escape key is Ctrl-A). From a script, write the byte `\x03` to QEMU's standard input.
+
+  **Debugging advice.** For breakpoints at boot, start QEMU halted with
+  `-S -gdb tcp::GDBPORT` (`GDBPORT` is any free port, e.g. 25501), or use `make qemu-gdb`,
+  which picks its own port; for a Ctrl-C you can also attach later.
+
+  - `break console.c:NNN` on your new `case` and look at `bt`: you will see whether the
+    interrupt came through `kerneltrap` (the hart was in the kernel, often idle in
+    [[scheduler]]) or [[usertrap]]. Print `cpus[i].noff` and `cpus[i].intena` for the hart
+    `info threads` calls CPU#i (gdb numbers threads from 1: Thread 1.1 is CPU#0) to check
+    your locking.
+  - A Ctrl-C that seems to do nothing: type Ctrl-P. [[procdump]] lists every process and its
+    state without taking any lock. A victim still `sleep` after the Ctrl-C was never woken.
+  - A machine that stops answering after Ctrl-C (even Ctrl-P prints nothing): attach gdb and
+    run `thread apply all bt`. Three harts spinning in [[acquire]] is a deadlock; look at
+    which lock each one holds (`p wait_lock`, and `proc[i].lock.cpu` for every slot).
+  - A command that silently prints nothing right after a Ctrl-C: suspect a process born
+    killed. Break on `kexit` and print `p->pid` and the slot number `p - proc`.
+clinic:
+  - bug: Killing everything except init
+    change: |
+      No groups at all: Ctrl-C kills every process but `init`. In the reference kill loop:
+
+      ```diff
+      -  if (pgid <= 0)
+      -    return 0; // group 0 is "no group": init and the shell
+         for (p = proc; p < &proc[NPROC]; p++) {
+           acquire(&p->lock);
+      -    if (p->pgid == pgid) {
+      +    if (p->pid > 1) { // everyone but init
+      ```
+    symptom: |
+      init: starting sh
+      $ cat
+      ^C
+      init: starting sh
+      $ (pause 30; echo survived) &
+      $ cat
+      ^C
+      init: starting sh
+      $ echo alive
+      alive
+      $
+    why: |
+      Every Ctrl-C kills `cat` and the shell (pid 2, asleep in `wait`, woken by the kill).
+      The shell's death is noticed by `init`, which is asleep in its own `wait` loop for the
+      shell's pid ([[user/init.c]], line 42-45): it prints `init: starting sh` and forks a
+      new shell. So the system recovers, but every Ctrl-C costs you your shell, its current
+      directory, and every background job: `survived` never appears, although the run waited 6
+      seconds for a job that needed 3. The background job was killed with everyone else.
+
+      Sparing `init` by pid kept the kernel alive; nothing in this rule knows what a "job" is.
+      Only the shell knows where a job starts, which is why the reference lets it say so
+      with `setpgid` and `setfg`.
+  - bug: Taking wait_lock inside the kill loop
+    change: |
+      A learner kills "the foreground leader and its descendants" and, knowing that
+      `p->parent` needs `wait_lock`, takes it inside the loop, while holding `p->lock`:
+
+      ```diff
+         for (p = proc; p < &proc[NPROC]; p++) {
+           acquire(&p->lock);
+      -    if (p->pgid == pgid) {
+      +    acquire(&wait_lock); // p->parent needs wait_lock
+      +    mine = 0;
+      +    for (q = p; q != 0; q = q->parent)
+      +      if (q->pid == pgid)
+      +        mine = 1;
+      +    release(&wait_lock);
+      +    if (mine) {
+      ```
+
+      The workload, `forkwait` (not part of the branch): three workers, each forking a child
+      that exits at once and reaping it, forever. Type `forkwait`, wait 1 second, Ctrl-C.
+    symptom: |
+      $ forkwait
+      ^C
+
+      # gdb attached 20 s after the Ctrl-C, same boot:
+      [...]
+        Id   Target Id                    Frame 
+      * 1    Thread 1.1 (CPU#0 [running]) acquire (lk=lk@entry=0x8000f9c8 <wait_lock>) at kernel/spinlock.c:37
+        2    Thread 1.2 (CPU#1 [running]) acquire (lk=lk@entry=0x8000f9c8 <wait_lock>) at kernel/spinlock.c:37
+        3    Thread 1.3 (CPU#2 [running]) acquire (lk=lk@entry=0x80010380 <proc+1440>) at kernel/spinlock.c:37
+
+      Thread 3 (Thread 1.3 (CPU#2 [running])):
+      #0  acquire (lk=lk@entry=0x80010380 <proc+1440>) at kernel/spinlock.c:37
+      #1  0x000000008000248a in kwait (addr=0) at kernel/proc.c:391
+      #2  0x0000000080002bae in sys_wait () at kernel/sysproc.c:36
+      #3  0x0000000080002b1c in syscall () at kernel/syscall.c:152
+      #4  0x00000000800028a2 in usertrap () at kernel/trap.c:68
+      #5  0x0000003ffffff09c in ?? ()
+
+      Thread 2 (Thread 1.2 (CPU#1 [running])):
+      #0  acquire (lk=lk@entry=0x8000f9c8 <wait_lock>) at kernel/spinlock.c:37
+      #1  0x0000000080001de8 in kfork () at kernel/proc.c:297
+      #2  0x0000000080002b8c in sys_fork () at kernel/sysproc.c:28
+      #3  0x0000000080002b1c in syscall () at kernel/syscall.c:152
+      #4  0x00000000800028a2 in usertrap () at kernel/trap.c:68
+      #5  0x0000003ffffff09c in ?? ()
+
+      Thread 1 (Thread 1.1 (CPU#0 [running])):
+      #0  acquire (lk=lk@entry=0x8000f9c8 <wait_lock>) at kernel/spinlock.c:37
+      #1  0x000000008000226c in killpgrp (pgid=3) at kernel/proc.c:648
+      #2  0x00000000800003fc in consoleintr (c=<optimized out>) at kernel/console.c:163
+      #3  0x0000000080000ab2 in uartintr () at kernel/uart.c:153
+      #4  0x00000000800027d2 in devintr () at kernel/trap.c:199
+      #5  0x000000008000283a in usertrap () at kernel/trap.c:69
+      #6  0x0000003ffffff09c in ?? ()
+      $1 = 3
+      $2 = 1
+      $3 = 2
+      [...]
+      $6 = {locked = 1, name = 0x80007168 "wait_lock", cpu = 0x8000fae0 <cpus+256>}
+      [...]
+      $8 = 11
+      [...]
+      slot 4 lock held by cpus+0
+      slot 4 pid 5 forkwait RUNNABLE killed 0 pgid 3 parent 3 chan 0x0 lock 1
+    why: |
+      No panic, no message: the machine just stops. Not even Ctrl-P answers, because every
+      hart is spinning with interrupts off. The gdb record (`$1`-`$3` are the three harts'
+      noff; `$6` is `wait_lock`; `$8` is `ticks`) shows a classic two-lock cycle, with a third
+      hart stuck behind it:
+
+      | hart | holds | waits for |
+      |---|---|---|
+      | 0, in the Ctrl-C handler (interrupt taken from user mode) | `cons.lock`, slot 4's `p->lock` (pid 5, a worker) | `wait_lock` |
+      | 2, `forkwait` (pid 3) in [[kwait]] | `wait_lock` (`cpus+256` is hart 2) | slot 4's `p->lock`: pid 5 is its child |
+      | 1, a worker in [[kfork]] | nothing | `wait_lock` |
+
+      Hart 0 has noff 3 (`cons.lock`, the slot lock, and the push_off of the `acquire` it is
+      spinning in). `ticks` is stuck at 11, because hart 0, the only hart that advances it, can
+      no longer take timer interrupts.
+
+      The cause is the order, nothing else. The kernel's rule, written above `wait_lock`
+      ([[kernel/proc.c:26]]), is `wait_lock` before any `p->lock`, and [[kwait]] follows it.
+      The handler took them the other way round. Of 9 boots of this kernel, each sent a
+      Ctrl-C (one boot was sent 20 Ctrl-Cs by its script; it hung at the first), 6 hung
+      at the first Ctrl-C like this (in one of them, hart 1 held `init`'s slot lock
+      in the handler while [[kexit]] on hart 2, holding `wait_lock`, was waking a parent with
+      [[wakeup]] and needed that same lock),
+      3 printed the prompt. A copy that takes `wait_lock` once, *before* the loop (the legal
+      order), passed 20 out of 20 Ctrl-Cs in one boot: being in an interrupt handler was never
+      the problem. Groups avoid the question entirely, since the kill loop needs no
+      `p->parent` at all.
+  - bug: The kill only sets the flag
+    change: |
+      The learner reasons that "kill means `killed = 1`" and writes the loop like
+      [[setkilled]]: no `SLEEPING` → `RUNNABLE`, and no `wakeup(&cons.r)` in [[consoleintr]]:
+
+      ```diff
+             p->killed = 1;
+      -      if (p->state == SLEEPING) {
+      -        // Wake process from sleep().
+      -        p->state = RUNNABLE;
+      -      }
+             n++;
+      [...]
+      -    // a killed reader may be between sleep_prepare() and
+      -    // sleep() in consoleread(); this clears its chan.
+      -    wakeup(&cons.r);
+           break;
+      ```
+    symptom: |
+      $ cat
+      ^C
+
+      $ pause 1000
+      ^C
+      $ cat | grep x
+      ^C
+
+      $ pgtest
+      pgtest: setpgid on a process that is not our child fails: OK
+      pgtest: killpg(0), the group of init and the shell, is refused: OK
+      pgtest: killpg finds the group (wait, pipe read, pause, console read): OK
+      pgtest: every member exited: OK
+      pgtest: ...within 3 seconds, without the watchdog's kill(): FAIL
+      pgtest: the leader exited with status -1, like any killed process: OK
+      pgtest: a process in another group survives: OK
+      pgtest: SOME TESTS FAILED
+      $
+    why: |
+      After each `^C` that is followed by an empty line, the console printed nothing for
+      the 5 seconds the run waited; the empty line is the echo of the Enter pressed after that. After
+      `pause 1000` the prompt came back with no key pressed.
+
+      - **`cat`** is marked killed but stays asleep on `&cons.r`. Nothing wakes that channel
+        until a whole line arrives. When Enter was pressed, the kernel echoed the newline
+        (the empty line in the transcript) and woke `cat`; `cat` found the `\n` in the
+        buffer, *read it* (the loop only tests `killed` while the buffer is empty), returned
+        1 from `read`, and [[usertrap]] killed it on the way back. The shell prompted.
+      - **`pause 1000`** died at once anyway: [[clockintr]] wakes `&ticks` ten times a second,
+        and [[sys_pause]]'s loop checks `killed` every time. This is why the bug is easy to
+        miss if you only test `pause`.
+      - **`cat | grep x`**: `cat` is stuck as above, `grep` sleeps in [[piperead]] and the
+        pipe's parent in [[kwait]]. After Enter, `cat` exits; its exit closes the pipe's
+        write end, which wakes `grep` (it reads end-of-file, returns, and is killed), and
+        wakes the parent through [[kexit]]'s `wakeup(p->parent)`.
+      - **`pgtest`** catches it without anyone typing: its pipe reader and console reader
+        never wake, and after 3 seconds the watchdog kills them one by one with `kill()`,
+        whose [[kkill]] does wake them. The `pause` member and the leader die on their own.
+
+      A second copy kept `wakeup(&cons.r)` and dropped only the `RUNNABLE`. All three
+      interactive cases then worked (the console wakeup rescues `cat`, and the rest follow from
+      its exit), but `pgtest` still failed the same check: its pipe reader and its console
+      reader both stay asleep (`killpg` from a system call never runs the console's
+      `wakeup(&cons.r)`, which only a keystroke triggers). That is why the reference keeps
+      both.
+  - bug: Group 0 is not refused
+    change: |
+      The kill loop forgets that 0 means "no group":
+
+      ```diff
+      -  if (pgid <= 0)
+      -    return 0; // group 0 is "no group": init and the shell
+         for (p = proc; p < &proc[NPROC]; p++) {
+      ```
+    symptom: |
+      init: starting sh
+      $ echo hi
+      hi
+      $ ^C
+      panic: init exiting
+    why: |
+      At the prompt the foreground group is 0, the value the shell sets after every job.
+      `init` (pid 1) and the shell (pid 2) never joined a group, so their `pgid` is 0 too: `init`
+      got 0 from the zeroed process table, and the shell copied it from `init` in [[kfork]].
+      The Ctrl-C marks both and wakes both: the shell from its `read` of the console, `init`
+      from `wait`. [[kwait]] sees `killed` and returns -1, and on its way back to user space
+      [[usertrap]] calls `kexit(-1)`; for `init`, [[kexit]] panics at its first line
+      ([[kernel/proc.c:330]]). Whether the shell got there first does not matter.
+
+      The fix is a single test, but the lesson is about sentinel values: the shell, the
+      console and the kill loop all use 0 to mean "nobody", and the processes that never
+      joined a group also hold 0. Every function that takes a group number must agree on
+      what 0 means. The reference refuses it in the kill loop, and `killpg(0)` returns -1,
+      which `pgtest` checks.
+  - bug: A freed slot keeps its group number
+    change: |
+      [[freeproc]] resets every field it knows about, but the learner forgot the new one:
+
+      ```diff
+         p->pid = 0;
+      -  p->pgid = 0;
+         p->name[0] = 0;
+      ```
+    symptom: |
+      init: starting sh
+      $ echo hi; cat
+      hi
+      ^C
+      $ ls | wc
+      0 0 0
+      $ echo after
+      after
+      $
+
+      # a second boot under gdb, same steps; one record from a breakpoint at
+      # usertrap's kexit(-1) for a killed system call (trap.c:58):
+      {"tag": "syscall-kexit", "n": 1, "hart": 2, "cur": {"pid": 6, "name": "sh", "state": "RUNNING", "pgid": 5, "slot": 3, "killed": 1, "kstack": "0x3fffff7000"}, "noff": 0, "intena": 0, "sie": 0, "sp": "0x3fffff7fe0", "satp": "0x8000000000087fff", "ticks": 14, "fg": 5, "bt": ["usertrap", "0x3ffffff09c"], "a7": 21}
+    why: |
+      `ls | wc` prints `0 0 0`: `wc` saw an empty pipe, because `ls` never ran. The chain:
+
+      1. `echo hi; cat` is job 3 (the shell's child, pid 3, in slot 2; gdb saw `cat` die as
+         pid 3 in slot 2). It forks `echo` (pid 4, in the first free slot, 3), waits for it
+         and reaps it: slot 3 is free again, but still says `pgid 3`.
+      2. pid 3 execs `cat`. Ctrl-C kills group 3: `cat` in slot 2, **and the free slot 3**,
+         whose `killed` becomes 1. [[freeproc]] already ran for slot 3 and will not run again
+         until it is reused.
+      3. The shell reaps `cat` (slot 2 is freed and cleaned) and runs `ls | wc`: its child
+         pid 5 takes slot 2, and pid 5 forks the left side of the pipe, pid 6, into slot 3
+         (gdb: pid 6, slot 3, group 5, `killed` 1).
+         [[allocproc]] sets `pid` and `state` but never touches `killed`, so pid 6 is born
+         killed.
+      4. pid 6 returns from `fork` into user mode (no check on that path), runs
+         [[user/sh.c:106]], `close(1)`, and the system-call entry check in [[usertrap]]
+         ([[kernel/trap.c:57]]) kills it. gdb shows it: pid 6 in slot 3, `a7` = 21, which is
+         `SYS_close`. `ls` was never exec'd; `wc` read end-of-file and printed zeros.
+
+      The original kernel has the same assumption: [[freeproc]] clears `killed` and
+      [[allocproc]] relies on that. It was safe because [[kkill]] matches on `pid`, which
+      [[freeproc]] sets to 0. Any new field that a kill can match on must be cleared too.
+      Only the line in [[freeproc]] is needed; a test of `p->state != UNUSED` in the kill loop
+      would also work.
+reveal:
+  - title: A group number in every process
+    commit: 1
+    file: kernel/proc.h
+    lines: 81-105
+    focus: 85-91
+    diff: true
+    state:
+      hart: any
+      proc: "(a definition: every process has one)"
+      locks: []
+    note: |
+      The story of this tour was recorded on three harts with gdb attached: the machine boots,
+      you type `echo hi`, then `cat` and Ctrl-C, `pause 1000` and Ctrl-C, `cat | grep x` and
+      Ctrl-C, and finally a background job and one more Ctrl-C. Pids, harts and lock depths
+      below come from that run.
+
+      Commit 1 adds one `int` to `struct proc`. Where it goes matters: in the block headed "p->lock
+      must be held when using these", next to `killed` and `state`. The kill loop will read
+      `pgid`, `killed` and `state` of another process together, and one lock must cover all
+      three.
+
+      `0` means "in no group". Nobody sets the field for `init`: the process table is a
+      zero-initialised global, so `init` starts with 0, and every process forked from it
+      inherits 0 until something puts it into a group. That includes the shell, which is
+      what keeps it safe later.
+  - title: fork copies the group, under two locks taken one after the other
+    commit: 1
+    file: kernel/proc.c
+    lines: 257-312
+    focus: 301-309
+    diff: true
+    state:
+      hart: 1
+      mode: S
+      proc: sh (pid 2)
+      intr: "off"
+      satp: kernel
+      locks: ["np->lock (pid 3's)"]
+      irq: {noff: 1, intena: 1}
+      stack: [usertrap, syscall, sys_fork, kfork]
+      sp: {"on": kernel, detail: "pid 2's kernel stack, `sp` = `0x3fffffbf70`"}
+    note: |
+      You typed `echo hi`; the shell (pid 2) forks pid 3 on hart 1. The child must end up in
+      its parent's group, and this is the last moment to do it: on line 308 it becomes
+      `RUNNABLE` and may start running on another hart at once.
+
+      The parent's `pgid` may be written by someone else (the parent's own parent can call
+      `setpgid` on it, next commit), so it is read under `p->lock` (lines 302-304) and copied
+      into a local. Then the child's lock is taken and the group stored, in the same critical
+      section as the `RUNNABLE`. The two locks are never held together: holding a second
+      `p->lock` while holding one is a pattern this kernel avoids, and here it is not needed.
+
+      gdb at line 307: hart 1, pid 2, noff 1 (the child's lock), intena 1 (a system call,
+      after [[usertrap]]'s `intr_on`); `pgid` was 0, because the shell is in no group.
+
+      Note what is *not* copied: `killed`. Until line 307 runs, the child is in the table
+      with group 0. The last think question shows what a Ctrl-C at that moment can do.
+    others: |
+      Another hart running the Ctrl-C handler would read pid 3's `pgid` under the same lock:
+      it sees either 0 (before line 307) or the parent's group (after), never a half-written
+      value.
+  - title: A freed slot belongs to no group
+    commit: 1
+    file: kernel/proc.c
+    lines: 152-172
+    focus: 164-171
+    state:
+      hart: any
+      mode: S
+      proc: "the parent, reaping a zombie in kwait"
+      intr: "off"
+      satp: kernel
+      locks: [wait_lock, "the zombie's p->lock"]
+      irq: {noff: 2, intena: 1}
+      stack: [usertrap, syscall, sys_wait, kwait, freeproc]
+      sp: {"on": kernel}
+    note: |
+      [[freeproc]] runs when a zombie is reaped and resets the slot so that the next process
+      starts clean. Line 166 adds the group. Without it, a free slot would still "belong" to
+      a group, a Ctrl-C for that group would mark the free slot killed, and the next process
+      born there would die at its first system call, because [[allocproc]] never resets
+      `killed` (clinic 5 is exactly that: `ls | wc` printing `0 0 0`).
+
+      The state shown is the usual one for [[freeproc]] (reasoned, not recorded for this step):
+      called from [[kwait]] with `wait_lock` and the zombie's `p->lock` held.
+  - title: "setpgid: only yourself or your children"
+    commit: 2
+    file: kernel/proc.c
+    lines: 631-661
+    focus: 646-660
+    diff: true
+    state:
+      hart: 2
+      mode: S
+      proc: sh (pid 2)
+      intr: "off"
+      satp: kernel
+      locks: [wait_lock, "pid 4's p->lock"]
+      irq: {noff: 2, intena: 1}
+      stack: [usertrap, syscall, sys_setpgid, ksetpgid]
+      sp: {"on": kernel, detail: "pid 2's kernel stack, `sp` = `0x3fffffbf60`"}
+    note: |
+      The new system call, `setpgid(pid, pgid)` (number 23, wired up in `syscall.h`,
+      `syscall.c`, `sysproc.c`, `user.h` and `usys.pl` as in lab 1). `pid` 0 means the caller;
+      `pgid` 0 means "a new group named after `pid`".
+
+      The target must be the caller or one of its children. "Child" means `p->parent == me`,
+      and `p->parent` is protected by `wait_lock`, so the scan holds `wait_lock` and takes
+      each candidate's `p->lock` inside it: the kernel's existing order (`wait_lock`, then
+      `p->lock`, as in [[kwait]]). The `pid` and `state` checks and the store need `p->lock`.
+
+      Recorded: you typed `cat`; the shell forked pid 4 and, on hart 2, set its group at line
+      652: pid 4 was still `RUNNABLE` (it had not run yet) with `pgid` 0, now 4. noff 2:
+      `wait_lock` and pid 4's lock. A little later pid 4 itself made the same call, on the
+      same hart, and found its group already 4.
+    others: |
+      While hart 2 holds `wait_lock`, a hart in [[kexit]] or [[kwait]] spins for a few
+      instructions. Nothing here sleeps or takes another lock, so the critical section is
+      short.
+  - title: "killpgrp: kkill for a whole group"
+    commit: 3
+    file: kernel/proc.c
+    lines: 631-655
+    focus: 640-654
+    diff: true
+    state:
+      hart: 1
+      mode: S
+      proc: none (scheduler)
+      intr: "off"
+      satp: kernel
+      locks: [cons.lock, "pid 6's p->lock"]
+      irq: {noff: 2, intena: 0}
+      stack: [scheduler, kernelvec, kerneltrap, devintr, uartintr, consoleintr, killpgrp]
+      sp: {"on": scheduler, detail: "hart 1's slice of `stack0`, `sp` = `0x80009640`, with a `kernelvec` frame below"}
+    note: |
+      The heart of the lab, and almost a copy of [[kkill]]: for every slot, under its
+      `p->lock`, if the group matches, set `killed` and turn `SLEEPING` into `RUNNABLE`.
+      Two differences: it does not stop at the first match, and it counts (the console will
+      need to know whether it found anyone). Group 0 is refused at line 640: that is what keeps
+      `init` and the shell out (clinic 4).
+
+      It takes nothing but `p->lock`, one slot at a time, so it may run in an interrupt
+      handler that holds `cons.lock`. The state shown is from commit 5's point of view, in
+      the recorded run: you pressed Ctrl-C during `cat | grep x`, hart 1 was idle in
+      [[scheduler]] and took the UART interrupt, and at line 645 gdb saw three victims in a
+      row, all `SLEEPING` and all in group 6:
+
+      | slot | pid | name | asleep in |
+      |---|---|---|---|
+      | 2 | 6 | `sh` (the pipe's parent) | [[kwait]] |
+      | 3 | 7 | `cat` | [[consoleread]] |
+      | 4 | 8 | `grep` | [[piperead]] |
+
+      noff 2 (`cons.lock` plus the victim's lock), intena 0, SIE 0. Nobody dies here. Each
+      victim is only made runnable; it notices `killed` when it runs.
+    others: |
+      The other two harts pick the three victims up as soon as their `p->lock`s are
+      released. In the recording, `sh` 6 exited on hart 0, `grep` 8 on hart 1 itself (after
+      the handler returned) and `cat` 7 on hart 2: all three harts were busy dying victims
+      within the same tick.
+  - title: killpg, for programs that are not a keyboard
+    commit: 3
+    file: kernel/sysproc.c
+    lines: 101-123
+    focus: 113-123
+    diff: true
+    state:
+      hart: any
+      mode: S
+      proc: pgtest
+      intr: "on"
+      satp: kernel
+      locks: []
+      irq: 0
+      stack: [usertrap, syscall, sys_killpg]
+      sp: {"on": kernel}
+    note: |
+      `killpg(pgid)` (number 24) calls the same loop from a system call. The return
+      convention follows `kill`: -1 if nothing was found (including group 0), 0 otherwise.
+
+      It exists for testing. A Ctrl-C can only come from outside the machine, but everything
+      after the keystroke (which processes are marked, whether each one wakes, how it dies) is
+      the same loop, and `pgtest` can drive it with four sleepers in four different places.
+      From a system call the loop runs with interrupts on between its critical sections and
+      intena 1 inside them; from the console handler, with interrupts off throughout.
+  - title: The console learns which group is in front
+    commit: 4
+    file: kernel/console.c
+    lines: 47-58
+    focus: 56-57
+    diff: true
+    state:
+      hart: any
+      proc: "(a definition)"
+      locks: []
+    note: |
+      The console cannot work out "the foreground job" by itself, so it is told. The number
+      lives in `cons`, next to the input buffer, under `cons.lock`. That is the lock the
+      interrupt handler takes first anyway, so reading `cons.fg` there costs nothing, and a
+      `setfg` can never change it halfway through a Ctrl-C.
+  - title: setfg takes cons.lock from a system call
+    commit: 4
+    file: kernel/console.c
+    lines: 192-214
+    focus: 194-201
+    state:
+      hart: 2
+      mode: S
+      proc: sh (pid 2)
+      intr: "off"
+      satp: kernel
+      locks: [cons.lock]
+      irq: {noff: 1, intena: 1}
+      stack: [usertrap, syscall, sys_setfg, consolesetfg]
+      sp: {"on": kernel, detail: "pid 2's kernel stack, `sp` = `0x3fffffbf80`"}
+    note: |
+      `setfg(pgid)` (number 25; the handler in `sysproc.c` refuses negative numbers) ends
+      here. Recorded: right after the `setpgid` of the previous steps, the shell made group 4
+      the foreground on hart 2: noff 1, intena 1.
+
+      `cons.lock` is taken both here, in a system call with interrupts on before the
+      `acquire`, and in [[consoleintr]], in an interrupt handler. That is safe for the reason
+      [[concept:locks#handlers]] gives: while this hart holds `cons.lock`, its interrupts are
+      off, so a UART interrupt cannot arrive on this hart and spin forever on a lock its own
+      hart holds. One on another hart waits a few instructions.
+  - title: "Ctrl-C: drop the line, echo, kill"
+    commit: 5
+    file: kernel/console.c
+    lines: 146-192
+    focus: 158-163
+    diff: true
+    state:
+      hart: 2
+      mode: S
+      proc: none (scheduler)
+      intr: "off"
+      satp: kernel
+      locks: [cons.lock]
+      irq: {noff: 1, intena: 0}
+      stack: [scheduler, kernelvec, kerneltrap, devintr, uartintr, consoleintr]
+      sp: {"on": scheduler, detail: "hart 2's slice of `stack0`, `sp` = `0x8000a690`, above a `kernelvec` frame"}
+    note: |
+      The new `case`. Recorded for the first Ctrl-C (`cat` waiting): the interrupt was taken
+      by hart 2, which had nothing to run. It was in [[scheduler]]'s `intr_on(); intr_off();`
+      window (an idle hart sleeps in `wfi` with interrupts off and takes the pending interrupt
+      the next time round that window), so `kernelvec` pushed its frame onto hart 2's
+      scheduler stack and [[kerneltrap]] → [[devintr]] → [[uartintr]] → [[consoleintr]] run
+      on top of it. All five Ctrl-Cs in the recording landed on an idle hart, in turn on
+      harts 2, 2, 1, 1 and 2. `cons.lock` is held from line 152: noff 1, intena 0.
+
+      Line 159 drops the line being edited (the characters from `cons.w` to `cons.e`, the
+      same region `^U` erases), so a half-typed command never reaches the next reader. Lines
+      160-162 echo `^C` and a newline through [[consputc]], which writes the UART directly
+      with interrupts off: safe here, unlike the sleeping [[uartwrite]]. Line 163 kills the
+      foreground group (previous steps): at this moment `cons.fg` was 4, `cat`'s group, and
+      `cat` (pid 4, slot 2) was `SLEEPING`.
+
+      ```text
+      hart 2's scheduler stack (stack0 slice), during the Ctrl-C
+        top ─► start, main      (boot frames, never popped)
+               scheduler
+               kernelvec        (256-byte frame: the interrupted registers)
+               kerneltrap
+               devintr
+               uartintr
+               consoleintr      (sp = 0x8000a690)
+      ```
+    others: |
+      Nobody else can touch the input buffer now: [[consoleread]] needs `cons.lock`. And no
+      other hart can be inside this `case` at the same time; a second Ctrl-C byte arriving
+      meanwhile waits in the UART until [[uartintr]]'s loop reads it.
+  - title: "Nobody found: an empty line; somebody found: wake the console's sleepers"
+    commit: 5
+    file: kernel/console.c
+    lines: 146-192
+    focus: 163-172
+    state:
+      hart: 2
+      mode: S
+      proc: none (scheduler)
+      intr: "off"
+      satp: kernel
+      locks: [cons.lock]
+      irq: {noff: 1, intena: 0}
+      stack: [scheduler, kernelvec, kerneltrap, devintr, uartintr, consoleintr]
+      sp: {"on": scheduler}
+    note: |
+      If the kill loop found nobody (at the prompt, or a group whose processes are gone), the
+      reader gets an empty line: one `\n` stored and published by moving `cons.w`, exactly as
+      a typed Enter would, minus the echo (the handler already echoed a newline). The shell's
+      `read` returns it, the shell skips the blank command and prints a fresh `$ `. The test
+      on line 163 also checks for room, as the default `case` does: a buffer full of
+      unread lines gets nothing more.
+
+      Line 171 is the subtle one, and it runs in both cases. A reader that was killed while
+      fully asleep is already `RUNNABLE`. But a reader that had released `cons.lock` and not
+      yet reached [[sleep]] is still `RUNNING`, with `p->chan` = `&cons.r`; the kill loop
+      only set its `killed`. [[wakeup]] clears its `chan`, so [[sleep]] returns at once
+      instead of sleeping until the next Enter. When nobody was killed, the same call wakes
+      the shell for its empty line. (It helps only readers of the console; a victim in the
+      same window in [[piperead]] or [[kwait]] is not covered, as the think section explains.)
+
+      Recorded: the wakeup at line 171 ran on hart 2 with noff 1 still (each `p->lock` inside
+      [[wakeup]] makes it 2 for a moment).
+    others: |
+      The window this line closes, as it would play out:
+
+      | time | hart 0: `cat` | hart 2: this handler |
+      |---|---|---|
+      | 1 | `killed`? no; `sleep_prepare(&cons.r)`; `release(&cons.lock)` | spins on `cons.lock` |
+      | 2 | | acquires; `cat` is `RUNNING`: `killed = 1` only |
+      | 3 | | `wakeup(&cons.r)`: `cat`'s `chan` = 0 |
+      | 4 | [[sleep]]: `chan` is 0, return at once | |
+      | 5 | loop: `killed`? yes: return -1 | |
+
+      Without line 171, step 4 would put `cat` to sleep with `killed` set, until the next
+      line arrived.
+  - title: The victim notices
+    commit: 5
+    file: kernel/console.c
+    lines: 87-115
+    focus: 102-106
+    state:
+      hart: 0
+      mode: S
+      proc: cat (pid 4)
+      intr: "on"
+      satp: kernel
+      locks: []
+      irq: 0
+      stack: [usertrap, syscall, sys_read, fileread, consoleread]
+      sp: {"on": kernel, detail: "pid 4's kernel stack, `sp` = `0x3fffff9f00`"}
+    note: |
+      Back to the first Ctrl-C. `cat` (pid 4) had been asleep inside [[sleep]] (line 109),
+      called from this loop. Made `RUNNABLE` by the kill loop on hart 2, it was picked up by
+      hart 0's scheduler within the same tick, returned from [[sleep]], took `cons.lock`
+      again, found the buffer still empty (`cons.r` = `cons.w` = 12: the Ctrl-C added
+      nothing), and this time the test on line 103 said yes. gdb recorded it at line 105,
+      after the release: hart 0, noff 0, SIE on.
+
+      Note the migration: `cat` went to sleep on whatever hart it was running on and wakes
+      on hart 0, chosen by whichever scheduler found it first. [[consoleread]] returns -1;
+      `read` in `cat` never sees it.
+  - title: usertrap ends the job
+    commit: 5
+    file: kernel/trap.c
+    lines: 49-95
+    focus: 81-82
+    state:
+      hart: 0
+      mode: S
+      proc: cat (pid 4)
+      intr: "on"
+      satp: kernel
+      locks: []
+      irq: 0
+      stack: [usertrap]
+      sp: {"on": kernel, detail: "pid 4's kernel stack, `sp` = `0x3fffff9fe0`: only usertrap's frame is left"}
+    note: |
+      The system call has returned into [[usertrap]], and before going back to user space it
+      checks `killed` again ([[kernel/trap.c:81]], unchanged by the branch). `cat` calls
+      `kexit(-1)` here, on hart 0. Every killed process in the recording died at this line:
+      `cat` 4, `pause` 5, the pipeline's `sh` 6, `cat` 7, `grep` 8 and the last `cat`, 12. `pause` and `grep`
+      returned from [[sys_pause]] and [[piperead]] with -1 first; `sh` 6 from [[kwait]].
+
+      [[kexit]] closes the files, wakes the parent and becomes a zombie; the shell (pid 2),
+      asleep in `wait`, reaps it. Its exit status is -1, the same value a process killed for
+      a bad memory access gets, which is why the shell does not try to print "interrupted".
+
+      The last of the kernel commits is done. Up to here the shell never sets a group, so
+      every Ctrl-C finds nobody and only gives an empty line. The next commit lets it say
+      which job is in front.
+  - title: The shell puts each job in front
+    commit: 6
+    file: user/sh.c
+    lines: 147-186
+    focus: 173-183
+    diff: true
+    state:
+      hart: 2
+      mode: U
+      proc: sh (pid 2)
+      intr: "on"
+      satp: user
+      locks: []
+      stack: [main]
+      sp: {"on": user}
+    note: |
+      Six lines in the shell, and the only place that knows where a job begins and ends.
+
+      - Line 176: the child moves itself into a new group named after its pid, before
+        `runcmd` can fork anything. Everything the job forks from here on inherits it.
+      - Line 179: the shell does the same for the child, in case it runs first. In the
+        recorded run it did: the shell's call found pid 3 still `RUNNABLE`.
+      - Line 180: only now is the group made the foreground one. It has a member, so a
+        Ctrl-C from this moment on finds the job. (Before it, from `fork1()` on, the
+        foreground group is still 0: a Ctrl-C there only produces an empty line, which the
+        new job may read.)
+      - Line 182: after `wait`, nobody is in front. A Ctrl-C at the prompt finds group 0,
+        is refused, and gets an empty line.
+
+      The shell itself never calls `setpgid` for itself: it stays in group 0 with `init`,
+      the group no Ctrl-C can reach.
+
+      The recorded sequence for `cat`: `fork` → pid 4; shell `setpgid(4, 4)`; shell
+      `setfg(4)`; pid 4 `setpgid(0, 0)`; pid 4 execs `cat`; Ctrl-C; `wait` returns 4;
+      `setfg(0)`.
+    others: |
+      `cd` is not affected: it runs in the shell itself, with no fork and no job.
+  - title: A background job leaves the group
+    commit: 6
+    file: user/sh.c
+    lines: 99-134
+    focus: 125-131
+    state:
+      hart: 0
+      mode: U
+      proc: sh (pid 10)
+      intr: "on"
+      satp: user
+      locks: []
+      stack: [main, runcmd]
+      sp: {"on": user}
+    note: |
+      For `(pause 30; echo survived) &` the shell's child (pid 9, group 9, in front) forks
+      pid 10 for the command and exits at once; the shell's `wait` returns and it calls
+      `setfg(0)`. Pid 10 inherited group 9, so before it does anything else it moves to a
+      group of its own (line 128). In the recording it did so on hart 0 (gdb saw its `pgid`
+      go from 9 to 10), and the `pause` it forked a moment later was born into group 10.
+      Group 10 is never made the foreground one, so no Ctrl-C reaches it: in the test, `cat`
+      and a Ctrl-C ran while the job slept, and `survived` appeared on time.
+
+      The shell's child does not need to set pid 10's group as well: nothing here races with
+      a `setfg`. The cost of that simplicity is a window of a few microseconds after the
+      `fork` in which a Ctrl-C for job 9 would still kill pid 10.
+  - title: pause, a job that sleeps without reading
+    commit: 7
+    file: user/pause.c
+    lines: 1-15
+    focus: 9-14
+    diff: true
+    state:
+      hart: any
+      mode: U
+      proc: pause
+      intr: "on"
+      satp: user
+      locks: []
+      stack: [main]
+      sp: {"on": user}
+    note: |
+      A two-line program around the `pause` system call: [[sys_pause]] sleeps on `&ticks` and
+      checks `killed` every tick ([[tour:14]]). It is the second kind of foreground job the
+      lab needs: asleep in the kernel but not waiting for the console, so it shows that the
+      kill reaches jobs that the console has nothing to do with. If `pause` is killed, the
+      system call returns -1 and [[usertrap]] ends the process before `main` sees the value,
+      so the program does not check it.
+  - title: pgtest drives the kill loop from inside
+    commit: 8
+    file: user/pgtest.c
+    lines: 45-125
+    focus: 68-110
+    diff: true
+    state:
+      hart: any
+      mode: U
+      proc: pgtest
+      intr: "on"
+      satp: user
+      locks: []
+      stack: [main]
+      sp: {"on": user}
+    note: |
+      The in-kernel test. A leader in a new group forks three members; together they are
+      asleep in four different places: [[kwait]] (the leader), [[piperead]] on a pipe whose
+      write end the member holds itself (so it never sees end-of-file), [[sys_pause]], and
+      [[consoleread]]. Each writes its pid to `ready` just before blocking; `pgtest` waits
+      half a second more so that all four are really asleep, then calls `killpg` once.
+
+      How does a test know they all exited, without a way to ask? Every member inherited
+      `done[1]` and `pgtest` closed its own copy (line 87), so the `read` on line 109 returns
+      0 (end-of-file) only when all four have exited and closed it. If the kill failed to
+      wake someone, that `read` would block forever, so a watchdog (lines 95-105) writes one
+      byte to the pipe `wd`, then kills the members one by one with `kill()` after 3 seconds.
+      `pgtest` reports `FAIL` if that byte is there once the watchdog has exited: clinic 3
+      shows that line failing. (The byte, rather than the watchdog's exit status, is the
+      evidence: a watchdog preempted right after its last `kill()` would be killed by `pgtest`
+      itself and exit with -1 just like one that never acted.)
+
+      A process in another group (forked first, line 59) must still answer on its pipe after
+      the `killpg`. The last line of the output says what this program cannot test: the
+      keystroke.
+  - title: ctrlc-test.py types the key
+    commit: 9
+    file: ctrlc-test.py
+    lines: 80-129
+    focus: 83-125
+    diff: true
+    state:
+      hart: none
+      proc: "(the host: a Python script talking to QEMU's UART)"
+      locks: []
+    note: |
+      The only way to press Ctrl-C is from outside the machine. QEMU's `-nographic` connects
+      the UART to its standard input and output, so the script starts QEMU with both on
+      pipes, writes `cat\n`, waits a second, writes the byte `\x03`, and waits for
+      `^C\n$ ` to come back. Each scenario of the spec is one check: `cat`, `pause 1000`
+      (it also prints how long the prompt took), `cat | grep x`, a background job surviving,
+      Ctrl-C at the prompt, a half-typed line dropped, and finally that `init: starting sh`
+      appeared only once, so the shell was never replaced.
+
+      A pitfall: a driver that waits for the text `survived` and then immediately sends the
+      next `\x03` breaks. `echo` writes its argument and the newline with two separate
+      `write` calls, so the kernel's `^C\n` can land between them and the next check sees
+      `^C\n\n$ `. The test waits for `survived\n`. Output from three harts and a test
+      driver interleaves at byte granularity; tests must wait for whole lines.
+
+      A second pitfall: a half-typed-line check that only looks for the text `junecho` is
+      too weak. A kernel without `cons.e = cons.w` passes it, because with no job the Ctrl-C
+      completes the line with its `\n` and the shell simply runs `echo jun`. So the check
+      demands `echo jun^C` followed directly by a prompt (line 122). With that line removed
+      from the kernel, the check fails (9 of 10); the console shows `echo jun^C`, then `jun`.
+
+      Commands after `--` are typed at the end: the verification below ran `pgtest`,
+      `usertests -q` and `pgtest` again in the same boot.
+verify: |
+  On the branch (`ext/06-ctrl-c`, 9 commits), run on 3
+  harts (`-smp 3 -m 128M`) by `ctrlc-test.py kernel fs.img -- pgtest "usertests -q" pgtest`,
+  all in one boot:
+
+  ```text
+  $ cat
+  ^C
+  $
+  ### ctrlc-test: cat waiting for input, then ^C: OK
+  pause 1000
+  ^C
+  $
+  ### ctrlc-test: pause 1000, then ^C (prompt after 0.001 s): OK
+  cat | grep x
+  ^C
+  $
+  ### ctrlc-test: cat | grep x, then ^C: OK
+  [...]
+  ### ctrlc-test: the shell was never restarted: OK
+  pgtest
+  pgtest: setpgid on a process that is not our child fails: OK
+  [...]
+  pgtest: ALL OK (the Ctrl-C keystroke itself is tested by ctrlc-test.py)
+  $ usertests -q
+  usertests starting
+  test copyin: OK
+  test copyout: OK
+  [...]
+  ALL TESTS PASSED
+  $ pgtest
+  [...]
+  pgtest: ALL OK (the Ctrl-C keystroke itself is tested by ctrlc-test.py)
+  $
+  ctrlc-test: 10 of 10 checks OK
+  ctrlc-test: ALL OK
+  ```
+
+  (The `### ctrlc-test:` lines are the driver's own, printed between the console output it
+  passes through.) Two more boots with the same commands gave the same result: 10 of 10,
+  `pgtest` ALL OK twice, ALL TESTS PASSED.
+
+  What it shows: Ctrl-C reaches a reader of the console, a sleeper in `pause`, and all
+  three processes of a pipeline; a background job lives through it; at the prompt it only
+  produces a new prompt; and the shell is never restarted. `pgtest` shows that `killpg` wakes
+  sleepers in [[kwait]], [[piperead]], [[sys_pause]] and [[consoleread]] without help.
+  `usertests -q` passing shows that nothing else changed, including `kill` itself
+  (`killstatus`, `kill`-based tests) and every program that forks and waits, now through a
+  shell that calls three new system calls per command.
+
+  The same `ctrlc-test.py` against the original kernel: `ctrlc-test: 1 of 10 checks OK`
+  (only "the shell was never restarted"). `^C` is stored as the byte `0x03` and the first
+  `cat` is never interrupted, so it reads every line typed after it: the driver's
+  `echo alive` came back twice, once as the console's echo and once printed by `cat`.
+
+  Every commit builds on its own (`make kernel/kernel fs.img`, only the usual RWX link
+  warning).
+measure: |
+  **How fast does a Ctrl-C take effect?** Time from writing `\x03` to QEMU's standard input
+  until the next `$ ` came back, measured by the driver on the host (no gdb attached; QEMU
+  10.2.1, 3 harts):
+
+  | foreground job | where the victims were | prompt after |
+  |---|---|---|
+  | `cat` | asleep in [[consoleread]] | 0.001 s |
+  | `pause 1000` | asleep in [[sys_pause]] (would have taken 100 s) | 0.001 s |
+  | `cat \| grep x` | [[kwait]], [[consoleread]], [[piperead]] | 0.006 s |
+  | `spin` (a loop in user mode, no system calls; not on the branch) | running on another hart | 0.001 s, three times |
+
+  Everything is bounded by the time the victims need to be scheduled and exit, and the
+  shell to be woken: a few milliseconds of emulated time. The surprise is `spin`. It is
+  running when the kill arrives and only dies at its next trap; one would expect that to be
+  its hart's next timer interrupt, up to 1/10 s later. gdb (four Ctrl-Cs) showed something
+  else: the Ctrl-C was always taken by an idle hart, and `spin` died on another hart a moment
+  later at an external-interrupt trap (`scause` `0x8000000000000009`), in the same tick.
+  An instrumented [[devintr]] showed that in 5 of 5 kills, `spin`'s hart took that
+  trap but its `plic_claim()` returned 0. The PLIC signals the interrupt to every hart,
+  another hart claimed and handled the UART, and the empty trap was still enough to bring
+  `spin` into [[usertrap]]'s `killed` test. Do not rely on it: the timer is the guarantee.
+
+  **The original kernel.** The same keystroke on 06aad25 (control bytes shown as `cat -v`
+  shows them; `^C` here is the single byte `0x03`, echoed back by the UART, not the two
+  characters the branch prints):
+
+  ```text
+  $ cat
+  ^C
+  ^C
+  ^D$ echo after
+  after
+  ```
+
+  `cat` waits for Enter, then prints the line holding the `0x03` byte, and only Ctrl-D ends
+  it. And with `spin` (added for this measurement), Ctrl-C changes nothing; five seconds
+  later Ctrl-P still lists `3 run    spin`. There is no way back to the prompt but a reboot.
+
+  **The windows, made wide on purpose** (scratch copies with an added delay, not the
+  branch):
+
+  - A `pause(20)` between the shell's `wait` and `setfg(0)`: a Ctrl-C pressed after `echo
+    hi` finished found only a reaped group and produced an empty line, and the console
+    showed `$ $ ` (two prompts). Nothing was killed; `ls | wc` afterwards printed `26 104
+    660`.
+  - A delay loop in [[kfork]] before the child joins its group (only for processes already
+    in a job): Ctrl-C half a second after `cat | grep x` killed the leader in the middle of
+    its first `fork`, and Ctrl-P showed `cat` (pid 4) still alive. The next line typed, `xx`, went to
+    that orphan `cat`, not to the shell (`cat: write error`, since `grep` never existed).
+further: |
+  - **Close the fork window.** Add a spinlock (say `pgrp_lock`) held across the whole kill
+    loop and across the moment in [[kfork]] when the child copies its parent's group; in that
+    critical section also copy the parent's `killed`. Work out the new lock order
+    (`cons.lock` → `pgrp_lock` → `p->lock`) and check it against every existing path. Note
+    the side effect: copying `killed` also lets a plain `kill(pid)` of a forking parent kill
+    its new child, which `kill` did not do before. The alternative is for [[kfork]] to free
+    the child and return -1 when, under that lock, it finds the parent killed. (A
+    `pgrp_lock` version was built and tested: no escape with the delay, all tests
+    passing without it.)
+  - **Close the sleep window for every victim.** Clear `p->chan` in the kill loop, under
+    `p->lock`, so that any victim between [[sleep_prepare]] and [[sleep]] returns at once,
+    whatever it waits for; `wakeup(&cons.r)` is then needed only for the empty line. Check
+    that every sleep loop in the tree re-checks its condition (they do), and measure that
+    nothing changes for the tests.
+  - **Signals instead of kill.** Let a process choose what Ctrl-C does to it: a handler
+    (as in lab 5's `sigalarm`) or ignore. `sh` would ignore it, and the kernel would no longer
+    need group 0 to protect the shell. You will need a pending-signal bit and a check in
+    [[usertrap]] alongside `killed`.
+  - **Ctrl-Z and job control.** A `STOPPED` state that the scheduler skips, a `^Z` that stops
+    the foreground group, and `fg`/`bg` in the shell. Teaches why a stopped process must still
+    be reapable and killable, and why the shell must hear about stops through `wait`.
+  - **Only the foreground job may read.** Make a background job that reads the console sleep
+    (or fail) instead of stealing the shell's input, as Unix's `SIGTTIN` does. The orphaned
+    `cat` in the fork-window experiment shows why this matters.
+  - **An exit status that says why.** Make `wait` report "killed by Ctrl-C" distinctly from
+    "killed for a fault", so the shell can print a newline or a message only when it should.

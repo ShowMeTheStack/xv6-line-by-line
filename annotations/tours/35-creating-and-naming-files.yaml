@@ -1,0 +1,634 @@
+title: Creating and naming files
+group: File system
+prerequisites: [31, 33, 34]
+summary: |
+  `echo hi > newfile` creates a file. That sounds like one action, but on the disk it is
+  three: an [[g:inode]] must be found and marked used, a directory entry must be written
+  that names it, and the directory's own inode is updated. Meanwhile, on two other harts,
+  other processes may be creating files in the same directory, perhaps with the same name.
+
+  This tour follows [[create]], called by [[sys_open]] with `O_CREATE`, line by line: how
+  it finds the parent directory, why it holds the parent's lock from the first lookup to
+  the last write, how [[ialloc]] scans the inode blocks for a free inode, and how
+  [[dirlink]] adds the name. Then it follows the other naming system calls: [[sys_link]]
+  (a second name for the same inode), [[sys_unlink]] (removing a name, and why `.` and
+  `..` are refused), and `mkdir`, whose `.` and `..` make the [[g:link-count]] of a
+  directory something to think about.
+
+  Throughout, watch the order of the locks: parent directory first, then the child, never
+  the reverse. And at the end, watch two harts create the same name at the same moment.
+cast: |
+  The machine has three [[g:hart|harts]], on a fresh boot (so the next free inode is 24).
+  When the tour starts:
+
+  | Hart | What it is doing |
+  |---|---|
+  | 0 | Idle in its [[kernel:scheduler]] |
+  | 1 | Running `sh` (pid 3), the shell's child for `echo hi > newfile`: the process this tour follows |
+  | 2 | Idle, or running another process that creates files in `/` |
+
+  The shell (pid 2) waits in [[kernel:kwait]]. Block numbers come from this build's `mkfs`
+  and a traced copy of the kernel: inodes 1–15 live in block 33, 16–31 in block 34; the
+  root directory's content is block 47; the bitmap is block 46.
+steps:
+  - title: The shell asks for a new file
+    file: user/sh.c
+    lines: 383-401
+    focus: 394-399
+    state:
+      hart: 1
+      mode: U
+      proc: sh (pid 3)
+      intr: on
+      satp: user
+      locks: []
+      stack: [main, parsecmd, parseline, parsepipe, parseexec, parseredirs]
+      sp: user
+    note: |
+      The shell forks first; the child (pid 3) parses the line. The parser turns
+      `> newfile` into a redirection with mode `O_WRONLY | O_CREATE | O_TRUNC`: write only,
+      create the file if it is missing, empty it if it exists. Then [[runcmd]] closes
+      descriptor 1 and calls `open("newfile", mode)` ([[user/sh.c:86]]).
+
+      Note `>>` on line 397: `O_WRONLY | O_CREATE`, no `O_TRUNC`. xv6 has no `O_APPEND`,
+      so `>>` does not append; it overwrites from the start of the file ([[tour:36]]).
+
+      Everything from here on is pid 3 in the kernel. The path is relative (`newfile`, no
+      `/`), so the walk will start from the shell's current directory, `/`.
+
+  - title: One transaction for the whole open
+    file: kernel/sysfile.c
+    lines: 328-348
+    focus: 337-344
+    state:
+      hart: 1
+      mode: S
+      proc: sh (pid 3)
+      intr: on
+      satp: kernel
+      locks: []
+      irq: 0
+      stack: [usertrap, syscall, sys_open]
+      sp: {"on": kernel, switched: "`ld sp, 8(a0)` in `uservec` ([[kernel/trampoline.S:76]]) when the shell executed `ecall`", detail: "sh's kernel stack: usertrap, syscall, sys_open"}
+    note: |
+      [[sys_open]] fetches the mode and copies the path into the kernel with [[argstr]].
+      Then [[begin_op]]: everything `create` writes, and the `O_TRUNC`, will be one
+      [[g:transaction]] ([[tour:31]]). If the power fails, `newfile` will exist completely
+      or not at all ([[tour:32]]).
+
+      With `O_CREATE`, it calls [[create]]`(path, T_FILE, 0, 0)`. The same function makes
+      directories for [[sys_mkdir]] and device files for [[sys_mknod]]; `major` and `minor`
+      matter only for devices.
+
+      From here to the end of `create`, the shell runs on its **kernel stack**
+      ([[concept:stacks#kernel]]), which was empty at the `ecall` until `uservec` pointed `sp`
+      at its top ([[kernel/trampoline.S:76]]). The path `argstr` copied lives there, in
+      `sys_open`'s local `path[128]`, and `create` will add a frame with its own `name[14]`
+      for the last element.
+
+  - title: Find the parent, lock it, check it still exists
+    file: kernel/sysfile.c
+    lines: 258-278
+    focus: 267-272
+    state:
+      hart: 1
+      mode: S
+      proc: sh (pid 3)
+      intr: on
+      satp: kernel
+      locks: ["inode 1 lock (sleep-lock)"]
+      irq: 0
+      stack: [usertrap, syscall, sys_open, create]
+      sp: kernel
+    note: |
+      [[nameiparent]] walks the path but stops before the last element ([[tour:34]]). For
+      `newfile` it returns the current directory, `/` (inode 1), referenced and unlocked,
+      and copies `"newfile"` into `name`.
+
+      Line 267 locks the parent, and `create` **keeps that lock until the very end**
+      (line 315). Every decision from here on (does the name exist? where does the entry
+      go?) is made and acted on under one lock.
+
+      Then two checks:
+
+      - `dp->nlink == 0`: the directory was deleted between `nameiparent` and this lock
+        (it was unlocked in between). Creating a file there would put it in a directory no
+        path reaches. Added in commit `9da28f5`.
+      - For a new directory, `dp->nlink >= NLINK_MAX`: its `..` would overflow the parent's
+        16-bit link count (commit `fa4789f`).
+    others: |
+      A process on hart 2 creating `/other` at the same time also calls
+      `ilock(/)` and sleeps until pid 3 releases it. Creation in one directory is
+      serialized by that directory's sleep-lock. Creation in *different* directories runs
+      in parallel, which is why [[ialloc]] needs its own protection (step 5).
+
+  - title: Is the name already taken?
+    file: kernel/sysfile.c
+    lines: 280-287
+    focus: 280-287
+    state:
+      hart: 1
+      mode: S
+      proc: sh (pid 3)
+      intr: on
+      satp: kernel
+      locks: ["inode 1 lock (sleep-lock)"]
+      irq: 0
+      stack: [usertrap, syscall, sys_open, create]
+      sp: kernel
+    note: |
+      [[dirlookup]] scans the root for `newfile`, all 64 slots of its 1024-byte block
+      (the root was made one block long by `mkfs`). Not found.
+
+      Had it been found, as with `echo hi > README`, `create` would unlock the parent and
+      lock the existing inode instead. For `T_FILE` requests, an existing file or device is
+      fine: `open` simply opens it (and `O_TRUNC` will empty it). Anything else, such as
+      `mkdir` of an existing name or `open(O_CREATE)` on a directory, fails.
+
+      Notice the order there: [[iunlockput]] the parent, *then* [[ilock]] the child. Here
+      this is required, not a nicety. `create` never refuses the names `.` and `..` (only
+      [[sys_unlink]] does): for `open(".", O_CREATE)`, [[dirlookup]] returns the parent
+      itself, and locking it while still holding it would deadlock the process against
+      itself; for `x/..` it would lock `x`'s parent while holding `x`, the reverse of the
+      parent-first order. Unlocking first makes both cases safe; they simply fail, because
+      the existing inode is a directory.
+
+  - title: ialloc scans for a free inode
+    file: kernel/fs.c
+    lines: 196-221
+    focus: 208-214
+    state:
+      hart: 1
+      mode: S
+      proc: sh (pid 3)
+      intr: on
+      satp: kernel
+      locks: ["inode 1 lock (sleep-lock)", "buf 34 (sleep-lock)"]
+      irq: 0
+      stack: [usertrap, syscall, sys_open, create, ialloc]
+      sp: kernel
+    note: |
+      [[ialloc]] looks at every inode in order, from 1 up, reading each one's block with
+      [[bread]]: inodes 1–15 in block 33, then 16 onwards in block 34. A [[dinode]] with
+      `type == 0` is free. On a fresh boot inodes 1–23 are used (the root, `README`, 20
+      programs, and `console`), so the 24th one checked, inode 24 at byte 512 of block 34,
+      is the first free one.
+
+      It claims it in the buffer: zero all 64 bytes, set `type = T_FILE`, [[log_write]]. The
+      on-disk `type` field *is* the allocation bit; there is no separate inode bitmap.
+      Then [[brelse]] and [[iget]]`(1, 24)`: a referenced, unlocked, not-yet-valid entry.
+
+      That is 24 `bread`/`brelse` pairs to find one inode. They hit the
+      [[g:buffer-cache]] (block 34 was read at boot for `console`), so it costs time, not
+      disk reads.
+    others: |
+      Two processes creating files in *different* directories can both be in `ialloc` at
+      once. What stops both from claiming inode 24?
+
+      | Time | Hart 1 (pid 3, in `/`) | Hart 2 (in `/a`) |
+      |---|---|---|
+      | t1 | `bread(34)`: holds buffer 34's sleep-lock | `bread(34)`: sleeps on the buffer lock |
+      | t2 | inode 24 `type == 0`: sets `type = T_FILE`, `brelse` | |
+      | t3 | | gets buffer 34; inode 24 `type == 2`: skip; inode 25 free: claims it |
+
+      The test of `type` and the write of `type` happen under one buffer sleep-lock, so
+      they are atomic with respect to every other `ialloc`. The buffer cache's rule "one
+      process per buffer at a time" ([[tour:30]]) doubles as the inode allocator's lock.
+
+  - title: Initialize the new inode, parent still locked
+    file: kernel/sysfile.c
+    lines: 289-298
+    focus: 294-298
+    state:
+      hart: 1
+      mode: S
+      proc: sh (pid 3)
+      intr: on
+      satp: kernel
+      locks: ["inode 1 lock (sleep-lock)", "inode 24 lock (sleep-lock)"]
+      irq: 0
+      stack: [usertrap, syscall, sys_open, create]
+      sp: kernel
+    note: |
+      [[ilock]] on inode 24 reads block 34 again (from the cache) and copies the freshly
+      zeroed dinode with its new type. Then `create` sets `major`, `minor` and `nlink = 1`,
+      and [[iupdate]] logs block 34 a second time (absorbed: still one log entry).
+
+      `nlink = 1` is set *before* the directory entry exists. For a moment, in memory, the
+      inode claims a link it does not have. That is harmless: it is all one transaction, so
+      the disk never sees the inode without its entry, and the failure path (step 8)
+      corrects the count if the entry cannot be written.
+
+      Now pid 3 holds **two** inode locks: the parent and the child. Every path in xv6
+      that holds two inode locks takes a directory first and then something named inside
+      it ([[sys_unlink]] does the same), never the reverse; paths that might break this
+      give up the first lock: [[namex]] holds one at a time, and `create` unlocks the
+      parent before locking an existing entry (step 4). So no cycle of waiting can form
+      ([[concept:locks#order]]).
+    others: |
+      Could another process be waiting for inode 24's lock? Only if it had a reference,
+      and the only way to get one is through a directory entry (there is none yet) or
+      [[ialloc]] (which now sees `type != 0`). So pid 3 is the only process that knows
+      inode 24 exists. That is why taking a second lock here is cheap.
+
+  - title: dirlink writes the name into the parent
+    file: kernel/fs.c
+    lines: 617-646
+    focus: 626-645
+    state:
+      hart: 1
+      mode: S
+      proc: sh (pid 3)
+      intr: on
+      satp: kernel
+      locks: ["inode 1 lock (sleep-lock)", "inode 24 lock (sleep-lock)"]
+      irq: 0
+      stack: [usertrap, syscall, sys_open, create, dirlink]
+      sp: kernel
+    note: |
+      [[dirlink]] first checks once more that the name is absent (redundant for `create`,
+      which just checked under the same lock, but [[sys_link]] relies on it). Then it looks
+      for an empty slot, an entry with `inum == 0`. Entry 24, at offset 384, is the first.
+
+      It fills a [[kernel:dirent|dirent]] with `inum = 24` and the name ([[strncpy]] pads with
+      zeros up to 14 bytes, and leaves a 14-character name unterminated), and [[writei]]s
+      the 16 bytes. `writei` logs block 47, and then [[iupdate]]s the root inode, logging
+      block 33.
+
+      While `writei` has block 47 locked, pid 3 holds **three** sleep-locks (two inodes and
+      a buffer), the most any process held at once in an instrumented run of the whole test
+      suite ([[concept:locks#nesting]]). Yet the irq strip reads `noff` 0 and interrupts are
+      on: sleep-locks are not push_off levels, and `lk->lk` inside each is held only within
+      [[acquiresleep]] and [[releasesleep]] ([[concept:locks#sleep-locks]]).
+
+      If no slot were free, the loop would end with `off == dp->size`, and `writei` at that
+      offset would **grow** the directory by one entry, allocating a new block through
+      [[bmap]] if needed. That is the step that can fail: out of disk space.
+
+  - title: When dirlink fails, iput cleans up
+    file: kernel/sysfile.c
+    lines: 300-326
+    focus: 306-325
+    state:
+      hart: 1
+      mode: S
+      proc: sh (pid 3)
+      intr: on
+      satp: kernel
+      locks: ["inode 1 lock (sleep-lock)", "inode 24 lock (sleep-lock)"]
+      irq: 0
+      stack: [usertrap, syscall, sys_open, create]
+      sp: kernel
+    note: |
+      `dirlink` succeeded for `newfile`, so `create` skips to line 315: [[iunlockput]] the
+      parent, and return the new inode **locked** to [[sys_open]].
+
+      The `fail:` path is worth reading anyway. The inode is already allocated on disk (in
+      the log). To undo it, `create` sets `nlink = 0` and calls [[iunlockput]]. This is the
+      last reference to an inode with no links, so [[iput]] truncates it and frees it
+      ([[tour:33]]). There is no separate "deallocate" code: an unnamed, unreferenced inode
+      *is* garbage, and `iput` is the garbage collector.
+
+      Because all of this is in the open transaction, the allocation and its undoing commit
+      together: the disk never sees inode 24 allocated.
+
+  - title: A slot in the file table
+    file: kernel/file.c
+    lines: 28-44
+    focus: 35-37
+    state:
+      hart: 1
+      mode: S
+      proc: sh (pid 3)
+      intr: off
+      satp: kernel
+      locks: ["inode 24 lock (sleep-lock)", ftable.lock]
+      irq: {noff: 1, intena: 1, note: "`ftable.lock` taken in a system call with SIE on, so intena 1; the inode 24 sleep-lock adds no level"}
+      stack: [usertrap, syscall, sys_open, filealloc]
+      sp: kernel
+    note: |
+      Back in [[sys_open]] ([[kernel/sysfile.c:368]]), the inode needs an [[g:open-file]].
+      [[filealloc]] scans the [[NFILE]] = 100 `struct file`s for one with `ref == 0` and
+      sets `ref = 1`, all under `ftable.lock`, a [[g:spinlock]] (so interrupts are off on
+      hart 1 for the scan).
+
+      The pattern is the same as [[iget]]'s: the scan for a free entry and the claim
+      (`ref = 1`) must happen under one lock, or two harts could claim the same
+      `struct file`.
+    others: |
+      Every `open`, `pipe` and `dup` on every hart goes through `ftable.lock`. The
+      critical section is a short loop with no sleeping, so a spinlock is the right tool.
+      Note that pid 3 holds an inode sleep-lock while it spins here; that is allowed (it
+      is not sleeping while holding a spinlock, it is spinning while holding a sleep-lock).
+
+  - title: fdalloc, and the file is open
+    file: kernel/sysfile.c
+    lines: 362-395
+    focus: 368-390
+    state:
+      hart: 1
+      mode: S
+      proc: sh (pid 3)
+      intr: on
+      satp: kernel
+      locks: ["inode 24 lock (sleep-lock)"]
+      irq: 0
+      stack: [usertrap, syscall, sys_open]
+      sp: kernel
+    note: |
+      [[fdalloc]] gives the lowest free descriptor in this process's `ofile[]` table. The
+      shell closed 1 just before, so it is **1**: this is how redirection works in Unix.
+      No lock: only pid 3 uses its own table ([[tour:5]]).
+
+      The file is `FD_INODE`, offset 0, not readable, writable. `O_TRUNC` calls
+      [[itrunc]] on an inode with no blocks: it changes nothing but logs block 34 once more
+      (absorbed). Then [[iunlock]] and [[end_op]], which commits. Our trace of exactly this
+      command:
+
+          [commit pid 3 n=3: 34 47 33]
+
+      The new inode, the directory entry, the directory's inode. Three blocks, eight disk
+      writes ([[tour:32]]), and `newfile` exists. Then the child `exec`s `echo`, which
+      inherits descriptor 1.
+
+  - title: link gives an inode a second name
+    file: kernel/sysfile.c
+    lines: 122-153
+    focus: 138-152
+    state:
+      hart: 1
+      mode: S
+      proc: ln (pid 4)
+      intr: on
+      satp: kernel
+      locks: ["inode 24 lock (sleep-lock)"]
+      irq: 0
+      stack: [usertrap, syscall, sys_link]
+      sp: {"on": kernel, switched: "`ld sp, 8(a0)` in `uservec` ([[kernel/trampoline.S:76]]) when `ln` executed `ecall`", detail: "ln's kernel stack"}
+    note: |
+      Now `ln newfile alias`. [[sys_link]] does not copy anything: it adds a second
+      [[g:hard-link|directory entry]] for inode 24.
+
+      It looks up `newfile` with [[namei]] and locks it. Directories cannot be linked
+      (line 139): a second name for a directory would let the tree have cycles and give a
+      directory two parents but only one `..`. The count is capped at [[NLINK_MAX]] (commit `fa4789f`; `nlink`
+      is a 16-bit `short`). Then `nlink++` (1 → 2), [[iupdate]], and **unlock** before
+      going on.
+
+      Again the count goes up *before* the name exists. If the second half fails, the
+      `bad:` path at line 176 locks the inode again and takes it back down. Inside one
+      transaction, nobody on disk ever sees the difference.
+
+  - title: "link, second half: lock the new parent, not both"
+    file: kernel/sysfile.c
+    lines: 155-183
+    focus: 157-168
+    state:
+      hart: 1
+      mode: S
+      proc: ln (pid 4)
+      intr: on
+      satp: kernel
+      locks: ["inode 1 lock (sleep-lock)"]
+      irq: 0
+      stack: [usertrap, syscall, sys_link]
+      sp: kernel
+    note: |
+      [[nameiparent]] finds `alias`'s directory, `/`, and it is locked. Inode 24 is not
+      locked now. Why give it up? `/` is `newfile`'s parent. Holding inode 24 while locking
+      `/` would be child-then-parent, and a concurrent `rm newfile` ([[sys_unlink]]) locks
+      `/` and then inode 24:
+
+      | Time | Hart 1 (`ln`, hypothetical version) | Hart 2 (`rm newfile`) |
+      |---|---|---|
+      | t1 | holds inode 24, wants `/` | holds `/`, wants inode 24 |
+      | t2 | asleep forever | asleep forever |
+
+      Holding one inode lock at a time avoids the question.
+
+      Two checks guard the write:
+
+      - `dp->nlink == 0`: the target directory was deleted meanwhile. Linking into it would
+        leak inode 24 with a link count one too high forever. Commit `a12cd83` (August
+        2026) added this, copying the guard `create` already had.
+      - `dp->dev != ip->dev`: a link cannot cross devices, since an inode number means
+        something only on its own disk. (xv6 has one disk, so this never fires.)
+
+      [[dirlink]] writes `{24, "alias"}` at offset 400. Our trace of `ln` on another file in
+      `/` committed `n=3: 34 47 33`: the inode's new `nlink`, the entry, the root inode.
+
+  - title: unlink refuses . and .. before it locks anything else
+    file: kernel/sysfile.c
+    lines: 201-226
+    focus: 220-226
+    state:
+      hart: 1
+      mode: S
+      proc: rm (pid 5)
+      intr: on
+      satp: kernel
+      locks: ["inode 1 lock (sleep-lock)"]
+      irq: 0
+      stack: [usertrap, syscall, sys_unlink]
+      sp: kernel
+    note: |
+      `rm alias`. [[sys_unlink]] gets the parent with [[nameiparent]], locks it, and
+      immediately rejects the names `.` and `..` (`rm .` prints `rm: . failed to delete`).
+
+      Removing them would break the tree: a directory without `.`, or one whose `..` no
+      longer leads up. But look also at what would happen next with the locks. For `.`,
+      [[dirlookup]] would return the parent itself, and `ilock(ip)` on line 226 would wait
+      for a lock this process already holds: a self-deadlock. For `..`, `ip` would be the
+      parent's parent, locked while holding its child: the reverse of the parent-first
+      order. The check on line 221 rules out both before any second lock is taken.
+
+      For `alias`, `dirlookup` returns inode 24 and its offset, 400, and line 226 locks it:
+      parent first, then child.
+    others: |
+      What if `alias` were `a/..` or `a/.`? `nameiparent` returns `a` and the name `..` or
+      `.`; the same check rejects it. The check is on the *last element*, which is all that
+      `sys_unlink` ever looks up.
+
+  - title: Remove the name, then maybe the file
+    file: kernel/sysfile.c
+    lines: 228-256
+    focus: 235-242
+    state:
+      hart: 1
+      mode: S
+      proc: rm (pid 5)
+      intr: on
+      satp: kernel
+      locks: ["inode 1 lock (sleep-lock)", "inode 24 lock (sleep-lock)"]
+      irq: 0
+      stack: [usertrap, syscall, sys_unlink]
+      sp: kernel
+    note: |
+      A non-empty directory cannot be removed ([[isdirempty]] skips the first two entries,
+      `.` and `..`). For our file:
+
+      1. Zero the 16-byte entry at offset 400 with [[writei]]. The directory does not
+         shrink; the hole is reused by the next [[dirlink]].
+      2. Unlock the parent ([[iunlockput]]).
+      3. `nlink--` (2 → 1), [[iupdate]], [[iunlockput]] inode 24.
+
+      `newfile` still names inode 24, so `iput` only drops the reference. Our trace of the
+      same `rm` committed `n=3: 47 33 34`. Had this been the last link (`rm newfile` next), the
+      same `iput`, now holding the last reference to an inode with `nlink == 0`, would
+      truncate and free it ([[tour:33]]).
+
+      If inode 24 were a directory, line 239 would also decrement the **parent's** `nlink`,
+      because the child's `..` entry, which counted as a link to the parent, is going away.
+
+  - title: "mkdir: . and .., and who counts as a link"
+    file: kernel/sysfile.c
+    lines: 294-317
+    focus: 300-313
+    state:
+      hart: 1
+      mode: S
+      proc: mkdir (pid 6)
+      intr: on
+      satp: kernel
+      locks: ["inode 1 lock (sleep-lock)", "inode 25 lock (sleep-lock)"]
+      irq: 0
+      stack: [usertrap, syscall, sys_mkdir, create]
+      sp: kernel
+    note: |
+      `mkdir a` runs the same [[create]] with `T_DIR`. After the inode is initialized
+      (`nlink = 1`), lines 300–304 give the new directory its two entries:
+
+      - `.` → itself. **Not** counted in `nlink` (the comment: "avoid cyclic ref count").
+        If a directory's own `.` counted, its `nlink` could never reach 0 by removing its
+        name, and it could never be freed.
+      - `..` → the parent. This **is** counted, in the parent: line 311 does `dp->nlink++`.
+
+      So a directory's `nlink` is 1 (its name) plus one per subdirectory. On a fresh disk
+      the root goes from `nlink 1` to `2` with `mkdir a`, and `a` gets `nlink 2` once
+      `a/b` exists, as `ls` and the image confirm.
+
+      The parent's count is raised only "now that success is guaranteed", after the
+      [[dirlink]] into the parent worked. The writes, from our trace of `mkdir a` on a
+      fresh disk: `commit pid 3 n=5: 34 46 1006 47 33`: the new inode, the bitmap and
+      block 1006 (the directory's first block, for `.` and `..`), the root's entry, the
+      root's inode with `nlink 2`.
+
+  - title: Two harts, one name
+    file: kernel/sysfile.c
+    lines: 258-287
+    focus: 267-284
+    state:
+      hart: [1, 2]
+      mode: S
+      proc: two echo processes
+      intr: on
+      satp: kernel
+      locks: ["inode 1 lock (sleep-lock)"]
+      irq: 0
+      stack: [usertrap, syscall, sys_open, create]
+      sp: kernel
+    note: |
+      We ran `echo aaa > same &; echo bbbbb > same` on a fresh disk: two processes on two
+      harts, both calling `create("same")` at nearly the same time. Both reach
+      [[nameiparent]] and get `/`. Then:
+
+      | Time | Hart 1 (one echo) | Hart 2 (the other; which one wins varies) |
+      |---|---|---|
+      | t1 | `ilock(/)` | `ilock(/)`: sleeps |
+      | t2 | `dirlookup("same")`: none; `ialloc` → 24; `dirlink` | asleep |
+      | t3 | `iunlockput(/)` | wakes, holds `/` |
+      | t4 | | `dirlookup("same")`: **found, 24**; `ilock(24)` (sleeps until hart 1's `sys_open` reaches `iunlock`); `T_FILE`: return it |
+
+      Both opens succeed, with **one** inode. `ls` showed a single `same 2 24 6`. Each
+      process has its own `struct file` with its own offset, so their writes land on top
+      of each other at offset 0: in this run `cat same` printed `bbbbb`; in another run
+      with a different file name the result was `bbb` and `b` on two lines ([[tour:36]]).
+
+      Without the parent's lock held from lookup to [[dirlink]], both could see "not
+      found" at t2, both call [[ialloc]] (getting 24 and 25), and both write an entry
+      named `same`: a directory with a duplicate name, one of which [[dirlookup]] would
+      never find. Or both could choose the same free slot, and one entry would overwrite the
+      other, leaving an inode with `nlink 1` and no name: leaked forever. The second check inside `dirlink` would not help, since it too would
+      run before the other's write.
+    others: |
+      In that run, the one creation, the other open's truncation and a write ended up in
+      **one** transaction
+      (`commit pid 3 n=5: 34 47 33 46 1006`): the log's group commit ([[tour:31]]). The
+      directory lock decided the order of the two `create`s; the log made them durable
+      together.
+
+      Each `echo` runs on its own hart with its own `sp`, on its own kernel stack: two `create`
+      frames, two `name` buffers both holding `"same"`, on two different pages. Nothing on the
+      stacks is shared, so nothing there needs a lock. The shared thing is the directory, and its
+      sleep-lock is what orders them.
+
+  - title: What it costs to name a file
+    file: kernel/sysfile.c
+    lines: 258-326
+    focus: 264-317
+    state:
+      hart: 1
+      mode: S
+      proc: sh (pid 3)
+      intr: on
+      satp: kernel
+      locks: []
+      irq: 0
+      stack: [usertrap, syscall, sys_open, create]
+      sp: kernel
+    note: |
+      Creating `newfile` took: a path walk, two scans of all 64 directory slots for the name (one in `create`, one repeated in
+      [[dirlink]]) and
+      up to 25 for a free slot, 24 inode checks in [[ialloc]], three logged blocks and
+      eight disk writes at commit. Linking and unlinking each touched the same three
+      blocks.
+
+      The ideas:
+
+      - **A file is created by two independent acts**: allocating an inode (its `type`
+        becomes non-zero) and naming it (a [[kernel:dirent|dirent]]). The log makes them one.
+      - **The parent's lock spans the whole check-then-act**: lookup, allocate, link. That
+        is what makes "create if absent" atomic, and what two harts racing on one name rely
+        on.
+      - **Parent before child, and never more than needed.** `create` and `unlink` hold
+        parent then child; `link` and `namex` hold one at a time.
+      - **Counts can run ahead of reality inside a transaction** (`nlink` raised before the
+        entry exists), because nobody outside can see the difference, and the failure
+        paths put them back.
+      - **Freeing is done by [[iput]]**, whenever the last name and the last reference are
+        both gone, whether after `rm`, a failed `create`, or a crash ([[tour:32]]).
+locks:
+  - lock: "parent directory's inode sleep-lock"
+    where: "[[create]], [[sys_unlink]], [[sys_link]] (second half)"
+    protects: "The directory's entries from lookup to write: makes create-if-absent and remove-if-present atomic"
+  - lock: "child inode's sleep-lock"
+    where: "[[create]] (new inode, parent held; existing inode, parent released first); [[sys_unlink]] (parent held); [[sys_link]] (no other inode lock held)"
+    protects: "`nlink`, `type`, `size` of the child; never taken before its parent's lock is acquired"
+  - lock: "buffer sleep-lock on an inode block"
+    where: "[[ialloc]] via [[bread]]"
+    protects: "The test and set of a dinode's `type`: the inode allocator's only lock"
+  - lock: "itable.lock (spinlock)"
+    where: "[[iget]] from [[ialloc]] and [[dirlookup]]; [[iput]]"
+    protects: "Reference counts and which inode each table slot holds"
+  - lock: "ftable.lock (spinlock)"
+    where: "[[filealloc]]"
+    protects: "Finding and claiming a free `struct file`"
+  - lock: "no lock: p->ofile[]"
+    where: "[[fdalloc]]"
+    protects: "Only the owning single-threaded process changes its descriptor table"
+  - lock: "log (begin_op / end_op)"
+    where: "[[sys_open]], [[sys_link]], [[sys_unlink]], [[sys_mkdir]]"
+    protects: "Makes the inode allocation, entry and count updates one atomic change on disk"
+quiz:
+  - q: "Why does `create` keep the parent directory locked from `dirlookup` until after `dirlink`, instead of locking it separately for each?"
+    a: "The check (name absent) and the action (add entry) must be atomic. If the lock were dropped in between, another process could create the same name in the gap, and the directory would end up with two entries named the same, pointing at different inodes."
+  - q: "Two processes create files in two different directories at the same moment. What prevents them from allocating the same inode?"
+    a: "`ialloc` reads each inode block with `bread`, which returns the buffer locked. Testing `type == 0` and writing `type` both happen while holding that buffer's sleep-lock, so the second process sees the first one's claim and moves on to the next inode."
+  - q: "Why does `sys_unlink` check for `.` and `..` before calling `dirlookup` and `ilock(ip)`?"
+    a: "Besides breaking the tree, `.` would make `ip` the parent itself, and `ilock(ip)` would wait forever for a lock the process already holds; `..` would lock the parent's parent while holding the child, against the parent-first lock order. Rejecting the names first avoids both."
+  - q: "A directory `d` has two subdirectories. What is `d`'s `nlink`, and why does its own `.` entry not count?"
+    a: "3: one for its name in its parent, and one for each subdirectory's `..`. If `.` counted, removing `d`'s name could never bring `nlink` to 0, so `iput` would never free it."
+  - q: "`dirlink` fails in `create` because the disk is full. How is the newly allocated inode freed?"
+    a: "`create` sets `ip->nlink = 0`, writes it with `iupdate`, and calls `iunlockput`. That `iput` holds the last reference to an inode with no links, so it truncates and frees it, all inside the same transaction, so the disk never shows the inode allocated."
+  - q: "`sys_link` increments `nlink` and then unlocks the inode before locking the target directory. Why not keep the inode locked?"
+    a: "Every other path that holds two inode locks takes a directory first and then something named inside it; locking the file and then the target directory reverses that. In step 12 the target `/` is `newfile`'s own parent, so a concurrent `rm newfile` (which locks `/`, then inode 24) would deadlock with it. Holding one inode lock at a time avoids that, and the transaction plus the `bad:` path keep the count correct."

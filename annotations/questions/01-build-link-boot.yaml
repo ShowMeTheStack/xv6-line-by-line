@@ -1,0 +1,781 @@
+title: Build, link and boot
+summary: How make, the linker script and mkfs produce kernel/kernel and fs.img, and how three harts get from QEMU's boot ROM through _entry, start and main to the first process.
+questions:
+  - id: boot-01
+    level: 1
+    type: choice
+    q: |
+      Every hart runs these lines of [[_entry]] at the same time. Why does the stack pointer
+      use `hartid + 1` instead of `hartid`?
+    code: kernel/entry.S:7-21@11-17
+    options:
+      - text: "Stacks grow down, so `sp` must start at the top (the end) of the hart's 4096-byte slice of `stack0`."
+        correct: true
+        why: |
+          A push first subtracts from `sp` and then stores. Hart 0's slice is
+          `stack0[0..4095]`, so its first `sp` must be `stack0 + 4096`, one past the end of
+          the slice. With `hartid` alone, hart 0 would start at the very bottom of `stack0` and
+          push into whatever lies below it.
+      - text: Hart IDs start at 1 on QEMU, so the `+ 1` turns them into array indexes.
+        why: |
+          You may have assumed CPUs are numbered from 1. `mhartid` is 0 on the first hart, and
+          hart 0 is the one that builds the kernel in [[kernel:main]]. The `+ 1` is about which
+          *end* of the slice the stack starts at, not about numbering.
+      - text: It leaves an unused 4096-byte guard area between consecutive harts' stacks.
+        why: |
+          You may have been thinking of the per-process kernel stacks, which do have unmapped
+          [[g:guard-page|guard pages]]. The boot stacks are adjacent slices of one array with no gap
+          at all, and `stack0` lies in `.bss` inside the kernel's direct map, so there is no
+          unmapped page between the slices even after paging is on.
+      - text: Slice 0 is reserved for the scheduler, so every hart skips it.
+        why: |
+          You may have heard that a hart's boot stack becomes its scheduler stack. That is
+          true, but it is the *same* slice: hart 0 uses slice 0 for booting and later for its
+          scheduler. No slice is reserved.
+    explain: |
+      `sp = stack0 + (hartid + 1) × 4096` points each hart at the top of its own slice,
+      because a RISC-V stack grows toward lower addresses. Each hart reads a different
+      `mhartid`, so the same instructions give three different stacks with no lock
+      ([[tour:2]], [[concept:stacks]]).
+
+  - id: boot-02
+    level: 1
+    type: number
+    q: |
+      In this build, [[stack0]] is at `0x80007890`. What value does `sp` hold on **hart 2**
+      right after line 17 (`add sp, sp, a0`)? Answer in hex.
+    code: kernel/entry.S:7-21@12-17
+    answer: "0x8000a890"
+    wrong:
+      "0x80009890": |
+        You may have computed `stack0 + hartid × 4096`. The code adds 1 to the hart ID
+        first (line 15), so hart 2 gets `stack0 + 3 × 4096`: the top of its slice, not the
+        bottom.
+      "0x80007890": |
+        That is the value after line 12 alone (`la sp, stack0`), the same on every hart. Lines
+        13–17 then add `(hartid + 1) × 4096`.
+      "0x80008890": |
+        That is hart 0's starting `sp`, `stack0 + 1 × 4096`. You may have added the 1 but
+        forgotten to include hart 2's ID in the multiplication.
+    why_wrong: "Compute `0x80007890 + (2 + 1) × 0x1000`: `li a0, 1024*4` is `0x1000`, and `a1` is `mhartid + 1`."
+    explain: |
+      `0x80007890 + 3 × 0x1000 = 0x8000a890`, the top of hart 2's slice
+      (`0x80009890`–`0x8000a890`). gdb reads exactly this value at the first instruction of
+      [[kernel:start]] on hart 2 ([[tour:2]]).
+
+  - id: boot-03
+    level: 1
+    type: choice
+    q: |
+      Every kernel file is compiled with `$(CC)`, the RISC-V [[g:cross-compiler]]. Why is
+      `mkfs` compiled with plain `gcc` on line 124?
+    code: Makefile:123-124
+    options:
+      - text: "`mkfs` runs on your own computer during the build, to write `fs.img`, so it must be native code for that computer."
+        correct: true
+        why: |
+          `mkfs` is a build tool, not part of xv6. It runs once, before QEMU starts, and writes
+          the disk image as an ordinary file on your machine.
+      - text: "`mkfs` runs inside xv6 at boot to format the disk, and plain `gcc` is enough because QEMU translates it."
+        why: |
+          You may have thought the disk is formatted by xv6 itself. xv6 has no formatting
+          program; the kernel only reads the layout `mkfs` already wrote ([[fsinit]] reads the
+          superblock). And QEMU runs only RISC-V code, so a native binary could never run inside it.
+      - text: Plain `gcc` is a shortcut; `$(CC)` would work just as well because both produce the same code.
+        why: |
+          You may have thought every `gcc` emits the same machine code. `$(CC)` emits RISC-V
+          instructions, which your computer's CPU cannot execute, so a RISC-V `mkfs` could not
+          run during the build.
+      - text: "`mkfs` needs the host's C library for `printf`, and the cross-compiler has no C library at all."
+        why: |
+          You may have connected the kernel's `-nostdlib` with the cross-compiler itself. The
+          real reason is *where the program runs*: on the host. That it can use the host's
+          `open`, `lseek` and `printf` follows from that.
+    explain: |
+      Two kinds of program come out of this Makefile: RISC-V code for the xv6 machine (the
+      kernel and the user programs) and host code that runs during the build (`mkfs`). `mkfs`
+      includes [[kernel/fs.h]] and [[kernel/param.h]] so that the disk it writes matches what
+      the kernel expects ([[tour:1]]).
+
+  - id: boot-04
+    level: 1
+    type: match
+    q: |
+      Match each build input with its job.
+    pairs:
+      - left: "`kernel/kernel.ld`"
+        right: places `_entry` at 0x80000000 and puts the trampoline on a page of its own
+        why: "The kernel's [[g:linker-script]] fixes every kernel address: line 10 starts at `0x80000000`, lines 15–19 isolate `trampsec`."
+      - left: "`user/user.ld`"
+        right: links every user program starting at virtual address 0
+        why: "Each process gets its own page table, so every program can be linked at 0 ([[user/user.ld:5]])."
+      - left: "`mkfs/mkfs`"
+        right: writes the 2000-block disk image on the build machine
+        why: "It is the one host program in the build ([[Makefile:155]])."
+      - left: "`user/usys.pl`"
+        right: generates the assembly stubs that put a system-call number in a7 and execute ecall
+        why: "Lines 111–112 of the Makefile run it to produce `user/usys.S`; the stubs are not in the source tree."
+      - left: "the `-MD` flag"
+        right: makes the compiler write .d files listing the headers each object depends on
+        why: "Line 157 includes those `.d` files, so editing a header such as `param.h` rebuilds every object that uses it."
+    explain: |
+      `make qemu` builds two things, `kernel/kernel` and `fs.img`. The linker scripts decide
+      addresses, `usys.pl` and `mkfs` are generators, and `-MD` keeps `make`'s dependency graph
+      honest ([[tour:1]]).
+
+  - id: boot-05
+    level: 1
+    type: tf
+    q: |
+      True or false: when hart 0 calls [[kvminithart]] on line 21 of [[kernel:main]], paging is
+      turned on for all three harts.
+    code: kernel/main.c:19-24@21
+    answer: false
+    why_tf: |
+      You may have thought paging is a machine-wide setting. It is controlled by `satp`, and
+      every hart has its own `satp`.
+    reasons:
+      - text: "`satp` is a per-hart CSR. Harts 1 and 2 keep running with paging off until each calls `kvminithart` itself, on line 39."
+        correct: true
+        why: |
+          That is why the `else` branch of `main` calls [[kvminithart]] again. For a while the
+          three harts run in different translation modes, and that is fine.
+      - text: The kernel page table does not exist yet when line 21 runs, so nothing is turned on until line 33.
+        why: |
+          You may have mixed up the order. Line 20, [[kvminit]], builds the table just before;
+          line 21 installs it on hart 0. Line 33 is the `started` flag.
+      - text: Harts 1 and 2 get paging automatically when they see `started` become 1.
+        why: |
+          You may have thought the flag carries hardware state. `started` is an ordinary
+          variable in memory; it only tells harts 1 and 2 that hart 0's shared tables are
+          ready, and each then writes its own `satp`.
+    explain: |
+      Every CSR belongs to one hart. Hart 0's `csrw satp` changes hart 0's translation and
+      nothing else; its `sfence.vma` flushes only hart 0's TLB ([[tour:3]], [[g:csr:satp]]).
+
+  - id: boot-06
+    level: 1
+    type: choice
+    q: |
+      [[userinit]] creates process 1 with **no user memory at all** (`p->sz` stays 0). How
+      does process 1 get the code of `/init`?
+    code: kernel/proc.c:216-231
+    options:
+      - text: "[[forkret]] calls `kexec(\"/init\", ...)` inside the kernel, the first time it runs, before process 1 ever reaches user mode."
+        correct: true
+        why: |
+          See [[kernel/proc.c:532]]. After [[fsinit]] has read the file system, `kexec` loads
+          `/init` from the disk exactly as it loads any later program.
+      - text: "`userinit` copies a small hand-assembled program, `initcode`, into the process's first page."
+        why: |
+          You may be remembering older versions of xv6 (and the xv6 book), which did this.
+          At this commit there is no `initcode`: `userinit` only allocates the slot, sets the
+          working directory and marks it `RUNNABLE`.
+      - text: QEMU loads `/init` into memory together with the kernel, and `userinit` maps it.
+        why: |
+          You may have thought QEMU knows about xv6's files. `-kernel` loads only
+          `kernel/kernel`; `fs.img` is a disk that only the kernel's file system can read.
+      - text: "[[kernel:main]] calls `kexec(\"/init\")` right after `userinit()`."
+        why: |
+          You may have thought `main` can read files. It cannot: reading the disk means
+          sleeping, which needs a process. `main` never calls `kexec`.
+    explain: |
+      Process 1 starts like every process: in [[forkret]], on its own empty kernel stack.
+      Being first, it runs [[fsinit]] and then `kexec("/init")`, and only then returns to user
+      mode through [[prepare_return]] and [[userret]] ([[tour:4]]).
+
+  - id: boot-07
+    level: 1
+    type: multi
+    q: |
+      While hart 0 runs the `if` branch of [[kernel:main]] (lines 14–33), what are harts 1
+      and 2 doing? Choose all that apply.
+    code: kernel/main.c:9-45@34-36
+    options:
+      - text: "Loading [[started]] over and over with an acquire load"
+        correct: true
+        why: "Lines 35–36 are a tight loop around `__atomic_load_n(&started, __ATOMIC_ACQUIRE)`."
+      - text: Running with paging off
+        correct: true
+        why: "They write `satp` only on line 39, after the loop. Until then `satp` is still the 0 that [[kernel:start]] wrote."
+      - text: Running with interrupts off
+        correct: true
+        why: "`mret` left `sstatus.SIE` at 0, and nothing turns it on until the scheduler's first [[intr_on]]."
+      - text: Sleeping on a channel until hart 0 calls wakeup
+        why: |
+          You may have thought every wait in xv6 is a sleep. Sleeping needs a process, and
+          none is running on these harts: they are on their boot stacks in `main`. They spin.
+      - text: Executing `wfi` until hart 0 sends them an interrupt
+        why: |
+          You may have seen `wfi` in the [[scheduler]]. xv6 never sends inter-processor
+          interrupts, so hart 0 has no way to wake them. The code on lines 35–36 is a spin loop
+          on `started`, not a `wfi`.
+      - text: Spinning in acquire on a lock that hart 0 holds until it finishes
+        why: |
+          You may have thought every wait between harts uses a spinlock. Here it is a plain
+          flag with release/acquire ordering; harts 1 and 2 hold no lock and wait for none.
+    explain: |
+      Hart 0 builds the shared tables alone; the others touch only [[started]]. When hart 0's
+      release store makes it 1, their acquire loads guarantee that everything hart 0 wrote
+      before is visible to them ([[tour:3]], [[g:memory-barrier]]).
+
+  - id: boot-08
+    level: 1
+    type: choice
+    q: |
+      [[binit]] and [[iinit]] run in [[kernel:main]], but [[fsinit]], which reads the
+      superblock from the disk, does not. Why must it wait until the first process runs?
+    code: kernel/proc.c:519-536@525-528
+    options:
+      - text: Reading a disk block means sleeping until the disk interrupt, and only a process can sleep; `main` runs with no process.
+        correct: true
+        why: |
+          The comment on lines 525–527 says it: the read sleeps. [[virtio_disk_rw]] sleeps for
+          the completion interrupt, and sleeping marks the *current process* `SLEEPING` and
+          switches away from it. During `main` [[myproc]] is 0.
+      - text: The disk driver is initialized only after `main` finishes.
+        why: |
+          You may have thought the driver comes later. [[virtio_disk_init]] runs on line 30 of
+          `main`, before [[userinit]]. The obstacle is not the driver but the waiting.
+      - text: The buffer cache is not ready until the scheduler starts.
+        why: |
+          You may have thought [[bread]] needs the scheduler. [[binit]] runs on line 27 of
+          `main`, before any of this.
+      - text: Only user-mode code is allowed to read the disk.
+        why: |
+          You may have thought [[forkret]] runs in user mode. It runs in the kernel, on process
+          1's kernel stack; the disk is always read by kernel code.
+    explain: |
+      `main` has a hart and a boot stack but no process, so it cannot block. [[forkret]] is
+      the first code that runs *as* a process, which is why the first process does the file
+      system's setup there ([[tour:4]]).
+
+  - id: boot-09
+    level: 2
+    type: line
+    q: |
+      [[kvmmake]] maps everything below [[etext]] read+execute and everything above it
+      read+write, page by page, so `etext` must be a multiple of `0x1000`. Click the line that
+      makes it so.
+    code: kernel/kernel.ld:12-21
+    answer: 18
+    lines:
+      15: |
+        This line aligns the *start* of the trampoline, so that `_trampoline` is on a page
+        boundary. The end of the trampoline code (and so `etext`) is aligned by a later line.
+      17: |
+        This line only places the `trampsec` code. It is about 0x124 bytes long, so after it
+        the location counter is in the middle of a page.
+      19: |
+        You may have thought the `ASSERT` fixes the size. It only *checks* that the trampoline
+        page is exactly 0x1000 bytes and stops the build otherwise; it moves nothing.
+      20: |
+        `PROVIDE(etext = .)` gives the current location a name. Whether that location is
+        aligned was decided on the line before the assert.
+    why_wrong: Look for the line that moves the location counter `.` to a page boundary after the trampoline code.
+    explain: |
+      Line 18, `. = ALIGN(0x1000)`, pads after `trampsec` to the next page boundary; line 20
+      names that point `etext` (`0x80007000` in this build). With etext aligned, no page has to
+      be both executable and writable ([[kernel/vm.c:39]], [[tour:1]]).
+
+  - id: boot-10
+    level: 2
+    type: order
+    q: |
+      Put these events on **hart 0** in the order they happen, from power-on to the first
+      moment it can take an interrupt.
+    items:
+      - text: QEMU's boot ROM at 0x1000 jumps to 0x80000000
+        why: Every hart starts in the boot ROM; `_entry` is only reached by its jump.
+      - text: "`_entry` points `sp` at the top of hart 0's slice of `stack0`"
+        why: No C function can run before there is a stack, so this comes before `start`.
+      - text: "`start` sets `mstatus.MPP` to S and `mepc` to `main`"
+        why: These must be written before `mret`, which reads them.
+      - text: "`mret` drops the hart to supervisor mode at `main`"
+        why: "`start` ends with `mret`; everything in `main` runs in supervisor mode."
+      - text: "`kvminithart` writes `satp`: paging on"
+        why: "Line 21 of `main`; paging is turned on before the trap vector is installed on line 24."
+      - text: "`trapinithart` sets `stvec` to `kernelvec`"
+        why: "Line 24 of `main`, after paging is on and before the rest of initialization."
+      - text: "`started` is set to 1 with a release store"
+        why: "Line 33: the very last thing in hart 0's `if` branch."
+      - text: "the scheduler's first `intr_on()`"
+        why: "Interrupts stay off from reset until [[kernel/proc.c:441]], after `main` has called `scheduler`."
+    why_wrong: Follow the code in file order - entry.S, start.c, then main.c line by line, then scheduler.
+    explain: |
+      Boot ROM → [[_entry]] (stack) → [[kernel:start]] (machine-mode setup, `mret`) →
+      [[kernel:main]] (paging, trap vector, the rest of the kernel, `started`) →
+      [[scheduler]], whose `intr_on` is the first time any hart enables interrupts
+      ([[concept:mode-stack-page-table#t8]]).
+
+  - id: boot-11
+    level: 2
+    type: multi
+    q: |
+      Which of these functions does **hart 1** call during boot? Choose all that apply.
+    code: kernel/main.c:9-45
+    options:
+      - text: "[[kvminithart]]"
+        correct: true
+        why: "Line 39: `satp` is per hart, so each hart turns on its own paging."
+      - text: "[[trapinithart]]"
+        correct: true
+        why: "Line 40: `stvec` is per hart."
+      - text: "[[plicinithart]]"
+        correct: true
+        why: "Line 41: each hart writes its own PLIC enable and threshold registers."
+      - text: "[[kinit]]"
+        why: |
+          You may have thought each hart needs its own allocator. There is one free list,
+          shared by all harts; hart 0 builds it once. A second `kinit` would put pages already
+          in use back on the list.
+      - text: "[[procinit]]"
+        why: |
+          You may have thought each hart has its own process table. There is one `proc[]`
+          array; hart 0 initializes it once, and every hart's scheduler scans the same table.
+      - text: "[[plicinit]]"
+        why: |
+          You may have matched the name with `plicinithart`. `plicinit` sets the device
+          priorities, which are machine-wide PLIC registers; hart 0 writes them once.
+    explain: |
+      The rule is in the names: an `...init` function sets up shared state and runs once, on
+      hart 0; an `...inithart` function sets up the calling hart's own registers and runs on
+      every hart ([[tour:3]]).
+
+  - id: boot-12
+    level: 2
+    type: state
+    q: |
+      Hart 1 is spinning on line 35 of [[kernel:main]], waiting for [[started]]. Hart 0 is
+      somewhere in [[kinit]]. Fill in hart 1's state.
+    code: kernel/main.c:34-41@35
+    state:
+      mode: S
+      stack: boot
+      satp: bare
+      sie: "off"
+      noff: "0"
+    why:
+      mode: |
+        You may have thought boot code runs in machine mode. [[kernel:start]]'s `mret` already
+        moved every hart to supervisor mode before `main`.
+      stack: |
+        No process exists yet, so there is no kernel stack to be on. Hart 1 is still on its
+        slice of [[stack0]] from [[_entry]] (it becomes the scheduler stack only once `main`
+        calls `scheduler`).
+      satp: |
+        You may have thought hart 0's paging applies to everyone. `satp` is per hart; hart 1
+        writes its own only on line 39, after the loop.
+      sie: |
+        `mret` left `sstatus.SIE` at 0, and nothing on hart 1 has turned it on.
+      noff: |
+        Hart 1 holds no spinlock in this loop, so no `push_off` is outstanding.
+    why_wrong: "Track what `start` and `mret` left behind, and remember that `satp` and `SIE` are per-hart."
+    explain: |
+      Supervisor mode, boot stack, paging off, interrupts off, no locks: this is the second row
+      of [[concept:mode-stack-page-table#table]]. Hart 1 changes only once it sees
+      `started == 1`.
+
+  - id: boot-13
+    level: 2
+    type: choice
+    q: |
+      The kernel's `.bss` section is `0x19350` bytes and holds [[proc@kernel/proc.c|proc]],
+      [[stack0]], [[cpus]] and the other zero-initialized globals. The C code assumes they
+      start as zero. Who zeroes them?
+    options:
+      - text: Nothing in xv6. The ELF program header asks for more memory (0x20bb0) than the file provides (0x7860), and QEMU provides that extra memory as zeros.
+        correct: true
+        why: |
+          `kernel/kernel`'s one loadable segment has file size `0x7860` and memory size
+          `0x20bb0`. No xv6 instruction clears `.bss`; the kernel relies on the loader.
+      - text: "[[_entry]] runs a loop that clears `.bss` before calling `start`."
+        why: |
+          You may know kernels whose entry code does this (many do). xv6's [[_entry]] is a
+          handful of instructions: it sets `sp` and calls `start`. There is no loop.
+      - text: "[[kinit]] clears it as part of setting up memory."
+        why: |
+          You may have connected "memory setup" with `.bss`. [[kinit]] works on the pages from
+          [[end]] upward, which lie *after* `.bss`, and it fills them with junk (`1`s), not
+          zeros.
+      - text: "[[kernel:start]] calls `memset` on it before `mret`."
+        why: |
+          You may have assumed machine-mode setup includes memory. [[kernel:start]] writes only
+          CSRs and `tp`; it touches no memory besides its own stack frame.
+    explain: |
+      `.bss` takes no space in the file: the linker records only its size. The kernel trusts
+      that whoever loads it provides zeroed memory, which is also why a `struct spinlock` in
+      `.bss` already means "unlocked" before [[initlock]] runs ([[tour:1]], [[g:bss]]).
+
+  - id: boot-14
+    level: 2
+    type: multi
+    q: |
+      Which of these live in the kernel's `.bss` section (`0x80007860`–`0x80020bb0` in this
+      build)? Choose all that apply.
+    options:
+      - text: "[[stack0]], the boot stacks"
+        correct: true
+        why: "A zero-initialized global array (`0x80007890`), 32 KiB, the largest object near the start of `.bss`."
+      - text: "the process table `proc[]`"
+        correct: true
+        why: "A zero-initialized global array of 64 `struct proc` at `0x8000fdd0`."
+      - text: "`started` in main.c (`volatile static int started = 0;`)"
+        correct: true
+        why: |
+          An explicit `= 0` still counts as zero-initialized, so the compiler puts it in
+          `.bss`: it is at `0x8000786c`.
+      - text: "the `static int first = 1;` flag in [[forkret]]"
+        why: |
+          You may have thought every `static` flag goes in the same place. Its initial value is
+          1, which must be stored in the file, so it is in `.data` (`0x80007850`).
+      - text: "the string `\"xv6 kernel is booting\\n\"`"
+        why: |
+          You may have thought every piece of data the kernel uses is in `.bss`. String
+          constants are read-only initialized data and go in `.rodata`, which starts at
+          `0x80007000`.
+      - text: the root page of the kernel page table that `satp` points to
+        why: |
+          You may have confused the variable [[kernel_pagetable]] (a pointer, which is in
+          `.bss`) with the page it points to. That page comes from [[kalloc]], above [[end]].
+    explain: |
+      `.bss` holds globals and statics whose initial value is zero; `.data` holds those with
+      another initial value; `.rodata` holds constants. Pages handed out at run time are not
+      in any section: they come from the free memory after [[end]] ([[tour:1]], [[g:bss]]).
+
+  - id: boot-15
+    level: 2
+    type: number
+    q: |
+      How many **metadata blocks** (`nmeta`) does `mkfs` compute? In this tree `FSSIZE` = 2000,
+      `BSIZE` = 1024, `LOGBLOCKS` = 30, `sizeof(struct dinode)` = 64 (so `IPB` = 16) and
+      `BPB` = 1024 × 8 = 8192.
+    code: mkfs/mkfs.c:23-32
+    answer: 47
+    wrong:
+      46: |
+        You may have dropped one of the `+ 1`s: the log has a header block in front of its 30
+        data blocks (`nlog` = 31), and `200 / 16` is 12 in integer division, so the inode
+        area needs `12 + 1` = 13 blocks.
+      45: |
+        You may have dropped both `+ 1`s (log header and the rounding of the inode blocks).
+        Line 30 and line 29 each add one.
+      44: |
+        You may have forgotten the boot block or the superblock. `nmeta` starts with `2` for
+        those two (line 96).
+    why_wrong: "Add up: 2 (boot + superblock) + nlog + ninodeblocks + nbitmap, computing each with C integer division."
+    explain: |
+      `nlog = 30 + 1 = 31`, `ninodeblocks = 200/16 + 1 = 13`, `nbitmap = 2000/8192 + 1 = 1`,
+      so `nmeta = 2 + 31 + 13 + 1 = 47` ([[mkfs/mkfs.c:96]]). That leaves
+      blocks 47–1999 for data, and `mkfs` prints exactly this line when it runs ([[tour:1]],
+      [[g:disk-layout]]).
+
+  - id: boot-16
+    level: 2
+    type: choice
+    q: |
+      The comment on line 24 says writing `main`'s address into `mepc` "requires gcc
+      -mcmodel=medany". Why?
+    code: kernel/start.c:23-25
+    options:
+      - text: The default code model can only form addresses within 2 GiB of address 0, and the kernel lives at 0x80000000 and above; medany builds addresses relative to the pc instead.
+        correct: true
+        why: |
+          With `medany`, `main`'s address is computed as `auipc a5, 0x1` + `addi a5, a5, -538`
+          (see `kernel/kernel.asm` at `0x80000078`): pc-relative, so it works wherever the code is.
+      - text: "`medany` makes the kernel position-independent, so QEMU can load it at any address."
+        why: |
+          You may have confused pc-relative addressing with a relocatable program. The kernel
+          is linked at fixed addresses (`-no-pie`, [[kernel/kernel.ld:10]]); `medany` only
+          changes how instructions form addresses that are still fixed.
+      - text: "`medany` is what allows 64-bit CSR writes like `csrw mepc`."
+        why: |
+          You may have connected the flag with the CSR instruction on the same line. `csrw`
+          works under any code model; the issue is computing the value of `main`'s address.
+      - text: "`medany` enables the compressed instructions that keep `start` short."
+        why: |
+          You may have confused code models with ISA extensions. Compressed instructions come
+          from the `c` in `-march=rv64gc`.
+    explain: |
+      A code model tells the compiler how far away symbols may be. The kernel is at 2 GiB,
+      just out of reach of the default model, so the Makefile passes `-mcmodel=medany`
+      ([[Makefile:71]], [[g:flag-mcmodel]], [[tour:46]]).
+
+  - id: boot-17
+    level: 2
+    type: number
+    q: |
+      `make` runs `mkfs/mkfs fs.img README $(UPROGS)`. `mkfs` gives the root directory the
+      first inode, then one inode to each file in command-line order. What is the inode number
+      of `/init`?
+    code: Makefile:132-155
+    answer: 7
+    wrong:
+      5: |
+        You may have used `_init`'s position in `UPROGS` (fifth). Two inodes come before the
+        programs: the root directory and `README`.
+      6: |
+        You may have forgotten `README`, which comes first on the command line (line 155) and
+        takes inode 2.
+      8: |
+        You may have started counting the root directory at 2. Inode numbers start at 1:
+        [[mkfs:ialloc]] begins with `freeinode = 1`, and [[ROOTINO]] is 1.
+    why_wrong: "Root is inode 1, then README, then each program in the order UPROGS lists them."
+    explain: |
+      Root = 1, `README` = 2, `cat` = 3, `echo` = 4, `forktest` = 5, `grep` = 6, `init` = 7.
+      [[kexec]] finds inode 7 when [[forkret]] runs `kexec("/init")` ([[tour:1]], [[tour:4]]).
+
+  - id: boot-18
+    level: 2
+    type: tf
+    q: |
+      True or false: right after [[kvminithart]] turns on paging, hart 0's `sp` (still in its
+      slice of [[stack0]]) points at usable memory, with no change to `sp`.
+    code: kernel/vm.c:38-43
+    answer: true
+    why_tf: |
+      You may have thought turning on paging invalidates every physical address the hart was
+      using. It only does so for addresses the new page table does not map the same way.
+    reasons:
+      - text: "[[kvmmake]] maps the kernel's data and the rest of RAM at virtual addresses equal to their physical addresses, read+write, and `stack0` is in `.bss`, inside that range."
+        correct: true
+        why: |
+          Lines 42–43 map `etext` to `PHYSTOP` one-to-one. The same direct mapping (lines 38–39)
+          is why the very next instruction fetch, at a physical address, also works.
+      - text: "`sp` is never translated by the page table, only instruction fetches are."
+        why: |
+          You may have thought the stack is special. Every load and store through `sp` is
+          translated by `satp` like any other data access.
+      - text: The hart keeps using physical addresses until it returns to user mode.
+        why: |
+          You may have thought supervisor mode bypasses translation. With `satp` in Sv39 mode,
+          supervisor accesses are translated too; that is why the trampoline and the direct
+          mapping are needed.
+    explain: |
+      The kernel page table is mostly a [[g:direct-map]]: virtual address = physical address
+      for the kernel image, its `.bss` and all RAM. That lets each hart switch paging on in
+      the middle of running code without moving its `pc` or `sp` ([[tour:3]], [[tour:24]]).
+
+  - id: boot-19
+    level: 2
+    type: choice
+    q: |
+      To leave for user mode the first time, [[forkret]] calls [[userret]] through the address
+      `TRAMPOLINE + (userret - trampoline)` (`0x3ffffff09c`), not at its link address
+      `0x8000609c`. Why?
+    code: kernel/proc.c:538-542@541-542
+    options:
+      - text: "`userret` switches to the user page table, which does not map 0x8000609c; the TRAMPOLINE alias is mapped in both page tables, so the next instruction can still be fetched."
+        correct: true
+        why: |
+          The trampoline page is mapped at `TRAMPOLINE` in the kernel page table
+          ([[kernel/vm.c:47]]) and in every user page table ([[kernel/proc.c:189]]). Code running
+          there survives the `csrw satp`.
+      - text: The kernel page table does not map 0x8000609c, so the link address cannot be used at all.
+        why: |
+          You may have thought kernel code is reached only through high addresses. The kernel
+          text is direct-mapped, so `0x8000609c` is a valid kernel address; the problem is the
+          *user* page table installed in the middle of `userret`.
+      - text: User mode can only execute code at high addresses, and `userret` runs in user mode.
+        why: |
+          You may have thought `userret` is user code. It runs in supervisor mode right up to its
+          final `sret`; the trampoline page is mapped without `PTE_U`.
+      - text: It is only an optimization to avoid a long jump; either address would work.
+        why: |
+          You may have thought the two addresses are interchangeable after the switch. At
+          `0x8000609c`, the fetch right after `csrw satp, a0` would fault, because the user page
+          table does not map the kernel's text.
+    explain: |
+      The trampoline is the one piece of code mapped at the same virtual address on both sides
+      of a page-table switch, so every switch between the kernel page table and a user page
+      table runs from it. The two boot-time `satp` writes, in [[kernel:start]] and
+      [[kvminithart]], run from ordinary kernel text and rely on the direct map instead
+      ([[g:trampoline]], [[tour:4]]).
+
+  - id: boot-20
+    level: 3
+    type: number
+    q: |
+      In this build [[end]] is `0x80020bb0` and [[PHYSTOP]] is `0x88000000`. How many pages
+      does [[kinit]] hand to the page allocator?
+    code: kernel/kalloc.c:26-40
+    answer: 32735
+    wrong:
+      32768: |
+        You may have counted all 128 MiB of RAM (`0x8000000 / 4096`). The kernel image and its
+        `.bss` occupy the first 33 pages, below `end`.
+      32736: |
+        You may have rounded `end` *down* to `0x80020000`. Line 37 uses `PGROUNDUP`, so the
+        first page freed is `0x80021000`: the partly used page holding the end of `.bss` must
+        not be given away.
+      32734: |
+        You may have excluded the last page. The loop condition `p + PGSIZE <= pa_end` lets
+        `0x87fff000` through, since it ends exactly at `PHYSTOP`.
+    why_wrong: "Round `end` up to a page boundary, then count the 4096-byte pages up to `PHYSTOP`: `(0x88000000 - first) / 0x1000`."
+    explain: |
+      `PGROUNDUP(0x80020bb0) = 0x80021000`, and `(0x88000000 - 0x80021000) / 0x1000 = 0x7fdf
+      = 32735`. Each one passes through [[kfree]], which takes `kmem.lock`, so `kinit` takes
+      and releases that lock 32,735 times with no other hart competing ([[tour:3]]).
+
+  - id: boot-21
+    level: 3
+    type: choice
+    q: |
+      You delete line 15 of [[kernel/kernel.ld]] (the `ALIGN(0x1000)` *before*
+      `_trampoline = .`) and run `make`. In this build the ordinary kernel code ends at
+      `0x80005bc0` and the trampoline code is `0x124` bytes long. What happens?
+    code: kernel/kernel.ld:12-21@15-19
+    options:
+      - text: "The link fails at the ASSERT: `_trampoline` is now 0x80005bc0, line 18 still pads to 0x80006000, so `. - _trampoline` is 0x440, not 0x1000."
+        correct: true
+        why: |
+          The message is `error: trampoline larger than one page`, although nothing grew: the
+          check is really "exactly one page", and it trips in both directions.
+      - text: The build succeeds, because line 18 still aligns the end of the trampoline to a page boundary.
+        why: |
+          You may have thought one ALIGN is as good as another. Line 18 aligns the *end*, but the
+          start, `_trampoline`, is no longer on a page boundary, and line 19 measures from the
+          start.
+      - text: The build succeeds, but the first system call crashes because `uservec` is no longer at the start of a page.
+        why: |
+          That *would* be the danger without line 19. The `ASSERT` exists to turn this runtime
+          disaster into a build error, so the kernel is never produced.
+      - text: The assembler rejects `trampoline.S` because `trampsec` must start on a page boundary.
+        why: |
+          You may have thought the assembler knows about pages. It assembles each file alone and
+          has no idea where its sections will land; placement is entirely the linker's job.
+    explain: |
+      Lines 15–19 together give the trampoline a page to itself: align, mark the start, place
+      the code, align, check. The kernel maps that one page at [[TRAMPOLINE]] in every page
+      table, so it must contain nothing else ([[tour:1]], [[g:linker-script]]).
+
+  - id: boot-22
+    level: 3
+    type: choice
+    q: |
+      [[NCPU]] is 8, so [[stack0]] has 8 slices and [[cpus]] has 8 entries. You run
+      `make qemu CPUS=10`. What happens?
+    code: kernel/start.c:10-11
+    options:
+      - text: Harts 8 and 9 compute stack tops past the end of `stack0` and push onto the globals that follow it in `.bss` (`cons`, `kmem`, `cpus`, `proc`...); their `cpus[]` entries are out of bounds too. Memory is silently corrupted.
+        correct: true
+        why: |
+          [[_entry]] never checks `mhartid` against `NCPU`. Hart 8's slice would be
+          `0x8000f890`–`0x80010890`, exactly where `cons`, `pr`, `kmem`, `cpus` and the start of
+          `proc[]` live in this build, and `cpus[8]` would overlap `proc[0]`.
+      - text: The kernel prints an error and panics, because `NCPU` is too small.
+        why: |
+          You may have expected a check. There is none on the boot path: `NCPU` only sizes
+          arrays, and nothing compares the hart count against it.
+      - text: Harts 8 and 9 wrap around and share the stacks of harts 0 and 1.
+        why: |
+          You may have imagined a modulo. The arithmetic in [[_entry]] is a plain multiply and
+          add; it goes past the end of the array instead.
+      - text: Only 8 harts start; QEMU refuses to create more harts than the kernel was compiled for.
+        why: |
+          You may have thought QEMU reads `NCPU`. QEMU knows nothing about xv6's constants; it
+          creates as many harts as `-smp` says.
+    explain: |
+      `NCPU` is a compile-time promise: the boot stacks and the per-CPU table are fixed-size
+      arrays in `.bss`, because each hart needs a stack before any allocator exists. Breaking
+      the promise corrupts memory with no message ([[tour:1]]).
+
+  - id: boot-23
+    level: 3
+    type: choice
+    q: |
+      Process 1 runs [[fsinit]] with interrupts **off** on its hart (the scheduler's `acquire`
+      recorded `intena = 0`, so [[forkret]]'s release leaves them off). Its first disk read
+      sleeps waiting for the completion interrupt. Which hart can take that interrupt?
+    code: kernel/proc.c:512-528@519-520
+    options:
+      - text: Any hart that has called plicinithart and is in its scheduler loop's interrupt window, including process 1's own hart once process 1 has gone to sleep.
+        correct: true
+        why: |
+          [[sleep]] switches the hart back to its [[scheduler]], which enables interrupts
+          briefly on every pass ([[kernel/proc.c:441]]). All three harts enabled the disk's IRQ
+          in [[plicinithart]], and whichever claims it first runs [[virtio_disk_intr]].
+      - text: Process 1's hart, inside fsinit, because sleeping turns interrupts on for the sleeping process.
+        why: |
+          You may have thought a sleeping process waits with interrupts on. A sleeping process
+          is not running at all; what runs on its hart is the scheduler, and it is the
+          scheduler's loop that enables interrupts.
+      - text: Only hart 0, because it is the only hart that ran plicinit.
+        why: |
+          You may have confused [[plicinit]] (machine-wide priorities, written once) with
+          [[plicinithart]] (per-hart enables). Harts 1 and 2 also called `plicinithart` before
+          entering their schedulers.
+      - text: No hart; during boot the driver polls the disk instead of waiting for an interrupt.
+        why: |
+          You may have thought boot-time I/O is special. [[fsinit]] runs in a process, and
+          [[virtio_disk_rw]] always sleeps until [[virtio_disk_intr]] wakes it.
+    explain: |
+      Interrupts being off is a property of a hart, not of a process's wait. Once process 1
+      sleeps, its hart returns to the scheduler, and any idle hart can handle the disk
+      interrupt and [[wakeup]] process 1, which may then resume on a different hart
+      ([[tour:4]]).
+
+  - id: boot-24
+    level: 3
+    type: multi
+    q: |
+      Suppose harts 1 and 2, after seeing `started == 1`, also ran these functions themselves.
+      Which would corrupt shared kernel state? Choose all that apply.
+    code: kernel/main.c:13-44
+    options:
+      - text: "[[kinit]]"
+        correct: true
+        why: |
+          It would [[kfree]] every page from `end` to `PHYSTOP` again, including pages already
+          in use (the kernel page table, the kernel stacks, process 1's trapframe). Those pages
+          could then be handed out twice.
+      - text: "[[procinit]]"
+        correct: true
+        why: |
+          It would set every slot to `UNUSED`, including process 1, which is already `RUNNABLE`
+          or running, and reinitialize each `p->lock`, possibly while another hart holds it.
+      - text: "[[plicinit]]"
+        why: |
+          You may have thought every repeated init is harmful. `plicinit` writes the same
+          priority values to the same registers; writing them again changes nothing.
+      - text: "[[kvminithart]]"
+        why: |
+          They already call it (line 39). It writes only this hart's `satp` and flushes this
+          hart's TLB, and it reads [[kernel_pagetable]] without changing it.
+      - text: "[[trapinithart]]"
+        why: |
+          They already call it (line 40). It writes only the calling hart's `stvec`.
+    explain: |
+      An `init` function builds shared state from scratch, so running it twice throws away
+      what the first run (and everything since) put there. That is why only hart 0 runs them,
+      before `started` ([[tour:3]]).
+
+  - id: boot-25
+    level: 3
+    type: order
+    q: |
+      Put the steps of process 1's life in order, from its creation to its first user
+      instruction.
+    items:
+      - text: "`allocproc` sets `p->context.ra = forkret` and `p->context.sp` to the top of its kernel stack"
+        why: The slot and its forged context are set up first, inside userinit, before anyone can run it.
+      - text: "`userinit` sets `p->state = RUNNABLE`"
+        why: Only a RUNNABLE process can be picked by a scheduler, so this comes before any switch.
+      - text: "a scheduler sets `RUNNING` and calls `swtch`, whose `ret` lands in `forkret`"
+        why: "The first code process 1 runs is forkret, reached through the forged `ra`."
+      - text: "`forkret` releases `p->lock`"
+        why: "Line 520 is forkret's first action; the lock was taken by the scheduler."
+      - text: "`fsinit` reads the superblock and recovers the log"
+        why: Files cannot be read before the file system is initialized, so fsinit precedes kexec.
+      - text: "`kexec(\"/init\")` loads the program and installs its new page table"
+        why: Only after this is there any user code, a user stack, and an `epc` to return to.
+      - text: "`prepare_return` points `stvec` at `uservec` and sets `sepc` to the entry point"
+        why: This prepares the CSRs that userret's sret will use, so it comes before userret.
+      - text: "`userret` switches `satp` to the user page table and executes `sret`"
+        why: The last step; sret is what finally enters user mode.
+    why_wrong: Trace userinit, then scheduler, then forkret from top to bottom.
+    explain: |
+      Every process starts in the kernel, in [[forkret]], on an empty kernel stack. Process 1's
+      only difference is the `first` branch, which sets up the file system and loads `/init`
+      before taking the same [[prepare_return]]/[[userret]] path as every later process
+      ([[tour:4]]).

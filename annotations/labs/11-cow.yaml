@@ -1,0 +1,1860 @@
+published: true
+title: Copy-on-write fork
+area: Memory
+stars: 4
+branch: ext/11-cow
+prerequisites: {tours: [10, 20, 25, 26, 27, 28], concepts: [stacks, locks]}
+summary: |
+  In this tree [[kfork]] copies every page of the parent with [[uvmcopy]]: one [[kalloc]] and
+  one 4096-byte `memmove` per page. Most of that work is wasted. The shell forks a child that
+  calls `exec` a few microseconds later and throws the copy away. In this lab you make `fork`
+  share the parent's pages instead: both page tables point at the same physical pages, mapped
+  read-only, and the first store by either process takes a [[g:page-fault]] that copies just
+  that one page.
+
+  The idea fits in one sentence; the details are where an operating system shows its insides.
+  A page can now belong to several page tables: when may it be freed, and what happens on
+  three [[g:hart|harts]] when its owners let go at the same moment? Does anything in this tree
+  already handle store faults, and what would it make of yours? The kernel also writes into
+  user memory on a process's behalf: does that write fault too? And some pages are read-only
+  for good, like program text: how will your fault handler know them from shared ones? The
+  think section asks these questions in the order a designer meets them.
+
+  The reference solution is six small commits. With it, a `fork` of the shell allocates 6
+  pages instead of 11, and a process using 60% of RAM can fork, which the original kernel
+  refuses.
+learn:
+  - "How the hardware enforces a read-only page: a store from user mode through a PTE without `PTE_W` raises a store page fault (`scause` 15) with the address in `stval`, and how the kernel can turn that fault into a private copy and retry the instruction."
+  - "How a new kind of page fault has to coexist with the fault handling this tree already has, and how to make sure two handlers never fight over one fault."
+  - "How the kernel's own writes into user memory interact with a read-only user PTE, and what that means for code that runs with spinlocks held."
+  - "How to keep a reference count per physical page correctly on three harts: which lock protects it, what exactly must happen inside the critical section, and what a lost update does on a real run."
+  - "Which PTE bits the hardware ignores, and why a kernel may need one of them."
+  - "Why `exec` and `exit` need no change at all, why the parent's TLB needs no flush, and why a page with one remaining sharer can be made writable instead of copied."
+spec: |
+  **Behaviour.** After `fork`, parent and child share every user page that the parent had
+  mapped. No user page is copied by `fork`. A page that was writable in the parent becomes
+  read-only in *both* page tables and is marked copy-on-write. The first store to it, by either
+  process, copies that one page into a fresh page owned by the storing process, and the store
+  is retried. Afterwards each process sees only its own writes, exactly as with a copying
+  `fork`.
+
+  The same must hold when the kernel writes into a shared page on a process's behalf: `read`
+  into a buffer, `wait(&status)`, `pipe(fds)`, `fstat` into a page shared since `fork` must
+  all work.
+
+  **What must not change.**
+
+  - Pages that were read-only before `fork` (program text, mapped `R|X|U` by [[kexec]]) stay
+    read-only forever. A store to text must still kill the process, as `usertests nowrite`
+    checks, and `read` into text must still fail, as `usertests copyout` checks.
+  - The stack guard page (mapped without `PTE_U`, [[kernel/exec.c:95]]) stays inaccessible.
+  - Lazy allocation keeps working: a page reserved by `sbrklazy` and never touched is not
+    mapped when `fork` runs, and a first touch in either process still allocates a fresh zeroed
+    page through [[vmfault]].
+  - If no memory is left for a copy, the faulting process is killed; the kernel must not panic.
+    (A system call that needs a copy and finds no memory fails instead; one consequence is
+    worked out in the think section.)
+  - No page leaks: `usertests` compares the number of free pages before and after.
+  - **`usertests -q` must print `ALL TESTS PASSED` on 3 harts.**
+
+  **The test program**, `cowtest`, prints one line per check:
+
+  ```text
+  $ cowtest
+  cowtest: big: OK
+  cowtest: lazy: OK
+  cowtest: copyout: OK
+  cowtest: independence: OK
+  usertrap(): unexpected scause 0xf pid=8
+              sepc=0x55c stval=0x508
+  cowtest: text: OK
+  cowtest: forks: OK
+  cowtest: free pages 32436 before, 32436 after
+  cowtest: no leaks: OK
+  cowtest: ALL OK
+  ```
+
+  - **big**: allocate 60% of RAM with `sbrk` (more than half of the free memory), write every
+    page, fork; the child checks and rewrites 101 pages, the parent rewrites 51 (both include the first page). Without
+    copy-on-write, `fork` fails for lack of memory.
+  - **lazy**: `sbrklazy` 8 pages, touch only the first, fork; the child writes the shared page
+    (a copy-on-write fault), writes and reads untouched pages (lazy faults), and the parent's
+    values must be unchanged.
+  - **copyout**: the child `read`s from a pipe into 6 bytes straddling two pages it has not
+    touched since `fork`: only the kernel writes them.
+  - **independence**: parent and child each write a global after `fork`, in a fixed order
+    enforced by pipes; neither may see the other's value.
+  - **text**: a child stores to its own code; it must be killed (the `usertrap()` message
+    above is that kill, expected).
+  - **forks**: 5 rounds of 20 children, each forking a grandchild, all running on 3 harts.
+  - **no leaks**: free pages counted with `sbrk` before and after are equal.
+think:
+  - title: Where is a write to a shared page caught?
+    q: |
+      Parent and child must be able to share a page until one of them writes it. Something
+      has to notice that write *before* it lands in the shared page. What notices it, and
+      what does the kernel learn when it does? Commit to an answer before the hints: is it a
+      check in software, or something the hardware does on every store?
+    hints:
+      - "Look at the PTE bits in [[kernel/riscv.h:395]] and at how [[usertrap]] handles `scause` 13 and 15 today ([[kernel/trap.c:71]])."
+      - "The [[g:pte]] of a user page is consulted by the hardware on every user load and store. A store through a PTE without `PTE_W` cannot complete: the hart takes a store page fault, puts the faulting virtual address in `stval`, and leaves `sepc` pointing at the store so it can be retried."
+      - "Map the shared page without `PTE_W` in **both** page tables. The fault handler gives the faulting process its own writable copy, replaces its PTE, and returns to the same instruction, which now succeeds. Nothing else in the process notices."
+    answer: |
+      The hardware catches it. On every user-mode store, the [[g:sv39]] walk checks `PTE_W`; if
+      it is clear, the store does not happen and the hart traps with `scause` = 15 (store/AMO
+      page fault), `stval` = the virtual address, and `sepc` = the address of the store
+      instruction. Because [[usertrap]] does not add 4 to `epc` for a fault (only for
+      `ecall`), returning to user space runs the store again.
+
+      So the design is: clear `PTE_W` on every shared page that used to be writable, in the
+      parent's page table as well as the child's; on a store fault to such a page, allocate a
+      page, copy the 4096 bytes, point the faulting process's PTE at the copy with `PTE_W` set,
+      drop one reference to the old page, and return. The trap costs one trip through
+      [[uservec]] and [[usertrap]], paid only for pages that are actually written. A
+      software check would have to be compiled into every store of every program, which is
+      impossible.
+
+      One thing the hardware does *not* catch: stores made by the kernel. They are the subject
+      of a later question.
+    checks:
+      - id: lab11-01
+        level: 1
+        type: choice
+        q: |
+          A child shares its parent's stack page, mapped without `PTE_W`. The child executes
+          `sd ra, 8(sp)` (a store) to that page. What value does [[usertrap]] read from
+          `scause`?
+        options:
+          - text: "15, a store/AMO page fault"
+            correct: true
+            why: |
+              A store that the PTE does not permit is a store page fault, cause 15. A load
+              would be 13, an instruction fetch 12.
+          - text: "13, a load page fault"
+            why: |
+              You may have thought any page fault on data is 13. RISC-V separates them: 13 is
+              for loads, 15 for stores and atomic memory operations. The handler in this lab
+              only cares about 15, since reading a shared page is allowed.
+          - text: "12, an instruction page fault"
+            why: |
+              You may have mixed up "which page" and "which access". 12 is raised when the
+              hart *fetches an instruction* from a page it may not execute. Here the
+              instruction is fetched from a text page, which is fine; the store is the problem.
+          - text: "8, an environment call from U-mode"
+            why: |
+              You may have thought a write to memory the process does not own goes through
+              the kernel as a system call. Cause 8 is only for `ecall`. A page fault is an
+              exception raised by the store itself.
+        explain: |
+          The access type decides the cause: 12 fetch, 13 load, 15 store or AMO. The PTE
+          permission bits decide whether there is a fault at all. Copy-on-write lives
+          entirely on cause 15. See [[tour:10]] and [[tour:26]] for how [[usertrap]] reads
+          `scause` and `stval`.
+      - id: lab11-02
+        level: 2
+        type: tf
+        q: |
+          True or false: after a copy-on-write fault is handled, [[usertrap]] must add 4 to
+          `p->trapframe->epc` so that the process does not execute the faulting store twice.
+        answer: false
+        why_tf: |
+          You may have copied the rule from system calls. There, `epc` points at `ecall`, which
+          must not run again ([[kernel/trap.c:62]]). A faulting store did *not* happen; it
+          must run again, this time against the private writable copy.
+        reasons:
+          - text: "The store never completed; returning to the same instruction makes it run once, on the new page."
+            correct: true
+            why: |
+              Right: a fault is precise. Nothing was written, so retrying it is exactly one
+              execution.
+          - text: "The hardware advances `sepc` by itself on a page fault."
+            why: |
+              You may have assumed traps always point past the instruction. For exceptions
+              RISC-V sets `sepc` to the faulting instruction; for `ecall` too, which is why the
+              kernel adds 4 there.
+          - text: "Stores are idempotent, so running one twice is harmless."
+            why: |
+              You may be thinking of a plain `sd`, which would write the same value twice. But
+              an AMO such as `amoadd` is not idempotent, and anyway the store did not run the
+              first time.
+        explain: |
+          Exceptions in RISC-V are precise: the faulting instruction has no effect, and `sepc`
+          names it. Leaving `epc` alone retries it; this is the same mechanism that lazy
+          allocation already relies on ([[tour:26]]).
+  - title: How does the kernel tell a shared page from a page that is read-only for good?
+    q: |
+      After the change, a store fault on a mapped, valid, user page without `PTE_W` happens in
+      two different situations: the page is shared copy-on-write, or the page really is
+      read-only (program text). The first must be copied; the second must kill the process.
+      The PTE in both cases has `V`, `R` and `U` set and `W` clear. How does the fault handler
+      tell them apart? And which other mapped, valid page will [[uvmcopy]] see that is neither?
+    hints:
+      - "Read [[kexec]]: how are text pages mapped ([[kernel/exec.c:72]], [[flags2perm]]), and how is the page below the stack mapped ([[kernel/exec.c:91]], [[kernel/exec.c:95]])?"
+      - "The hardware reads bits 0 to 7 of a PTE. Bits 8 and 9 (RSW, reserved for supervisor software) are ignored by the hardware and left to the kernel."
+      - "Define `PTE_COW` as bit 8. `uvmcopy` sets it, together with clearing `PTE_W`, only on pages that had `PTE_W`. The fault handler copies only when `V`, `U` and `COW` are all set; anything else is not its business."
+    answer: |
+      The PTE has to carry one more bit of information, and RISC-V reserves two bits for
+      exactly this: bits 8 and 9, the RSW field, which the page-table walk ignores. The
+      reference solution defines `PTE_COW` as bit 8.
+
+      - When `fork` shares a page that was writable, it clears `PTE_W` and sets `PTE_COW`.
+      - When it shares a page that was already read-only (text), it leaves the flags alone: no
+        `PTE_COW`. That page can be shared forever; nobody may write it.
+      - The fault handler only acts if `PTE_V`, `PTE_U` and `PTE_COW` are all set.
+
+      The third kind of page is the **guard page** below the user stack. [[kexec]] maps it
+      writable and then clears `PTE_U` ([[uvmclear]]), so it is valid but unusable from user
+      mode. It has `PTE_W`, so `fork` marks it COW too; requiring `PTE_U` in the handler is
+      what keeps a stack overflow into it a fatal fault. (Alternatives: skip `PTE_U`-less pages
+      in `uvmcopy`. Either works; checking in one place, the handler, is harder to forget.)
+
+      Without the extra bit you could try "every read-only user page is COW", which is exactly
+      the bug in clinic 3: stores to text start succeeding.
+    checks:
+      - id: lab11-03
+        level: 2
+        type: bits
+        q: |
+          On the reference branch, gdb stopped in the copy-on-write handler and printed the
+          faulting process's PTE: `0x21fcf1d3`. Decode the flag bits (bits 0 to 9). What kind
+          of page is it?
+        value: "0x21fcf1d3"
+        fields:
+          - label: "V (bit 0)"
+            options: ["0", "1"]
+            answer: "1"
+            why: "The low 10 bits are 0x1d3 = 01 1101 0011 in binary: bit 0 is 1, the PTE is valid."
+          - label: "W (bit 2)"
+            options: ["0", "1"]
+            answer: "0"
+            why: "The low nibble 0x3 is bits 0 and 1 (V and R); bit 2, W, is clear: a store will fault."
+          - label: "U (bit 4)"
+            options: ["0", "1"]
+            answer: "1"
+            why: "0x1d3 = 01 1101 0011: bit 4 is 1, so user mode may access it."
+          - label: "D (bit 7)"
+            options: ["0", "1"]
+            answer: "1"
+            why: "Bit 7 (0x80) is set. You may have expected D to be clear on a read-only page, but QEMU sets A and D on accesses, and this page was written before fork made it read-only; fork copied the flags as they were."
+          - label: "RSW bit 8"
+            options: ["0", "1"]
+            answer: "1"
+            why: "0x100 is set: in this lab that is PTE_COW. The hardware ignores it; only the kernel reads it."
+          - label: "What happens on a user store?"
+            options: ["it succeeds", "store page fault, then a private copy", "store page fault, then the process is killed"]
+            answer: "store page fault, then a private copy"
+            why: "W is clear, so the store faults; V, U and COW are set, so the handler copies the page (or takes it over if it is the last sharer). Without bit 8 the handler would decline and the process would be killed."
+        explain: |
+          `0x21fcf1d3 & 0x3ff` = `0x1d3` = V (1) + R (2) + U (0x10) + A (0x40) + D (0x80) + bit 8
+          (0x100). The physical page number is `0x21fcf1d3 >> 10` = `0x87f3c`, so the page is at
+          physical address `0x87f3c000`. A text PTE has X (bit 3) set and never bit 8. Without
+          bit 8, a valid user page without W gets no copy: the store kills the process. See
+          [[kernel/riscv.h:395]] and [[g:pte]].
+      - id: lab11-04
+        level: 2
+        type: choice
+        q: |
+          With copy-on-write in place, a child overflows its one-page user stack and stores
+          to the guard page just below it. The guard PTE has `V` and `W` set and `U` clear; at
+          fork, `uvmcopy` turned `W` into `PTE_COW` as for any writable page. What must happen?
+        options:
+          - text: "The process is killed, because the handler requires PTE_U as well as PTE_COW."
+            correct: true
+            why: |
+              Right. The guard page exists to turn an overflow into a fatal fault; the COW
+              handler must not "repair" it.
+          - text: "The handler copies the guard page and the store succeeds."
+            why: |
+              That is what happens if the handler checks only `PTE_COW`. The overflow then
+              silently writes into a page the program should never touch, which is exactly
+              what the guard page is there to stop.
+          - text: "The kernel panics in walk."
+            why: |
+              You may be thinking of a virtual address at or above [[MAXVA]], which [[walk]]
+              refuses with a panic. The guard page is a low, ordinary address; walking to it is
+              fine.
+          - text: "vmfault allocates a fresh zeroed page there, as for a lazy page."
+            why: |
+              You may have forgotten [[ismapped]]: [[vmfault]] refuses any page that already
+              has a valid PTE ([[kernel/vm.c:466]]). The guard page is valid, just not
+              user-accessible.
+        explain: |
+          An access from user mode through a PTE without `U` faults regardless of `W`. Both
+          fault handlers must decline it: [[vmfault]] because the page is mapped, the COW
+          handler because `PTE_U` is clear. The process falls into the `else` branch of
+          [[usertrap]] and is killed. `usertests stacktest` checks the read side of this.
+  - title: A store fault already means something in this tree
+    q: |
+      This tree has lazy allocation: `sbrklazy(n)` only raises `p->sz`
+      ([[kernel/sysproc.c:62]]), and the first touch of each page faults into [[vmfault]],
+      called from [[usertrap]] for `scause` 13 and 15 ([[kernel/trap.c:71]]). Suppose you add
+      copy-on-write `fork` but do not touch [[usertrap]]. A child writes its stack after
+      `fork`. What happens, step by step? Then: how should the two handlers be combined, and
+      in which order? Could one fault ever need both?
+    hints:
+      - "Read [[vmfault]] line by line ([[kernel/vm.c:459]]): what does it do with an address that is already mapped?"
+      - "[[uvmcopy]] skips pages that are not mapped in the parent ([[kernel/vm.c:309]]). So at any moment a page of a process is either unmapped (lazy, still to be allocated) or mapped (possibly COW). A single PTE cannot be both."
+      - "Try the COW handler first, for `scause` 15 only; it succeeds only on a mapped PTE with `PTE_COW`. Then let the existing `vmfault` branch run unchanged; it succeeds only on an unmapped page below `p->sz`. If both decline, kill."
+    answer: |
+      Without a change to [[usertrap]], the child's store faults with `scause` 15, the existing
+      branch calls [[vmfault]], and [[vmfault]] returns 0 because [[ismapped]] says the page is
+      mapped ([[kernel/vm.c:466]]). [[usertrap]] prints `unexpected scause 0xf` and kills the
+      child. And not only the child: `fork` marked the *parent's* PTEs COW as well, so the
+      parent dies at its own first store to a formerly writable page, and so does `init`,
+      whose pages became COW when it forked the shell at boot. We built exactly that (commit 2
+      plus the new `uvmcopy`) and typed `echo hi`: pid 3, then pid 2, then pid 1 were killed,
+      and the kernel stopped with `panic: init exiting`. That is the interaction to
+      discover: in this tree "store page fault" does not mean "lazy page", it means "lazy page
+      *or* COW page", and the existing code only knows the first.
+
+      The two cases are disjoint because they are about different PTE states:
+
+      | the PTE for the faulting page | lazy (`vmfault`) | COW handler |
+      |---|---|---|
+      | no PTE, or `V` clear, address below `p->sz` | allocates | declines |
+      | `V`, `U`, `PTE_COW` set | declines (mapped) | copies |
+      | `V` set, no `PTE_COW` (text, guard) | declines | declines: kill |
+      | address at or above `p->sz` and unmapped | declines | declines: kill |
+
+      The reference adds one branch before the lazy one: `scause == 15 && cowfault(...)`.
+      Load faults (13) never need COW, since reading a shared page is allowed. A fault never
+      needs both handlers: a lazy page that is not mapped at `fork` is simply not shared, and
+      after the fault that allocates it, it is a private writable page. `fork` does not copy
+      lazy pages at all; each process gets its own zeroed page if it touches one later.
+
+      The same two-way split appears again in [[copyout]], which already calls [[vmfault]] for
+      unmapped pages and now also has to handle COW pages (next question).
+    checks:
+      - id: lab11-05
+        level: 2
+        type: choice
+        q: |
+          You have changed only [[uvmcopy]] (pages are shared and marked COW) and nothing
+          else. You type `echo hi` at the shell. What do you see?
+        code: kernel/trap.c:69-79
+        options:
+          - text: "The shell's child, then the shell, then init are killed at their first store (unexpected scause 0xf), and the kernel panics with init exiting."
+            correct: true
+            why: |
+              Every store to a formerly writable page faults, in parents as well as children,
+              and [[vmfault]] declines each one because the page is mapped. `init` shares its
+              pages with the shell since boot, so it dies too, and [[kexit]] panics for `init`.
+          - text: "usertrap(): unexpected scause 0xf for the shell's child only, which is killed before it can exec echo; the shell prints the next prompt."
+            why: |
+              You may have thought only the child's page table changed. [[uvmcopy]] marks the
+              *parent's* PTEs read-only and COW too, so the shell's next store faults in the
+              same way, and so does `init`'s. The recorded run: pid 3, pid 2, pid 1, then
+              `panic: init exiting`.
+          - text: "hi, because vmfault allocates a fresh page for the faulting address."
+            why: |
+              You may have read [[vmfault]] as "fix any page fault". It refuses addresses that
+              are already mapped ([[kernel/vm.c:466]]); a shared COW page is mapped.
+          - text: "panic: mappages: remap, because vmfault maps over the existing PTE."
+            why: |
+              That would happen if [[vmfault]] called [[mappages]] without the [[ismapped]]
+              check. It checks first and returns 0.
+          - text: "hi, because the store goes to the shared page and nobody notices."
+            why: |
+              You may have thought the PTE change is only advisory. The hardware enforces
+              `PTE_W` on every user store; the store faults.
+        explain: |
+          In this tree a store fault reaches [[vmfault]] before anything else, and [[vmfault]]
+          only handles pages that are *not* mapped. A COW page is mapped, so the fault is
+          "unexpected" until you add a branch for it, for every process that has ever forked
+          or been forked. See [[tour:26]] for the lazy path.
+      - id: lab11-06
+        level: 3
+        type: tf
+        q: |
+          True or false: in the reference design, if a parent reserved 8 pages with
+          `sbrklazy` and touched none of them, then after `fork` the child's first store to
+          one of those pages is handled by the copy-on-write handler.
+        answer: false
+        why_tf: |
+          You may have assumed `fork` shares everything below `p->sz`. It shares only what is
+          mapped; unmapped lazy pages are skipped ([[kernel/vm.c:309]]).
+        reasons:
+          - text: "The page is not mapped in the child either, so the store is a lazy fault handled by vmfault."
+            correct: true
+            why: |
+              Right. The child inherits `p->sz`, so the address is legal, and [[vmfault]]
+              gives it a fresh zeroed page.
+          - text: "The COW handler handles it, because the child's PTE was marked COW at fork."
+            why: |
+              There is no PTE to mark: [[uvmcopy]] `continue`s past unmapped pages. Nothing is
+              written into the child's page table for them.
+          - text: "Neither handler can, so the child is killed."
+            why: |
+              You may have thought lazy pages are lost across `fork`. The child's `p->sz` is
+              the parent's ([[kernel/proc.c:276]]), so [[vmfault]]'s `va < psz` test passes.
+        explain: |
+          Lazy and COW pages are disjoint states of a PTE: unmapped-but-promised versus
+          mapped-and-shared. `cowtest lazy` checks exactly this mix: page 0 shared and copied,
+          pages 3 and 5 allocated lazily in the child.
+  - title: Who counts the sharers, and under which lock?
+    q: |
+      A physical page may now be mapped by several page tables. [[kfree]] is called by
+      [[uvmunmap]] whenever any one of them lets go (exit, exec, `sbrk(-n)`). When may the
+      page really go back on the free list, and where do you keep the information? Then, on 3
+      harts: the parent and the child exit at the same moment on two harts, and both call
+      [[kfree]] on the same text page. What must be true of your code so that the page is
+      freed exactly once?
+    hints:
+      - "Physical RAM runs from [[KERNBASE]] to [[PHYSTOP]]: 128 MiB, 32,768 pages. Look at how [[kfree]] already validates its argument ([[kernel/kalloc.c:51]])."
+      - "The count changes by read-modify-write: load, add or subtract, store. Two harts doing that at once can lose one update. Also, the decision \"the count reached 0, so free the page\" must be made by exactly one of the two harts."
+      - "An `int` array indexed by `(pa - KERNBASE) / PGSIZE`, a spinlock around every access, and in `kfree`: lock, check the count is at least 1, decrement, remember the new value, unlock; then free only if the remembered value is 0. `kalloc` sets the count to 1; fork adds 1 per shared page."
+    answer: |
+      Keep one counter per physical page: `int count[(PHYSTOP - KERNBASE) / PGSIZE]`, 32,768
+      entries, 128 KiB of kernel `.bss` (32 pages, which shows up as 32 fewer free pages:
+      `cowtest` counts 32,468 free pages on the original kernel and 32,436 with this branch).
+      The index is `(pa - KERNBASE) / PGSIZE`. [[kalloc]] sets it to 1, `fork` adds one for
+      every page it shares, and [[kfree]] becomes "drop one reference": it frees the page only
+      when its count reaches 0. [[freerange]] sets each page's count to 1 before its first
+      [[kfree]] so that the boot-time frees bring it to 0.
+
+      The race. `--count[i]` is a load, a subtract and a store (`lw`, `addiw`, `sw` in this
+      build). Without a lock:
+
+      | time | hart 0 (parent exits) | hart 1 (child exits) |
+      |---|---|---|
+      | 1 | loads 2 | |
+      | 2 | | loads 2 |
+      | 3 | stores 1, "still shared" | |
+      | 4 | | stores 1, "still shared" |
+
+      Nobody frees the page: a leak. The mirror image (a lost *increment* during a `fork` racing
+      with an exit) is worse: the count reaches 0 while a page table still maps the page, the
+      page is freed and handed to someone else. Clinic 1 shows both happening on a real run.
+
+      With a spinlock around the read-modify-write and the test, the two decrements serialize:
+      one hart sees 1, the other sees 0 and frees. The lock must cover the decrement *and* the
+      decision; reading the count again after releasing it would reopen the race.
+
+      **Which lock?** `kmem.lock` would work, but the reference uses a separate `kref.lock`.
+      The counts and the free list share no invariant that needs one critical section: once a
+      count reaches 0 nobody else holds the page, so pushing it on the free list a moment later,
+      under `kmem.lock`, is safe; and in [[kalloc]] the page just popped is known to nobody
+      until its count is set. Separate locks keep `fork`, which now does one count update per
+      page and no page copies (it still allocates page-table pages), off the free list's lock. The two locks are never held together
+      (each function releases one before taking the other), so they add no lock-order edge
+      between them.
+    checks:
+      - id: lab11-07
+        level: 1
+        type: number
+        q: |
+          The counts array has one `int` for every 4096-byte page between [[KERNBASE]] and
+          [[PHYSTOP]]. How many entries does it have?
+        code: kernel/memlayout.h:40-44
+        answer: 32768
+        wrong:
+          32735: |
+            You may have counted only the pages [[freerange]] puts on the free list (the ones
+            after the kernel image). Indexing from [[KERNBASE]] is simpler and wastes only the
+            entries for the kernel's own pages.
+          131072: |
+            You may have computed the array's size in bytes (32,768 × 4). The question asks
+            for entries.
+          4096: |
+            You may have divided 128 MiB by 32 KiB, or confused the page size with the page
+            count. 128 MiB / 4 KiB = 32,768.
+        why_wrong: "PHYSTOP - KERNBASE is 128 MiB = 0x8000000; divide by PGSIZE (4096)."
+        explain: |
+          `0x8000000 / 0x1000 = 0x8000` = 32,768. At 4 bytes each that is 128 KiB, 32 pages of
+          kernel `.bss`. Pages below `end` (the kernel itself) have entries that are never used.
+      - id: lab11-08
+        level: 3
+        type: choice
+        q: |
+          Suppose [[kfree]] does this, with a lock only around the decrement:
+
+          ```c
+          acquire(&kref.lock);
+          kref.count[i]--;
+          release(&kref.lock);
+          if (kref.count[i] == 0)
+            /* put the page on the free list */
+          ```
+
+          Two harts drop the last two references to one page at the same time. What can go
+          wrong?
+        options:
+          - text: "Both harts can read 0 after their releases and both free the page: a double free that corrupts the free list."
+            correct: true
+            why: |
+              Both decrements are serialized (2 → 1 → 0), but both re-reads happen after
+              both releases and see 0. The page goes on the free list twice and will be
+              handed out twice.
+          - text: "Nothing: the decrement is protected, so the count is always right."
+            why: |
+              The count is right; the decision is not. Who frees must be decided inside the
+              same critical section as the decrement, from the value that this hart produced.
+          - text: "The page leaks, because both harts read 1."
+            why: |
+              You may be thinking of the fully unlocked version. Here the decrements cannot
+              interleave, so the count does reach 0; the danger is that both see it.
+          - text: "A deadlock, because kfree takes kref.lock twice."
+            why: |
+              The code takes the lock once and releases it before the test. No lock is
+              taken twice.
+        explain: |
+          A lock protects an *invariant*, not a variable: here "exactly one dropper sees the
+          count reach 0". The reference stores the decremented value in a local `n` inside the
+          critical section and tests `n` after releasing. See [[concept:locks#why]].
+  - title: The kernel writes too
+    q: |
+      `read(fd, buf, n)` in a forked child, where `buf` is in a page the child has not written
+      since `fork`. The kernel puts the data in `buf` with [[copyout]]. Does that store take a
+      page fault? What does [[copyout]] do today with the shared page, and what must it do? Look
+      at [[piperead]]: which locks are held when [[copyout]] runs, and what does that forbid
+      your fix to do? Finally, `read` is not the only system call that writes into user memory.
+      Which call does every shell make after every `fork`, and what would its failure leave
+      behind in the process table?
+    hints:
+      - "[[copyout]] translates `dstva` with [[walkaddr]] and then calls `memmove` on a *physical* address ([[kernel/vm.c:370]]). Through which page table does that `memmove` go? ([[kernel/vm.c:42]])"
+      - "The kernel page table maps all of RAM `R|W` at its physical address. The user PTE's `PTE_W` is only *read* by [[copyout]] at [[kernel/vm.c:364]]; the hardware never sees it. [[piperead]] holds `pi->lock` around the copy ([[kernel/pipe.c:118]], [[kernel/pipe.c:133]]); [[kwait]] holds `wait_lock` and the child's `p->lock` ([[kernel/proc.c:390]])."
+      - "In [[copyout]], after finding the PTE and before the `PTE_W` test: if the PTE has `PTE_COW`, call the same function the fault handler uses and write into the physical page it returns. That function may call [[kalloc]] and [[kfree]] (spinlocks only) but must never sleep."
+    answer: |
+      The kernel's store does not fault. [[copyout]] finds the physical address with
+      [[walkaddr]] and writes through the kernel page table's [[g:direct-map]] of RAM, which is
+      writable. The user PTE is looked at only in software. Today, [[copyout]] sees that
+      `PTE_W` is clear and returns -1 ([[kernel/vm.c:364]]): the `read` fails. (If that test
+      were missing, the kernel would write straight into the page every sharer sees, the worst
+      possible outcome.)
+
+      So [[copyout]] must break the sharing itself: if the PTE has `PTE_COW`, call the COW
+      handler (the reference's `cowfault`), which copies and remaps the page, then write into
+      the physical page it returns. Read-only pages without `PTE_COW` still fail with -1, which
+      is what `usertests copyout` checks with a buffer at address 0.
+
+      The locking constraint: [[copyout]] is called with spinlocks held. In [[piperead]] it runs
+      under `pi->lock` (noff 1), in [[kwait]] under `wait_lock` and the child's `p->lock` (noff
+      2). Holding a spinlock means interrupts are off and the code must not sleep. The handler
+      calls [[kalloc]] and [[kfree]], which only take spinlocks and never sleep, so it is
+      legal, and it adds new lock-order edges: `pi->lock` → `kmem.lock`, `pi->lock` →
+      `kref.lock`, and in [[kwait]] a third level, noff 3, measured with gdb in the reveal. If
+      memory is exhausted, `cowfault` returns 0, [[copyout]] returns -1, and the system call
+      fails cleanly; no sleeping wait for memory is possible here.
+
+      The other call is `wait(&status)`: [[kwait]] copies the exit status out with
+      [[copyout]] *before* it frees the zombie, and gives up with -1 if that fails
+      ([[kernel/proc.c:390]]-[[kernel/proc.c:395]]). The status variable usually lives in the
+      parent's stack page, which is shared with the child it just forked. If the COW copy
+      fails, the zombie stays in the process table. That happens in two situations:
+
+      - **[[copyout]] does not handle COW at all** (clinic 2): every such `wait` fails, zombies
+        pile up, and `fork` eventually runs out of process slots.
+      - **Memory is exhausted**, perhaps by the dying child itself: `wait` returns -1. In an
+        out-of-memory test run on this branch, the parent's next store to that still-shared
+        stack page then found no memory either and the parent was killed. Nothing panicked
+        and no page leaked.
+    checks:
+      - id: lab11-09
+        level: 2
+        type: state
+        q: |
+          A forked child (`cowtest`, pid 6) calls `read` on a pipe into a buffer it shares
+          copy-on-write with its parent. [[piperead]] holds `pi->lock` and calls [[copyout]],
+          which calls the COW handler, which calls [[kalloc]]. Fill in the hart's state just
+          after [[kalloc]] has acquired `kmem.lock`.
+        code: kernel/pipe.c:112-143@129-139
+        state:
+          mode: S
+          stack: kernel
+          satp: kernel
+          sie: "off"
+          noff: 2
+          intena: 1
+        why:
+          noff: |
+            Two spinlocks are held: `pi->lock` (from [[piperead]]) and `kmem.lock` (from
+            [[kalloc]]). Each [[acquire]] pushes one level. The gdb run recorded noff 2 here.
+          intena: |
+            intena records SIE before the *outermost* push_off. This is a system call, and
+            [[usertrap]] turned interrupts on before [[syscall]] ([[kernel/trap.c:66]]), so the
+            first acquire (`pi->lock`) saw SIE on: intena is 1.
+          sie: |
+            Any held spinlock means interrupts are off on this hart, whatever intena says.
+          stack: |
+            A system call runs on the process's kernel stack; the COW copy is just more frames
+            on it: `usertrap → syscall → sys_read → fileread → piperead → copyout → cowfault →
+            kalloc`.
+          satp: |
+            The kernel runs on the kernel page table; [[uservec]] switched to it. The copy
+            reaches the user page through the direct map.
+        why_wrong: Follow the path ecall → uservec → usertrap (intr_on) → piperead (acquire) → copyout → cowfault → kalloc (acquire) and track each field.
+        explain: |
+          This is why the COW handler must never sleep: it can run with up to three spinlocks
+          held. Measured with gdb on the reference branch: noff 2, intena 1, SIE 0 at
+          [[kalloc]]'s `kmem.freelist` read on this path; noff 3 on the [[kwait]] path.
+      - id: lab11-10
+        level: 1
+        type: tf
+        q: |
+          True or false: when [[copyout]] writes into a user page, the hardware checks that
+          page's user PTE, so a copy-on-write page makes [[copyout]] fault like a user store.
+        answer: false
+        why_tf: |
+          You may have assumed the kernel accesses user memory through the user page table. In
+          this tree it never does: `satp` holds the kernel page table while the kernel runs.
+        reasons:
+          - text: "copyout writes to the physical address through the kernel page table's direct map; the user PTE is only read in software."
+            correct: true
+            why: Right. That is why the kernel must test `PTE_COW` itself.
+          - text: "Supervisor mode ignores PTE permissions entirely."
+            why: |
+              You may be overgeneralizing. S-mode accesses are checked against the PTEs of the
+              page table in `satp` (the kernel's, which maps RAM writable). They are not
+              checked against the user page table because it is not in `satp`.
+          - text: "copyout uses sstatus.SUM to write user pages directly, and SUM bypasses W."
+            why: |
+              This tree never sets `SUM`; that is a different design (lab 17). And `SUM` does
+              not bypass `W` either.
+        explain: |
+          [[copyout]] = translate in software ([[walkaddr]]), write physically
+          ([[kernel/vm.c:370]]). See [[tour:28]].
+  - title: When can you skip the copy?
+    q: |
+      Parent and child share a page. The child writes it first and gets its own copy; the
+      shared page now has count 1, and only the parent maps it, still read-only with
+      `PTE_COW`. Later the parent writes it. Does the parent need to copy? What check lets you
+      skip the copy, and is that check safe on three harts without holding `kref.lock` until the
+      PTE is updated? What if parent and child fault on the same page at the same moment on two
+      harts?
+    hints:
+      - "Who could possibly increase a page's count from 1? Only a `fork` of a process that maps it."
+      - "xv6 processes are single-threaded. The process that is in the fault handler is not, at the same moment, in `fork`."
+      - "If the count is 1, set `PTE_W`, clear `PTE_COW`, keep the page. Otherwise copy, remap, and drop one reference with `kfree`. Two simultaneous faults both see count 2, both copy, and the two `kfree`s bring the original to 0 and free it."
+    answer: |
+      If the count is 1, this page table is the only one mapping the page: nobody else can see
+      a store into it. Copying would allocate a page, copy 4096 bytes and free the original for
+      nothing. The reference makes the PTE writable and clears `PTE_COW` instead (it calls this
+      "taking the page over"). In the measured `echo hi` run, the shell's child copied its
+      stack and data pages, called `exec`, and dropped its references; when the shell (pid 2)
+      next wrote those two pages, both were taken over, no copy.
+
+      The check reads the count under `kref.lock` and releases the lock before changing the
+      PTE. That is safe because a count of 1 cannot go up behind our back: the only way to add
+      a reference is a `fork` of a process that maps the page, the only such process is the
+      one in the fault handler, and it is single-threaded. It cannot go down either: only a
+      process that maps the page can drop a reference.
+
+      The other case, two sharers faulting at once on two harts, needs no special code. Both
+      read count 2, both [[kalloc]] a page and copy, both remap their own PTE, and both
+      [[kfree]] the original: 2 → 1 → 0, and the second `kfree` (serialized by `kref.lock`)
+      frees it. One copy was unnecessary in hindsight, but nothing is wrong. The optimisation
+      is optional: without it every COW fault copies, and the last copy frees the original.
+    checks:
+      - id: lab11-11
+        level: 3
+        type: choice
+        q: |
+          The COW handler reads the count with `krefcount(pa)` (which takes and releases
+          `kref.lock`) and, if it is 1, sets `PTE_W` in the faulting process's PTE. Why is it
+          safe to set `PTE_W` after the lock has been released?
+        options:
+          - text: "Only a fork of a process that maps the page can raise the count, and the only such process is the one in the handler; xv6 processes are single-threaded."
+            correct: true
+            why: |
+              Right: the count can neither rise (no other mapper can fork) nor fall (no other
+              mapper can drop) between the check and the PTE update.
+          - text: "Because interrupts are off in usertrap, so no other hart can run."
+            why: |
+              You may have thought SIE is global. It only affects this hart; the other two keep
+              running ([[concept:locks#sie]]).
+          - text: "It is not safe; the reference has a race here."
+            why: |
+              That would be true if a process could have two threads, one forking while the
+              other faults. In this kernel a process is one thread, so the race cannot happen.
+          - text: "Because the PTE update is a single atomic store."
+            why: |
+              The store is atomic, but that is not the point: the question is whether the
+              decision (count is 1) is still true when the store happens.
+        explain: |
+          Locks protect invariants; sometimes an invariant is guaranteed by structure instead of
+          by a lock. Here the structure is "one thread per process" (see
+          [[tour:20]]). Lab 9 (threads with `clone`) breaks that structure, and this handler
+          would then need the lock held across the PTE update.
+  - title: What else frees, flushes, or fails?
+    q: |
+      Go through every place that unmaps or frees user memory, and every place that changes a
+      PTE. Which need changes for copy-on-write: [[kexec]] freeing the old image, [[kexit]] and
+      [[freeproc]], `sbrk(-n)`, the error path of [[uvmcopy]] itself? After [[uvmcopy]] clears
+      `PTE_W` in the *parent's* page table, the parent's hart may still hold a writable
+      translation in its [[g:tlb]]. Does it need an `sfence.vma`?
+    hints:
+      - "All of them free user pages through [[uvmunmap]] with `do_free` = 1 ([[kernel/vm.c:207]]), which calls [[kfree]]."
+      - "Where is `sfence.vma` executed on the way from the kernel back to user space? ([[kernel/trampoline.S:110]]) Which page table does the parent's hart use while it runs [[kfork]]? Can any other hart be using the parent's page table?"
+      - "Nothing outside `kalloc.c`, `vm.c` and `trap.c` changes. In `uvmcopy`'s error path, every page already mapped in the child has been counted once, and `uvmunmap(new, 0, i / PGSIZE, 1)` drops exactly those references."
+    answer: |
+      Nothing else changes. Every path that gives back user memory ends in
+      `uvmunmap(..., do_free = 1)` → [[kfree]], and [[kfree]] now means "drop one reference".
+      `exec` dropping the old image, `exit` + `wait` freeing a zombie, `sbrk(-n)`: all correct
+      as they are. This is the payoff of putting the counting inside the allocator.
+
+      The error path of [[uvmcopy]]: pages `0 .. i-1` are mapped in the child and counted;
+      page `i` failed in [[mappages]] (out of memory for a page-table page) and was neither
+      mapped nor counted. `uvmunmap(new, 0, i / PGSIZE, 1)` drops exactly the child's
+      references. The parent's PTEs already marked COW stay that way, which is harmless: with
+      count 1, its next store takes the page over. Calling `kfree(pa)` for page `i` (a habit
+      from the old code's `kfree(mem)`) would drop the *parent's* reference: clinic 4.
+
+      No TLB flush is needed. [[kfork]] runs on the parent's kernel stack with `satp` holding
+      the kernel page table; [[uservec]] flushed the TLB when it switched to it
+      ([[kernel/trampoline.S:89]]-[[kernel/trampoline.S:95]]), and [[userret]] flushes again
+      when it switches back ([[kernel/trampoline.S:110]]-[[kernel/trampoline.S:112]]). No other
+      hart can be using the parent's page table: one process, one thread, one hart at a time.
+      The same reasoning covers the COW handler's own PTE changes.
+    checks:
+      - id: lab11-12
+        level: 2
+        type: multi
+        q: |
+          Which functions does the reference copy-on-write branch change?
+        options:
+          - text: "kfree and kalloc"
+            correct: true
+            why: "They gain the reference count: kalloc sets it to 1, kfree drops one and frees at 0."
+          - text: "uvmcopy"
+            correct: true
+            why: "It shares pages instead of copying them."
+          - text: "usertrap"
+            correct: true
+            why: "One new branch sends store faults on COW pages to the handler."
+          - text: "copyout"
+            correct: true
+            why: "Kernel writes do not fault, so copyout breaks the sharing itself."
+          - text: "uvmunmap"
+            why: |
+              You may have thought the unmapping code must know about sharing. It calls
+              [[kfree]], and [[kfree]] now decides whether the page is really freed.
+          - text: "kexec"
+            why: |
+              You may have expected exec to need special care for shared pages. It frees the old
+              image through [[proc_freepagetable]] → [[uvmunmap]] → [[kfree]], which only drops
+              references now.
+        explain: |
+          Seven existing functions change: these five plus [[kinit]] and [[freerange]] (only for
+          initialisation), along with one new function (`cowfault`) and two small helpers
+          (`krefinc`, `krefcount`). The rest of the kernel is unaware of sharing, because the one operation
+          that ends a page's life, [[kfree]], counts.
+      - id: lab11-13
+        level: 3
+        type: choice
+        q: |
+          [[uvmcopy]] clears `PTE_W` in the parent's PTEs while the parent is in [[kfork]]. Why
+          is no `sfence.vma` needed?
+        options:
+          - text: "The parent's hart runs on the kernel page table now, and userret executes sfence.vma when it switches back to the user page table; no other hart uses the parent's page table."
+            correct: true
+            why: Right. The stale writable entry, if any, cannot be used before the flush.
+          - text: "RISC-V hardware never caches PTEs without PTE_W."
+            why: |
+              You may have assumed the TLB only holds writable entries. It caches any valid
+              translation, permissions included.
+          - text: "Because the TLB is flushed on every timer interrupt."
+            why: |
+              A timer interrupt taken *in user mode* does pass through [[uservec]], which flushes.
+              But this one would be taken in the kernel (the parent is in [[kfork]]), and
+              kernel traps go through `kernelvec`, which never flushes. Flushes happen only in
+              [[kvminithart]], [[uservec]] and [[userret]].
+          - text: "It is needed; without it the parent could write the shared page."
+            why: |
+              It would be needed if the parent could return to user mode without a flush, or
+              if another hart ran the parent's threads. Neither is possible here.
+        explain: |
+          A stale TLB entry matters only if some hart can use it. [[userret]]'s `sfence.vma`
+          ([[kernel/trampoline.S:112]]) runs on every return to user mode, before any user
+          instruction, so the parent's first store after `fork` uses the new, read-only PTE.
+build: |
+  **Start.**
+
+  ```text
+  git checkout -b my-cow 06aad25
+  ```
+
+  Add your test program first (copy the spec's list of checks into `user/cowtest.c`, add
+  `$U/_cowtest\` to `UPROGS` in the `Makefile`). On the unmodified kernel `cowtest big` must
+  print `fork failed` and `FAIL`: that is the test working.
+
+  **Milestones, in an order that keeps the system bootable after each one.**
+
+  1. **Reference counts in `kalloc.c`.** The array, its lock, [[kalloc]] setting 1, [[kfree]]
+     dropping one, a `krefinc`, a `krefcount`, and [[freerange]] setting 1 before each boot-time
+     free. Nothing shares pages yet, so every count is 0 or 1. Test: boot, `usertests -q`. A
+     panic in [[kfree]] now means a real double free somewhere (the original kernel would have
+     silently corrupted its free list).
+  2. **The COW bit and the handler.** `PTE_COW` in `riscv.h`; a function in `vm.c` that takes a
+     page table and a virtual address and either makes the page writable (copy, or take over)
+     or returns 0. Nothing calls it yet. Test: it compiles.
+  3. **The fault path.** One new branch in [[usertrap]], before the lazy one, for `scause` 15.
+     Test: `usertests -q` (still no shared pages, so behaviour is unchanged).
+  4. **The kernel's writes.** In [[copyout]], call the handler for `PTE_COW` pages before the
+     `PTE_W` test. Test: `usertests -q`.
+  5. **Flip the switch: share in [[uvmcopy]].** Now everything above is exercised. Test:
+     `cowtest`, then `usertests -q`, then `cowtest` again (a leak in usertests would show as
+     fewer free pages in the second `cowtest`).
+
+  **Debugging advice.** For breakpoints at boot, start QEMU halted with `make qemu-gdb` (it
+  adds `-S` and a gdb port of its own, which it writes into `.gdbinit`), run
+  `${TOOLPREFIX}gdb kernel/kernel` in another terminal, and set them before the first
+  `continue`; for later events, continue and interrupt with Ctrl-C when you need to.
+  `TOOLPREFIX` is your RISC-V toolchain's prefix, the same one xv6's Makefile detects
+  (`riscv64-unknown-elf-`, `riscv64-linux-gnu-` or `riscv64-elf-`); set it with `export
+  TOOLPREFIX=riscv64-unknown-elf-` or whichever you have. On Debian/Ubuntu/WSL,
+  `gdb-multiarch` also works as the debugger.
+
+  - Print, don't guess: a temporary `printk("cow %s %d va %p ref %d\n", ...)` in the handler
+    shows each copy. On the reference, `echo hi` prints two copies in the shell's child (stack
+    `0x4000`, then data `0x2000`) and two takeovers in the shell afterwards.
+  - Count pages: a counter in [[kalloc]] attributed to `myproc()` gives "pages per fork" and
+    "pages per exec" (the measurements below were made that way).
+  - `panic: kfree: refcount` means some page was dropped more times than it was counted:
+    break on that panic and look at `bt` (which path), then think about who else dropped it.
+  - `usertrap(): unexpected scause 0xf` for a process that should live means neither handler
+    accepted the fault: print the PTE (`p/x *walk(p->pagetable, va, 0)` in gdb) and check
+    `V`, `U`, `W` and bit 8.
+  - A test that hangs: attach gdb, `thread apply all bt`, and list `proc[]` states. Usually
+    one process is `SLEEPING` in [[piperead]] and the partner is a `ZOMBIE` that exited early.
+clinic:
+  - bug: The reference counts are not locked
+    change: |
+      Every `acquire(&kref.lock)` / `release(&kref.lock)` pair in `kalloc.c` removed (in
+      [[kfree]], [[kalloc]], `krefinc` and `krefcount`); everything else as in the reference:
+
+      ```diff
+      -  acquire(&kref.lock);
+         if (kref.count[PA2REF(pa)] < 1)
+           panic("kfree: refcount");
+         n = --kref.count[PA2REF(pa)];
+      -  release(&kref.lock);
+         if (n > 0)
+           return; // another page table still maps it
+      ```
+
+      In this build the decrement is `lw` at `0x80000a6a`, then seven instructions, then `sw`
+      at `0x80000a80`: nine instructions from load to store.
+    symptom: |
+      $ refrace 500
+      refrace: free pages 32440 before, 32440 after: OK
+      $ refrace 500
+      refrace: free pages 32440 before, 32439 after: FAIL
+      $ refrace 500
+      refrace: free pages 32439 before, 32439 after: OK
+      $ refrace 500
+      refrace: free pages 32439 before, 32439 after: OK
+      $ refrace 500
+      refrace: free pages 32439 before, 32439 after: OK
+      $
+
+      (another boot)
+      $ refrace 500
+      refrace: free pages 32440 before, 32440 after: OK
+      $ refrace 500
+      refrace: free pages 32440 before, 32441 after: FAIL
+      panic: kfree: refcount
+    why: |
+      Honest summary first: **`usertests -q` and `cowtest` never caught this bug.** On 3 boots
+      of this kernel (3 harts), each running `usertests -q` twice and `cowtest` five times, all
+      21 runs passed, `cowtest` always reporting 32,436 free pages before and after.
+
+      It took a stress program written for it, `refrace` (not part of the branch): three
+      workers, each doing `fork` + `exit` + `wait` 500 times, with free pages counted before and
+      after. The workers and all their short-lived children share the program's text pages, so
+      every `fork` (`krefinc`) and every `exit` ([[kfree]] via [[uvmunmap]]) on any hart does a
+      read-modify-write of the same few counters. It ran 5 times on each of 6 fresh boots:
+      boots 1 and 3 printed five `OK` lines; boot 2 is the first block above (one leaked page);
+      boots 4, 5 and 6 ended in `panic: kfree: refcount` (boot 6 is the second block; boot 5
+      first leaked a page between runs, then panicked on its fifth run). 4 boots of 6 went
+      wrong. On the reference branch the same program printed `OK` every time.
+
+      Two kinds of lost update show up, exactly as predicted in the think section:
+
+      - **A lost decrement** (two harts load the same count, both store count − 1): the count
+        never reaches 0, the page is never freed. `32440 before, 32439 after` is one leaked
+        page. Nothing crashes; the memory is simply gone until reboot (boot 2, and between the
+        second and third run of boot 5).
+      - **A lost increment** (a `fork` on one hart and an `exit` on another, overlapping): the
+        count is one too low, so it reaches 0 while a page table still maps the page.
+        [[kfree]] puts a page that is still in use on the free list: one page *more* than
+        before (`32441`). The next drop of that page by the page table that still maps it finds
+        count 0, and the check added in commit 1 panics with `kfree: refcount`. Without that
+        check, the page would have been handed to someone else while still mapped: silent
+        corruption of two processes.
+
+      Why did gdb hide it? With gdb attached and a breakpoint inserted, QEMU's timing changes;
+      8 logged runs under gdb showed nothing. This is typical of races: the observation changes the
+      odds. We also ran a copy with the window artificially widened (a 1000-iteration delay
+      loop between the load and the store): `refrace` failed on its first run with `32441`
+      and the same panic, yet `usertests -q` and `cowtest` still passed on that copy, because
+      they rarely change the same counter from two harts at once.
+
+      The lesson: a passing test suite says little about a missing lock. Reason it out from the
+      interleaving table, then write a test that makes the interleaving likely.
+  - bug: copyout does not handle copy-on-write pages
+    change: |
+      The new block in [[copyout]] is missing, so a COW destination falls into the existing
+      `PTE_W` test:
+
+      ```diff
+           pte = walk(pagetable, va0, 0);
+      -    // the kernel's own writes do not fault: copy a
+      -    // copy-on-write page here, as a user store would.
+      -    if ((*pte & PTE_COW) != 0) {
+      -      if ((pa0 = cowfault(pagetable, va0)) == 0)
+      -        return -1;
+      -    }
+           // forbid copyout over read-only user text pages.
+           if ((*pte & PTE_W) == 0)
+             return -1;
+      ```
+    symptom: |
+      $ cowtest
+      cowtest: big: OK
+      cowtest: lazy: OK
+      cowtest: copyout: FAIL
+      cowtest: independence: OK
+      cowtest: text: FAIL
+      cowtest: forks: FAIL
+      cowtest: free pages 32436 before, 32428 after
+      cowtest: no leaks: FAIL
+      cowtest: SOME TESTS FAILED
+      $ usertests -q
+      usertests starting
+      test copyin: OK
+      ...
+      test twochildren: OKpreempt: preempt read errorx
+      ...
+      test sbrkfail: OK
+      test sbrkarg: runtest: fork error
+       pipe1 oops 3 total 0
+      pipe1: pipe1 oops 1
+      forkfocreateforkteMAXVAplus: fork failed
+      sbrkfail: no allocation failed; allocate more?
+      sbrkfail: fork failed
+      kernmem: fork failed
+      ...
+      openiput: fork failed
+      $
+    why: |
+      `copyout: FAIL` is the direct effect: the child's `read` into a buffer it shares with
+      its parent returns -1, because [[copyout]] sees a PTE without `PTE_W`.
+
+      The other failures come from a less obvious user of [[copyout]]: **`wait`**. [[kwait]]
+      copies the child's exit status into `*addr` with [[copyout]] ([[kernel/proc.c:390]])
+      *before* it frees the zombie, and if that fails it returns -1 and leaves the zombie in the
+      process table ([[kernel/proc.c:391]]-[[kernel/proc.c:395]]). A parent that forks and then
+      calls `wait(&status)` without storing to its stack in between still has its stack page
+      shared copy-on-write, so every such `wait` fails:
+
+      - `text: FAIL`: the child was killed as it should be, but `wait(&xstatus)` failed and
+        `xstatus` was never written.
+      - `forks: FAIL`: texttest's killed child (exit status -1) is still an unreaped zombie,
+        and the first `childok()` in forkstest reaps *that* zombie instead of one of its own
+        children. (The children's waits for their grandchildren succeed: `int xs = 1;` stores
+        to the child's stack first, which gives it a private stack page, and `childok`'s
+        prologue stores `ra` before calling `wait`. An instrumented copy confirmed it: the
+        failed copyout is texttest's, the late reap happens inside forkstest.)
+      - `no leaks: FAIL`: 8 pages still held by the one forks child left unreaped when
+        `countfree` runs.
+
+      In `usertests`, [[user:run]] does exactly that pattern, `fork()` then `wait(&xstatus)`
+      ([[user/usertests.c:3427]]), and does not check `wait`'s return value. `wait` returns -1
+      at once (it finds the previous test's unreaped zombie and fails to copy out its status),
+      `xstatus` is never written (its stack slot happens to hold 0), and `run` prints `OK`
+      while the test is still running. Tests start overlapping, their output interleaves (`test
+      twochildren: OKpreempt: preempt read error`), unreaped zombies fill the process table,
+      and finally `fork` itself fails: `runtest: fork error`. The leftover test processes keep
+      printing `fork failed` after the shell prompt is back.
+
+      One missing `if` in [[copyout]] breaks `read`, `wait` and through them half of
+      `usertests`, with not a single panic.
+  - bug: Every page becomes copy-on-write, including text
+    change: |
+      In [[uvmcopy]], the `PTE_W` test is dropped, so read-only pages are marked COW too:
+
+      ```diff
+      -    if (*pte & PTE_W) {
+      -      // the parent must stop writing it too.
+      -      *pte = (*pte & ~PTE_W) | PTE_COW;
+      -    }
+      +    *pte = (*pte & ~PTE_W) | PTE_COW;
+      ```
+    symptom: |
+      $ cowtest
+      cowtest: big: OK
+      cowtest: lazy: OK
+      cowtest: copyout: OK
+      cowtest: independence: OK
+      cowtest: text: FAIL
+      cowtest: forks: OK
+      cowtest: free pages 32436 before, 32436 after
+      cowtest: no leaks: OK
+      cowtest: SOME TESTS FAILED
+      $ usertests -q
+      usertests starting
+      test copyout: usertrap(): unexpected scause 0x2 pid=211
+                  sepc=0x676 stval=0x2c61646b
+      FAILED
+      SOME TESTS FAILED
+    why: |
+      Text pages are mapped `R|X|U` with no `W` ([[flags2perm]], [[kernel/exec.c:72]]). After a
+      `fork`, this kernel marks them `PTE_COW` as well, so a store to text is no longer fatal:
+      the handler sees `V|U|COW`, copies the page, and *adds* `PTE_W`. In `cowtest text` the
+      child's store to its own function succeeds and it exits with status 0: `FAIL`.
+
+      `usertests` stops at its second test. `copyout` ([[user/usertests.c:79]]) runs in a
+      forked child (every test does), so its text pages are COW. It calls `read(fd, 0, 8192)`
+      on `README`: the kernel's [[copyout]] sees `PTE_COW` on page 0, gives the child a
+      private writable copy of its code page, and writes 8192 bytes of README over it. When
+      `read` returns, the child executes README as machine code. `sepc=0x676` is inside the
+      test function, and `stval=0x2c61646b` is the illegal instruction it found there: the
+      bytes `6b 64 61 2c`, the text `kda,`, which is exactly what README contains at byte
+      offset 1654 = `0x676`. Cause 2, illegal instruction, kills the child, and the test fails.
+
+      The `PTE_W` test in [[uvmcopy]] is the only thing that separates "shared for now" from
+      "read-only for good"; bit 8 records that decision for the fault handler.
+  - bug: The fork error path frees the parent's page
+    change: |
+      In [[uvmcopy]], the error path keeps the shape of the original code, which freed the page
+      it had just allocated (`kfree(mem)`), but now there is no new page, so it frees the
+      shared one:
+
+      ```diff
+      -    if (mappages(new, i, PGSIZE, pa, flags) != 0)
+      -      goto err;
+      +    if (mappages(new, i, PGSIZE, pa, flags) != 0) {
+      +      kfree((void *)pa);
+      +      goto err;
+      +    }
+           krefinc(pa); // the child's page table maps it too
+      ```
+
+      The error path only runs when [[mappages]] cannot allocate a page-table page, so we used a
+      trigger program (`forkoom`, not part of the branch): allocate every free page with `sbrk`,
+      give back *k* pages, `fork`, for *k* = 2, 4, 6, ... 40.
+    symptom: |
+      $ forkoom
+      forkoom: 2 pages free: fork failed
+      usertrap(): unexpected scause 0xc pid=3
+                  sepc=0x1000 stval=0x1000
+      panic: kfree: refcount
+
+      # gdb, breakpoint on the new kfree in uvmcopy:
+      uvmcopy (old=0x87f28000, new=0x80041000, sz=132874240) at kernel/vm.c:317
+      #1 kfork () at kernel/proc.c:271  #2 sys_fork  #3 syscall  #4 usertrap
+      i = 0x0, pa = 0x87f25000, kref.count[pa] = 1
+      # after the kfree:
+      kref.count[pa] = 0
+      0x87f25000:  0x00000000  0x00000000  0x01010101  0x01010101
+      # breakpoint on the panic:
+      #0 kfree (pa=0x87f25000) at kernel/kalloc.c:72
+      #1 uvmunmap (pagetable=0x87f28000, va=0, npages=32440, do_free=1)
+      #2 uvmfree  #3 proc_freepagetable  #4 freeproc (p=<proc+720>)
+      #5 kwait (addr=0)  #6 sys_wait  #7 syscall  #8 usertrap
+      myproc()->name = "sh", pid 2, mycpu()->noff = 3
+
+      # the reference branch, same program: "fork failed" for every k,
+      # then cowtest: ALL OK.
+    why: |
+      With 2 pages given back, [[allocproc]] itself fails (it needs 4: the trapframe, the root
+      page table and the two page-table pages under the trampoline); that is the `fork failed`
+      line, and the buggy code is not reached. On the next round, 4 pages, [[allocproc]] takes
+      all of them and the very first [[mappages]] in [[uvmcopy]] (page `i` = 0, which needs a
+      new level-1 and level-0 page-table page) fails. That round never prints its line,
+      because `forkoom` dies first. (An instrumented copy printed `allocproc failed`, then
+      `uvmcopy failed`, then the kill.) The buggy path then calls [[kfree]] on page 0 of the **parent**, its only text
+      page, whose count is 1 because nothing has been shared yet. The count goes to 0, and
+      [[kfree]] does what it does with a free page: fills it with `0x01` bytes and stores the
+      free-list link in its first 8 bytes (here 0, because memory was exhausted and the list
+      was empty). gdb shows exactly that at `0x87f25000`.
+
+      `fork` returns -1 to `forkoom`, but its code page is now junk while its PTE
+      still maps it. The hart returns to the instruction after the `ecall`, inside page 0, and
+      runs the junk: `0x0101` decodes as a compressed `addi sp, sp, 0`, a no-op, so it slides
+      to the end of the page and fetches from `0x1000`. In `forkoom` that is the data page,
+      mapped without `X`: instruction page fault, `scause 0xc`, and the process is killed.
+
+      The panic comes later, on another process's stack: the shell (pid 2) reaps the zombie in
+      [[kwait]] → [[freeproc]] → [[uvmunmap]], which drops page 0 again, finds count 0, and
+      panics. noff is 3 at that moment: `wait_lock`, the zombie's `p->lock`, and `kref.lock`.
+
+      This panic is the *lucky* outcome. Had the freed page been handed to another process in
+      between, its count would have been 1 again, and this second drop would have freed a page
+      that someone else is using, with no message at all. The error path must undo exactly
+      what the loop did: the child's references for pages `0 .. i-1`, which
+      `uvmunmap(new, 0, i / PGSIZE, 1)` already does.
+  - bug: Only the child's PTE is made copy-on-write
+    change: |
+      [[uvmcopy]] computes read-only COW flags for the child but leaves the parent's PTE
+      writable:
+
+      ```diff
+      -    if (*pte & PTE_W) {
+      -      // the parent must stop writing it too.
+      -      *pte = (*pte & ~PTE_W) | PTE_COW;
+      -    }
+           flags = PTE_FLAGS(*pte);
+      +    if (flags & PTE_W)
+      +      flags = (flags & ~PTE_W) | PTE_COW;
+      ```
+    symptom: |
+      $ cowtest
+      cowtest: big: OK
+      cowtest: lazy: OK
+      cowtest: copyout: OK
+      cowtest: independence: FAIL
+      usertrap(): unexpected scause 0xf pid=8
+                  sepc=0x55c stval=0x508
+      cowtest: text: OK
+      cowtest: forks: OK
+      cowtest: free pages 32436 before, 32436 after
+      cowtest: no leaks: OK
+      cowtest: SOME TESTS FAILED
+      $ usertests -q
+      usertests starting
+      ...
+      ALL TESTS PASSED
+    why: |
+      The child is protected: its PTE is read-only, its first store copies. The parent is not:
+      its PTE still has `PTE_W`, so its stores go straight into the physical page that the
+      child is also mapping, with no fault. `cowtest independence` makes the parent write
+      `shared = 2` and only then lets the child look: the child reads 2 instead of 1 and exits
+      with status 1, and the parent's `read` on the pipe returns 0 (the child's write end was
+      closed by its exit): `FAIL`.
+
+      (`cowtest` closes the unused pipe ends for this reason. With them left open, this bug
+      makes the test hang instead: gdb showed the parent `SLEEPING` in [[piperead]] and the
+      child a `ZOMBIE`.)
+
+      **`usertests -q` passes.** Its tests check what a child sees right after `fork`, and
+      parents mostly just `wait`. The parent's own stack writes do land in the child's stack
+      page too, until the child's first store gives it a copy; in this run that never broke a
+      test. A copy-on-write kernel with this bug passes the standard suite and corrupts
+      memory between processes in real programs. "Both page tables" in the design is not a
+      detail.
+  - bug: Off by one in the reference-count index
+    change: |
+      The index macro adds one, a typical slip when thinking of "page numbers" as counting
+      from 1:
+
+      ```diff
+      -#define PA2REF(pa) (((uint64)(pa) - KERNBASE) / PGSIZE)
+      +#define PA2REF(pa) (((uint64)(pa) - KERNBASE) / PGSIZE + 1)
+      ```
+    symptom: |
+      $ cowtest
+      ...
+      cowtest: free pages 32436 before, 32436 after
+      cowtest: ALL OK
+      $ usertests -q
+      ...
+      ALL TESTS PASSED
+
+      # gdb, before kvminit (after kinit):
+      p &kref.count[32768]      = (int *) 0x8002f9d8 <pid_lock>
+      p &pid_lock               = (struct spinlock *) 0x8002f9d8 <pid_lock>
+      p pid_lock.locked         = 0
+      # after kvminit, before procinit:
+      p/x kernel_pagetable      = 0x87fff000
+      p pid_lock.locked         = 1
+      # after procinit:
+      p pid_lock.locked         = 0
+    why: |
+      Everything passes, and that is the lesson. Shifting every index by one is still a
+      one-to-one mapping from pages to counters, so for every page but one the bug is
+      invisible. The exception is the last page of RAM, `0x87fff000`, whose index becomes
+      32,768: one past the end of the array. In this build the linker placed `pid_lock`
+      right after `kref`, so that counter *is* `pid_lock.locked`.
+
+      And that page is touched early: [[freerange]] frees pages in increasing order, so
+      `0x87fff000` is the head of the free list, and the very first [[kalloc]], in
+      [[kvmmake]], returns it for the kernel's root page table. Setting its count to 1 set
+      `pid_lock.locked` to 1: the lock looked held, by no CPU (`pid_lock.cpu` was 0), and nobody would ever release it. It was saved by
+      pure luck: [[procinit]] runs next and its [[initlock]] writes `locked = 0`. The kernel
+      page table is never freed, so the count is never touched again.
+
+      Move the array, or free that page later, and the first [[allocpid]] would spin forever
+      on a lock nobody holds, or a decrement would silently unlock someone's lock. Index
+      arithmetic needs a bounds check you can see: a `panic` if `PA2REF(pa)` is not below the
+      array size, or a test that `PA2REF(PHYSTOP - PGSIZE)` is the last entry.
+reveal:
+  - title: One counter for every page of RAM
+    commit: 1
+    file: kernel/kalloc.c
+    lines: 17-43
+    focus: 26-35
+    diff: true
+    state:
+      hart: 0
+      mode: S
+      proc: none (boot)
+      intr: "off"
+      satp: bare
+      locks: []
+      irq: 0
+      stack: [main, kinit]
+      sp:
+        "on": boot
+        detail: "hart 0's slice of `stack0`; paging is still off"
+    note: |
+      The story of this tour, recorded on three harts with gdb attached and with a counting
+      copy of the kernel: the machine boots, you type `echo hi`, the shell (pid 2) forks pid 3,
+      pid 3 writes its stack and data pages, then calls `exec`. Later steps follow `cowtest`'s
+      `read` into a shared buffer and `wait` reaping a child.
+
+      Commit 1 prepares the allocator for pages with several owners. `kref.count` has one `int`
+      per physical page from [[KERNBASE]] to [[PHYSTOP]]: 32,768 entries, 128 KiB in `.bss`.
+      In this build `kref` sits at `0x8000f9c0`, right after `kmem`, and the array begins 24
+      bytes later, after the spinlock. `PA2REF` turns a page's physical address into its index.
+
+      The count means "how many page tables map this page", with one convention: a page that
+      [[kalloc]] has handed out counts 1 even before it is mapped (page-table pages,
+      trapframes and pipe buffers are never shared, so they stay at 1).
+
+      `kref.lock` is a new spinlock, separate from `kmem.lock`. [[kinit]] runs on hart 0 before
+      the other harts are released from their wait in [[main]], with interrupts off and
+      paging off; initializing both locks here is the same pattern as before.
+    others: |
+      Harts 1 and 2 are spinning in [[main]] on `started`, which hart 0 sets only after
+      [[userinit]]. Nobody else can touch the allocator yet.
+  - title: Every page starts life counted once
+    commit: 1
+    file: kernel/kalloc.c
+    lines: 45-54
+    focus: 50-53
+    state:
+      hart: 0
+      mode: S
+      proc: none (boot)
+      intr: "off"
+      satp: bare
+      locks: []
+      irq: 0
+      stack: [main, kinit, freerange]
+      sp: {"on": boot}
+    note: |
+      [[freerange]] hands every page to [[kfree]] once, to build the free list. But [[kfree]]
+      now *drops a reference*, and refuses (panics) when the count is already 0. So each page's
+      count is set to 1 first, and the [[kfree]] call brings it to 0, which frees it.
+
+      The assignment needs no lock: only hart 0 runs, with interrupts off. Inside [[kfree]],
+      `kref.lock` and then `kmem.lock` are taken and released, one after the other, 32,703
+      times each (the free pages in this build, whose `end` is `0x80040be8`) (noff goes 0 → 1 → 0, intena 0, since interrupts were already off).
+
+      Why not let [[kfree]] treat count 0 as "fine, free it"? Because then a double free would
+      look exactly like a normal one. With this convention, dropping a page that nobody holds
+      is always a bug, and commit 1 makes it a panic: clinic 4 shows it catching one.
+  - title: kfree drops one reference
+    commit: 1
+    file: kernel/kalloc.c
+    lines: 56-87
+    focus: 70-74
+    state:
+      hart: 0
+      mode: S
+      proc: echo (pid 3)
+      intr: "off"
+      satp: kernel
+      locks: [kref.lock]
+      irq: {noff: 1, intena: 1}
+      stack: [usertrap, syscall, sys_exec, kexec, proc_freepagetable, uvmfree, uvmunmap, kfree]
+      sp: {"on": kernel, detail: "pid 3's kernel stack"}
+    note: |
+      Jump ahead to a moment that only makes sense once sharing is on: pid 3 has finished
+      `exec("echo")` and [[kexec]] frees the old image ([[kernel/exec.c:138]]). Its first text
+      page is still shared with the shell, so its count is 2. This [[kfree]] brings it to 1 and
+      returns at line 76: the page stays where it is, mapped by pid 2.
+
+      The decrement and the test for zero are one critical section: the new value goes into
+      the local `n` *while the lock is held*, and the decision on line 75 uses `n`, not a
+      second read of the array. If two harts drop the last two references at once, one gets
+      `n` = 1 and the other `n` = 0, and exactly one frees.
+
+      The `memset` junk fill and the free-list push happen only for a page whose count reached
+      0, after `kref.lock` is released and before `kmem.lock` is taken. That is safe: with the
+      count at 0, no page table maps the page any more, so nobody else can reach it. And
+      because the two locks are never held together, there is no ordering to get wrong between
+      them.
+
+      State: this is a system call, so [[usertrap]] turned interrupts on; the
+      [[acquire]] recorded intena 1 and turned SIE off. (No breakpoint was set on this
+      particular [[kfree]]; the hart is the one where gdb saw pid 3's last allocations in
+      [[kexec]], and the lock state follows from the code.) When `release` pops back to noff 0,
+      interrupts come back on.
+    others: |
+      In this scenario the shell is asleep in `wait`, but the code cannot rely on that. Suppose
+      both sharers dropped the page at once:
+
+      | time | hart 0: pid 3 | hart 1: the other sharer |
+      |---|---|---|
+      | 1 | `acquire(&kref.lock)` | [[acquire]] spins |
+      | 2 | count 2 → 1, `n = 1` | spins |
+      | 3 | `release`, return (keep) | acquires, count 1 → 0, `n = 0` |
+      | 4 | | `release`, junk-fill, push on the free list |
+
+      Exactly one of them frees. Clinic 1 removes the lock and shows the
+      lost updates that follow.
+  - title: kalloc sets the count, and two small helpers
+    commit: 1
+    file: kernel/kalloc.c
+    lines: 89-133
+    focus: 105-107
+    state:
+      hart: 0
+      mode: S
+      proc: sh (pid 3)
+      intr: "off"
+      satp: kernel
+      locks: [kref.lock]
+      irq: {noff: 1, intena: 0}
+      stack: [usertrap, cowfault, kalloc]
+      sp: {"on": kernel, detail: "pid 3's kernel stack, `0x3fffff9000`–`0x3fffffa000`"}
+    note: |
+      [[kalloc]] pops a page under `kmem.lock` exactly as before. A page just popped belongs to
+      nobody else, so its count is set to 1 afterwards, under `kref.lock`. (The store would
+      be safe even without the lock, since no other hart can know this page yet; taking the
+      lock keeps the rule simple: every access to `kref.count` holds `kref.lock`.)
+
+      `krefinc` is what `fork` will call for every shared page; it panics if the page is not
+      allocated, which catches a whole class of bugs. `krefcount` reads one count; the fault
+      handler will use it to decide whether a copy is needed at all.
+
+      The state shown is from a later commit's point of view: in the recorded run, pid 3 (the
+      shell's child, before `exec`) took a copy-on-write fault and the handler called
+      [[kalloc]]. At the focus lines `kref.lock` is held: noff 1, intena 0, because a page
+      fault leaves interrupts off for the whole handler, so the first [[acquire]] saw SIE
+      off. gdb recorded the same state a few lines earlier, at the `kmem.freelist` read under
+      `kmem.lock`: noff 1, intena 0, SIE 0, on hart 0.
+  - title: A PTE bit that the hardware ignores
+    commit: 2
+    file: kernel/riscv.h
+    lines: 389-410
+    focus: 395-400
+    diff: true
+    state:
+      hart: any
+      proc: "(a definition: used by every page-table operation below)"
+      locks: []
+    note: |
+      A copy-on-write page and a text page look the same to the hardware: `V`, `R`, `U` set,
+      `W` clear. The kernel needs to remember which is which, and the place to remember it is
+      the PTE itself. Bits 0-7 are interpreted by the [[g:sv39]] walk (`V R W X U G A D`).
+      Bits 8 and 9, the RSW field, are "reserved for supervisor software": the hardware
+      ignores them. `PTE_COW` is bit 8.
+
+      Two consequences worth seeing:
+
+      - `PTE_FLAGS` keeps the low 10 bits (`0x3FF`), so it already carries bit 8 along when a
+        PTE's flags are copied, and [[freewalk]]'s leaf test, which looks at `R|W|X` only, is
+        unaffected.
+      - A COW PTE observed with gdb on this branch: `0x21fcf1d3`, physical page `0x87f3c`,
+        flags `0x1d3` = `V|R|U|A|D|COW` (QEMU sets the A and D bits as pages are used). A text
+        page of `sh` has `X` set and never bit 8.
+  - title: "cowfault: is this really a copy-on-write page?"
+    commit: 2
+    file: kernel/vm.c
+    lines: 480-516
+    focus: 493-502
+    diff: true
+    state:
+      hart: 0
+      mode: S
+      proc: sh (pid 3)
+      intr: "off"
+      satp: kernel
+      locks: []
+      irq: 0
+      stack: [usertrap, cowfault]
+      sp: {"on": kernel, detail: "`0x3fffff9fa0`, two frames into pid 3's kernel stack at `0x3fffff9000`"}
+    note: |
+      The new function. It will be called with whatever address faulted, so it first decides
+      whether the fault is its business, and says no in every doubtful case by returning 0:
+
+      - `va >= MAXVA`: [[walk]] would *panic* on such an address. User programs can produce
+        one: `usertests nowrite` stores to `0xffffffffffffffff`.
+      - no PTE, or the PTE lacks any of `V`, `U`, `PTE_COW`: an unmapped page (maybe lazy, for
+        [[vmfault]] to handle), a text page (no COW bit), or the guard page (no `U`).
+
+      Only then is it a shared page that this process is allowed to write. Line 502 computes the
+      flags of the private version: the old flags with `W` added and `COW` removed (so text's
+      `X`, if it were ever here, and `U`, `R` and the `A`/`D` bits carry over).
+
+      In the recorded run this is pid 3, the shell's child, on hart 0, a few instructions after
+      `fork` returned 0 in it: its first store, to its stack page `0x4000`, faulted. gdb showed
+      `sp` = `0x3fffff9fa0` in the kernel stack whose base is `p->kstack` = `0x3fffff9000`, and
+      noff 0, SIE 0: no lock, interrupts off, as in every page fault ([[tour:26]]).
+  - title: The last sharer takes the page over
+    commit: 2
+    file: kernel/vm.c
+    lines: 480-516
+    focus: 504-508
+    state:
+      hart: 0
+      mode: S
+      proc: sh (pid 2)
+      intr: "off"
+      satp: kernel
+      locks: []
+      irq: 0
+      stack: [usertrap, cowfault]
+      sp: {"on": kernel, detail: "pid 2's kernel stack, `0x3fffffb000`–`0x3fffffc000`"}
+    note: |
+      If this page table holds the only reference, there is nobody to protect: make the PTE
+      writable, clear `PTE_COW`, keep the page. No allocation, no copy.
+
+      In the measured run this happened right after `echo hi` finished. pid 3 had copied the
+      stack page `0x4000` and the data page `0x2000` (dropping its references to the shell's
+      originals), and its `exec` dropped the rest. When the shell (pid 2) next wrote those two
+      pages, both faulted (they were still marked COW in its page table) and both were taken
+      over: the counting kernel printed `cow takeover sh 2 va 0x4000` and `va 0x2000`.
+
+      The count is read under `kref.lock` inside `krefcount`, and the lock is released before
+      the PTE changes. Safe, because a count of 1 can only rise through a `fork` of a process
+      that maps the page, and the only such process is this one, which is busy here: xv6
+      processes have one thread.
+    others: |
+      What if both sharers fault on the same page at the same moment?
+
+      | time | hart 0: pid 2 stores to `0x4000` | hart 2: pid 3 stores to `0x4000` |
+      |---|---|---|
+      | 1 | `krefcount` → 2 | `krefcount` → 2 |
+      | 2 | [[kalloc]], copy, remap own PTE | [[kalloc]], copy, remap own PTE |
+      | 3 | [[kfree]] old: 2 → 1, keep | |
+      | 4 | | [[kfree]] old: 1 → 0, free |
+
+      Two copies where one would have done, and the original is freed by whichever `kfree`
+      comes second. Correct, just not optimal; the window is a few instructions wide.
+  - title: Copy, remap, drop
+    commit: 2
+    file: kernel/vm.c
+    lines: 480-516
+    focus: 510-515
+    state:
+      hart: 0
+      mode: S
+      proc: sh (pid 3)
+      intr: "off"
+      satp: kernel
+      locks: []
+      irq: 0
+      stack: [usertrap, cowfault]
+      sp: {"on": kernel}
+    note: |
+      The general case, pid 3's stack page with count 2: allocate a page, copy all 4096
+      bytes, point *this* PTE at the copy with `W` set and `COW` cleared, then drop this page
+      table's reference to the original with [[kfree]]: 2 → 1, so the shell keeps it.
+
+      The order matters. The PTE is rewritten only after the copy is complete, and the old
+      page is released only after the PTE no longer points at it. If [[kalloc]] fails, nothing
+      has changed and the function returns 0; the caller then kills the process (a fault) or
+      fails the system call ([[copyout]]).
+
+      No `sfence.vma` here. This hart runs on the kernel page table, and the user page table's
+      new PTE is used only after [[userret]] switches `satp` back, with an `sfence.vma` before
+      and after ([[kernel/trampoline.S:110]]-[[kernel/trampoline.S:112]]).
+
+      Every call here is short and never sleeps: [[kalloc]] and [[kfree]] take spinlocks only.
+      That is what makes `cowfault` callable from places that already hold spinlocks, which
+      is commit 4's problem.
+  - title: "usertrap: a store fault now has two meanings"
+    commit: 3
+    file: kernel/trap.c
+    lines: 49-84
+    focus: 71-76
+    diff: true
+    state:
+      hart: 0
+      mode: S
+      proc: sh (pid 3)
+      intr: "off"
+      satp: kernel
+      locks: []
+      irq: 0
+      stack: [usertrap]
+      sp:
+        "on": kernel
+        switched: "`ld sp, 8(a0)` in [[uservec]] ([[kernel/trampoline.S:76]]), after the store page fault"
+        detail: "was empty; now holds only `usertrap`'s frame"
+    note: |
+      One branch, placed *before* the lazy-allocation branch, for `scause` 15 only (a load from
+      a shared page is always fine). The two branches can never both claim a fault:
+      `cowfault` succeeds only for a mapped PTE with `V|U|COW`, and [[vmfault]] succeeds only
+      for an *unmapped* page below `p->sz` ([[kernel/vm.c:463]], [[kernel/vm.c:466]]). So the
+      order is not about priority; it is just which question is asked first.
+
+      Before this commit, the store fault in the child would have gone to [[vmfault]], which
+      returns 0 for any mapped page, and the child would have been killed with
+      `unexpected scause 0xf`. That is the interaction between the two features: in this tree,
+      a store fault means "lazy page" *or* "COW page".
+
+      The fault arrives exactly like the lazy faults of [[tour:26]]: [[uservec]] saved the user
+      registers in the [[g:trapframe]] and moved to pid 3's empty kernel stack; [[usertrap]]
+      left interrupts **off** (only the system-call branch calls `intr_on`), so the whole copy
+      runs with SIE 0 and noff 0. `epc` is not advanced, so the return retries the store.
+
+      ```text
+      pid 3's kernel stack, during the fault
+        top ─► usertrap
+               cowfault
+               kalloc / kfree (briefly)
+      ```
+    others: |
+      The other harts are unaffected: the fault touched only pid 3's page table and the shared
+      allocator, whose locks are held for a few instructions each. Hart 1 may be in its
+      scheduler loop; hart 2 may be running any other process.
+  - title: When nobody can fix the fault
+    commit: 3
+    file: kernel/trap.c
+    lines: 69-89
+    focus: 77-84
+    state:
+      hart: 0
+      mode: S
+      proc: cowtest (pid 8)
+      intr: "off"
+      satp: kernel
+      locks: []
+      irq: 0
+      stack: [usertrap]
+      sp: {"on": kernel}
+    note: |
+      `cowtest text` makes a child (pid 8 in the recorded run) store to its own code at `0x508`. Text
+      is `R|X|U` without bit 8, so `cowfault` declines; the page is mapped, so [[vmfault]]
+      declines; the `else` branch prints the message and kills it:
+
+      ```text
+      usertrap(): unexpected scause 0xf pid=8
+                  sepc=0x55c stval=0x508
+      ```
+
+      The same branch catches the other refusals: the guard page (no `U`), an address beyond
+      `p->sz`, and a copy-on-write fault that found no free memory (`cowfault` returns 0 when
+      [[kalloc]] fails). Out of memory on a COW fault therefore kills the process instead of
+      panicking the kernel, the same policy as for lazy pages. The process cannot be given an
+      error code: it was executing an ordinary store, not a system call.
+  - title: "copyout: the kernel's writes do not fault"
+    commit: 4
+    file: kernel/vm.c
+    lines: 341-383
+    focus: 362-371
+    diff: true
+    state:
+      hart: 0
+      mode: S
+      proc: cowtest (pid 6)
+      intr: "off"
+      satp: kernel
+      locks: [pi->lock]
+      irq: {noff: 1, intena: 1}
+      stack: [usertrap, syscall, sys_read, fileread, piperead, copyout]
+      sp: {"on": kernel, detail: "pid 6's kernel stack, `0x3fffff7000`–`0x3fffff8000`"}
+    note: |
+      Scene 2: `cowtest copyout`. pid 6, a child that has not touched `buf` since `fork`, reads
+      6 bytes from a pipe into `buf`, straddling the pages `0x3000` and `0x4000`. Both are
+      shared with the parent, count 2. [[piperead]] copies byte by byte, calling [[copyout]]
+      for each, with `pi->lock` held ([[kernel/pipe.c:133]]).
+
+      [[copyout]] writes with `memmove` to `pa0`, a physical address, through the kernel page
+      table's direct map, which maps all RAM writable ([[kernel/vm.c:42]]). The hardware never
+      looks at the user PTE, so there is no fault to rely on. The new lines check `PTE_COW`
+      themselves and call the same `cowfault`, which returns the physical address of the
+      private copy; the `memmove` then goes there. The old `PTE_W` test right below stays: a
+      read into text still fails, as `usertests copyout` demands.
+
+      Note the order relative to [[vmfault]] above: an unmapped lazy page is first allocated
+      (fresh, writable, never COW), so it passes straight through.
+
+      gdb recorded this exact moment twice in one `read`, at `va` `0x3000` and then `0x4000`
+      (the first byte that lands on each page triggers the copy; the rest find `PTE_W` set):
+      noff 1, intena 1, SIE 0, hart 0.
+    others: |
+      `pi->lock` is held, so the writer of this pipe, the parent on another hart, spins in
+      [[pipewrite]]'s [[acquire]] if it tries to add data right now. It waits for the whole
+      copy, including a [[kalloc]] and a 4096-byte `memmove`: a longer critical section than
+      before, but bounded, and never a sleep.
+  - title: A copy under two spinlocks
+    commit: 4
+    file: kernel/kalloc.c
+    lines: 89-110
+    focus: 97-101
+    state:
+      hart: 0
+      mode: S
+      proc: cowtest (pid 6)
+      intr: "off"
+      satp: kernel
+      locks: [pi->lock, kmem.lock]
+      irq: {noff: 2, intena: 1}
+      stack: [usertrap, syscall, sys_read, fileread, piperead, copyout, cowfault, kalloc]
+      sp: {"on": kernel}
+    note: |
+      Inside that copy, `cowfault` calls [[kalloc]], which takes `kmem.lock` while
+      `pi->lock` is still held: noff 2, intena 1 (the outer acquire happened after
+      [[usertrap]]'s `intr_on`). gdb confirmed noff 2, intena 1, SIE 0 at line 98.
+
+      This is why `cowfault` must never sleep. [[sched]] panics with `sched locks` if a process
+      tries to give up the CPU with any spinlock other than its own `p->lock` held
+      ([[concept:locks#rules]]). [[kalloc]] and [[kfree]] never sleep, so the rule holds; and
+      if memory has run out, [[copyout]] just fails and `read` returns what it copied so far.
+
+      The lock-order graph gains edges: `pi->lock` → `kmem.lock` and `pi->lock` →
+      `kref.lock`. An edge into a lock that takes nothing else cannot close a cycle, since
+      neither `kmem.lock` nor `kref.lock` is ever held while acquiring anything.
+    others: |
+      The other path that reaches here with locks held is [[kwait]]. When `cowtest` (pid 3)
+      waits for a child, `wait(&xstatus)` copies the status into its stack page `0x7000`,
+      which is shared with the child it just forked. gdb recorded that copy with
+      `wait_lock` and the child's `p->lock` held: noff 2 entering `cowfault`, **noff 3** inside
+      [[kalloc]] and `krefcount`, intena 1. Before this lab, [[kwait]] → [[copyout]] →
+      [[kalloc]] was possible only through a lazy page and was never seen in [[tour:51]]'s
+      main workload (only its targeted test program reached it); with copy-on-write it happens
+      whenever the status variable sits in a page still shared with a child.
+  - title: "uvmcopy shares instead of copying"
+    commit: 5
+    file: kernel/vm.c
+    lines: 292-325
+    focus: 305-319
+    diff: true
+    state:
+      hart: 0
+      mode: S
+      proc: sh (pid 2)
+      intr: "off"
+      satp: kernel
+      locks: ["np->lock (pid 3's)"]
+      irq: {noff: 1, intena: 1}
+      stack: [usertrap, syscall, sys_fork, kfork, uvmcopy]
+      sp: {"on": kernel, detail: "pid 2's kernel stack, `sp` = `0x3fffffbf30`"}
+    note: |
+      The switch. Back to the start of scene 1: you typed `echo hi`, and the shell (pid 2)
+      is in [[kfork]], holding its new child's `np->lock` since [[allocproc]] (through
+      [[kernel/proc.c:294]]). gdb recorded noff 1, intena 1 here.
+
+      For each mapped page: the same physical address goes into the child's page table, with
+      the same flags, and `krefinc` counts the new mapping. No [[kalloc]], no `memmove`. For
+      `sh` that is five pages: text `0x0` and `0x1000`, data `0x2000`, the guard page
+      `0x3000`, the stack `0x4000`; gdb counted five `krefinc` calls for this fork. The guard
+      page is writable without `U`, so it becomes `COW` without `U` and the fault handler will
+      refuse it.
+
+      The cost of this fork, measured with a counting kernel: 6 pages (4 in [[allocproc]] for
+      the trapframe, the root page table and the two page-table pages under the trampoline,
+      plus 2 page-table pages for the child's low addresses), against 11 in the original (the
+      same 4, plus 5 copied pages and 2 page-table pages).
+
+      Unmapped pages (lazy `sbrk` pages never touched) are skipped as before: there is
+      nothing to share, and each process will fault its own copy in.
+    others: |
+      `kref.lock` is now taken once per page under `np->lock`: a new edge `p->lock` →
+      `kref.lock`, next to the existing `p->lock` → `kmem.lock`. A hart doing a [[kfree]] for
+      an unrelated exit waits a few instructions at most. No other hart can be using pid 2's
+      page table: pid 2 is running here.
+  - title: The parent must stop writing too
+    commit: 5
+    file: kernel/vm.c
+    lines: 298-320
+    focus: 310-315
+    state:
+      hart: 0
+      mode: S
+      proc: sh (pid 2)
+      intr: "off"
+      satp: kernel
+      locks: ["np->lock (pid 3's)"]
+      irq: {noff: 1, intena: 1}
+      stack: [usertrap, syscall, sys_fork, kfork, uvmcopy]
+      sp: {"on": kernel}
+    note: |
+      The parent's PTE is modified *in place*, before the child's flags are read from it:
+      `PTE_W` off, `PTE_COW` on. Both page tables now say the same thing about the page.
+      Forget the parent's side and the child is protected but the parent is not: its stores
+      land in the page the child sees (clinic 5, which `usertests` does not notice).
+
+      Read-only pages (text, `R|X|U`) skip the `if` and are shared with their flags unchanged:
+      read-only forever, never copied, freed when the last of the sharers lets go.
+
+      What about the parent's [[g:tlb]], which may still hold a writable translation for
+      `0x4000`? It cannot be used: pid 2 is in the kernel on the kernel page table, and the
+      only way back to user mode is [[userret]], which executes `sfence.vma` before and after
+      loading `satp` ([[kernel/trampoline.S:110]]-[[kernel/trampoline.S:112]]). No other hart
+      can be running pid 2.
+  - title: Undoing a fork that ran out of memory
+    commit: 5
+    file: kernel/vm.c
+    lines: 298-325
+    focus: 316-324
+    state:
+      hart: 0
+      mode: S
+      proc: forkoom (pid 3)
+      intr: "off"
+      satp: kernel
+      locks: ["np->lock (the child's)"]
+      irq: {noff: 1, intena: 1}
+      stack: [usertrap, syscall, sys_fork, kfork, uvmcopy]
+      sp: {"on": kernel}
+    note: |
+      [[mappages]] can fail: it may need a new page-table page and [[kalloc]] can return 0.
+      The order of the two lines in the loop makes the undo exact: the reference is added only
+      after the mapping exists, so on failure pages `0 .. i-1` are mapped and counted, page
+      `i` is neither, and `uvmunmap(new, 0, i / PGSIZE, 1)` drops exactly the child's
+      references.
+
+      The parent keeps whatever `PTE_COW` marks were already made; with count 1 its next store
+      to such a page takes it over, no copy.
+
+      We tested this path with a program that leaves only 2 to 40 free pages before calling
+      `fork`: on this branch every `fork` failed cleanly, and `cowtest` passed afterwards.
+      With one extra `kfree((void *)pa)` here, copied from the old code's `kfree(mem)`, the
+      parent's own text page was freed under it: an instruction fault, then
+      `panic: kfree: refcount` in the shell's [[kwait]] (clinic 4).
+  - title: exec and exit change nothing
+    commit: 5
+    file: kernel/vm.c
+    lines: 190-213
+    focus: 202-212
+    state:
+      hart: 0
+      mode: S
+      proc: sh (pid 2)
+      intr: "off"
+      satp: kernel
+      locks: [wait_lock, "echo's p->lock (pid 3)"]
+      irq: {noff: 2, intena: 1}
+      stack: [usertrap, syscall, sys_wait, kwait, freeproc, proc_freepagetable, uvmfree, uvmunmap]
+      sp: {"on": kernel}
+    note: |
+      [[uvmunmap]] is untouched by the branch, and that is the point. `echo` has exited, and
+      the shell reaps it in [[kwait]] holding `wait_lock` and the zombie's `p->lock`; the
+      zombie's pages go through this loop and each one through [[kfree]]. Here every page
+      reaches 0 and is freed: echo's image came from its own `exec`, and the sharing with the
+      shell already ended there (step 3). A zombie that never called `exec` (a forkstest child
+      in `cowtest`, say) would only drop references on the pages it still shares with its
+      parent.
+
+      Inside each [[kfree]], `kref.lock` makes it noff 3 for a few instructions: the same depth
+      as the original kernel's [[kwait]] → [[kfree]] → `kmem.lock`. `exec` dropping an old
+      image ([[kexec]] → [[proc_freepagetable]]) and `sbrk(-n)` ([[uvmdealloc]]) take the same
+      path. Because the allocator counts, nothing above it needed to learn about sharing.
+  - title: The test that the original kernel fails
+    commit: 6
+    file: user/cowtest.c
+    lines: 45-88
+    focus: 51-69
+    diff: true
+    state:
+      hart: 1
+      mode: U
+      proc: cowtest (pid 3)
+      intr: "on"
+      satp: user
+      locks: []
+      stack: [main, bigtest]
+      sp: {"on": user}
+    note: |
+      `cowtest big` asks for 60% of the 128 MiB of RAM, `80530632` bytes (19,661 pages), and
+      writes every page, so they are all really allocated. Then it forks. The original kernel
+      would have to copy all of them, with about 12,800 pages left: [[uvmcopy]] fails and
+      `fork` returns -1 (`cowtest: fork failed`, `big: FAIL` on the unmodified kernel). With
+      sharing, `fork` costs page-table pages only.
+
+      The child checks that it sees the parent's values and overwrites 101 pages spread over the
+      region: about 100 copy-on-write faults, one page each. The parent overwrites 51 (at offset
+      8, so it does not disturb the child's checks; both loops include the first page), then waits and checks that *its* values
+      are untouched. Everything fits because only written pages are copied.
+
+      The other checks follow the think section one by one: lazy pages after `fork`, the
+      kernel's writes ([[copyout]] through `read`, which straddles two pages), independence in
+      both directions, text staying read-only, 100 children and 100 grandchildren on three
+      harts, and a page count before and after.
+verify: |
+  On the branch (`ext/11-cow`, 6 commits), built with the project toolchain and run on 3 harts
+  (`-smp 3 -m 128M`):
+
+  ```text
+  $ cowtest
+  cowtest: big: OK
+  cowtest: lazy: OK
+  cowtest: copyout: OK
+  cowtest: independence: OK
+  usertrap(): unexpected scause 0xf pid=8
+              sepc=0x55c stval=0x508
+  cowtest: text: OK
+  cowtest: forks: OK
+  cowtest: free pages 32436 before, 32436 after
+  cowtest: no leaks: OK
+  cowtest: ALL OK
+  $ usertests -q
+  usertests starting
+  test copyin: OK
+  test copyout: OK
+  ...
+  test nowrite: usertrap(): unexpected scause 0xf pid=6770
+  ...
+  OK
+  ...
+  ALL TESTS PASSED
+  ```
+
+  The `usertrap()` lines are the expected kills: `cowtest text` and `usertests nowrite` store to
+  text and must die. `usertests -q` passing shows that everything the original kernel did
+  still works: `copyout` into text still fails, the guard page still faults (`stacktest`),
+  lazy allocation still works through `fork` (`lazy_*`), and the free-page count at the end
+  equals the one at the start. `cowtest` run again after `usertests` and again after
+  `ls | wc` (all in one boot) reports the same 32,436 free pages; since `cowtest` now
+  requires the counts to be *equal*, a page freed while still mapped would fail it as surely
+  as a leak.
+
+  The same `cowtest` on the original kernel: `cowtest: fork failed`, `big: FAIL`, all other
+  checks OK, 32,468 free pages. The 32-page difference is the reference-count array.
+measure: |
+  **Pages per `fork`.** A scratch copy of each kernel counted every [[kalloc]] against the
+  process that made it, and printed the count for each `fork` and `exec` (instrumentation not
+  on the branch):
+
+  | event | original | copy-on-write |
+  |---|---|---|
+  | `fork` of `sh` (pid 2 → 3) | 11 pages: 4 [[allocproc]] + 5 copied + 2 page-table | 6 pages: 4 [[allocproc]] + 2 page-table |
+  | the child's copies before `exec("echo")` | 0 | 2 (stack `0x4000`, data `0x2000`) |
+  | `exec("echo")` | 9 | 9 |
+  | the shell's next stores to `0x2000` and `0x4000` | 0 | 0 (two takeovers, no copy) |
+
+  **`ls | wc`.** The shell forks a child (pid 4) that parses the line (allocating a 16-page
+  heap with `malloc`), creates the pipe, and forks the two sides:
+
+  | | original | copy-on-write |
+  |---|---|---|
+  | fork 2 → 4 | 11 | 6 |
+  | fork 4 → 5 (`ls`) | 27 (its 16 heap pages copied too) | 6 |
+  | fork 4 → 6 (`wc`) | 27 | 6 |
+  | copy-on-write copies | 0 | 4 (3 in pid 4, 1 in pid 6) + 1 takeover in pid 5 |
+  | `exec` of `ls` and `wc` | 9 + 9 | 9 + 9 |
+  | **fork + exec total** | **83 pages** | **40 pages** |
+
+  The pages that pid 4's heap occupies (16), the pipe (1) and `exec`'s argument pages are the
+  same in both. Copy-on-write halves the cost of a pipeline of tiny programs; the bigger the
+  forking process, the bigger the saving, up to the `cowtest big` case where the original
+  kernel cannot fork at all.
+
+  **What it costs.** 32 pages (128 KiB) of `.bss` for the counts, one spinlock round trip per
+  page per `fork`, and one trap per first write to a shared page (a full [[uservec]] /
+  [[userret]] round trip plus a 4096-byte copy, the same copy the original `fork` made
+  eagerly).
+further: |
+  - **Share page-table pages too.** `fork` still allocates the child's page-table pages (2 for
+    `sh`, about 40 for `cowtest big`). Sharing level-0 page-table pages read-only and copying
+    them on demand is how real kernels make `fork` of a huge process cheap; it teaches how the
+    walk itself can be copy-on-write.
+  - **Per-page metadata instead of an array of ints.** Replace `kref.count` with a `struct
+    page` per physical page (count, flags, a list link). This is how Linux organizes memory,
+    and it prepares for swapping (lab 16) and `mmap` (lab 15).
+  - **Atomic counts without a lock.** Use `__atomic_fetch_add` / `__atomic_sub_fetch` on the
+    counters (RISC-V `amoadd.w`) and remove `kref.lock`. Work out why the decrement-and-test
+    becomes one instruction's result, and measure lock contention before and after with the
+    `refrace` program.
+  - **vfork.** A `vfork` that lends the parent's page table to the child until it calls `exec`
+    costs even less than copy-on-write. Find out what it forbids the child to do, and why.
+  - **Threads break the takeover argument.** After lab 9 (`clone`), two threads share a page
+    table, so a count of 1 can rise while the handler is deciding. Fix `cowfault` for that
+    world.

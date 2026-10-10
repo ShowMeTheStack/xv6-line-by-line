@@ -1,0 +1,698 @@
+title: A user address space
+group: Memory
+prerequisites: [5, 22, 24]
+summary: |
+  The shell `sh` (pid 2) believes it owns a private memory that starts at address 0 and
+  runs up to 256 GiB. Its code is at `0x0`, its command buffer at `0x2020`, its stack near
+  `0x5000`. Every other process believes the same thing about its own memory, with the same
+  addresses meaning entirely different bytes. This tour takes that illusion apart.
+
+  First you will see the layout of `sh`'s [[g:address-space]], drawn with the real addresses
+  from `readelf` and from a gdb dump of its page table taken in this build. Then you will
+  follow one load, `buf[0]` at virtual address `0x2020`, through the three levels of an
+  [[g:sv39]] [[g:page-table]] **by hand**: bits, indices, page-table entries and the physical
+  byte at the end. Finally you will see why the kernel, which can reach every byte of
+  physical memory, still cannot simply dereference `0x2020`.
+
+  Physical addresses below are from our runs of this build. They depend on the order of
+  `kalloc` calls, so another build, a different `-smp`, or a different history of commands
+  can change them; virtual addresses, sizes and flags do not.
+cast: |
+  The machine has three [[g:hart|harts]]. When the tour starts:
+
+  | Hart | What it is doing |
+  |---|---|
+  | 0 | Running `sh` (pid 2) in user mode, at its prompt: `getcmd` has just returned from reading a line |
+  | 1 | Idle in its [[kernel:scheduler]] |
+  | 2 | Idle in its [[kernel:scheduler]]. In a moment it will pick up sh's child (pid 3), which will parse the command and become `ls` |
+
+  Each hart has its own [[g:csr:satp|satp]] register and its own [[g:tlb]]. Hart 0's `satp`
+  names `sh`'s page table; hart 2's names `ls`'s.
+steps:
+  - title: The linker decides the addresses
+    file: user/user.ld
+    lines: 1-39
+    focus: 5-24
+    state:
+      hart: 0
+      mode: U
+      proc: sh (pid 2)
+      intr: on
+      satp: user
+      locks: []
+      stack: [main]
+      sp:
+        "on": user
+        detail: "`sh`'s one stack page, `0x4000`–`0x4fff`"
+    note: |
+      Every xv6 user program is linked with this [[g:linker-script]]. Line 5 starts the
+      program at virtual address **0**. Code (`.text`) and read-only data (`.rodata`) follow,
+      then line 23 jumps to the next 4096-byte boundary before writable data (`.data`, then
+      [[g:bss|.bss]]). Code and data must be on different pages, because permissions are set
+      per page: code should be executable and not writable, data the reverse.
+
+      `${TOOLPREFIX}readelf -l user/_sh` (`TOOLPREFIX` is your RISC-V toolchain's prefix; see
+      [[tour:1]]) shows the result as two loadable segments:
+
+      | Segment | Virtual address | In file | In memory | Flags |
+      |---|---|---|---|---|
+      | code + rodata | `0x0` | `0x13d9` | `0x13d9` | R E |
+      | data + bss | `0x2000` | `0x10` | `0x98` | R W |
+
+      So `sh`'s code spans two pages (`0x0` and `0x1000`), and its data fits in one page at
+      `0x2000`. The symbol table puts the static `buf` of `main` at **`0x2020`**, inside
+      `.bss`, and the entry point [[user:start]] at `0x9d0`.
+
+      Every program uses the same addresses. That is not a conflict, because each process
+      gets its own page table: `0x2020` in `sh` and `0x2020` in `ls` are different bytes.
+
+  - title: The whole map
+    file: kernel/memlayout.h
+    lines: 46-63
+    focus: 54-63
+    state:
+      hart: 0
+      mode: U
+      proc: sh (pid 2)
+      intr: on
+      satp: user
+      locks: []
+      stack: [main]
+      sp: user
+    note: |
+      [[kexec]] ([[tour:22]]) placed the two segments, then a [[g:guard-page]] and a one-page
+      stack above them, and the kernel added two special pages at the very top. Here is
+      `sh`'s address space, with every mapped page:
+
+      ```
+      0x40_0000_0000  MAXVA (256 GiB), nothing at or above
+      0x3f_ffff_f000  TRAMPOLINE   R X     (shared kernel code)
+      0x3f_ffff_e000  TRAPFRAME    R W     (sh's saved registers)
+                       ... unmapped: about 256 GiB of nothing ...
+      0x00_0000_5000  sz: end of sh's memory; the heap would grow from here
+      0x00_0000_4000  stack        R W U   (sp starts at 0x4fe0)
+      0x00_0000_3000  guard page   R W     (no U)
+      0x00_0000_2000  data + bss   R W U   (buf at 0x2020)
+      0x00_0000_1000  code         R X U
+      0x00_0000_0000  code         R X U   (start at 0x9d0)
+      ```
+
+      `p->sz`, the process size, is `0x5000`: everything from 0 up to it is the program's
+      own memory. `sh` itself never calls `malloc` (its child does the parsing), so `sh`'s
+      heap stays empty: 0 bytes, for its whole life.
+
+      The comment on lines 54–62 lists the same order. The two top pages are the only ones
+      not counted in `sz`.
+
+  - title: Why 256 GiB and not 512
+    file: kernel/riscv.h
+    lines: 408-417
+    focus: 413-417
+    state:
+      hart: 0
+      mode: U
+      proc: sh (pid 2)
+      intr: on
+      satp: user
+      locks: []
+      stack: [main]
+      sp: user
+    note: |
+      Sv39 translates 39-bit virtual addresses: 3 × 9 bits of page-table index plus 12 bits
+      of offset. That would give 2^39 bytes, 512 GiB.
+
+      But the hardware requires bits 63..39 of an address to be copies of bit 38. An address
+      with bit 38 set therefore looks like `0xffffffc000000000`, a huge 64-bit number. xv6
+      avoids that complication by never using bit 38: [[MAXVA]] is 2^38 = `0x4000000000`,
+      and every valid user or kernel virtual address is below it.
+
+      [[kernel:TRAMPOLINE]] is `MAXVA - PGSIZE` = `0x3ffffff000` and [[kernel:TRAPFRAME]] is
+      one page lower, `0x3fffffe000`. [[walk]] panics on any address at or above `MAXVA`,
+      and [[walkaddr]] and [[copyout]] reject them, so a user pointer like
+      `0x8000000000` never reaches the page table at all.
+
+  - title: Two pages every process has
+    file: kernel/proc.c
+    lines: 173-205
+    focus: 185-202
+    state:
+      hart: 0
+      mode: S
+      proc: pid 2, about to become sh
+      intr: on
+      satp: kernel
+      locks: ["sh inode lock (sleep-lock)"]
+      irq: 0
+      stack: [usertrap, syscall, sys_exec, kexec, proc_pagetable]
+      sp:
+        "on": kernel
+        switched: "`ld sp, 8(a0)` in [[uservec]] ([[kernel/trampoline.S:76]]), when pid 2's `exec` call trapped in"
+        detail: "pid 2's kernel stack, `KSTACK(1)` = `0x3fffffb000`, in the kernel page table only"
+    note: |
+      Every user page table starts life in [[proc_pagetable]] (called here from the `exec`
+      that made `sh`): an empty top-level page, then two mappings.
+
+      - The [[g:trampoline]] at `TRAMPOLINE`, pointing at the kernel's own `trampoline`
+        code, physical `0x80006000` in this build. **R X**, no **U**.
+      - This process's [[g:trapframe]] at `TRAPFRAME`, pointing at the page [[allocproc]]
+        allocated for it. **R W**, no **U**.
+
+      Neither page has [[PTE_U]], so user code cannot touch either: if `sh` loaded from
+      `0x3fffffe000`, it would take a page fault and be killed. They are mapped in the user
+      page table only for the supervisor, who runs the trampoline code while `satp` still
+      points at the user table ([[tour:7]]).
+    others: |
+      Every process's page table maps `TRAMPOLINE` to the **same** physical page, so all
+      three harts may be executing the same trampoline instructions at once. That is safe:
+      the code is never written, and each process's `TRAPFRAME` maps to a **different**
+      physical page. Same virtual address, different memory: per-process data with no lock.
+
+  - title: The register that names the page table
+    file: kernel/riscv.h
+    lines: 245-250
+    focus: 246-248
+    state:
+      hart: 0
+      mode: U
+      proc: sh (pid 2)
+      intr: on
+      satp: user
+      locks: []
+      stack: [main]
+      sp:
+        "on": user
+        switched: "`ld sp, 48(a0)` in [[userret]] ([[kernel/trampoline.S:118]]) and `sret` ([[kernel/trampoline.S:153]]), on the way back to user mode"
+        detail: "the page at `0x4000`; `exec` started it at `0x4fe0`"
+    note: |
+      The hardware finds a page table through [[g:csr:satp|satp]]: the top 4 bits select the
+      mode (8 = Sv39), and the low 44 bits hold the **physical page number** of the top-level
+      page-table page, its address divided by 4096.
+
+      In our run, `exec` built `sh`'s top-level page at physical `0x87f41000`. So:
+
+      ```
+      MAKE_SATP(0x87f41000) = (8 << 60) | (0x87f41000 >> 12)
+                            = 0x8000000000000000 | 0x87f41
+                            = 0x8000000000087f41
+      ```
+
+      [[userret]] wrote that value into hart 0's `satp` the last time `sh` returned to user
+      mode. From then on, every address `sh` uses is translated through that table.
+    others: |
+      Hart 2's `satp`, once it runs pid 3, will hold a different value naming that process's
+      own top-level page. Hart 1, in its scheduler, has the kernel's. Nothing is shared between these registers; each hart
+      translates through its own `satp` and caches results in its own TLB.
+
+  - title: One load from buf
+    file: user/sh.c
+    lines: 134-143
+    focus: 140
+    state:
+      hart: 0
+      mode: U
+      proc: sh (pid 2)
+      intr: on
+      satp: user
+      locks: []
+      stack: [main, getcmd]
+      sp: user
+    note: |
+      Our specimen: `getcmd` has just read a line, and line 140 tests `buf[0] == 0` (empty
+      input means end of file). `buf` is `main`'s static array, passed in as a pointer, so
+      this compiles to a one-byte load from address **`0x2020`**.
+
+      The CPU never sends `0x2020` to memory. In user mode with Sv39 on, every address is
+      *virtual*: the hardware first looks for it in the [[g:tlb]], and on a miss it walks
+      the page table in memory, starting from `satp`. Let's do that walk ourselves, the way
+      the hardware does it (and the way [[walk]] does it in software).
+
+  - title: Cutting the address into fields
+    file: kernel/vm.c
+    lines: 86-98
+    focus: 90-97
+    state:
+      hart: 0
+      mode: U
+      proc: sh (pid 2)
+      intr: on
+      satp: user
+      locks: []
+      stack: [main, getcmd]
+      sp: user
+    note: |
+      The comment above [[walk]] gives the split. Write `0x2020` in binary and cut:
+
+      ```
+      0x2020 = 0b 000000000 000000000 000000010 000000100000
+                  |  L2   | |  L1   | |  L0   | |  offset  |
+                  bits     bits      bits      bits
+                  38..30   29..21    20..12    11..0
+      ```
+
+      | Field | Bits | Value |
+      |---|---|---|
+      | level-2 index | 38..30 | 0 |
+      | level-1 index | 29..21 | 0 |
+      | level-0 index | 20..12 | 2 |
+      | byte offset | 11..0 | `0x020` |
+
+      Each index picks one of the 512 eight-byte entries in a 4096-byte page-table page
+      (512 × 8 = 4096). The offset is carried through unchanged: pages are 4096 bytes, so
+      the low 12 bits are the position inside the page.
+
+      For small addresses like this one, the upper indices are 0. All of `sh`'s memory
+      (`0x0`–`0x4fff`) shares the same level-2 and level-1 entries and differs only in the
+      level-0 index, 0 through 4.
+
+  - title: PX, the field extractor
+    file: kernel/riscv.h
+    lines: 401-411
+    focus: 408-411
+    state:
+      hart: 0
+      mode: U
+      proc: sh (pid 2)
+      intr: on
+      satp: user
+      locks: []
+      stack: [main, getcmd]
+      sp: user
+    note: |
+      [[PX]]`(level, va)` is the software version of that cut: shift right by `12 + 9 *
+      level`, keep 9 bits.
+
+      - `PX(2, 0x2020)` = `(0x2020 >> 30) & 0x1ff` = 0
+      - `PX(1, 0x2020)` = `(0x2020 >> 21) & 0x1ff` = 0
+      - `PX(0, 0x2020)` = `(0x2020 >> 12) & 0x1ff` = 2
+
+      Lines 401–406 are the other half of the toolkit. A page-table entry stores a physical
+      page number in bits 53..10 and flags in bits 9..0. [[PTE2PA]] shifts out the flags
+      and shifts in 12 zero bits to get a byte address; [[PA2PTE]] goes the other way;
+      [[PTE_FLAGS]] keeps the low 10 bits.
+
+  - title: Level 2 and level 1
+    file: kernel/vm.c
+    lines: 98-116
+    focus: 104-114
+    state:
+      hart: 0
+      mode: U
+      proc: sh (pid 2)
+      intr: on
+      satp: user
+      locks: []
+      stack: [main, getcmd]
+      sp: user
+    note: |
+      The hardware (or the loop in [[walk]]) now descends. Values are from the gdb dump of
+      `sh`'s page table:
+
+      **Level 2.** Root page = `satp`'s PPN × 4096 = `0x87f41000`. Entry 0 is at
+      `0x87f41000 + 0 × 8`. It holds `0x21fcf401`:
+
+      - flags `0x001`: only **V** (valid). R, W and X are all 0, which means "this is not a
+        page of memory, it points to the next level";
+      - next table = `(0x21fcf401 >> 10) << 12` = **`0x87f3d000`**.
+
+      **Level 1.** Entry 0 of `0x87f3d000` holds `0x21fcf001`: again only V, pointing to
+      **`0x87f3c000`**, the level-0 page.
+
+      If any entry on the way had V = 0, the walk would stop with a [[g:page-fault]]. That
+      is what happens for the 256 GiB of unmapped space between `sz` and `TRAPFRAME`: the
+      level-2 entries 1 through 254 are all zero, and most of the space is ruled out by a
+      single empty entry per GiB.
+
+  - title: The leaf, and the physical byte
+    file: kernel/vm.c
+    lines: 98-116
+    focus: 115
+    state:
+      hart: 0
+      mode: U
+      proc: sh (pid 2)
+      intr: on
+      satp: user
+      locks: []
+      stack: [main, getcmd]
+      sp: user
+    note: |
+      **Level 0.** Entry **2** of `0x87f3c000`, at physical `0x87f3c010`, holds
+      `0x21fce8d7`:
+
+      | Bits | Value | Meaning |
+      |---|---|---|
+      | 53..10 (PPN) | `0x87f3a` | physical page `0x87f3a000` |
+      | 7 D | 1 | dirty: written since mapped |
+      | 6 A | 1 | accessed |
+      | 4 U | 1 | user mode may access |
+      | 3 X | 0 | not executable |
+      | 2 W | 1 | writable |
+      | 1 R | 1 | readable |
+      | 0 V | 1 | valid |
+
+      R, W or X is set, so this is a **leaf**: a real page. The hardware checks the
+      permissions for this access (a load in U-mode: needs U and R; both set), then forms
+      the physical address:
+
+      ```
+      0x87f3a000 + 0x020 = 0x87f3a020
+      ```
+
+      That is where `buf[0]` lives in RAM, and the byte `'l'` of `"ls\n"` is there. Three
+      page-table reads before the byte itself can be fetched, which is why the TLB caches the
+      answer: later loads from page `0x2000` skip the walk as long as the translation stays
+      in the TLB.
+
+      (Right after `exec` this entry was `0x21fce817`: no A, no D. [[start]] enables hardware
+      updating of the A and D bits ([[kernel/start.c:41]], [[g:svadu]]), so the MMU set A and
+      D when `getcmd`'s `memset` ([[user/sh.c:138]]) stored to the page, and low byte `0x17`
+      became `0xd7`; we observed this in our run. The kernel's `copyout` of `"ls\n"` does not
+      set D here, because the kernel writes through its own direct map, not through `sh`'s
+      table.)
+
+  - title: Every leaf in sh's table
+    file: kernel/riscv.h
+    lines: 389-399
+    focus: 395-399
+    state:
+      hart: 0
+      mode: U
+      proc: sh (pid 2)
+      intr: on
+      satp: user
+      locks: []
+      stack: [main, getcmd]
+      sp: user
+    note: |
+      The five flag bits xv6 uses, and every leaf entry of `sh` as gdb printed it right
+      after `exec`:
+
+      | Virtual page | PTE right after exec | Flags | Physical page |
+      |---|---|---|---|
+      | `0x0000` | `0x21fcf81b` | V R X U | `0x87f3e000` |
+      | `0x1000` | `0x21fcec1b` | V R X U | `0x87f3b000` |
+      | `0x2000` | `0x21fce817` | V R W U | `0x87f3a000` |
+      | `0x3000` | `0x21fce407` | V R W | `0x87f39000` |
+      | `0x4000` | `0x21fce017` | V R W U | `0x87f38000` |
+      | `0x3fffffe000` | `0x21fd5407` | V R W | `0x87f55000` (trapframe) |
+      | `0x3ffffff000` | `0x2000180b` | V R X | `0x80006000` (trampoline) |
+
+      By `sh`'s first `read`, the hardware had set A or A+D on several entries: page `0x0`
+      → `0x…5b`; `0x2000` and `0x4000` → `0x…d7`; trapframe → `0x21fd54c7` (A and D, from
+      [[uservec]]'s stores); trampoline → `0x2000184b` (A). Page `0x1000` still had no A.
+
+      What the hardware enforces with them:
+
+      - **U**: in user mode, only U pages are accessible. In supervisor mode, U pages are
+        *not* accessible unless `sstatus.SUM` is set, which xv6 never does.
+      - **R / W / X**: a load needs R, a store needs W, an instruction fetch needs X. So
+        `sh` cannot overwrite its own code (no W) or run its data (no X).
+
+      Any violation raises a page fault: `scause` 12 (fetch), 13 (load) or 15 (store), with
+      the faulting address in `stval` ([[tour:10]]).
+
+      Notice the physical pages run downward and are not in virtual order: page `0x0` is at
+      `0x87f3e000`, and the next two pages the allocator handed out became `sh`'s level-1
+      and level-0 page-table pages, so page `0x1000` landed at `0x87f3b000`. Contiguous
+      virtual memory need not be contiguous physically; [[kalloc]] just hands out whatever page is at the
+      head of its free list ([[tour:27]]).
+
+  - title: The guard page is mapped, but not for you
+    file: kernel/vm.c
+    lines: 328-339
+    focus: 335-338
+    state:
+      hart: 0
+      mode: U
+      proc: sh (pid 2)
+      intr: on
+      satp: user
+      locks: []
+      stack: [main, getcmd]
+      sp:
+        "on": user
+        detail: "`sp` is somewhere in `0x4000`–`0x4fff`, above the guard page at `0x3000`"
+    note: |
+      Page `0x3000` is present, valid, readable and writable, but has no U bit. [[kexec]]
+      allocated it like a stack page and then [[uvmclear]] removed [[PTE_U]].
+
+      `sh`'s stack is the page above it, `0x4000`–`0x4fff`, with `sp` starting at `0x4fe0`.
+      Stacks grow downward. A runaway recursion that pushes `sp` below `0x4000` next touches
+      `0x3fxx`, and the U check fails: page fault, and [[usertrap]] kills `sh` instead of
+      letting it scribble over `buf` and the rest of its data at `0x2000`.
+
+      Why keep it mapped instead of leaving it empty? Because the page sits inside `sz`, and
+      [[vmfault]] would treat an unmapped page inside `sz` as a lazily allocated one and
+      quietly supply a fresh page. A mapped page is refused ([[tour:26]] shows the check).
+
+      Both pages come from one call in [[kexec]]: it allocates `USERSTACK + 1` pages above
+      the data ([[kernel/exec.c:91]]; [[USERSTACK]] is 1 in [[kernel/param.h]]), clears
+      `PTE_U` on the lower one ([[kernel/exec.c:95]]), and starts `sp` at the top. Then it
+      copies the arguments in, which is why `sp` starts at `0x4fe0` and not `0x5000`:
+
+      ```text
+      sh's user stack, when exec finished
+        0x5000  top (= sz)
+        0x4ff0  "sh\0"                 argv[0] string, padded to 16 bytes
+        0x4fe0  { 0x4ff0, 0 }          the argv[] array; sp = 0x4fe0
+          …     main's frame and everything it calls grow down from here
+        0x4000  bottom of the one stack page
+        0x3000  guard page (no U)
+      ```
+
+      That is all the stack `sh` will ever have: one fixed page, 4 KiB. It cannot grow,
+      because the heap starts right above it. This is the stack `sp` points into whenever
+      `sh` runs in user mode ([[concept:stacks#user]]). It exists only in `sh`'s page
+      table. Apart from `exec` copying the arguments in, the kernel never puts anything on
+      it: traps and system calls run on `sh`'s kernel stack instead.
+
+  - title: Walking to the top of the address space
+    file: kernel/memlayout.h
+    lines: 46-63
+    focus: 63
+    state:
+      hart: 0
+      mode: S
+      proc: sh (pid 2)
+      intr: off
+      satp: user
+      locks: []
+      irq: 0
+      stack: [uservec]
+      sp:
+        "on": none
+        detail: "`sp` still holds `sh`'s user stack pointer (an address in `0x4000`–`0x4fff`): saved at [[kernel/trampoline.S:41]], replaced only at [[kernel/trampoline.S:76]]"
+    note: |
+      The trampoline and trapframe are used in supervisor mode with `sh`'s table still in
+      `satp`: [[uservec]] stores the user registers to `TRAPFRAME` before it switches
+      tables. Walk `0x3fffffe000` the same way:
+
+      ```
+      0x3fffffe000 = 0b 011111111 111111111 111111110 000000000000
+                        L2 = 255  L1 = 511  L0 = 510  offset 0
+      ```
+
+      | Level | Entry | PTE | Meaning |
+      |---|---|---|---|
+      | 2 | 255 of `0x87f41000` | `0x21fd0001` | V: next table `0x87f40000` |
+      | 1 | 511 of `0x87f40000` | `0x21fcfc01` | V: next table `0x87f3f000` |
+      | 0 | 510 of `0x87f3f000` | `0x21fd5407` | V R W: page `0x87f55000` |
+
+      `0x87f55000` is exactly `p->trapframe`, as gdb printed it. Entry 511 of the same
+      level-0 page is the trampoline, `0x2000180b`, physical `0x80006000`.
+
+      So `sh`'s page table uses five page-table pages: the root, a level-1 and level-0 page
+      for the bottom of the address space, and a level-1 and level-0 page for the top. The
+      254 GiB in between cost nothing.
+
+      Notice what is **not** in that top level-0 page: `sh`'s kernel stack. In our run `sh`
+      (pid 2) has process slot 1, so its kernel stack is `KSTACK(1)` = `0x3fffffb000`, entry
+      507 of the same region. That entry is zero in `sh`'s table; only the **kernel** page
+      table maps it. That is why [[uservec]] does nothing with `sp` at this point except save
+      it: at this instant `sp` still holds `sh`'s user stack pointer, and the hart has no
+      stack it could use. Line 76 loads `p->trapframe->kernel_sp` (`0x3fffffc000`, the top
+      of that page) into `sp`, and nothing is pushed until line 92 has installed the kernel
+      table, where that address is mapped.
+
+  - title: Why the kernel cannot dereference 0x2020
+    file: kernel/vm.c
+    lines: 20-53
+    focus: 29-50
+    state:
+      hart: 0
+      mode: S
+      proc: sh (pid 2)
+      intr: on
+      satp: kernel
+      locks: []
+      irq: 0
+      stack: [usertrap, syscall, sys_read]
+      sp:
+        "on": kernel
+        switched: "`ld sp, 8(a0)` in [[uservec]] ([[kernel/trampoline.S:76]])"
+        detail: "`KSTACK(1)`, `0x3fffffb000`–`0x3fffffbfff`: mapped in the kernel page table, absent from `sh`'s"
+    note: |
+      When `sh` calls `read(0, buf, ...)`, it passes the number `0x2020` to the kernel. Why
+      can't the kernel write to `*(char *)0x2020`?
+
+      1. **Wrong page table.** In the kernel, `satp` holds the kernel page table
+         ([[tour:24]]), built by [[kvmmake]]. Its lowest mapping is the [[g:plic|PLIC]] at
+         `0x0c000000`. Nothing is mapped at `0x2020`, so the access would page-fault in
+         supervisor mode, and [[kerneltrap]] panics on any exception
+         ([[kernel/trap.c:153]]).
+      2. **It would mean the wrong thing.** Even if something were mapped there, it would
+         be *kernel* memory, the same for every process, not `sh`'s `buf`.
+      3. **The U bit.** Even with `sh`'s table loaded, supervisor mode may not touch U
+         pages, because xv6 leaves `sstatus.SUM` clear. A kernel bug that follows a user
+         pointer faults instead of silently reading user data.
+
+      A user pointer is a number that only `sh`'s page table can interpret.
+
+      The same goes for the stack. The kernel code here runs on `sh`'s **kernel** stack at
+      `0x3fffffb000`, which `sh`'s page table does not map, while `sh`'s user stack at
+      `0x4000` is, to the kernel, just another user page it can reach only by translating
+      it. Two stacks per process, each visible in only one of the two page tables.
+    others: |
+      This is also what keeps processes from attacking each other through the kernel.
+      Later, when pid 3 has become `ls` and passes `0x2020` to `read`, the kernel interprets
+      it in `ls`'s page table, where `0x2000` is the **guard page** (no U, so refused). Each system call is
+      checked against the caller's own map.
+
+  - title: So the kernel walks the user table itself
+    file: kernel/vm.c
+    lines: 118-139
+    focus: 127-138
+    state:
+      hart: 0
+      mode: S
+      proc: sh (pid 2)
+      intr: off
+      satp: kernel
+      locks: [cons.lock]
+      irq: {noff: 1, intena: 1}
+      stack: [usertrap, syscall, sys_read, fileread, consoleread, either_copyout, copyout, walkaddr]
+      sp: kernel
+    note: |
+      The kernel's answer is to do in software what the MMU does in hardware. [[walkaddr]]
+      takes `sh`'s page table (`p->pagetable`, the same `0x87f41000`) and `0x2000`, calls
+      [[walk]] to run the three levels exactly as we did by hand, and returns the physical
+      page `0x87f3a000`. The kernel can then write `0x87f3a020` directly, because it maps
+      all of RAM at its own physical address ([[g:direct-map]]).
+
+      [[walkaddr]] refuses entries without V and **entries without U**: if a program passes
+      the address of its guard page, or of its trapframe, the kernel will not write there on
+      its behalf. That keeps the kernel's checks equal to the hardware's.
+
+      [[copyin]] and [[copyout]] wrap this in a loop that handles crossings between pages;
+      [[tour:28]] follows them.
+    others: |
+      No lock protects `sh`'s page table during this walk: only `sh` itself changes it (its
+      system calls and its own page faults), and `sh` is single-threaded and busy here. The
+      one spinlock held is `cons.lock`, taken by [[consoleread]] ([[kernel/console.c:95]])
+      before it copies each byte out, so interrupts are off on hart 0, and any other hart
+      that wants `cons.lock` spins until the copy is done. Other harts have their own
+      processes and their own tables. The only shared memory touched is the kernel page
+      table, which is never modified after boot.
+
+  - title: Where the heap would go
+    file: kernel/proc.c
+    lines: 233-254
+    focus: 241-253
+    state:
+      hart: 2
+      mode: S
+      proc: sh (pid 3)
+      intr: on
+      satp: kernel
+      locks: []
+      irq: 0
+      stack: [usertrap, syscall, sys_sbrk, growproc]
+      sp: kernel
+    note: |
+      The address space is not fixed after `exec`. `sz` is a movable boundary: [[growproc]]
+      maps new pages above it, and the region between the stack and `sz` is the
+      [[g:heap]].
+
+      `sh` itself never grows, but its child does. When the shell's child (pid 3) parses
+      `ls`, `malloc` asks for 64 KiB, and [[growproc]] moves the child's `sz` from `0x5000`
+      to `0x15000`: 16 new pages, at level-0 indices 5 through 20 of the same level-0 page
+      (so no new page-table pages). This is on **hart 2**, in a **different page table**:
+      the child's copy, which `fork` made. `sh`'s map on hart 0 is unaffected.
+
+      The upper limit is `TRAPFRAME`: the heap may grow until it would collide with the two
+      special pages. [[tour:26]] tells the whole story of growth, including lazy growth that
+      maps pages only when they are touched.
+    others: |
+      [[kalloc]] takes `kmem.lock` for each of the 16 pages. Hart 0 or hart 1 may be
+      allocating or freeing at the same moment; the lock makes each pop from the free list
+      atomic, so two harts can never be handed the same physical page.
+
+  - title: What an address space costs
+    file: kernel/memlayout.h
+    lines: 46-63
+    focus: 54-63
+    state:
+      hart: 0
+      mode: U
+      proc: sh (pid 2)
+      intr: on
+      satp: user
+      locks: []
+      stack: [main]
+      sp:
+        "on": user
+        switched: "`ld sp, 48(a0)` in [[userret]] ([[kernel/trampoline.S:118]]) and `sret` ([[kernel/trampoline.S:153]])"
+    note: |
+      Add up `sh`:
+
+      | Item | Pages |
+      |---|---|
+      | user memory (code ×2, data, guard, stack) | 5 |
+      | trapframe | 1 |
+      | page-table pages (root, 2 for the bottom, 2 for the top) | 5 |
+      | trampoline | 0 (shared with every process and the kernel) |
+      | **total** | **11 pages, 44 KiB** |
+
+      Nearly half of it is bookkeeping. For a large program the page-table overhead becomes
+      tiny (one level-0 page maps 2 MiB), but for xv6's small programs it is a real share.
+
+      The ideas to keep:
+
+      - **Same addresses, different memory.** Every process sees `0x2020`; each page table
+        sends it somewhere else.
+      - **Permissions per page**, checked by the hardware on every access: U, R, W, X.
+      - **Sparse tables.** One empty entry rules out a whole GiB.
+      - **The kernel cannot trust or use user pointers directly.** It translates them
+        itself, with the same checks, against the caller's own table.
+locks:
+  - lock: "(no lock) a process's own page table"
+    where: "[[walk]], [[walkaddr]], [[growproc]], [[kexec]]"
+    protects: "Nothing needed: only the process itself changes it (its system calls and its own page faults; xv6 processes have one thread), until it is a zombie and its parent's wait frees it"
+  - lock: cons.lock
+    where: "[[consoleread]], held across [[either_copyout]]"
+    protects: "The console input buffer `cons.buf` and its r/w/e indices"
+  - lock: "sh's inode lock (sleep-lock)"
+    where: "[[ilock]] in [[kexec]] ([[kernel/exec.c:46]])"
+    protects: "The executable's inode while exec reads its ELF headers and segments"
+  - lock: "(no lock) the kernel page table"
+    where: "[[kvmmake]] at boot; read by every hart's `satp`"
+    protects: "Nothing needed: written once by hart 0 before the other harts use it, never modified after"
+  - lock: "(no lock) the trampoline page"
+    where: "[[proc_pagetable]] maps it into every process"
+    protects: "Nothing needed: shared but read-only code"
+  - lock: kmem.lock
+    where: "[[kalloc]], when [[walk]] or [[uvmalloc]] needs a page"
+    protects: "The free-page list that every page-table page and user page comes from"
+quiz:
+  - q: "Work out the three Sv39 indices and the offset for `sh`'s stack pointer at start, `0x4fe0`."
+    a: "Level 2: `0x4fe0 >> 30` = 0. Level 1: `(0x4fe0 >> 21) & 0x1ff` = 0. Level 0: `(0x4fe0 >> 12) & 0x1ff` = 4. Offset `0xfe0`. So it uses entry 4 of the same level-0 page as `buf`, the stack page."
+  - q: "The trapframe page is mapped in `sh`'s page table. Why can't `sh` read its own saved registers from `0x3fffffe000`?"
+    a: "Its PTE lacks `PTE_U`. In user mode the hardware allows access only to U pages, so the load raises a page fault and `usertrap` kills the process."
+  - q: "Why is the guard page left mapped (without U) instead of simply unmapped?"
+    a: "It lies below `sz`, and an unmapped page below `sz` is treated by `vmfault` as lazily allocated, so a fault there would be satisfied with a fresh page. A mapped page makes `vmfault` refuse, so the stack overflow kills the process."
+  - q: "Suppose hart 2 is running `ls` while hart 0 runs `sh`, and both load from virtual address `0x0` at the same moment. Why don't they interfere?"
+    a: "Each hart translates through its own `satp`, naming a different page table, so `0x0` reaches different physical pages. Each hart also has its own TLB, so no cached translation is shared."
+  - q: "`read(0, buf, 100)` hands the kernel the number `0x2020`. Give two reasons the kernel cannot just write to that address."
+    a: "In the kernel `satp` holds the kernel page table, where `0x2020` is unmapped (and would mean something else if it were). And even under the user table, S-mode cannot touch U pages because `SUM` is clear. So the kernel translates it with `walkaddr` and writes the physical address."
+  - q: "How many page-table pages would `sh` need if its heap grew to 4 MiB above `0x5000`?"
+    a: "One level-0 page covers 2 MiB (512 × 4 KiB). The heap would then span addresses up to about `0x405000`, which needs level-0 indices in three 2 MiB regions, so two extra level-0 pages under the same level-1 page: 7 in total."

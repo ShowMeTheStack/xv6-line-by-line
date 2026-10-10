@@ -1,0 +1,721 @@
+title: exec
+group: Processes
+prerequisites: [5, 20, 25]
+summary: |
+  The shell's child (pid 3) is a copy of the shell ([[tour:20]]). It has parsed the command
+  line, found the single word `ls`, and now calls `exec("ls", argv)`. When that call
+  succeeds, the process is no longer the shell: its memory holds the code of `ls`, its stack
+  holds `ls`'s arguments, its program counter is at `ls`'s first instruction, and its name is
+  `ls`. Its pid, its open files, its current directory and its parent stay the same.
+
+  This tour follows [[kernel:kexec]] line by line: reading the [[g:elf]] file through the
+  file system, building a brand-new [[g:page-table]] beside the old one, loading two
+  segments, laying out a [[g:guard-page]] and a stack, pushing the argument strings, and the
+  single **commit point** where the new image replaces the old. Before that point, any
+  failure leaves the shell intact and `exec` returns -1; after it, there is nothing to
+  return to.
+
+  The concurrency story is unusual. The process's own memory needs no locks at all, because
+  nothing else can touch it. The locks that matter belong to the file system: the log, the
+  `ls` [[g:inode]]'s sleep-lock and the buffer cache, all shared with every other hart.
+  Addresses and sizes come from `readelf` on `user/_ls` and from a gdb run of this build.
+cast: |
+  The machine has three [[g:hart|harts]]. When the tour starts:
+
+  | Hart | What it is doing |
+  |---|---|
+  | 0 | Idle in its scheduler. The shell (pid 2) is asleep in `wait` ([[tour:21]]) |
+  | 1 | Idle, or running whatever else is runnable |
+  | 2 | Running the shell's child, pid 3, still named `sh`, in user mode |
+
+  The child's memory is the shell's five pages plus a 64 KiB heap that `parsecmd` just
+  allocated through `malloc` ([[tour:26]]): `p->sz = 0x15000`.
+steps:
+  - title: The child asks to become ls
+    file: user/sh.c
+    lines: 57-82
+    focus: 75-80
+    state:
+      hart: 2
+      mode: U
+      proc: sh (pid 3)
+      intr: on
+      satp: user
+      locks: []
+      stack: [main, runcmd]
+      sp: user
+    note: |
+      [[user:runcmd]] has an `EXEC` command whose `argv` is `{"ls", 0}`. The string `"ls"` is
+      inside the child's copy of `buf` (at `0x2020`), cut off by a null byte where the
+      newline was; the `argv` array itself is in the `execcmd` structure that `malloc`
+      placed in the heap.
+
+      `exec(ecmd->argv[0], ecmd->argv)` passes two **user** addresses: the path and the
+      array. If `exec` returns at all, it failed, and line 80 prints `exec ls failed`. On
+      success it never returns: the code that would have returned to is gone.
+
+      `exec` is the stub `li a7,7` (`SYS_exec`) and `ecall`; the trip to [[kernel:sys_exec]]
+      is [[tour:5]]'s.
+
+  - title: sys_exec copies everything into the kernel first
+    file: kernel/sysfile.c
+    lines: 458-499
+    focus: 465-486
+    state:
+      hart: 2
+      mode: S
+      proc: sh (pid 3)
+      intr: on
+      satp: kernel
+      locks: []
+      irq: 0
+      stack: [usertrap, syscall, sys_exec]
+      sp: {"on": kernel, switched: "`ld sp, 8(a0)` in [[uservec]] ([[kernel/trampoline.S:76]])", detail: "pid 3's kernel stack, KSTACK(2), top 0x3fffffa000"}
+    note: |
+      [[sys_exec]] copies the path into `path[128]` on the kernel stack with [[argstr]], and
+      then each argument string into a page of its own from [[kalloc]]: it reads each
+      pointer of the user `argv` array with [[fetchaddr]] until it finds the null, and copies
+      the string it points to with [[fetchstr]]. For `ls` that is one page, holding `"ls"`.
+
+      Why copy before doing anything? Because `kexec` is about to **destroy the memory these
+      strings live in**. The new stack will be built from the kernel copies, and only after
+      that is the old image freed. The copies also protect the kernel from a pointer that is
+      bad or that points at nothing: [[fetchaddr]] and [[fetchstr]] check every access
+      ([[tour:6]]).
+
+      Both arrays are locals of `sys_exec`, on pid 3's **kernel stack**: `path[128]` and
+      `argv[32]`, the 32 pointers to those kernel pages. That is why `sys_exec`'s frame is
+      480 bytes (`kernel/kernel.asm`). With `kexec`'s 544-byte frame on top of it, these
+      two functions alone take 1 KiB, a quarter of the one-page kernel stack; the argument
+      strings, up to a page each, could never fit there, so they get pages of their own.
+
+      At most [[MAXARG]] (32) slots, so at most 31 arguments, each at most a page. A bad
+      path returns -1 at once. Any later failure (too many arguments, a bad pointer,
+      [[kalloc]] out of memory) jumps to `bad`, which frees the pages already taken and
+      returns -1.
+    others: |
+      Each [[kalloc]] takes `kmem.lock` for a moment, shared with every hart. No other lock
+      is needed for the copying: the user memory being read is the child's own, and nothing
+      else can change it while the child is in this system call.
+
+  - title: A transaction, a path lookup and an inode lock
+    file: kernel/exec.c
+    lines: 24-46
+    focus: 46
+    state:
+      hart: 2
+      mode: S
+      proc: sh (pid 3)
+      intr: on
+      satp: kernel
+      locks: ["ls inode lock (sleep-lock)"]
+      irq: 0
+      stack: [usertrap, syscall, sys_exec, kexec]
+      sp: kernel
+    note: |
+      [[kexec]] starts with [[begin_op]], opening a file-system [[g:transaction]]. `exec`
+      only *reads* the file, so why? Because at the end it drops its inode reference with
+      [[iunlockput]], and if someone deleted `ls` in the meantime, that drop would be the last
+      reference and would free the file's blocks: a disk write, which must be inside a
+      transaction ([[tour:31]]). [[begin_op]] may sleep if the log is busy; no spinlock is
+      held, so that is allowed.
+
+      [[namei]]`("ls")` resolves the relative path from the current directory, `/`, and
+      returns the in-memory inode for `/ls` (inode 10, 40256 bytes), referenced but unlocked
+      ([[tour:34]]). On the way, [[namei]] briefly locks the `/` directory inode to search
+      it, then unlocks it. If there is no such file, `kexec` ends the transaction and returns -1:
+      this is the one failure that does not go through `bad`.
+
+      [[ilock]] then takes the inode's [[g:sleeplock]], reading the on-disk inode if needed.
+      The process holds it while it reads the file. Interrupts stay **on**: a sleep-lock is
+      not a spinlock. Its inner spinlock was held only inside [[acquiresleep]], so once
+      `ilock` returns, this hart's `noff` is back to 0 ([[concept:locks#sleep-locks]]).
+    others: |
+      Suppose a process on hart 1 also runs `ls` right now. Both namei calls return the
+      **same** in-memory inode (its reference count goes up to 2 or more), and both
+      [[ilock]] the same sleep-lock. The second one sleeps until the first finishes loading,
+      giving its hart to something else. Meanwhile the log's `outstanding` count includes
+      both exec calls, so a commit waits for both to call [[end_op]].
+
+  - title: Is this an ELF file?
+    file: kernel/exec.c
+    lines: 48-57
+    focus: 48-54
+    state:
+      hart: 2
+      mode: S
+      proc: sh (pid 3)
+      intr: on
+      satp: kernel
+      locks: ["ls inode lock (sleep-lock)"]
+      irq: 0
+      stack: [usertrap, syscall, sys_exec, kexec]
+      sp: kernel
+    note: |
+      [[readi]] copies the first 64 bytes of the file into `elf`, a local
+      [[kernel:elfhdr|struct elfhdr]] on the kernel stack. The `0` argument says the
+      destination is a kernel address. Underneath, [[readi]] asks the buffer cache for the
+      file's first block, taking `bcache.lock` and that buffer's sleep-lock briefly
+      ([[tour:30]]).
+
+      Two checks: the file must hold at least 64 bytes (line 49), and its first four bytes
+      must be `7f 45 4c 46`
+      ("\x7fELF"), which as a little-endian `uint` is [[ELF_MAGIC]], `0x464C457F`. For
+      `user/_ls`, `readelf -h` shows what else the header says:
+
+      | Field | Value |
+      |---|---|
+      | `entry` | `0x258` (the address of [[user:start]]) |
+      | `phoff` | 64: the program headers start right after this header |
+      | `phnum` | 4 program headers, 56 bytes each |
+
+      A file that is not ELF (say, `README`) fails here and goes to `bad`.
+
+  - title: A second page table, beside the first
+    file: kernel/exec.c
+    lines: 48-57
+    focus: 56-57
+    state:
+      hart: 2
+      mode: S
+      proc: sh (pid 3)
+      intr: on
+      satp: kernel
+      locks: ["ls inode lock (sleep-lock)"]
+      irq: 0
+      stack: [usertrap, syscall, sys_exec, kexec, proc_pagetable]
+      sp: kernel
+    note: |
+      [[proc_pagetable]] builds a fresh page table with no user memory, only the
+      [[g:trampoline]] and the [[g:trapframe]] mapped at the top ([[tour:25]]). It is held
+      in the local variable `pagetable`. The process is still running on its **old** page
+      table, `p->pagetable`, and nothing points to the new one except this local.
+
+      Look closely at which trapframe gets mapped: `p->trapframe`, the process's existing
+      trapframe page. Both page tables now map the same physical page at `TRAPFRAME`. That
+      is what makes the switch at the commit point painless: the registers `exec` writes
+      for the new program (`epc`, `sp`, `a1`) go into a page that both the old and the new
+      image share.
+
+      This is the whole strategy of `exec`: build the new world entirely on the side, then
+      swap it in with a few stores.
+
+  - title: Reading the program headers
+    file: kernel/exec.c
+    lines: 59-78
+    focus: 60-70
+    state:
+      hart: 2
+      mode: S
+      proc: sh (pid 3)
+      intr: on
+      satp: kernel
+      locks: ["ls inode lock (sleep-lock)"]
+      irq: 0
+      stack: [usertrap, syscall, sys_exec, kexec]
+      sp: kernel
+    note: |
+      The loop reads the four [[g:program-header|program headers]] one at a time, at file
+      offsets 64, 120, 176 and 232:
+
+      | i | Type | vaddr | filesz | memsz | flags | Action |
+      |---|---|---|---|---|---|---|
+      | 0 | `RISCV_ATTRIBUTES` | | | | | skipped |
+      | 1 | `LOAD` | `0x0` | `0xb89` | `0xb89` | R E | load |
+      | 2 | `LOAD` | `0x1000` | 0 | `0x30` | R W | load (all bss) |
+      | 3 | `GNU_STACK` | | | | | skipped |
+
+      For each `LOAD` segment, three checks guard against a malicious file:
+
+      - `memsz < filesz`: the segment would claim more file bytes than memory to hold them;
+      - `vaddr + memsz < vaddr`: the sum wraps around 2^64, which could make a huge segment
+        look small to the next check;
+      - `vaddr % PGSIZE != 0`: [[loadseg]] assumes the segment starts on a page boundary
+        (it walks the new table one page at a time from `vaddr`).
+
+      None of these needs a lock beyond the inode's: the header bytes come from this file,
+      read under its sleep-lock.
+
+  - title: Allocating pages for each segment
+    file: kernel/vm.c
+    lines: 215-242
+    focus: 226-241
+    state:
+      hart: 2
+      mode: S
+      proc: sh (pid 3)
+      intr: on
+      satp: kernel
+      locks: ["ls inode lock (sleep-lock)"]
+      irq: 0
+      stack: [usertrap, syscall, sys_exec, kexec, uvmalloc]
+      sp: kernel
+    note: |
+      [[kexec]] calls [[uvmalloc]]`(pagetable, sz, vaddr + memsz, flags2perm(flags))` for each
+      segment ([[kernel/exec.c:72]]). [[uvmalloc]] maps fresh, **zeroed** pages from the old
+      size up to the new end, adding [[PTE_R]] and [[PTE_U]] to the permissions:
+
+      - Segment 1, code: `uvmalloc(pt, 0, 0xb89, PTE_X)`. One page at `0x0`, flags R X U.
+      - Segment 2, data: `uvmalloc(pt, 0xb89, 0x1030, PTE_W)`. The old size rounds up to
+        `0x1000`, so one page at `0x1000`, flags R W U.
+
+      `sz` is now `0x1030`.
+
+      Zero-filling is not optional. The data segment has `filesz = 0`: all 48 bytes are
+      [[g:bss]], variables C promises start at zero, and they get that only because
+      `memset` cleared the page. It also keeps the previous owner's data in a recycled
+      page from leaking into `ls`.
+
+      If [[kalloc]] or [[mappages]] fails, [[uvmalloc]] frees the pages it added and returns
+      0, and [[kexec]] goes to `bad`.
+    others: |
+      Every [[kalloc]] takes `kmem.lock`; if another hart holds it, this hart spins, but only
+      for the few instructions of a free-list update, even though the child is holding the
+      `ls` inode's sleep-lock meanwhile. The new page table needs no lock: no other hart
+      knows it exists.
+
+  - title: loadseg copies the file into physical pages
+    file: kernel/exec.c
+    lines: 152-176
+    focus: 163-173
+    state:
+      hart: 2
+      mode: S
+      proc: sh (pid 3)
+      intr: on
+      satp: kernel
+      locks: ["ls inode lock (sleep-lock)"]
+      irq: 0
+      stack: [usertrap, syscall, sys_exec, kexec, loadseg]
+      sp: kernel
+    note: |
+      [[loadseg]] fills the pages just mapped. It cannot write to virtual address `0x0`: this
+      hart runs on the kernel page table, and the new page table is not installed anywhere.
+      So, for each page, it asks [[walkaddr]] for the **physical** address that `0x0` maps
+      to in the new table, and has [[readi]] copy file bytes straight there. The kernel can
+      write any physical address directly ([[g:direct-map]]).
+
+      For segment 1: one iteration, `n = 0xb89` (2953) bytes from file offset `0x1000`. At
+      1024 bytes per block, that is three blocks read through the buffer cache. For
+      segment 2, `filesz` is 0, so the loop does not run at all.
+
+      The `panic` on line 166 cannot fire unless [[uvmalloc]] is broken: every page was just
+      mapped. A short read (a truncated file) returns -1, and [[kexec]] goes to `bad`.
+    others: |
+      Each block read goes through [[bread]], which takes `bcache.lock` and then the buffer's
+      own sleep-lock. If another hart is reading the same block (another `ls` starting), one
+      waits, asleep. If the block is not cached, this process sleeps until the disk interrupt
+      arrives, possibly handled on another hart ([[tour:29]]), and may resume on a different
+      hart. Nothing in `exec` cares which hart it is on.
+
+  - title: Done with the file
+    file: kernel/exec.c
+    lines: 79-84
+    focus: 79-81
+    state:
+      hart: 2
+      mode: S
+      proc: sh (pid 3)
+      intr: on
+      satp: kernel
+      locks: []
+      irq: 0
+      stack: [usertrap, syscall, sys_exec, kexec]
+      sp: kernel
+    note: |
+      [[iunlockput]] releases the inode's sleep-lock and drops the reference that [[namei]]
+      took; [[end_op]] closes the transaction. Setting `ip = 0` tells the `bad:` code that
+      there is no inode left to release.
+
+      This happens **before** building the stack, deliberately. The rest of `exec` touches
+      only memory, so there is no reason to keep other processes waiting on the inode lock or
+      to keep the log from committing. Hold file-system locks for as short a time as
+      possible.
+
+      From here to the end, `kexec` holds no locks at all, apart from the brief
+      `kmem.lock` inside [[kalloc]] (two stack pages) and [[kfree]] (the 26 pages of the old
+      image).
+
+  - title: A guard page and a one-page stack
+    file: kernel/exec.c
+    lines: 83-97
+    focus: 89-97
+    state:
+      hart: 2
+      mode: S
+      proc: sh (pid 3)
+      intr: on
+      satp: kernel
+      locks: []
+      irq: 0
+      stack: [usertrap, syscall, sys_exec, kexec]
+      sp: kernel
+    note: |
+      Two different things are called "stack" and "`sp`" from here on, and they must not be
+      confused. The hart is running `kexec` on pid 3's **kernel stack**: its real `sp`
+      register is `0x3fffff9bc0`, 1088 bytes below the top of `KSTACK(2)` (gdb at line 137
+      showed exactly that depth for every `exec` system call in our run). The **user stack**
+      being built here lives in the new page table, which no hart is using; `kexec`'s C
+      variable `sp` is just a number, the address that the new program's `sp` *will* have.
+      No instruction pushes onto it; every byte goes there by [[copyout]].
+
+      The stack goes just above the program. `sz` rounds up from `0x1030` to `0x2000`, and
+      [[uvmalloc]] maps `USERSTACK + 1` = 2 more pages, writable: `0x2000` and `0x3000`.
+      `sz` becomes `0x4000`.
+
+      [[uvmclear]] then clears [[PTE_U]] on the lower page, `0x2000`. It stays mapped, but
+      user code may not touch it: it is the [[g:guard-page]]. If `ls` recursed too deep and
+      its stack pointer went below `0x3000`, the next store would fault there instead of
+      silently overwriting `ls`'s data at `0x1000` ([[tour:26]] shows the refusal).
+
+      `sp = 0x4000`, the top of the stack, and `stackbase = 0x3000`, the lowest address the
+      arguments may reach.
+
+      Here is the new image so far, in the new page table:
+
+      | Page | Flags | Contents |
+      |---|---|---|
+      | `0x0000` | R X U | code and read-only data of `ls` |
+      | `0x1000` | R W U | data and bss (zero) |
+      | `0x2000` | R W | guard page |
+      | `0x3000` | R W U | stack, empty |
+
+  - title: Pushing the argument strings
+    file: kernel/exec.c
+    lines: 99-110
+    focus: 101-110
+    state:
+      hart: 2
+      mode: S
+      proc: sh (pid 3)
+      intr: on
+      satp: kernel
+      locks: []
+      irq: 0
+      stack: [usertrap, syscall, sys_exec, kexec]
+      sp: kernel
+    note: |
+      The strings come first, at the very top of the stack. For each argument, `sp` moves
+      down by the string's length plus its null byte, then down again to a multiple of 16
+      (the RISC-V [[g:calling-convention]] requires a 16-byte-aligned `sp`).
+
+      For our one argument, `"ls"`: `0x4000 - 3 = 0x3ffd`, aligned down to `0x3ff0`. The
+      check against `stackbase` stops a huge argument list from running into the guard page.
+
+      [[copyout]] writes the 3 bytes into the **new** page table, at `0x3ff0`, by walking
+      that table to the physical page ([[tour:28]]). It also refuses pages without
+      [[PTE_W]], which is why it could never be tricked into writing over code.
+
+      `ustack[0] = 0x3ff0` remembers where the string landed, as an address that will be
+      valid in `ls`'s address space. Then `ustack[1] = 0`, the null that ends `argv`.
+
+  - title: Pushing argv, and what main will see
+    file: kernel/exec.c
+    lines: 112-124
+    focus: 113-124
+    state:
+      hart: 2
+      mode: S
+      proc: sh (pid 3)
+      intr: on
+      satp: kernel
+      locks: []
+      irq: 0
+      stack: [usertrap, syscall, sys_exec, kexec]
+      sp: kernel
+    note: |
+      Next the array of pointers: `(argc + 1) * 8` = 16 bytes, so `sp` goes from `0x3ff0` to
+      `0x3fe0` (already aligned). [[copyout]] writes `ustack[0..1]` there. That array *is*
+      `ls`'s `argv`.
+
+      The top page of `ls`'s stack, as `main` will find it:
+
+      ```
+      0x4000  +---------------------------+  top of stack (sz)
+              | (13 bytes of padding)     |
+      0x3ff3  +---------------------------+
+              | 'l' 's' '\0'              |  argv[0] points here
+      0x3ff0  +---------------------------+
+              | 0x0000000000000000        |  argv[1] = null
+      0x3fe8  +---------------------------+
+              | 0x0000000000003ff0        |  argv[0]
+      0x3fe0  +---------------------------+  <- sp, and a1 = argv
+              |                           |
+              | free stack, grows down    |
+      0x3000  +---------------------------+  stackbase
+              | guard page (no PTE_U)     |
+      0x2000  +---------------------------+
+      ```
+
+      Notice where `ustack[]` lived while it was being filled: it is a local array of
+      `kexec`, so it sat on the **kernel** stack, and line 117 copied its first 16 bytes out
+      to the user stack in the new page table. The kernel stack is the workbench, the user
+      stack the finished product.
+
+      Line 124 stores `sp`, `0x3fe0`, into the saved `a1`. By the calling convention, `a1`
+      is the second argument of a function, and the program's first function will be
+      `start(argc, argv)`. gdb confirmed: `sp=0x3fe0 a1=0x3fe0` for `ls`.
+
+  - title: Naming the process
+    file: kernel/exec.c
+    lines: 126-130
+    focus: 127-130
+    state:
+      hart: 2
+      mode: S
+      proc: sh (pid 3)
+      intr: on
+      satp: kernel
+      locks: []
+      irq: 0
+      stack: [usertrap, syscall, sys_exec, kexec]
+      sp: kernel
+    note: |
+      The loop finds the last path component (for `/usr/bin/ls` it would be `ls`; here the
+      path is already `ls`), and [[safestrcpy]] copies it into `p->name`. The name is only
+      for debugging: Ctrl-P's [[procdump]] prints it, and so does [[syscall]]'s "unknown
+      sys call" message.
+
+      Strictly, this is a change to the process that happens before the commit point. It
+      does no harm: nothing after it can fail.
+    others: |
+      [[procdump]], run by Ctrl-P on any hart, reads `p->name` with no lock at all (it is
+      deliberately lockless, so it works even on a wedged machine); it might print a
+      half-copied name, which is accepted for a debugging aid. It is the only code that
+      reads `name` from another hart; the process itself reads its own name only in
+      [[kfork]] (copying it to a child) and in [[syscall]]'s "unknown sys call" message.
+
+  - title: The commit point
+    file: kernel/exec.c
+    lines: 132-140
+    focus: 133-138
+    state:
+      hart: 2
+      mode: S
+      proc: ls (pid 3)
+      intr: on
+      satp: kernel
+      locks: []
+      irq: 0
+      stack: [usertrap, syscall, sys_exec, kexec]
+      sp: kernel
+    note: |
+      Everything is ready. Four stores turn the shell's child into `ls`:
+
+      - `p->pagetable = pagetable`: the new address space;
+      - `p->sz = 0x4000`: its size;
+      - `p->trapframe->epc = 0x258`: user execution will resume at [[user:start]], not after
+        the `ecall`;
+      - `p->trapframe->sp = 0x3fe0`: the new stack.
+
+      There is no lock here, and none is needed. `p->pagetable` and `p->sz` are private to
+      the process ([[kernel/proc.h:95]]); the trapframe is used only by this process's own
+      traps. And the hart is running on the **kernel** page table, so swapping
+      `p->pagetable` does not pull the memory out from under the code running now. The new
+      table takes effect when [[usertrap]] returns and the trampoline loads `satp` from
+      `MAKE_SATP(p->pagetable)`.
+
+      The last store matters most for the stack story: `p->trapframe->sp` used to hold the
+      user `sp` saved when this process trapped in for `exec` (inside the shell's stack page
+      at `0x4000`). It now holds `0x3fe0`, in the new stack page. The hart, meanwhile, is
+      still on the kernel stack and stays there until [[userret]].
+
+      Then [[proc_freepagetable]] frees the old image: 21 user pages (`0x15000` bytes:
+      the shell's five pages plus the 16-page heap) and its 5 page-table pages. One of those
+      21 is the old user stack, the one the process was running on when it called `exec`.
+      Freeing it is safe only because nothing points into it any more: the hart is on the
+      kernel stack, and the saved user `sp` was just overwritten. Only the
+      trapframe and trampoline mappings are removed without freeing: the trapframe page
+      lives on in the new table.
+    others: |
+      Who else could be looking at this process's memory right now? The parent is asleep in
+      `wait`. [[kkill]] on another hart touches only `killed` and `state`, under `p->lock`.
+      The schedulers read `state`. No code anywhere reads another process's page table while
+      that process is alive; [[freeproc]] does so only for a zombie, or for a half-built
+      child that never ran. That is why the most
+      drastic change a process can undergo needs no lock at all.
+
+  - title: Every way to fail
+    file: kernel/exec.c
+    lines: 140-150
+    focus: 142-149
+    state:
+      hart: 2
+      mode: S
+      proc: sh (pid 3)
+      intr: on
+      satp: kernel
+      locks: []
+      irq: 0
+      stack: [usertrap, syscall, sys_exec, kexec]
+      sp: kernel
+    note: |
+      All the failures before the commit point land here (except a failed [[namei]], which
+      returns directly). The `bad:` code undoes exactly what was done, using the two
+      variables that were initialized for this purpose:
+
+      | Failed at | `pagetable` | `ip` | Undo |
+      |---|---|---|---|
+      | reading the header, bad magic | 0 | set | unlock and put the inode, end the transaction |
+      | [[proc_pagetable]] | 0 | set | same |
+      | a program header, a check, [[uvmalloc]], [[loadseg]] | set | set | free the new table and its `sz` bytes; inode; transaction |
+      | the stack [[uvmalloc]], `sp < stackbase`, [[copyout]] | set | 0 | free the new table only |
+
+      In every case `p->pagetable`, `p->sz` and the user registers are untouched (only
+      `p->name` might be, after line 130, but nothing after it fails). The shell's child
+      gets -1 from `exec`, prints `exec ls failed`, and exits.
+
+      `sz` grows only as pages are actually mapped, so [[proc_freepagetable]]`(pagetable,
+      sz)` frees exactly what exists. That is why the code is careful to assign
+      `sz = sz1` only after each [[uvmalloc]] succeeds.
+
+  - title: The return value becomes argc
+    file: kernel/sysfile.c
+    lines: 486-499
+    focus: 488-493
+    state:
+      hart: 2
+      mode: S
+      proc: ls (pid 3)
+      intr: on
+      satp: kernel
+      locks: []
+      irq: 0
+      stack: [usertrap, syscall, sys_exec]
+      sp: kernel
+    note: |
+      [[kexec]] returns `argc`, 1. [[sys_exec]] frees the kernel pages that held the argument
+      strings (they have been copied onto the new stack) and returns 1. [[syscall]] stores
+      it in the saved `a0`.
+
+      So, when `ls` starts, its registers are:
+
+      | Register | Value | Meaning |
+      |---|---|---|
+      | `pc` (from `epc`) | `0x258` | [[user:start]] |
+      | `sp` | `0x3fe0` | top of the new stack |
+      | `a0` | 1 | `argc` |
+      | `a1` | `0x3fe0` | `argv` |
+
+      Every other register still holds whatever the **shell** had in it at the `ecall`.
+      xv6 does not clear them. `ls` cannot depend on them, and does not, since compiled C
+      code initializes registers before reading them.
+
+      `exec` "returns" a value even though the code that called it is gone. The trick is
+      that the system-call return path does not care whose code it returns to: it loads the
+      trapframe and executes `sret`.
+
+  - title: ls starts at start()
+    file: user/ulib.c
+    lines: 8-18
+    focus: 11-17
+    state:
+      hart: 2
+      mode: U
+      proc: ls (pid 3)
+      intr: on
+      satp: user
+      locks: []
+      stack: [start]
+      sp: {"on": user, switched: "`ld sp, 48(a0)` in [[userret]] ([[kernel/trampoline.S:118]]) and `sret` ([[kernel/trampoline.S:153]])", detail: "0x3fe0, in ls's new stack page at 0x3000"}
+    note: |
+      [[usertrap]] returns into the trampoline with `MAKE_SATP(p->pagetable)`, now the **new**
+      page table. [[userret]] executes `fence.i` (as it does on every return to user mode),
+      installs that table between two `sfence.vma`s, reloads the registers and `sret`s.
+      The register reload includes `ld sp, 48(a0)` ([[kernel/trampoline.S:118]]): that is
+      the instant `sp` leaves pid 3's kernel stack (empty again: every kernel frame has
+      returned) for the user stack `exec` built, at `0x3fe0`; the hart can use that stack
+      only after `sret` returns it to user mode. Until that
+      load, from `csrw satp` on, `sp` still held a kernel-stack address that `ls`'s page
+      table does not map ([[concept:stacks]]).
+
+      The first instruction fetched in user mode is at `0x258`: [[user:start]], whose
+      arguments arrive in `a0` and `a1`, exactly where `exec` put `argc` and `argv`. It calls
+      `main(1, argv)`, and `ls` lists the current directory. When `main` returns,
+      [[user:start]] calls `exit` with its result, so even a program that forgets to call
+      `exit` ends cleanly ([[tour:21]]).
+
+      No stale translation from the shell's page table can survive into `ls`: they were
+      discarded when the `exec` system call entered the kernel ([[uservec]] runs
+      `sfence.vma` right after switching to the kernel table), and the new table is
+      installed between two more.
+
+  - title: What exec cost, and why it is shaped this way
+    file: kernel/exec.c
+    lines: 99-150
+    focus: 132-138
+    state:
+      hart: 2
+      mode: S
+      proc: ls (pid 3)
+      intr: on
+      satp: kernel
+      locks: []
+      irq: 0
+      stack: [usertrap, syscall, sys_exec, kexec]
+      sp: kernel
+    note: |
+      The bill for turning the shell's child into `ls`: one kernel page for the argument
+      string (given back at the end), 4 user pages and 5 page-table pages taken (the
+      trapframe page is reused), 26 pages given back, and three blocks of program code read
+      from the file after the block holding the headers. All 26 had been allocated moments
+      earlier: 10 by `fork` (5 user pages copied by [[uvmcopy]], 5 page-table pages) and 16
+      by `malloc`'s eager `sbrk`. Copy-on-write `fork` avoids copying the 5 pages, and a
+      combined spawn call avoids building the child's address space at all.
+
+      The design rests on two ideas:
+
+      - **Build beside, then commit.** The new image is complete before the old one is
+        touched, so failure is always recoverable, and the commit is four stores. The same
+        holds for the stack: the new user stack is built in the new page table while the
+        hart runs on the kernel stack, which `exec` never replaces, and the old user stack
+        is freed only after the commit.
+      - **Private things need no locks.** A process's page table, size and trapframe belong
+        to it alone, and xv6 processes have a single thread, so even replacing the whole
+        address space is done without a lock. The locks in `exec` are all on the shared
+        things: the log, the inode, the buffer cache and the page allocator, and each is
+        held only as long as it must be.
+locks:
+  - lock: "log (begin_op / end_op)"
+    where: "[[kexec]] lines 39–80"
+    protects: "Not a lock but a reservation: keeps a commit from starting while `exec` might still write (through `iput`)"
+  - lock: "the ls inode's sleep-lock"
+    where: "[[ilock]] to [[iunlockput]] in [[kexec]]"
+    protects: "The inode's contents and block list while the ELF header, program headers and segments are read"
+  - lock: "bcache.lock, buffer sleep-locks"
+    where: "[[bread]], [[brelse]] inside [[readi]]"
+    protects: "The buffer cache, and each cached block while it is read"
+  - lock: itable.lock
+    where: "[[iget]]/[[idup]]/[[iput]] inside [[namei]] and [[iunlockput]]"
+    protects: "The in-memory inode table and each inode's reference count"
+  - lock: "the / directory inode's sleep-lock"
+    where: "[[ilock]] inside `namex` during [[namei]]"
+    protects: "The directory's contents while `ls` is looked up in it; released before `ls` is locked"
+  - lock: log.lock
+    where: "inside [[begin_op]] and [[end_op]]"
+    protects: "`log.outstanding` and `log.committing`"
+  - lock: "lk->lk (inner spinlocks), vdisk lock"
+    where: "inside [[acquiresleep]]/[[releasesleep]]; in the disk driver on a cache miss"
+    protects: "Each sleep-lock's own `locked` flag; the virtio disk's queues ([[tour:29]])"
+  - lock: kmem.lock
+    where: "[[kalloc]] (argument pages, segment pages, page-table pages); [[kfree]] (old image)"
+    protects: "The shared free-page list"
+  - lock: "(no lock) p->pagetable, p->sz, p->trapframe"
+    where: "the commit point"
+    protects: "Nothing needed: they are private to a single-threaded process, and the hart runs on the kernel page table while they change"
+  - lock: "(no lock) p->name"
+    where: "[[kexec]] line 130"
+    protects: "Read unlocked from other harts only by [[procdump]] (a torn name is accepted for a debugging aid); otherwise read only by the process itself, in [[kfork]] and [[syscall]]"
+quiz:
+  - q: "Why does `sys_exec` copy the argument strings into kernel pages instead of letting `kexec` read them from user memory as it builds the new stack?"
+    a: "`kexec` frees the old user memory at the commit point, and the strings live there. Kernel copies survive the switch, and copying them first also checks every user pointer before any irreversible step."
+  - q: "`exec` only reads the file. Why does it need `begin_op`?"
+    a: "Releasing the inode at the end (`iunlockput`) could be the last reference to a file that was unlinked meanwhile, and then `iput` frees its blocks on disk. Every disk write must be inside a transaction."
+  - q: "The commit point changes `p->pagetable` while the process is running, without a lock. Why doesn't the hart crash, and why can no other hart see a half-made change?"
+    a: "The hart is in the kernel, translating with the kernel page table; the user table only takes effect when the trampoline loads `satp` on the way out. No other code reads a live process's page table, and the process has a single thread, so nothing can observe the change."
+  - q: "`ls` has `filesz = 0` and `memsz = 0x30` for its data segment. Where do those 48 bytes come from?"
+    a: "Nowhere in the file: `uvmalloc` maps a fresh page and zero-fills it, and `loadseg` copies nothing. The bytes are `.bss`, which C requires to start at zero."
+  - q: "Trace `sp` for `exec(\"ls\", {\"ls\", 0})` given that the stack top is `0x4000`. Where does `a1` point, and what is stored there?"
+    a: "`0x4000 - 3 = 0x3ffd`, aligned down to `0x3ff0`, where `\"ls\"` is written. The pointer array needs 16 bytes, so `sp = 0x3fe0`; it holds `0x3ff0` then 0. `a1 = 0x3fe0`."
+  - q: "If `copyout` of the `argv` array fails, which resources does `bad:` release and which does it leave alone?"
+    a: "It frees the new page table and its pages (`proc_freepagetable(pagetable, sz)`). The inode and transaction were already released (`ip == 0`). The old page table, size and registers are untouched, so the caller gets -1 and keeps running."

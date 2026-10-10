@@ -1,0 +1,731 @@
+title: One interrupt, three landing sites
+group: The dance of privilege
+prerequisites: [8, 11, 41, 43]
+summary: |
+  A timer interrupt is the same event every time: on some hart, the clock passes
+  `stimecmp`. But *where* it lands depends entirely on what that hart was doing. There are
+  exactly three possibilities in xv6, and they differ in every answer to the master question:
+
+  - **Site A, user mode.** The hart was running a program. The interrupt enters through the
+    trampoline, switches page table and stack, and lands on an **empty kernel stack**.
+  - **Site B, a process in the kernel.** The hart was in a system call. The interrupt pushes a
+    256-byte frame onto **the process's kernel stack**, on top of whatever is there, and may
+    end with the process continuing on a *different hart*.
+  - **Site C, the scheduler.** The hart was between processes. The frame goes onto **the
+    scheduler stack**, and there is nobody to preempt.
+
+  This tour visits all three with values measured in this build: gdb attached to QEMU while
+  `usertests preempt` ran on three harts. Along the way it answers why [[kernelvec]] doesn't
+  restore `tp`, why [[kerneltrap]] keeps `sepc` and `sstatus` in local variables, and why the
+  scheduler opens a two-instruction window for interrupts.
+cast: |
+  `usertests preempt` is running. It forks three children that spin forever in user mode,
+  then kills them. In our run:
+
+  | Hart | What it is doing |
+  |---|---|
+  | 0 | Running child pid 5, spinning in user mode: **site A** |
+  | 1 | Running `usertests` itself (pid 3), entering a system call: **site B** |
+  | 2 | Idle in its [[kernel:scheduler]] at times: **site C** |
+
+  The harts trade roles constantly; the measurements below come from several moments of the
+  same run, and each step names the hart it saw. The shell (pid 2) is waiting for `usertests`.
+steps:
+  - title: Each hart's own alarm clock
+    file: kernel/start.c
+    lines: 54-66
+    focus: 58-65
+    state:
+      hart: [0, 1, 2]
+      mode: M
+      proc: none
+      intr: off
+      satp: bare
+      locks: []
+      stack: [start, timerinit]
+      sp: {"on": boot, detail: "tops 0x80008890, 0x80009890, 0x8000a890"}
+    note: |
+      A flashback to boot. Each hart turned on the Sstc extension and set its own
+      **`stimecmp`**, a supervisor CSR. When the hart's `time` counter passes it, the hart sets
+      its supervisor-timer-pending bit (`sip.STIP`). [[clockintr]] later re-arms it with
+      `w_stimecmp(r_time() + 1000000)` ([[kernel/trap.c:179]]), which also clears the pending
+      bit. Each hart has its own comparator, so three harts get three independent streams of
+      ticks.
+
+      A pending bit is only half of an interrupt. The hart *takes* it when two more
+      conditions hold:
+
+      | Condition | Set by |
+      |---|---|
+      | `sie.STIE = 1` (timer), `sie.SEIE = 1` (devices) | [[kernel/start.c:33]], once |
+      | in **U-mode**: always; in **S-mode**: only if `sstatus.SIE = 1` | [[intr_on]] / [[intr_off]], `push_off` / `pop_off`, trap entry, `sret` |
+
+      Then the hardware does what [[tour:43]] measured for `ecall`: it saves `pc` in `sepc`,
+      writes `scause`, copies `SIE` to `SPIE`, clears `SIE`, records the previous mode in
+      `SPP`, and jumps to **`stvec`**. The rest of this tour is about what `stvec` holds, and
+      what `sp` holds, at that moment.
+    figure: t44-three-sites
+    caption: |
+      The same tick on three harts. Where the 256-byte [[kernelvec]] frame goes, or whether
+      there is one at all, depends only on what the hart was doing. Addresses are from our run.
+
+  - title: "Site A: a child spinning in user mode"
+    file: user/usertests.c
+    lines: 855-870
+    focus: 866-867
+    state:
+      hart: 0
+      mode: U
+      proc: usertests child (pid 5)
+      intr: on
+      satp: user
+      locks: []
+      stack: [preempt]
+      sp: {"on": user, detail: "0x11e80"}
+    note: |
+      Child pid 5 is executing `j 0x3a7a`, a jump to itself, at user address `0x3a7a`. It
+      makes no system calls. Without a timer interrupt it would keep hart 0 forever.
+
+      What decides where the tick will land:
+
+      | Register | Value | Set by |
+      |---|---|---|
+      | mode | U | `sret` |
+      | `stvec` | `0x3ffffff000` ([[uservec]]) | [[prepare_return]], before the child last entered user mode |
+      | `satp` | the child's page table | [[userret]] |
+      | `sp` | `0x11e80`, the child's user stack | the child |
+
+      In U-mode the interrupt is taken regardless of `SIE`. `stvec` points into the
+      trampoline because the last thing the kernel did on this hart was prepare a return to
+      user mode, and nothing has changed it since.
+
+  - title: The tick enters through the trampoline
+    file: kernel/trampoline.S
+    lines: 16-38
+    focus: 22-37
+    state:
+      hart: 0
+      mode: S
+      proc: usertests child (pid 5)
+      intr: off
+      satp: user
+      locks: []
+      irq: 0
+      stack: [uservec]
+      sp: {"on": none, detail: "still the child's 0x11e80"}
+    note: |
+      We stopped at [[usertrap]]'s first instruction, before anything had touched the
+      trap CSRs (the trampoline reads none of them):
+
+      | Register | Value | Meaning |
+      |---|---|---|
+      | `scause` | `0x8000000000000005` | top bit 1: an **interrupt**; code 5: supervisor timer |
+      | `sepc` | `0x3a7a` | the `j` that was interrupted: it will run again |
+      | `sstatus` | `SPP=0 SPIE=1 SIE=0` | from U-mode |
+      | `stvec` | `0x3ffffff000` | not yet changed |
+      | `sp` | `0x3fffff6000` | top of `KSTACK(4)`, slot 4's kernel stack: **empty** |
+
+      Between the interrupt and that stop, [[uservec]] did exactly what it does for a system
+      call ([[tour:43]]): saved 31 registers through the user page table, loaded `sp` and
+      `satp`, jumped to `usertrap`. Nothing in the trampoline knows or cares why it was
+      entered.
+
+      Unlike an `ecall`, `sepc` names an instruction that has **not** executed. No `+4`: the
+      child resumes by running `j 0x3a7a` again.
+
+  - title: usertrap treats the tick as a device
+    file: kernel/trap.c
+    lines: 69-89
+    focus: 69-70
+    state:
+      hart: 0
+      mode: S
+      proc: usertests child (pid 5)
+      intr: off
+      satp: kernel
+      locks: []
+      irq: {noff: 0, note: "at the call on line 69 noff is 0; on hart 0, `clockintr` holds `tickslock` for a few lines (noff 1, intena 0)"}
+      stack: [usertrap, devintr, clockintr]
+      sp: {"on": kernel, detail: "slot 4's stack: usertrap → devintr → clockintr"}
+    note: |
+      `scause` isn't 8, so [[usertrap]] asks [[devintr]], which matches code 5, calls
+      [[clockintr]] (which re-arms this hart's `stimecmp`, and on hart 0 also counts a tick),
+      and returns 2. Back in `usertrap`, `which_dev == 2`, so line 86 calls [[yield]]: the
+      child goes back to `RUNNABLE` and hart 0 switches to its scheduler.
+
+      ```text
+      child pid 5's kernel stack (KSTACK(4))
+        0x3fffff6000 ─ top (empty a moment ago)
+                       usertrap
+                       yield
+                       sched
+                       swtch      ← p->context.sp points here while it waits
+      ```
+
+      Interrupts stay **off** for all of this: they were cleared by the hardware on entry, and
+      `usertrap` turns them on only for system calls (line 66). That's why site A never
+      stacks one interrupt on top of another.
+
+      A device interrupt at site A takes the same path with `scause = 0x8000000000000009`. We
+      caught one on hart 2 while the child was at `0x3a7a`. Then `devintr` returns 1 and there
+      is no `yield`. [[tour:11]] follows a site A tick all the way through the context switch.
+    others: |
+      `clockintr` takes `tickslock` only on hart 0, which owns the global `ticks` counter. Harts
+      1 and 2 re-arm their own comparators without any lock: `stimecmp` is per hart.
+
+  - title: "Site B: usertests enables interrupts in a system call"
+    file: kernel/trap.c
+    lines: 54-69
+    focus: 66
+    state:
+      hart: 1
+      mode: S
+      proc: usertests (pid 3)
+      intr: on
+      satp: kernel
+      locks: []
+      irq: {noff: 0, note: "noff 0, so turning SIE on is safe; the first `acquire` in the call will record intena 1"}
+      stack: [usertrap]
+      sp: {"on": kernel, detail: "0x3fffff9fe0: usertrap's frame on slot 2's stack"}
+    note: |
+      Now hart 1. `usertests` (pid 3, slot 2) has just made a system call. [[usertrap]] has
+      saved `sepc` and switched `stvec` to [[kernelvec]] (line 47), and line 66 turns
+      interrupts on.
+
+      | Register | Value |
+      |---|---|
+      | mode | S |
+      | `stvec` | `0x800055b0` ([[kernelvec]]) |
+      | `satp` | kernel |
+      | `sp` | `0x3fffff9fe0`: one 32-byte frame below the top `0x3fffffa000` |
+      | `sstatus.SIE` | 0 → **1** |
+
+      A tick had gone pending while interrupts were off. In our run, it was taken at the very
+      next instruction. This is common. In a run without a debugger, about half (122 of 228)
+      of the kernel-mode ticks on processes landed right after an instruction that turned
+      interrupts back on, either here or in [[pop_off]] (`sepc = 0x80000c50`). Most of the rest
+      landed in the middle of work, such as `memset` or [[uartwrite]] (right after a byte was
+      stored into the UART, `sepc = 0x8000094c`).
+      Wherever it lands, site B is a process's kernel stack.
+
+  - title: The hardware's part, and a frame on the current stack
+    file: kernel/kernelvec.S
+    lines: 1-15
+    focus: 12-14
+    state:
+      hart: 1
+      mode: S
+      proc: usertests (pid 3)
+      intr: off
+      satp: kernel
+      locks: []
+      irq: {noff: 0, note: "an interrupt is only ever taken at noff 0: SIE is never 1 while this hart holds a spinlock"}
+      stack: [usertrap, kernelvec]
+      sp: {"on": kernel, detail: "0x3fffff9fe0 → 0x3fffff9ee0: a 256-byte kernelvec frame"}
+    note: |
+      gdb at [[kernelvec]]'s first instruction on hart 1:
+
+      | Register | Value | Meaning |
+      |---|---|---|
+      | `sepc` | `0x8000266c` | `usertrap+162`, the `jal syscall` right after `intr_on` |
+      | `scause` | `0x8000000000000005` | supervisor timer |
+      | `sstatus` | `SPP=1 SPIE=1 SIE=0` | from S-mode, where interrupts had been on |
+      | `satp` | `0x8000000000087fff` | unchanged: already the kernel's |
+      | `sp` | `0x3fffff9fe0` | unchanged: already a kernel stack |
+
+      Compare site A. No page-table switch, no `sscratch`, no trapframe. The trap came from
+      the kernel, so `sp` is already a kernel stack and the kernel page table is already
+      installed. `addi sp, sp, -256` simply makes room **on whatever stack is current**.
+      There is no separate interrupt stack in xv6 ([[concept:stacks#same]]).
+
+      And `noff` is 0. It always is when an interrupt lands: SIE can be 1 only while this hart
+      holds no spinlock, so a handler can never interrupt a critical section on its own hart
+      ([[concept:locks#invariant]]).
+
+      ```text
+      usertests' kernel stack (KSTACK(2))
+        0x3fffffa000 ─ top
+        0x3fffff9fe0   usertrap      (32 bytes)
+        0x3fffff9ee0   kernelvec frame (256 bytes)
+      ```
+
+  - title: Saving only what C might clobber
+    file: kernel/kernelvec.S
+    lines: 16-39
+    focus: 16-38
+    state:
+      hart: 1
+      mode: S
+      proc: usertests (pid 3)
+      intr: off
+      satp: kernel
+      locks: []
+      irq: 0
+      stack: [usertrap, kernelvec]
+      sp: {"on": kernel, detail: "0x3fffff9ee0"}
+    note: |
+      Seventeen stores: `ra`, `gp`, `t0`–`t6`, `a0`–`a7`. These are the 16 **caller-saved**
+      registers, plus `gp`: the [[g:calling-convention]] lets any C function, such as
+      [[kerneltrap]], destroy the caller-saved ones. `s0`–`s11` are callee-saved, so any C function that uses one saves and
+      restores it itself.
+
+      Two lines are commented out on purpose:
+
+      - `sp` (line 18): the frame's address *is* `sp`. Restoring it is just `addi sp, sp, 256`.
+      - `tp` (line 20): `tp` holds this hart's number. It must **not** be restored, for a
+        reason step 12 explains, with the measurement from step 10.
+
+      Compare [[uservec]]'s 31 stores: it can't rely on the calling convention, because
+      the code it interrupted was a user program, which may have had anything in any register.
+      Here the interrupted code is the kernel's own C, compiled to known rules.
+
+  - title: kerneltrap keeps sepc and sstatus for itself
+    file: kernel/trap.c
+    lines: 134-148
+    focus: 140-147
+    state:
+      hart: 1
+      mode: S
+      proc: usertests (pid 3)
+      intr: off
+      satp: kernel
+      locks: []
+      irq: 0
+      stack: [usertrap, kernelvec, kerneltrap]
+      sp: {"on": kernel, detail: "0x3fffff9eb0 after kerneltrap's 48-byte frame"}
+    note: |
+      The first thing [[kerneltrap]] does is copy three CSRs into local variables. In this
+      build the compiler keeps `sepc` in register `s2` and `sstatus` in `s1` (instructions at
+      `0x800026e0` and `0x800026e4`); the prologue saved the caller's `s1`/`s2` in the 48-byte
+      frame.
+
+      Why copy? Because this handler may **[[yield]]**. While this thread is switched out, the
+      hart will run other threads and take other traps, and each one overwrites this hart's
+      `sepc` and `sstatus`. A local variable belongs to the *thread*. It sits in `s1`/`s2`,
+      callee-saved registers. Every function that wants them first spills them onto this
+      kernel stack. In this build, [[yield]] saves `s1` and [[sched]] saves `s2` in their
+      frames before [[swtch]], and the epilogues put them back when the thread resumes. So
+      the values come back intact, on any hart.
+
+      The two checks confirm the hardware's story: `SPP = 1` (from supervisor mode), and
+      `SIE = 0` (the trap turned interrupts off and nothing has turned them on).
+
+  - title: A tick with a process attached means yield
+    file: kernel/trap.c
+    lines: 149-159
+    focus: 156-158
+    state:
+      hart: 1
+      mode: S
+      proc: usertests (pid 3)
+      intr: off
+      satp: kernel
+      locks: []
+      irq: {noff: 0, note: "`yield`'s `acquire` will record intena 0: SIE is off inside `kerneltrap`"}
+      stack: [usertrap, kernelvec, kerneltrap]
+      sp: {"on": kernel, detail: "0x3fffff9eb0"}
+    note: |
+      [[devintr]] handled the tick and returned 2, and `myproc()` is pid 3, so line 158 calls
+      [[yield]]. gdb at that call: hart 1, `sp = 0x3fffff9eb0`, `s2 = 0x8000266c`,
+      `s1 = 0x200000120` (`SPP=1 SPIE=1`).
+
+      Look at what will sit on usertests' kernel stack while it waits:
+
+      ```text
+      KSTACK(2)
+        0x3fffffa000 ─ top
+                       usertrap
+                       ── kernelvec frame: 17 registers of the interrupted usertrap ──
+                       kerneltrap        (holds s1, s2 of its caller)
+                       yield             (saves kerneltrap's s1)
+                       sched             (saves kerneltrap's s2)
+                       swtch             ← p->context.sp
+      ```
+
+      An interrupted C function, frozen in the middle of a stack, with a hardware trap frame
+      wedged in. This is the deepest kind of suspended process in xv6 ([[tour:47]]).
+    others: |
+      [[yield]] takes `usertests`' `p->lock`, sets `RUNNABLE`, and calls [[sched]] holding
+      exactly that one lock with interrupts off. `sched` checks both. If interrupts were on
+      at this point, a second tick could arrive inside `sched`, and its `kerneltrap` would call
+      `yield`, which would `acquire` the `p->lock` this hart already holds, and panic
+      ("acquire"). That re-entry is what the "sched interruptible" check guards against.
+      `yield`'s `acquire` is the step from `noff` 0 to 1, taken with SIE already off, so it
+      records `intena` 0 for this thread ([[concept:locks#intena]]).
+
+  - title: Resumed on hart 0, with hart 0's leftovers in the CSRs
+    file: kernel/proc.c
+    lines: 479-497
+    focus: 495-496
+    state:
+      hart: 0
+      mode: S
+      proc: usertests (pid 3)
+      intr: off
+      satp: kernel
+      locks: ["usertests' p->lock"]
+      irq: {noff: 1, intena: 0, note: "line 496 has just put back `usertests`' own intena, 0 (it yielded from `kerneltrap`)"}
+      stack: [usertrap, kernelvec, kerneltrap, yield, sched]
+      sp: {"on": kernel, switched: "`ld sp, 8(a1)` in [[swtch]], called by hart 0's [[scheduler]]", detail: "usertests' kernel stack, inside sched, below kerneltrap's frame at 0x3fffff9eb0"}
+    note: |
+      Hart 1's scheduler released the lock; a moment later **hart 0**'s scheduler acquired it,
+      found `usertests` `RUNNABLE`, and switched to it. `swtch` returned into `sched` on hart 0,
+      and `yield` and `kerneltrap` continue there.
+
+      gdb at [[kernel/trap.c:162]], on hart 0, with `usertests`' saved values beside hart 0's
+      live CSRs:
+
+      | | saved by the thread (`s2`, `s1`) | live on hart 0 |
+      |---|---|---|
+      | `sepc` | `0x8000266c` | **`0x80001e10`** |
+      | `sstatus` | `SPP=1 SPIE=1` | **`SPP=0 SPIE=1`** |
+
+      The live values describe hart 0's own recent past. `0x80001e10` is an address inside
+      hart 0's *scheduler* (step 14), and `SPP = 0` was left by that trap's own `sret`: every
+      `sret` resets `SPP` to 0. Neither has anything to do with `usertests`.
+
+      One more hart value is put right here: line 496 restores `intena` from the local
+      `sched` kept in `s3`, the 0 that `usertests`' `yield` recorded on hart 1. `yield`'s
+      `release` will drop `noff` to 0 and leave SIE off, as `kerneltrap` needs
+      ([[concept:locks#sched-intena]]).
+    others: |
+      | Time | Hart 0 | Hart 1 |
+      |---|---|---|
+      | t1 | scheduler window: a tick, `sepc = 0x80001e10` | `usertests`: tick, `kerneltrap` → `yield` |
+      | t2 | scans; spins on `usertests`' `p->lock` | `swtch` to scheduler, which releases it |
+      | t3 | gets the lock, `RUNNABLE` → `RUNNING`, `swtch` | runs something else |
+      | t4 | `usertests` continues in `kerneltrap` | |
+
+      The `p->lock` handoff ([[tour:13]]) is what guarantees hart 0 doesn't load the saved `sp`
+      until hart 1 has stopped using that stack.
+
+  - title: Putting this thread's sepc and sstatus back
+    file: kernel/trap.c
+    lines: 156-164
+    focus: 160-163
+    state:
+      hart: 0
+      mode: S
+      proc: usertests (pid 3)
+      intr: off
+      satp: kernel
+      locks: []
+      irq: {noff: 0, note: "`yield`'s `release` left SIE off (intena 0); `sret` turns it back on from SPIE"}
+      stack: [usertrap, kernelvec, kerneltrap]
+      sp: {"on": kernel, detail: "0x3fffff9eb0"}
+    note: |
+      Lines 162–163 write the thread's copies back into hart 0's CSRs: `sepc = 0x8000266c`,
+      `sstatus` with `SPP = 1`, `SPIE = 1`.
+
+      Without them, [[kernelvec]]'s `sret` would read hart 0's leftovers: jump to `0x80001e10`
+      with `SPP = 0`, so **in user mode**, at a kernel address. The kernel page table maps that
+      address, but without `PTE_U`, so the fetch would fault at once. The trap would enter
+      `kernelvec` with `SPP = 0`, and `kerneltrap` would panic, "kerneltrap: not from
+      supervisor mode".
+
+      Restoring `sstatus` also restores `SPIE = 1`, which `sret` will copy into `SIE`. So the
+      interrupted code gets its interrupts back on, exactly as it had them.
+
+      The comment on lines 160–161 says "the yield() may have caused some traps to occur". The
+      measurement shows it's not only traps on *this* hart: after a yield, the thread may
+      not even be on the same hart.
+
+  - title: Restore everything except tp, then sret
+    file: kernel/kernelvec.S
+    lines: 40-64
+    focus: 41-64
+    state:
+      hart: 0
+      mode: S
+      proc: usertests (pid 3)
+      intr: off
+      satp: kernel
+      locks: []
+      irq: 0
+      stack: [usertrap, kernelvec]
+      sp: {"on": kernel, detail: "0x3fffff9ee0 → 0x3fffff9fe0 at line 61"}
+    note: |
+      Seventeen loads (`ra`, `gp`, `t0`–`t6`, `a0`–`a7`), `addi sp, sp, 256`, and `sret`.
+
+      Line 44 is the point of this step. The frame has no `tp` slot in use, so `tp` keeps its
+      current value: **0**, hart 0's number, set by hart 0's own `start` at boot. If
+      `kernelvec` had saved `tp` on hart 1 and restored it here, it would put **1** back, and
+      from then on [[cpuid]] and [[mycpu]] on hart 0 would return hart 1's `struct cpu`. Two
+      harts would share one `cpus[]` entry: the same `noff`, the same `c->proc`. Locks and
+      scheduling would fail in ways that are very hard to trace.
+
+      `sret` then does what [[tour:43]] listed: `pc` ← `0x8000266c`, mode ← S (`SPP = 1`),
+      `SIE` ← 1, `SPP` ← 0. `usertrap` continues at `jal syscall` on hart 0, with interrupts
+      on. It never knew it was on hart 1 a moment ago.
+
+  - title: "Site C: the scheduler opens a two-instruction window"
+    file: kernel/proc.c
+    lines: 428-444
+    focus: 441
+    state:
+      hart: 2
+      mode: S
+      proc: none
+      intr: on
+      satp: kernel
+      locks: []
+      irq: {noff: 0, note: "line 463 released the last `p->lock`, so noff is 0 when line 441 opens the window"}
+      stack: [scheduler]
+      sp: {"on": scheduler, detail: "0x8000a810, the scheduler's frame"}
+    note: |
+      The third landing site. Hart 2 is in its [[scheduler]], between processes. `c->proc` is
+      0. Every time around the loop, line 441 turns interrupts on and line 442 turns them off
+      again:
+
+      ```text
+      0x80001e0c: csrsi sstatus, 2    # intr_on
+      0x80001e10: csrci sstatus, 2    # intr_off
+      ```
+
+      This is the **only** place where the scheduler runs with interrupts on. Every other line
+      of the loop runs with them off.
+
+      | Register | Value |
+      |---|---|
+      | `stvec` | `0x800055b0` ([[kernelvec]]) |
+      | `sp` | `0x8000a810`, the scheduler's 96-byte frame on hart 2's slice |
+      | `satp` | kernel |
+
+      Why is `stvec` right? [[trapinithart]] set it at boot, and every path that returns to
+      the scheduler comes through [[swtch]] from kernel code, where `stvec` is always
+      [[kernelvec]]. Only [[prepare_return]] sets the trampoline address, with interrupts off,
+      and no switch happens between there and `sret`.
+
+  - title: The trap lands on the scheduler stack
+    file: kernel/kernelvec.S
+    lines: 9-15
+    focus: 12-14
+    state:
+      hart: 2
+      mode: S
+      proc: none
+      intr: off
+      satp: kernel
+      locks: []
+      irq: 0
+      stack: [scheduler, kernelvec]
+      sp: {"on": scheduler, detail: "0x8000a810 → 0x8000a710: a kernelvec frame pushed on it"}
+    note: |
+      We logged dozens of these on all three harts. Every one, timer or device, looked the
+      same:
+
+      | Register | Value |
+      |---|---|
+      | `sepc` | **`0x80001e10`**, `scheduler+154`: the `intr_off` instruction |
+      | `scause` | `0x8000000000000005` (timer) or `0x8000000000000009` (device) |
+      | `sstatus` | `SPP=1 SPIE=1 SIE=0` |
+      | `sp` | `0x80008810`, `0x80009810` or `0x8000a810`: hart 0, 1 or 2's scheduler frame |
+
+      The interrupt is taken right after `csrsi` makes `SIE` 1, before `csrci` executes. So
+      `sepc` is always the `csrci`, and after `sret` the loop turns interrupts off and carries
+      on.
+
+      The same [[kernelvec]] code pushes its 256 bytes onto **hart 2's slice of `stack0`**.
+      That slice has no guard page, but the depth is fixed: the scheduler frame, one
+      `kernelvec` frame, and whatever [[kerneltrap]] calls. Interrupts are off inside, so
+      frames can't pile up.
+
+  - title: No process, no yield
+    file: kernel/trap.c
+    lines: 149-164
+    focus: 156-158
+    state:
+      hart: 2
+      mode: S
+      proc: none
+      intr: off
+      satp: kernel
+      locks: []
+      irq: 0
+      stack: [scheduler, kernelvec, kerneltrap]
+      sp: {"on": scheduler, detail: "0x8000a6e0: kerneltrap's frame below the kernelvec frame"}
+    note: |
+      [[devintr]] runs as usual: for a tick, [[clockintr]] re-arms `stimecmp`; for a device,
+      the [[g:plic|PLIC]] claim, the driver, maybe a [[wakeup]] ([[tour:9]] follows one).
+      Then line 157 checks `myproc() != 0`. It is 0, because the scheduler set `c->proc = 0`.
+      So no `yield`.
+
+      It couldn't yield even if it wanted to. [[yield]] does `acquire(&p->lock)` on the
+      current process, and there is none. And there is no thread to give up the hart *to*:
+      the scheduler is the thing that would run next.
+
+      An idle hart reaches this same spot from `wfi` too. When the scan finds nothing,
+      line 467 runs `wfi` with interrupts **off**. The privileged spec says `wfi` wakes when
+      an interrupt is *pending*, whatever `SIE` says. It falls through to line 441, `csrsi`
+      enables interrupts, and the interrupt is taken with `sepc = 0x80001e10`. Same landing
+      site, same frame. In our logs we couldn't tell the two paths apart, and nothing in xv6
+      needs to.
+    others: |
+      A device interrupt can be claimed by any hart whose PLIC context has it enabled. With
+      two harts idle, both may take the external interrupt in their windows; the PLIC hands
+      the claim to one, and the other's [[plic_claim]] returns 0. Both handle it on their own
+      scheduler stacks, with no lock between them except inside the driver.
+
+  - title: Why the window is open, and why it is so small
+    file: kernel/proc.c
+    lines: 435-469
+    focus: 436-442
+    state:
+      hart: 2
+      mode: S
+      proc: none
+      intr: off
+      satp: kernel
+      locks: []
+      irq: 0
+      stack: [scheduler]
+      sp: {"on": scheduler, detail: "0x8000a810"}
+    note: |
+      **Why open it at all?** The scheduler scans holding a `p->lock` most of the time, and
+      it switched here from a process that had interrupts off. If interrupts were never
+      enabled, a hart with nothing runnable would never take the disk or UART interrupt that
+      makes something runnable. With every process waiting, that's a deadlock. The comment
+      on lines 436–440 says so. (Line 456 sets `intena` to 0 after each `swtch` back, so the
+      `release` on line 463 never turns interrupts on mid-scan, whatever the process had
+      ([[concept:locks#sched-intena]]). Line 441 is the only place the scan's interrupts
+      come on, at `noff` 0.)
+
+      **Why close it again before scanning and `wfi`?** Suppose interrupts stayed on:
+
+      | Time | Hart 2 (scheduler, interrupts on) | Device |
+      |---|---|---|
+      | t1 | scans the table: nothing `RUNNABLE` | |
+      | t2 | | interrupt: handled at once, [[wakeup]] makes a waiting process `RUNNABLE` |
+      | t3 | `found == 0`, so `wfi`: sleeps | |
+      | t4 | sleeps until the *next* interrupt, up to a tick later, with work ready | |
+
+      With interrupts off during the scan, the interrupt at t2 stays **pending**. `wfi` sees a
+      pending interrupt and returns immediately, the loop reopens the window, the interrupt
+      is handled, and the next scan finds the process.
+
+  - title: Why the scheduler needs a stack of its own
+    file: kernel/proc.c
+    lines: 472-497
+    focus: 479-497
+    state:
+      hart: 1
+      mode: S
+      proc: usertests (pid 3)
+      intr: off
+      satp: kernel
+      locks: ["usertests' p->lock"]
+      irq: {noff: 1, intena: 0, note: "`sched` insists on noff 1, and keeps intena (0 here) in `s3` across `swtch`"}
+      stack: [usertrap, kernelvec, kerneltrap, yield, sched]
+      sp: {"on": kernel, detail: "usertests' kernel stack, just before swtch"}
+    note: |
+      Back on hart 1, at the `swtch` from step 9. Why doesn't [[sched]] simply pick the next process
+      itself, on `usertests`' stack, and switch to it directly?
+
+      Because the moment `usertests`' `p->lock` is released, **another hart may start running
+      on that stack**. We just watched hart 0 do it. Whatever hart 1 runs after giving up
+      `usertests` must stand on memory that no other hart can claim. The scheduler stack is
+      that memory: one per hart, valid at every moment, belonging to no process. The same
+      goes for a process that has just called [[kexit]]: its slot will be reused by the next
+      `fork` after its parent reaps it, so the hart must leave that stack before anyone can.
+
+      There is a locking reason too. A direct switch from A to B would hold A's lock while
+      acquiring B's. Two harts doing A→B and B→A at once would each hold one and wait for
+      the other.
+
+      Site C is the price: the scheduler stack is one more place an interrupt can land. It
+      needs no special handling, because [[kernelvec]] works on any kernel stack.
+
+  - title: stvec is right for every landing site
+    file: kernel/trap.c
+    lines: 97-113
+    focus: 108-112
+    state:
+      hart: 1
+      mode: S
+      proc: usertests (pid 3)
+      intr: off
+      satp: kernel
+      locks: []
+      irq: 0
+      stack: [usertrap, prepare_return]
+      sp: {"on": kernel, detail: "usertests' kernel stack"}
+    note: |
+      The three sites work only because `stvec` always names the handler that matches the
+      hart's situation:
+
+      | Hart is… | `stvec` must be | Set by |
+      |---|---|---|
+      | in user mode | [[uservec]]: switch page table and stack | [[prepare_return]], line 112 |
+      | in the kernel, on a process's stack | [[kernelvec]]: push on the current stack | [[usertrap]], line 47 |
+      | in the scheduler | [[kernelvec]] | [[trapinithart]] at boot, and never changed on this path |
+
+      There are two windows where the match is wrong, and xv6 keeps interrupts off across
+      both. In [[uservec]], from the trap until line 47 of [[usertrap]], `stvec` still says
+      `uservec`. Here, from line 112 until `sret`, `stvec` says `uservec` while the hart is
+      still in the kernel. Line 108 turns interrupts off first. The code in these windows is
+      also written so it can't fault, since an exception isn't masked by `SIE`.
+    others: |
+      `stvec` is per hart. Hart 1 pointing its vector at the trampoline doesn't affect hart 0's
+      `kernelvec`, so no lock is involved. The danger is entirely local: this hart's own next
+      trap.
+
+  - title: Three sites, side by side
+    file: kernel/kernelvec.S
+    lines: 1-14
+    focus: 1-8
+    state:
+      hart: [0, 1, 2]
+      mode: S
+      proc: any
+      intr: off
+      satp: kernel
+      locks: []
+      irq: 0
+      stack: [kernelvec]
+      sp: {"on": kernel, detail: "a process's kernel stack, or the scheduler stack at site C"}
+    note: |
+      The comment says "the current stack is a kernel stack". It is right in the broad sense:
+      at site B it is a process's kernel stack, at site C it is the hart's scheduler stack,
+      and both are kernel memory mapped in the kernel page table.
+
+      | | Site A: user | Site B: process in kernel | Site C: scheduler |
+      |---|---|---|---|
+      | `stvec` | [[uservec]] | [[kernelvec]] | [[kernelvec]] |
+      | page table switch | yes, `csrw satp` | no | no |
+      | registers saved to | trapframe (31) | kernelvec frame (17) | kernelvec frame (17) |
+      | lands on | empty kernel stack | top of a busy kernel stack | the scheduler's frame |
+      | `sepc` kept in | `trapframe->epc` | a local in [[kerneltrap]] | a local in [[kerneltrap]] |
+      | timer leads to | [[yield]] | [[yield]] | nothing |
+      | may resume on another hart | yes | yes, so `tp` isn't restored | no |
+      | measured `sepc` | `0x3a7a` | `0x8000266c` | `0x80001e10` |
+
+      The handler code is shared ([[devintr]], [[clockintr]]); only the entry and exit
+      differ. And in every case the hardware did the same few things. The difference comes
+      from what xv6 left in `stvec` and `sp`. [[tour:45]] puts all three sites into one
+      complete time slice.
+locks:
+  - lock: "tickslock (spinlock)"
+    where: "[[clockintr]], on hart 0 only"
+    protects: "`ticks`, the global tick counter; the other harts only re-arm their own `stimecmp`"
+  - lock: "p->lock (spinlock)"
+    where: "[[yield]] (sites A and B), released by the [[scheduler]], re-taken by the next hart's scheduler"
+    protects: "`p->state`, so exactly one hart runs on a suspended thread's kernel stack"
+  - lock: "stvec, sepc, sstatus, tp (no lock)"
+    where: "every step"
+    protects: "Per-hart registers: other harts can't touch them. The danger is this hart's next trap, or a thread moving to another hart, which is why `kerneltrap` keeps copies and `kernelvec` leaves `tp` alone"
+  - lock: "PLIC claim (no kernel lock)"
+    where: "[[plic_claim]] at site C"
+    protects: "The PLIC gives each device interrupt to one claimer; the others read 0"
+quiz:
+  - q: "A timer tick arrives at site A and another at site C. At what point do their paths become the same code, and where do they part again?"
+    a: "They converge at [[devintr]] → [[clockintr]], reached from [[usertrap]] at site A and from [[kerneltrap]] at site C. They part right after: `usertrap` yields when `which_dev == 2`, while `kerneltrap` yields only if `myproc() != 0`, which is false in the scheduler. They return differently too: `prepare_return`, `userret` and `sret` to user mode, versus `kernelvec`'s `sret` back into the scheduler at `0x80001e10`."
+  - q: "Why doesn't `kernelvec` restore `tp`, while `userret` does restore the user's `tp`?"
+    a: "In the kernel `tp` is the hart's identity, and after a `yield` inside `kerneltrap` the thread may be on a different hart (we measured hart 1 → hart 0). Restoring the saved `tp` would make that hart claim to be the old one. For user code, `tp` is just a register the program owns. The kernel's hart number goes back into `tp` from `kernel_hartid` on the next trap."
+  - q: "`kerneltrap` writes `sepc` and `sstatus` back even when it did not yield. What would go wrong, in our measured run, if it only did so after a yield returned on a different hart?"
+    a: "Even on the same hart, the yield may have run other threads, or taken interrupts in the scheduler's window, and each overwrites `sepc` and `sstatus`. A scheduler-window interrupt on the *same* hart leaves `sepc = 0x80001e10` and `SPP = 0`, exactly the leftovers we measured after a hart change, so a \"did we move?\" test would miss it. Writing both back always costs two instructions."
+  - q: "`sched` panics with \"sched interruptible\" if interrupts are on. Describe the failure that check prevents."
+    a: "`sched` is called holding the process's `p->lock`. If interrupts were on, a timer could arrive at site B inside `sched`. Its `kerneltrap` would call `yield`, which calls `acquire(&p->lock)` on a lock this hart already holds, and `acquire` panics. In practice `acquire` already turned interrupts off; the check catches code that turned them back on."
+  - q: "The scheduler runs `wfi` with interrupts *off*. Why doesn't the hart sleep through the interrupt that should wake it?"
+    a: "`wfi` resumes when an interrupt is *pending* (and enabled in `sie`), whatever the global `SIE` bit says. The hart falls through to `intr_on()` at line 441, and the pending interrupt is taken there, with `sepc = 0x80001e10`. Keeping interrupts off until then is what prevents the lost-wakeup race in step 16."
+  - q: "Site B's kernelvec frame and site C's both hold 17 registers. Why does site A need 31, and why can't it put them on a stack like the other two?"
+    a: "At site A the interrupted code is a user program, which owes the kernel nothing under the calling convention, so every register must be saved. And there's no usable stack: the user's `sp` can't be trusted, and the kernel stack isn't mapped until `satp` changes. So [[uservec]] stores into the trapframe, reachable through the user page table at `TRAPFRAME`."

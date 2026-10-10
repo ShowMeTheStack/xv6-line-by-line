@@ -1,0 +1,243 @@
+summary: |
+  `malloc` and `free` for user programs: the classic allocator from Kernighan and Ritchie's
+  *The C Programming Language* (2nd edition, section 8.7), almost unchanged. It is a
+  [[g:free-list-allocator]] that manages the process's [[g:heap]].
+
+  The kernel provides only one way to get memory: [[sbrk]], which extends the process's
+  memory by a number of bytes. That is too coarse to use for every small request, and it
+  cannot return a block from the middle. This file sits between the two:
+
+  - Memory is handled in **units** of one [[Header]], 16 bytes. Every block, free or in
+    use, starts with a header that records its size in units.
+  - Free blocks are kept on a **circular list sorted by address**, linked through their
+    headers. [[freep]] points into the list, at the place where the last search ended.
+  - [[malloc]] walks the list from there and takes the first block that is large enough;
+    if it is larger than needed, it cuts the request off the block's **tail**.
+  - [[free]] puts a block back in address order and **merges** it with the free block
+    directly before or after it, when they touch.
+  - When no block is large enough, [[morecore]] gets at least 64 KiB more from the kernel
+    with `sbrk` and adds it to the list by calling `free`.
+
+  Memory is never returned to the kernel; a process's heap only grows.
+
+  The kernel's allocator for physical pages, [[kernel/kalloc.c]], uses the same free-list
+  idea in its simplest form, with fixed-size blocks.
+
+  **Read before:** [[user/ulib.c]] (for `sbrk`). [[user/sh.c]] is the main user.
+
+blocks:
+  - lines: 1-4
+    title: Headers
+    note: |
+      [[kernel/types.h]] for `uint`, [[user/user.h]] for [[sbrk]] and [[SBRK_ERROR]].
+      [[kernel/stat.h]] and [[kernel/param.h]] are not used by this file.
+
+  - lines: 6-7
+    title: Where the code comes from
+    note: |
+      Credit for the algorithm. Reading section 8.7 of the book alongside this file is
+      worthwhile: the code is nearly identical, and the book explains it with diagrams.
+
+  - lines: 9-19
+    title: "The block header: a union that forces alignment"
+    note: |
+      Every block starts with a header holding two fields: `ptr`, the next block on the
+      free list (meaningful only while the block is free), and `size`, the length of the
+      block **in header-sized units, including the header itself**.
+
+      The struct is wrapped in a union with a `long`. A union is as large as its largest
+      member and as strictly aligned as its most demanding one, so the union's purpose is
+      to guarantee that a header, and therefore the memory right after it, is aligned for
+      a `long`, which K&R take as the most demanding type on the machine. On RV64 the
+      pointer alone already needs 8-byte alignment, so the `long` changes nothing here,
+      but the code does not rely on that.
+
+      With GCC for riscv64, `sizeof(Header)` is 16 (8 for the pointer, 4 for `size`, 4
+      bytes of padding) and its alignment is 8. A block of `n` units is therefore
+      `16 * n` bytes, and what [[malloc]] returns is the address right after the header:
+
+      ```
+      +--------+-------------------------------+
+      | header |  space returned to the caller |
+      +--------+-------------------------------+
+      ^        ^
+      p        p + 1   (Header arithmetic: 16 bytes later)
+      ```
+
+  - lines: 21-22
+    title: The list's anchor and the roving pointer
+    note: |
+      [[base]] is a zero-size block that lives in this file's `.bss`, not in the heap. It
+      gives the circular list a member from the very first call, so the code never has to
+      handle an empty list specially. Its size is 0, so `malloc` can never hand it out.
+
+      [[freep]] is where the next search starts. It is 0 (null) until the first `malloc`,
+      which is how `malloc` recognizes the first call. Both are `static`, private to this
+      file.
+
+  - lines: 24-44
+    title: "free(): put a block back, merging with its neighbors"
+    note: |
+      `free` finds the place where the block belongs in the address-sorted circular
+      list, then joins it to its neighbors when there is no gap between them.
+
+      **Finding the spot (lines 30–32).** The goal is the free block `p` after which `bp`
+      belongs: `p < bp < p->s.ptr`. Because the list is circular, one place is special:
+      the block with the highest address, whose `ptr` wraps around to the lowest one
+      (`p >= p->s.ptr`). A block that lies above every free block, or below every free
+      block, belongs right there, between the end and the start.
+
+      **Merging (lines 33–42).** With `p` found, `bp` would go between `p` and
+      `p->s.ptr`:
+
+      - If `bp` ends exactly where the next free block starts, the two are combined: `bp`
+        grows by the next block's size and takes over its `ptr`.
+      - If `p` ends exactly where `bp` starts, `bp` (possibly already combined) is absorbed
+        into `p` the same way.
+
+      So a freed block can merge on both sides, turning three blocks into one. Without
+      merging, the heap would fill with small free pieces that no larger request could use
+      (fragmentation).
+
+      Finally [[freep]] is set to `p`, so the next `malloc` starts its search next to the
+      block just freed.
+
+      Nothing is checked. `free(0)`, which standard C allows and ignores, here computes a
+      header address 16 bytes below 0, which wraps around to the top of the 64-bit address
+      space. Once the list exists, `free` reads that header; the address is not mapped, so
+      the process takes a page fault and the kernel kills it. Freeing a pointer twice, or one that `malloc` did not return, quietly corrupts
+      the list.
+
+  - lines: 46-61
+    title: "morecore(): ask the kernel for more memory"
+    note: |
+      Called by [[malloc]] when no free block is large enough. It extends the process's
+      memory with [[sbrk]], which reaches [[kernel:sys_sbrk]] and [[kernel:growproc]]:
+      the kernel allocates zeroed physical pages, maps them right after the current end of
+      the process's memory, and returns the old end.
+
+      The new memory is turned into one big block with a header, and then handed to
+      [[free]], which inserts it into the free list (and merges it with the last free block
+      if that one ended exactly where the new memory begins, which happens when the end of
+      the previous `sbrk` area is free). Reusing `free` this way means there is only one
+      piece of code that inserts into the list.
+
+      It returns [[freep]], which `free` has just pointed at the block before the new
+      memory, so that [[malloc]]'s search reaches the new block next. (If the new memory
+      was merged into that block, `freep` is the merged block itself; the search then
+      passes it once and finds it on the next lap.)
+
+  - lines: 63-90
+    title: "malloc(): find a block, splitting off the tail"
+    note: |
+      Converts the request to units, then walks the circular free list starting after
+      [[freep]], taking the first block that is large enough. Starting where the previous
+      search stopped, instead of always at the beginning, is K&R's choice; it spreads
+      allocations over the list instead of piling small leftovers up at its start
+      (allocators that do this are sometimes called *next fit*).
+
+      When the walk comes all the way back to `freep` without success, every free block is
+      too small. Then [[morecore]] adds memory and the walk continues; it will reach the
+      new block. If the kernel refuses, `malloc` returns 0.
+
+      `prevp` trails one block behind `p`, because removing `p` from a singly linked list
+      requires changing the `ptr` of the block before it.
+
+      The memory returned is not cleared. Fresh memory from `sbrk` happens to be zero,
+      but a reused block holds whatever its previous user left in it.
+
+lines:
+  9: |
+    `Align` names the type with the strictest alignment, in K&R's terms. Changing this one
+    `typedef` would adapt the allocator to a machine where another type is stricter.
+  13: |
+    The next free block in the circular list. Unused while the block is allocated.
+  14: |
+    The block's size in units (16 bytes each), header included. A `uint` limits one block
+    to fewer than 2^32 units, far more than an xv6 process can have.
+  16: |
+    Never used for data. Its presence makes the union at least as aligned as a `long`.
+  19: |
+    Lets the code write `Header` instead of `union header`.
+  21: |
+    The zero-size block that starts the list. It is a global, so its address is in the
+    program's `.bss`, below the heap; the list stays sorted with `base` as its lowest
+    member.
+  22: |
+    The roving start point for searches; null until the first `malloc`.
+  29: |
+    `ap` points just after a header, so one `Header` back (16 bytes) is the block's own
+    header. Pointer arithmetic on `Header *` moves in whole units.
+  30-32: |
+    Walk the list until `bp` lies strictly between `p` and the next block. The `if` inside
+    the loop catches the wrap-around point (`p >= p->s.ptr`, the highest block): if `bp`
+    is above it or below the lowest block, it belongs there, and the loop stops early.
+  33-35: |
+    Merge with the following block: `bp + bp->s.size` is the address just past `bp`'s
+    end. If the next free block starts exactly there, `bp` takes over its size and its
+    link, and the next block disappears into `bp`.
+  36-37: |
+    Otherwise `bp` points to the next block, which keeps it in the list's order.
+  38-40: |
+    Merge with the preceding block: if `p` ends exactly where `bp` begins, `p` grows by
+    `bp`'s size and takes over `bp`'s link, so `bp` disappears into `p`. Because `bp` may
+    already have absorbed the next block, this can join three blocks into one.
+  41-42: |
+    Otherwise link `p` to `bp`, completing the insertion.
+  43: |
+    Start the next search at `p`, next to the newly freed space.
+  52-53: |
+    Ask for at least 4096 units, 4096 × 16 = 65536 bytes (64 KiB), even for a small
+    request. Each `sbrk` is a system call that allocates and maps pages, so asking for a
+    larger amount at once means few calls; the rest stays on the free list for later
+    requests.
+  54: |
+    Grow the process's memory by `nu * 16` bytes. `p` is the old end of memory, the start
+    of the new area. This always uses [[sbrk]] (eager), never `sbrklazy`. The size is
+    passed as an `int`. A request whose byte count is 2^31 or more turns negative; the
+    kernel treats it as a shrink that changes nothing and reports success, and the header
+    write on line 58 then faults on unmapped memory. The process is killed instead of
+    `malloc` returning 0.
+  55-56: |
+    The kernel refused, typically because physical memory ran out ([[kernel:uvmalloc]]
+    failed) or the process would grow past [[kernel:TRAPFRAME]]. Report failure; `malloc`
+    then returns 0. [[user/usertests.c:1097]] allocates until this happens.
+  57-58: |
+    Write a header at the start of the new memory, describing it as one block of `nu`
+    units.
+  59: |
+    Insert the new block into the free list by freeing it. `free` expects the address after
+    the header, as `malloc` would have returned it, hence `hp + 1`.
+  60: |
+    `free` has set `freep` to the block just before the new one (or to the merged block),
+    which is a good place to continue the search.
+  69: |
+    Round the request up to whole units and add one unit for the header. For example,
+    `malloc(1)` to `malloc(16)` take 2 units (32 bytes), `malloc(17)` takes 3. Even
+    `malloc(0)` takes one unit, the header alone, and returns a unique pointer to zero
+    usable bytes.
+  70-73: |
+    First call: no list yet. Make [[base]] a one-element circular list (pointing to itself)
+    with size 0, and start searching there.
+  74: |
+    Walk the list from the block after `freep`, with `prevp` one step behind. The loop has
+    no exit condition; it ends by returning from inside.
+  75: |
+    First fit: this block has at least the requested number of units.
+  76-77: |
+    Exact fit: unlink the whole block from the list by making its predecessor skip it.
+  78-82: |
+    Larger block: keep its front part on the free list, only smaller, and hand out its
+    tail. Shrinking the size (line 79) is all that is needed to keep the remainder
+    listed: its header, link and position stay the same. Line 80 moves `p` to the start
+    of the tail, and line 81 writes the new block's header there.
+  83: |
+    The next search will start right after this point.
+  84: |
+    Return the address just past the header. The header stays in front of the returned
+    memory, where [[free]] will find it.
+  86-88: |
+    Back at the start of the walk with nothing found: get more memory. `morecore` returns
+    the block before the new memory, so the loop's next step (`p = p->s.ptr`) reaches it.
+    (When the new memory was merged into that block, the walk goes around once more and
+    finds it there.) If the kernel refused, give up and return 0, the null pointer.

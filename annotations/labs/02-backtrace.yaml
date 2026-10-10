@@ -1,0 +1,1976 @@
+published: true
+title: A kernel backtrace on panic
+area: The system-call and trap path
+stars: 1
+branch: ext/02-backtrace
+prerequisites: {tours: [5, 8, 12, 42, 44], concepts: [stacks]}
+summary: |
+  When this kernel panics it prints one line, such as `panic: sched locks`, and stops. The
+  line names the check that failed, not the path that led to it. In this lab you add
+  `backtrace()`, which prints the return address of every function on the current kernel
+  call chain, and make [[panic]] call it. On the host, `addr2line` turns the addresses
+  into file names and line numbers.
+
+  The walk itself is a five-line loop over the [[g:flag-frame|frame pointers]] the compiler
+  already maintains. The interesting part is where the loop must stop, and that depends on
+  which stack it is walking. A process's [[g:kernel-stack]] is one page, so its top is a
+  page boundary. A hart's [[g:scheduler-stack]] is a 4096-byte slice of `stack0`, which is
+  only 16-byte aligned, so its top is in the middle of a page, and its top 32 bytes hold two
+  frames left over from boot. And when an interrupt arrives in the middle of a call chain, [[kernelvec]]
+  pushes a 256-byte [[g:kernelvec-frame]] that the walk has to step across. You will see all
+  three, in real output from three [[g:hart|harts]], and you will see what goes wrong, in
+  recorded runs, when the walk does not stop where it should.
+learn:
+  - "How a RISC-V function's prologue links its frame to its caller's: with `-fno-omit-frame-pointer`, `s0` points just above a two-word record holding the return address (at `s0-8`) and the caller's `s0` (at `s0-16`), so the frames form a linked list through the stack."
+  - "What sits at the top of each kind of kernel stack: on a process's kernel stack, [[usertrap]]'s record, holding the address after `uservec`'s `jalr` (the first instruction of [[userret]]) and the *user's* `s0`; on a scheduler stack, `start`'s and `main`'s frames, never popped, with `start`'s record holding the `ra` and `s0` of power-on."
+  - "Why `stack0` slices are not page-aligned, and what `PGROUNDUP(fp)` does on them: it stops the walk too late (printing `start`'s power-on record, and, without an upward check, following its `s0` of 0) or too early (cutting the chain at a page boundary in the middle of the slice). Both happen in one recorded run."
+  - "What the walk sees across a trap: [[kernelvec]] saves `ra` but not `s0` and builds no record, so the chain goes from [[kerneltrap]] straight to the interrupted function's frame, and the interrupted function's own name never appears (nor its caller's, if the trap strikes in a prologue or epilogue); its address is in `sepc`."
+  - "How to turn return addresses into lines with `addr2line`, and why you should look up `ra - 1`: with optimization, the instruction after a call can belong to another line, or to another block of code entirely."
+  - "Why a backtrace in [[panic]] must run before `panicked` is set and must never fault: a fault inside it re-enters [[kerneltrap]], which panics again. A recorded run of a walk without bounds went down through every kernel stack below its own and their guard pages, then through the top of physical memory, before it froze."
+spec: |
+  **The function.** `void backtrace(void)` prints `backtrace:` and then, one per line, the
+  return addresses of the current kernel call chain, newest first, in the form `printk`'s
+  `%p` produces (`0x0000000080002c46`). It must stop at the top of the stack it started
+  on, whichever kind of kernel stack that is, and it must never read outside that stack:
+  it is about to be called from [[panic]], where a fault would start another panic.
+
+  **panic.** [[panic]] prints its message, then the backtrace, then stops as before.
+
+  **A way to try it from user space.** A system call `int kbacktrace(int where)` makes the
+  kernel print a backtrace from one of three places:
+
+  | `where` | where the backtrace is taken | stack it walks |
+  |---|---|---|
+  | 0 | inside the system call | the calling process's kernel stack |
+  | 1 | in [[kerneltrap]], at the next timer interrupt that arrives while this system call is running | the same kernel stack, with a [[g:kernelvec-frame]] in the middle |
+  | 2 | in [[kerneltrap]], at the next timer interrupt that some *idle* hart takes in [[scheduler]] | that hart's slice of `stack0` |
+
+  It returns 0 when the backtrace has been printed, and -1 for any other `where` or if no
+  hart took a `where 2` request within 10 ticks.
+
+  **The test.** `bttest` calls `kbacktrace` with 0, 1, 2 and 3 and checks the return values
+  (0, 0, 0, -1). It cannot read the console, so the addresses themselves are checked by eye,
+  by symbolizing them on the host; its last line says so:
+
+  ```text
+  $ bttest
+  bttest: from a system call, on this process's kernel stack:
+  backtrace:
+  0x0000000080002c46
+  0x00000000800029f2
+  0x0000000080002736
+  bttest: kbacktrace(0) returned 0: OK
+  bttest: from a timer interrupt during a system call:
+  backtrace:
+  ...
+  bttest: kbacktrace(3) returned -1: OK
+  bttest: 4 checks OK; the addresses can only be checked by symbolizing them on the host with addr2line
+  ```
+
+  `bttest N` runs only case `N`, to look at one stack at a time.
+
+  **Constraints.** Nothing else may change: no new output from any other program, and
+  `usertests -q` must still print `ALL TESTS PASSED` on three harts. Do not change the
+  compiler flags; the kernel is already built with `-fno-omit-frame-pointer`.
+think:
+  - title: What does a function leave behind that leads to its caller?
+    q: |
+      To print the chain of calls that led to the current function, you need a way to get
+      from a function to its caller, then to the caller's caller, and so on. When a C
+      function in this kernel is called, what does it store on the stack that would let you
+      do that, and where exactly? Look at a few real prologues before you answer.
+    hints:
+      - |
+        Build the kernel and open `kernel/kernel.asm`. Read the first four or five
+        instructions of `cpuid`, `usertrap` and `scheduler`. Then find the compiler flags on
+        line 66 of the [[Makefile]].
+      - |
+        Two registers are saved by every one of those prologues: `ra`, the address to return
+        to, and `s0`. Then `s0` is set from `sp`. Work out where the two saved values sit
+        relative to the *new* `s0`, and whose `s0` the saved one is.
+      - |
+        After the prologue, `s0` points just above a two-word record: the return address at
+        `s0-8` and the caller's `s0` at `s0-16`. Loading `s0-16` gives you the caller's
+        record, and so on up the stack.
+    answer: |
+      Here is `cpuid`, in the branch's build, a function so small that it calls nothing:
+
+      ```text
+      8000199a:  1141   addi  sp,sp,-16
+      8000199c:  e406   sd    ra,8(sp)
+      8000199e:  e022   sd    s0,0(sp)
+      800019a0:  0800   addi  s0,sp,16
+      ```
+
+      The prologue makes room, saves `ra` and the caller's `s0`, and points `s0` at the old
+      `sp`. So `ra` is at `s0-8` and the caller's `s0` at `s0-16`, and the same holds for
+      `usertrap` (`addi sp,sp,-32`, `sd ra,24(sp)`, `sd s0,16(sp)`, `addi s0,sp,32`) and
+      every other C function in the kernel. Variadic functions differ in one detail:
+      [[printk]] keeps its register save area *above* the record (`addi s0,sp,128` in a
+      192-byte frame), but the record is still at `s0-8` and `s0-16`.
+
+      The saved `s0` values link the frames into a list running up the stack, newest first.
+      That list is what `-fno-omit-frame-pointer` buys ([[g:flag-frame]]; line 66 of the
+      Makefile). Without it, GCC at `-O` treats `s0` as one more callee-saved register and
+      keeps a variable in it; clinic 4 shows what a walk finds then.
+
+      Notice that `cpuid` saves `ra` even though it never calls anything: with this flag every
+      function, leaf or not, gets a record, so the walk never has to know which kind it is in.
+    checks:
+      - id: lab02-01
+        level: 1
+        type: number
+        q: |
+          `usertrap` begins `addi sp,sp,-32; sd ra,24(sp); sd s0,16(sp); sd s1,8(sp);
+          sd s2,0(sp); addi s0,sp,32`. At what offset from the new `s0` is the caller's `s0`
+          saved? (Write a negative number.)
+        answer: -16
+        wrong:
+          -8: |
+            You may have mixed up the two words of the record. `ra` is saved at `24(sp)`,
+            which is `s0-8`; the old `s0` is at `16(sp)`, which is `s0-16`.
+          16: |
+            You may have read the offset from `sp` instead of from `s0`. `16(sp)` is
+            correct relative to `sp`, but the walk only knows `s0`, which is `sp + 32`.
+          -32: |
+            You may have taken the frame size for the offset. `s0-32` is where `sp` points,
+            the bottom of the frame; it holds `s2`.
+        why_wrong: |
+          Compute from the prologue: `s0 = sp + 32`, and the old `s0` is stored at `sp + 16`,
+          so it is at `s0 - 16`.
+        explain: |
+          With `-fno-omit-frame-pointer`, every prologue in this kernel stores the return
+          address at `s0-8` and the caller's `s0` at `s0-16`, whatever the frame size. That
+          fixed layout is what makes a walk possible without knowing each function's frame.
+      - id: lab02-02
+        level: 2
+        type: bits
+        q: |
+          A copy of the kernel built **without** `-fno-omit-frame-pointer` printed, from a
+          backtrace taken in [[kerneltrap]], `fp 0x0000000200000120 is not on a kernel stack`:
+          `s0` held some variable of `kerneltrap`'s. Decode the value as the register it
+          really came from, `sstatus`.
+        value: "0x200000120"
+        fields:
+          - label: SPP (bit 8), the mode the trap came from
+            options: ["0: user", "1: supervisor"]
+            answer: "1: supervisor"
+            why: You may have missed bit 8. `0x120` is `0x100 + 0x20`, so bit 8 is set; the trap came from supervisor mode, as every trap into kerneltrap does.
+          - label: SPIE (bit 5), SIE before the trap
+            options: ["0", "1"]
+            answer: "1"
+            why: You may have read the wrong nibble. `0x20` is bit 5, so SPIE is 1. Interrupts were on when the timer interrupt arrived, which is why it could arrive.
+          - label: SIE (bit 1), interrupts now
+            options: ["0", "1"]
+            answer: "0"
+            why: You may have expected interrupts to be on in a handler. Taking a trap clears SIE, and kerneltrap checks that it is still clear.
+          - label: UXL (bits 32-33)
+            options: ["0", "1", "2", "3"]
+            answer: "2"
+            why: You may have overlooked the high word. `0x2_0000_0000` is 2 in bits 32-33, meaning user mode is 64-bit.
+        explain: |
+          `kerneltrap` keeps `sstatus` in a callee-saved register so it can restore it at
+          the end ([[kernel/trap.c:163]]); without frame pointers the compiler picked `s0`.
+          So "the frame pointer" was just `sstatus`. The flag is not a detail: without it there
+          is no chain to walk.
+  - title: How does C code get hold of the first link?
+    q: |
+      The walk starts from the current function's frame pointer. C has no way to name a
+      register. How will your walker read `s0`, and whose frame pointer will it get? Would
+      reading `sp` do as well?
+    hints:
+      - |
+        [[kernel/riscv.h]] already has a dozen two-line functions that each read one
+        register. Look at the ones for `sp` and `tp`, and at how they are declared.
+      - |
+        A `static inline` function's body is copied into its caller, so an `asm` statement in
+        it runs in the caller's frame. And `sp` is the *bottom* of the current frame, where
+        nothing is stored at a fixed offset.
+      - |
+        One more `static inline` accessor beside `r_sp`, for the other register, called
+        first thing in the walker. Then ask whose record the first iteration prints.
+    answer: |
+      Add `r_fp()` to [[kernel/riscv.h]], next to `r_sp` and `r_ra`: one `mv %0, s0`
+      instruction in a `static inline` function. Because it is inlined, the instruction runs
+      inside `backtrace` itself, after `backtrace`'s prologue has set `s0`, so the value is
+      `backtrace`'s frame pointer. The first line printed is then the return address saved by
+      `backtrace`'s own prologue: the place in the caller where `backtrace()` was called,
+      which is exactly where you want the list to start. (GCC's
+      `__builtin_frame_address(0)` gives the same value.)
+
+      `sp` will not do. It points at the bottom of `backtrace`'s frame, below which there is
+      only memory that calls *from* `backtrace` will use. A copy of the branch with
+      `r_sp()` in place of `r_fp()` printed one line, `0x0000000000000017`, for each of
+      the three cases, and stopped. That is not a code address: the call
+      `printk("backtrace:\n")` had just written `printk`'s varargs save area right below
+      `backtrace`'s frame, so `*(sp-8)` was `printk`'s saved copy of `a7`.
+    checks:
+      - id: lab02-03
+        level: 2
+        type: choice
+        q: |
+          Why is the register reader declared `static inline` rather than as an ordinary
+          function in some `.c` file?
+        options:
+          - text: So that its `mv` runs in the caller's frame and reads the caller's `s0`.
+            correct: true
+            why: |
+              An inlined body has no prologue of its own. As an ordinary function it would get
+              a prologue that sets `s0` to *its* frame, and the walk would start one frame
+              too deep (harmless here, but no longer what the name says).
+          - text: Because `asm` statements are only allowed in header files.
+            why: |
+              You may have generalized from where xv6 happens to put them. `asm` works in any
+              C file; `kernelvec` and `swtch` are separate `.S` files for other reasons.
+          - text: Because an ordinary function call would overwrite `s0` with `sp`.
+            why: |
+              You may have half-remembered the prologue. A call saves `s0` and then points it
+              at the new frame; the caller's value is not lost, it is one record up.
+          - text: To make it faster; the value is the same either way.
+            why: |
+              You may have thought inlining never changes behaviour. For code that reads the
+              frame pointer it does: the value depends on whose frame is current.
+        explain: |
+          Reading a register from C means one `asm` instruction, and whose register value you
+          get depends on which function's code it runs in. `static inline` puts it in the
+          caller. See the other accessors in [[kernel/riscv.h]] and [[g:inline-asm]].
+  - title: Where does the chain end on a process's kernel stack?
+    q: |
+      Start from a system-call handler and follow the saved frame pointers up. Every record
+      leads to the caller's record, until you reach the outermost frame of the kernel stack.
+      What is stored in *that* frame's record, and what happens if the walk follows it?
+      How will the walker know where to stop?
+    hints:
+      - |
+        Who calls [[usertrap]], and how? Read [[kernel/trampoline.S:76]] to
+        [[kernel/trampoline.S:98]]. Then read how kernel stacks are placed: `KSTACK` in
+        [[kernel/memlayout.h]] and [[proc_mapstacks]].
+      - |
+        `uservec` enters `usertrap` with `jalr t0` and never sets `s0`, so `usertrap`'s
+        prologue saves a return address into the trampoline and whatever `s0` the *user
+        program* had. The kernel stack is exactly one page, at a page-aligned address, and
+        `usertrap`'s frame pointer is its top.
+      - |
+        Compute the top once, from the first `fp`, as the next page boundary above it, and
+        stop as soon as `fp` reaches it. As a second guard, stop if a saved frame pointer is
+        not above the current one: callers' frames are always higher.
+    answer: |
+      `bttest`'s kernel stack, read with gdb at the moment of its first backtrace (pid 3,
+      slot 2, `KSTACK(2)` = `0x3fffff9000`):
+
+      | frame pointer | function | its record: return address | saved `s0` |
+      |---|---|---|---|
+      | `0x3fffffa000` | `usertrap` | `0x3ffffff09c` (after `uservec`'s `jalr`) | `0x3fd0` (the user's) |
+      | `0x3fffff9fe0` | `syscall` | `0x80002736` (in `usertrap`) | `0x3fffffa000` |
+      | `0x3fffff9fc0` | `sys_kbacktrace` | `0x800029f2` (in `syscall`) | `0x3fffff9fe0` |
+      | `0x3fffff9f90` | `backtrace` | `0x80002c46` (in `sys_kbacktrace`) | `0x3fffff9fc0` |
+
+      `usertrap` was not called by a kernel function. [[uservec]] loaded `sp` with the empty
+      stack's top ([[kernel/trampoline.S:76]]) and jumped with `jalr t0`
+      ([[kernel/trampoline.S:98]]), so `usertrap`'s record holds the address after that
+      `jalr` (the trampoline page is mapped at `0x3ffffff000`) and the user program's own
+      frame pointer, `0x3fd0`, a user virtual address. Following it means loading from
+      `0x3fc8` with the kernel page table installed, which maps nothing there: a load page
+      fault in the kernel, and [[kerneltrap]] panics (clinic 2).
+
+      So the walk must stop *at* `usertrap`'s frame, without printing its record. Its frame
+      pointer equals the top of the stack, and the top is easy to compute: kernel stacks are
+      exactly one page at page-aligned addresses, so for any `fp` strictly inside one, the
+      top is `PGROUNDUP(fp)`, here `0x3fffffa000`. The loop runs `while (fp < top)`; the
+      `usertrap` line still appears, because `syscall`'s record holds the return address
+      into `usertrap`.
+
+      The second guard, "a saved `fp` must be higher than the current one", costs one
+      comparison and protects against a corrupted chain, which is exactly what you may be
+      walking in a panic. Clinic 1 shows it catching a real mistake.
+    checks:
+      - id: lab02-04
+        level: 1
+        type: number
+        q: |
+          The walk starts with `fp = 0x3fffff9f90` on a process's kernel stack. What is
+          `PGROUNDUP(fp)`, the address where it stops? (Hex is fine.)
+        answer: "0x3fffffa000"
+        wrong:
+          "0x3fffff9000": |
+            You may have rounded down. `0x3fffff9000` is the *bottom* of this kernel stack
+            (`PGROUNDDOWN`); the stack grows down from the top.
+          "0x3fffff9f90": |
+            You may have thought `PGROUNDUP` of an address inside a page is the address
+            itself. Only an address already on a page boundary rounds to itself.
+          "0x3ffffff000": |
+            You may have jumped to `TRAMPOLINE`. The next page boundary above
+            `0x3fffff9f90` is `0x3fffffa000`.
+        why_wrong: |
+          Round up to the next multiple of 4096 (`0x1000`): clear the low 12 bits and add
+          `0x1000`, unless they were already zero.
+        explain: |
+          A kernel stack is one 4096-byte page at a page-aligned address ([[proc_mapstacks]]),
+          so the next page boundary above any address inside it is its top, here
+          `KSTACK(2) + PGSIZE`. That is also `usertrap`'s frame pointer.
+      - id: lab02-05
+        level: 2
+        type: tf
+        q: |
+          True or false: the record of `usertrap`'s frame, the outermost one on a process's
+          kernel stack, holds a saved frame pointer that points to another frame on the same
+          kernel stack.
+        answer: false
+        why_tf: |
+          You may have assumed that every function was called by another kernel function.
+          `usertrap` is entered from the trampoline, which does not maintain `s0`.
+        reasons:
+          - text: "False: it holds the user program's s0, because uservec never sets s0 before it jumps to usertrap."
+            correct: true
+            why: That is the reason. In the recorded run it was `0x3fd0`, an address in `bttest`'s user stack.
+          - text: "False: it holds 0, because uservec clears s0 for safety."
+            why: You may have expected the kernel to sanitize registers. uservec saves the user's registers in the trapframe but leaves `s0` itself as it was.
+          - text: "True: uservec builds a frame record before it calls usertrap."
+            why: You may have thought the trampoline is ordinary compiled code. It is hand-written assembly that uses no stack at all until usertrap.
+          - text: "True: the kernel stack always holds the frames of the previous system call underneath."
+            why: You may have thought kernel stacks keep old frames. Every entry from user space starts on an empty kernel stack; `kernel_sp` is always the top.
+        explain: |
+          The user/kernel boundary is also the boundary of the frame chain. Above `usertrap`
+          there is no kernel frame, so the walk must stop at the top of the stack rather than
+          wait for the chain to end. See [[concept:stacks#kernel]].
+  - title: How do you turn the printed numbers into names?
+    q: |
+      The walk prints numbers like `0x0000000080002736`. The running kernel has no symbol
+      table to look them up in. How do you find the function and line for each one, and is
+      the line you get the line of the call?
+    hints:
+      - |
+        `kernel/kernel` is an [[g:elf]] file built with `-ggdb`: it carries a symbol table and
+        line information. The cross toolchain has a tool that maps addresses to lines.
+      - |
+        A return address is the address of the instruction *after* the call. With
+        optimization, that instruction can belong to the next line, or to a different block
+        of code altogether when the called function never returns.
+      - |
+        Run `${TOOLPREFIX}addr2line -e kernel/kernel -f -p ADDR` on each address, and once
+        more on `ADDR - 1`, which lands inside the call instruction itself. `TOOLPREFIX` is
+        your RISC-V toolchain's prefix, the same one xv6's Makefile detects
+        (`riscv64-unknown-elf-`, `riscv64-linux-gnu-` or `riscv64-elf-`); set it with
+        `export TOOLPREFIX=riscv64-unknown-elf-` or whichever you have. On
+        Debian/Ubuntu/WSL, `gdb-multiarch` also works as the debugger.
+    answer: |
+      On the host:
+
+      ```text
+      $ ${TOOLPREFIX}addr2line -e kernel/kernel -f -p 0x80002735
+      usertrap at ./kernel/trap.c:75
+      ```
+
+      Asking for `ADDR - 1` matters. Here are the five distinct addresses that cases 0 and 1
+      of `bttest` printed, looked up both ways:
+
+      | printed | `addr2line ADDR` | `addr2line ADDR-1` |
+      |---|---|---|
+      | `0x80002c46` | `sys_kbacktrace` sysproc.c:129 | `sys_kbacktrace` sysproc.c:128 |
+      | `0x800029f2` | `syscall` syscall.c:148 | `syscall` syscall.c:148 |
+      | `0x80002736` | `usertrap` trap.c:88 | `usertrap` trap.c:75 |
+      | `0x80002862` | `kerneltrap` trap.c:170 | `kerneltrap` trap.c:169 |
+      | `0x800057e8` | `kernelvec` kernelvec.S:41 | `kernelvec` kernelvec.S:38 |
+
+      The right column is the line of each call. The left one is wrong four times out of
+      five: with `-O` the instruction after a call often belongs to the next statement
+      (`usertrap`'s return address lands on line 88, the `killed(p)` check after the `if`).
+      It can be much worse in a function that never returns from a call; think question 6
+      meets such a case. `ADDR - 1` is always inside the call instruction (4 bytes for
+      `jal`, 2 for the compressed `c.jalr`), so it always names the call. `gdb` does the same
+      when it prints caller frames.
+
+      One address will not resolve: `0x3ffffff09c`, the address after `uservec`'s `jalr t0`
+      ([[kernel/trampoline.S:98]]), if you ever print it. The trampoline is *linked* at
+      `0x80006000` but runs at `TRAMPOLINE` (`0x3ffffff000`). Even `0x8000609c` gives only
+      `userret at ??:?`: it is [[userret]]'s first instruction, and the trampoline has no
+      line information.
+    checks:
+      - id: lab02-13
+        level: 1
+        type: choice
+        q: |
+          Case 0 printed `0x0000000080002736`. `${TOOLPREFIX}addr2line -e kernel/kernel -f -p
+          0x80002736` says `usertrap at ./kernel/trap.c:88`, the `if (killed(p))` after the
+          system call. Which line actually made the call that this address returns from?
+        options:
+          - text: "trap.c:75, the `syscall()` call; `addr2line` on `0x80002735` names it."
+            correct: true
+            why: |
+              A return address is the instruction *after* the call. One byte back is inside
+              the `jal`, so it maps to the line of the call.
+          - text: "trap.c:88; the backtrace shows where `usertrap` was when it was interrupted."
+            why: |
+              You may have read a backtrace line as "where the hart is". Each line is a
+              place to return to; `usertrap` is waiting for `syscall()` to return.
+          - text: "trap.c:87, because a return address is always exactly one line after the call."
+            why: |
+              You may have expected a fixed offset in lines. The next instruction can belong
+              to any line the compiler laid out next; only the address minus one is reliable.
+          - text: "None: `addr2line` cannot map kernel addresses, only user ones."
+            why: |
+              You may have thought the kernel has no debug information. `kernel/kernel` is
+              built with `-ggdb`, and `addr2line` reads its line table on the host.
+        explain: |
+          Look up `ra - 1`. A return address points after the call; with `-O` that
+          instruction often belongs to the next statement.
+  - title: What does the walk see across a trap?
+    q: |
+      Suppose a timer interrupt arrives while some system-call handler `f` is running in the
+      kernel, and the walk starts inside the interrupt handler. [[kernelvec]] pushes 256
+      bytes onto the same stack and calls [[kerneltrap]]. Which return addresses will the
+      walk print, and which function on the path will not appear at all?
+    hints:
+      - |
+        Read [[kernel/kernelvec.S:14]] to [[kernel/kernelvec.S:38]]: which registers does
+        `kernelvec` save, does it touch `s0`, and does it create a frame record?
+      - |
+        `s0` is callee-saved, so `kernelvec` leaves it alone: when `kerneltrap`'s prologue
+        saves "the caller's `s0`", it saves `f`'s frame pointer. And `kerneltrap`'s return
+        address points into `kernelvec`.
+      - |
+        The walk goes from `kerneltrap`'s record (return address in `kernelvec`) straight
+        to `f`'s record, whose return address is in `f`'s *caller*. Nothing records where in
+        `f` the interrupt struck; that is `sepc`.
+    answer: |
+      `kernelvec` saves `ra`, `gp`, the `t` and `a` registers, and leaves `sp`, `tp` and the
+      callee-saved `s` registers alone ([[kernel/kernelvec.S:17]] to
+      [[kernel/kernelvec.S:35]]). It builds no record. So the 256 bytes are invisible to the
+      walk: `kerneltrap`'s saved `s0` is the interrupted function's frame pointer, and the
+      chain goes on through `f`'s frame as if `kerneltrap` had been called from inside `f`.
+      (That holds once `f`'s prologue has set `s0` and before its epilogue reloads it. If the
+      trap strikes inside `f`'s prologue or epilogue, `s0` still holds the caller's frame
+      pointer, and the caller is missing as well; a stack-overflow fault, for example, lands
+      in a prologue.)
+
+      The recorded case 1, `sys_kbacktrace` spinning with interrupts on and the timer firing
+      on hart 2:
+
+      | frame pointer | function | return address in its record | saved `s0` |
+      |---|---|---|---|
+      | `0x3fffff9fe0` | `syscall` | `0x80002736` (`usertrap`) | `0x3fffffa000` |
+      | `0x3fffff9fc0` | `sys_kbacktrace` | `0x800029f2` (`syscall`) | `0x3fffff9fe0` |
+      | | `kernelvec`'s 256 bytes, `0x3fffff9e90` to `0x3fffff9f90` | no record | |
+      | `0x3fffff9e90` | `kerneltrap` | `0x800057e8` (`kernelvec`) | `0x3fffff9fc0` |
+      | `0x3fffff9e60` | `backtrace` | `0x80002862` (`kerneltrap`) | `0x3fffff9e90` |
+
+      The console showed `kerneltrap`, `kernelvec`, `syscall`, `usertrap`. Each line names
+      the *caller* of a frame, so `sys_kbacktrace`, the function that was interrupted, never
+      appears: no record holds an address inside it. Its address is in `sepc`
+      (`0x80002c64`, the spin loop on line 135 of `sysproc.c`), which `kerneltrap` keeps in
+      a register. When a fault (not an interrupt) panics through [[kerneltrap]], the
+      `scause=... sepc=...` line it prints first is the only place the faulting function is
+      named.
+
+      gdb's own `bt` does worse here: it stops at `kernelvec` with "Backtrace stopped: frame
+      did not save the PC", because `kernelvec` has no unwind information. The frame-pointer
+      walk crosses the trap only because `kernelvec` leaves `s0` untouched.
+    checks:
+      - id: lab02-07
+        level: 2
+        type: order
+        q: |
+          In case 1, a timer interrupt hits `sys_kbacktrace`'s spin loop and `kerneltrap`
+          calls `backtrace()`. Put the functions named by the printed lines in the order they
+          are printed.
+        items:
+          - kerneltrap
+          - kernelvec
+          - syscall
+          - usertrap
+        why_wrong: |
+          You may have listed callees instead of callers, or put `sys_kbacktrace` in. The
+          first line is the return address in `backtrace`'s own record, which is in
+          `kerneltrap`; each later line is one caller further out. `sys_kbacktrace` is the
+          interrupted function and no record points into it.
+        explain: |
+          The printed lines are return addresses, newest first: kerneltrap (where it called
+          backtrace), kernelvec (where it called kerneltrap), then the interrupted function's
+          record, which points into syscall, then syscall's, which points into usertrap.
+      - id: lab02-08
+        level: 3
+        type: choice
+        q: |
+          Why can the frame-pointer walk continue past `kernelvec` at all, when `kernelvec`
+          builds no frame record?
+        options:
+          - text: kernelvec never changes s0, so kerneltrap's prologue saves the interrupted function's frame pointer as "the caller's".
+            correct: true
+            why: |
+              Callee-saved registers survive the trap untouched; the chain is linked through
+              them, not through anything kernelvec stores. (If the trap strikes in a prologue
+              or epilogue, `s0` is still the caller's, and one more frame goes missing.)
+          - text: kernelvec saves s0 at a fixed offset in its 256-byte frame, and the walk reads it from there.
+            why: |
+              You may have expected a trap entry to save everything. kernelvec saves only the
+              caller-saved registers plus `ra` and `gp`; the `sd s0` line does not exist, and
+              the walk never looks inside the 256 bytes.
+          - text: kerneltrap reads sepc and links the interrupted function into the chain.
+            why: |
+              You may have thought the handler repairs the chain. kerneltrap only reads sepc
+              to restore it later; nothing writes it into a record.
+          - text: It cannot; the walk stops at kernelvec, just like gdb's bt.
+            why: |
+              You may have generalized from gdb. gdb unwinds with debug information, which
+              kernelvec lacks; the frame-pointer walk needs none and went on to `syscall` and
+              `usertrap` in the recorded run.
+        explain: |
+          A trap that saves only caller-saved registers is transparent to a frame-pointer
+          walk: the interrupted function's frame pointer is still in `s0` when the handler's
+          prologue saves it. What the walk loses is the interrupted *pc*, which only `sepc`
+          holds. See [[g:kernelvec-frame]] and [[concept:stacks#same]].
+  - title: Where is the top of a scheduler stack?
+    q: |
+      The same walk must work when the interrupted code is the [[scheduler]] loop on an idle
+      hart. That stack is not a process's kernel stack: it is the hart's slice of `stack0`,
+      the same memory it booted on. Is "the next page boundary above `fp`" still its top? If
+      not, what happens when the walk uses it, and how should the walker find the real top?
+    hints:
+      - |
+        Read the declaration of `stack0` ([[kernel/start.c:11]]) and how `sp` is set from
+        it ([[kernel/entry.S:12]] to [[kernel/entry.S:17]]). Then look up `stack0` in
+        `kernel/kernel.sym`. What is at the very top of a slice ([[concept:stacks#boot]])?
+      - |
+        `stack0` is aligned to 16 bytes, not 4096, and each slice is 4096 bytes, so slice
+        *h* ends at `stack0 + 4096 * (h + 1)`, in the middle of a page. Above `scheduler`'s
+        frame sit `main`'s and `start`'s, and `start`'s record holds the `ra` and `s0` the
+        hart had at power-on.
+      - |
+        Decide by address which kind of stack `fp` is on. Inside `stack0`: compute the
+        slice's top from `stack0`'s address. Inside the kernel-stack area: next page
+        boundary. Anywhere else: print a warning and do not walk.
+    answer: |
+      In the unmodified kernel `stack0` is at `0x80007890`; in this branch's build, at
+      `0x800078d0`. So in this build the three slices in use end at `0x800088d0`,
+      `0x800098d0` and `0x8000a8d0` (`...890` in the unmodified one), none of them on a page
+      boundary. On hart 1, recorded with gdb during case 2:
+
+      | frame pointer | function | return address | saved `s0` |
+      |---|---|---|---|
+      | `0x800098d0` (the slice's top) | `start` | `0x8000001a` (`spin` in [[_entry]]) | `0x0` (power-on) |
+      | `0x800098c0` | `main` | `0x800000c2` (in `start`) | `0x800098d0` |
+      | `0x800098b0` | `scheduler` | `0x80000f66` (in `main`) | `0x800098c0` |
+      | | `kernelvec`'s 256 bytes | | |
+      | `0x80009750` | `kerneltrap` | `0x800057e8` | `0x800098b0` |
+      | `0x80009720` | `backtrace` | `0x80002862` | `0x80009750` |
+
+      `PGROUNDUP(0x80009720)` is `0x8000a000`, 1840 bytes above the real top. A walk bounded
+      by it does not stop at `start`'s frame: it prints `start`'s return address
+      `0x8000001a` (`spin`), a line that describes no call. The upward check then stops at
+      the saved `s0` of 0 (a copy of the branch with only this bound changed printed exactly
+      that extra line, three runs out of three). A loop without that check (clinic 3)
+      follows 0 and loads from `0xfffffffffffffff8`, a kernel page fault. And the opposite
+      error is just as real: the page boundary `0x80009000` lies
+      2256 bytes below the top, so a walk that *starts* deeper than that computes
+      `0x80009000` as the top and stops in the middle of the chain. Clinic 3 has a single
+      recorded run that does both.
+
+      The fix is to know the layout: `stacktop(fp)` checks whether `fp` is inside `stack0`
+      (`base + (fp - base) / 4096 * 4096 + 4096`), inside the 64 kernel stacks
+      (`PGROUNDUP`), or neither (return 0, and `backtrace` prints `fp ... is not on a kernel
+      stack` instead of walking). The starting `fp` is always strictly inside its slice,
+      because `backtrace` is called by a function with a frame of its own, so the division
+      picks the right slice.
+
+      Symbolizing this chain (think question 4) holds one more trap: `0x80000f66` gives
+      `main.c:14` (`consoleinit()`) as printed, `main.c:44` minus one. `main` calls
+      [[scheduler]] on line 44 as its very last action, and the compiler placed the code of
+      the `cpuid() == 0` branch right after that call, so the return address lands there.
+
+      `main`'s record is worth a second look. `start` never *called* `main`; it reached it
+      with `mret` ([[kernel/start.c:51]]). `main`'s prologue saved whatever was in `ra` at
+      that moment: the return address of `start`'s call to `timerinit` on line 44, a fossil
+      from boot that every scheduler-stack backtrace prints (`0x800000c2` looks up as the
+      inlined `r_mhartid` as printed, `start.c:44` minus one).
+    checks:
+      - id: lab02-06
+        level: 2
+        type: choice
+        q: |
+          A backtrace contains `0x0000000080000f66`, and `addr2line` reports
+          `main at ./kernel/main.c:14`, the line `consoleinit();`. Yet the stack belongs to
+          a hart that has been in the scheduler for minutes. What is going on?
+        options:
+          - text: The address is the return address after main's call to scheduler; the compiler placed other code of main right after that call.
+            correct: true
+            why: |
+              `scheduler()` never returns, so nothing after the `jal` on line 44 ever runs on
+              that path, and the compiler put the code of the `cpuid() == 0` branch there.
+              `addr2line 0x80000f65` says main.c:44.
+          - text: The hart is still in consoleinit, which never finished.
+            why: |
+              You may have taken the line as "where the hart is". A backtrace line names a
+              place to *return* to; this hart is far past `consoleinit`, which returned
+              during boot.
+          - text: The walk read a stale value left on the stack by consoleinit during boot.
+            why: |
+              You may have suspected the walk. The value is the live return address in
+              `scheduler`'s record; only its line attribution is off.
+          - text: addr2line is reading the wrong kernel file.
+            why: |
+              You may have suspected the tool. With the wrong ELF you would usually get
+              nonsense or `??`; here the function is right and only the line is off by the
+              layout of the code.
+        explain: |
+          A return address points *after* the call. Look up `ra - 1` to get the call itself.
+          The effect is largest exactly where a backtrace often ends: in functions that never
+          return, like `main` calling `scheduler`.
+      - id: lab02-09
+        level: 2
+        type: number
+        q: |
+          In the unmodified kernel `stack0` is at `0x80007890` and each hart's slice is 4096
+          bytes. What is the address of the top of hart 2's slice, where `_entry` points
+          hart 2's first `sp`? (Hex is fine.)
+        answer: "0x8000a890"
+        wrong:
+          "0x8000b000": |
+            You may have rounded up to a page boundary. That is `PGROUNDUP` of an address in
+            hart 2's slice, which is exactly the mistake this question is about: the slice
+            ends `0x770` bytes earlier.
+          "0x80009890": |
+            You may have forgotten the `+ 1` in `(hartid + 1) * 4096`. `0x80009890` is the
+            top of hart 1's slice and the bottom of hart 2's.
+          "0x8000a000": |
+            You may have assumed the slices are page-aligned. `stack0` is only 16-byte
+            aligned, so every slice boundary is `0x890` past a page boundary.
+        why_wrong: |
+          Compute `stack0 + (2 + 1) * 4096 = 0x80007890 + 0x3000`.
+        explain: |
+          `_entry` sets `sp = stack0 + (hartid + 1) * 4096` ([[kernel/entry.S:17]]). The
+          alignment of `stack0` is 16 ([[kernel/start.c:11]]), so none of these tops is a
+          page boundary, and `PGROUNDUP` cannot find them.
+      - id: lab02-10
+        level: 2
+        type: state
+        q: |
+          Case 2: an idle hart takes a timer interrupt in the scheduler loop's `intr_on();
+          intr_off();` window, and `kerneltrap` calls `backtrace()`. Fill in the machine
+          state on that hart as `backtrace` starts.
+        state: {mode: S, stack: scheduler, satp: kernel, sie: "off", noff: "0", intena: "-"}
+        why:
+          mode: You may have thought the scheduler runs in machine mode because it started on the boot stack. After start's mret, the kernel runs in supervisor mode.
+          stack: You may have expected an interrupt stack or a process's kernel stack. xv6 has neither for this case; kernelvec pushed its frame onto the scheduler stack the hart was already on.
+          satp: You may have thought paging is off on stack0. main turned paging on long ago; stack0 is reached through the kernel page table's direct map.
+          sie: You may have thought the interrupt left interrupts on. Taking a trap clears SIE, and kerneltrap panics if it finds it set.
+          noff: You may have thought the scheduler holds a lock here. In the intr_on/intr_off window it holds none; that is why an interrupt can be taken there at all.
+          intena: With noff 0 there is no saved interrupt state to report.
+        why_wrong: |
+          Ask the three questions of [[concept:mode-stack-page-table]], then whether a lock is
+          held. The recorded run (hart 1) had `noff` 0 and SIE 0.
+        explain: |
+          Supervisor mode, the hart's slice of `stack0`, the kernel page table, interrupts off,
+          no lock: the scheduler stack with a [[g:kernelvec-frame]] on top
+          ([[concept:stacks#scheduler]]). `kerneltrap` will not [[yield]], because
+          `myproc()` is 0.
+  - title: How can a user program make the kernel walk from each place?
+    q: |
+      To test the walk you want a backtrace (a) from inside a system call, (b) from the
+      interrupt handler while a system call is the interrupted code, and (c) from the
+      interrupt handler on an idle hart's scheduler stack. (a) is a system call that calls
+      the walker. Design (b) and (c): how does the interrupt handler know it should print,
+      how do you make sure exactly one hart prints, and when may the system call return?
+    hints:
+      - |
+        Timer interrupts in the kernel all reach [[kerneltrap]]. What tells it whether a
+        process was interrupted ([[myproc]])? Are interrupts on while a system call runs
+        ([[kernel/trap.c:66]])?
+      - |
+        One shared variable can carry the request. For (b) only the requesting process can
+        match it, and it runs on one hart. For (c) *any* idle hart can match it, and the
+        timers of idle harts fire at nearly the same moment. And the requester must not
+        return, and print its own next line, while another hart is still printing.
+      - |
+        One shared request word with more than two states. Decide who may change it from
+        which state to which, and with what kind of operation; then decide, for (b) and (c)
+        separately, whether the requester should spin or sleep while it waits, and what it
+        does if nobody ever answers.
+    answer: |
+      The branch adds `kbacktrace(where)` and one variable in `trap.c`:
+
+      - **(b)** `sys_kbacktrace` stores its pid in `btwant` and spins `while (btwant != 0)`.
+        Interrupts are on during a system call, so the next timer interrupt on that hart
+        lands in the loop, and `kerneltrap` sees its own process's pid. No other hart runs
+        that process, so only one hart can match.
+      - **(c)** `sys_kbacktrace` stores -1 and sleeps on `ticks`, as [[sys_pause]] does,
+        until `btwant` is 0 again. While it sleeps, its own hart goes idle too. Every idle
+        hart's timer interrupt reaches `kerneltrap` with `myproc() == 0`, and all of them
+        can match -1.
+      - **Exactly one hart.** Idle harts' timers are not staggered: clinic 6 recorded all
+        three idle harts in `kerneltrap` within the same instant. A plain
+        `if (btwant == -1) { btwant = 0; ... }` lets two of them pass the test before either
+        clears it. `__sync_bool_compare_and_swap(&btwant, want, -2)` is a single atomic
+        step (an `lr.w`/`sc.w` loop on RISC-V), so exactly one hart wins.
+      - **Clear only after printing.** The winner sets -2 ("printing"), prints, and only
+        then sets 0. Clearing the request first is a real bug: hart 0's
+        timer interrupt runs [[clockintr]], which wakes everything sleeping on `ticks` before
+        `kerneltrap` gets to the backtrace, so (reasoning from the code) when hart 0 won,
+        the woken `bttest` could run on another hart and print in the middle; the log does
+        not show which hart printed. A recorded run of a version that cleared first (which also
+        had clinic 2's bug) printed `b0x0000000080005768` and then
+        `ttest: kbacktrace(2) returned 0: OK` a few lines later.
+      - **Withdraw.** If no hart has taken the request after 10 ticks, the system call takes
+        it back with another compare-and-swap (-1 to 0) and returns -1; if a hart took it in
+        the meantime, the swap fails and the call keeps waiting for the print to finish.
+
+      None of this is needed for [[panic]], which calls the walker directly. It exists so
+      that `bttest` can show all three stacks on a healthy kernel.
+    checks:
+      - id: lab02-11
+        level: 3
+        type: multi
+        q: |
+          Which statements about the request variable `btwant` in the reference are true?
+        options:
+          - text: Without the compare-and-swap, two idle harts could both print a backtrace for one case-2 request.
+            correct: true
+            why: Both can read -1 before either writes 0; the timers of idle harts fire at nearly the same time.
+          - text: Case 1 would be correct even with a plain test and clear, because only the requesting process can match its own pid.
+            correct: true
+            why: The pid is matched only on the hart running that process, and that process is the interrupted code, so nothing else can race for it.
+          - text: The value -2 exists so that the requester keeps waiting while the winner prints.
+            correct: true
+            why: The requester waits for 0. If the winner wrote 0 before printing, the requester could return and print in the middle of the backtrace.
+          - text: btwant must be protected by tickslock, because kerneltrap reads it in an interrupt handler.
+            why: |
+              You may have thought every shared variable needs a spinlock. Here one atomic
+              compare-and-swap does the whole test-and-set, and kerneltrap never takes
+              tickslock for it.
+          - text: The compare-and-swap also makes the backtrace lines of two harts come out whole.
+            why: |
+              You may have confused two guarantees. Whole lines come from `pr.lock` in printk;
+              the swap only decides *who* prints.
+        explain: |
+          A test followed by a write is two steps; between them another hart can take the
+          same test. An atomic compare-and-swap makes it one step. The request then has
+          three states, none, requested and printing, so that the requester can wait for the
+          end of the print. See [[g:atomic]] and [[concept:locks#amoswap]].
+  - title: What must panic do, and in what order?
+    q: |
+      Now make [[panic]] print a backtrace. Where in `panic` does the call go, and what must
+      the walker itself never do when it is called from there?
+    hints:
+      - |
+        Read [[panic]] and [[uartputc_sync]] ([[kernel/uart.c:103]]): what do `panicking`
+        and `panicked` change, and for which harts?
+      - |
+        `panicked` makes the next character printed by *any* hart spin forever, including
+        the panicking hart's. And a fault inside the walker is a trap from the kernel, which
+        goes to [[kerneltrap]], which calls `panic` again.
+      - |
+        Which of the two flags must still be clear while the walk prints, and which may
+        already be set? And which of the guards you built earlier make sure the walk itself
+        cannot trap?
+    answer: |
+      ```c
+      panicking = 1;
+      printk("panic: ");
+      printk("%s\n", s);
+      backtrace(); // before panicked, which would freeze this hart's output too
+      panicked = 1;
+      ```
+
+      **Before `panicked`.** [[uartputc_sync]] spins forever once `panicked` is set
+      ([[kernel/uart.c:108]]), on every hart: the flag does not know who set it. A copy of
+      the branch with the two lines swapped printed `panic: sched locks` and then nothing,
+      ever (clinic 5's bug used as the trigger).
+
+      **After `panicking`.** While `panicking` is set, [[printk]] takes no lock
+      ([[kernel/printk.c:70]]). So a panic on a hart that already holds `pr.lock` still gets
+      its backtrace out, but two harts panicking at once interleave character by character:
+      clinic 6 shows exactly that.
+
+      **Never fault.** A fault inside the walk enters [[kerneltrap]], which prints
+      `scause=...` and calls `panic` again, which walks again, from a deeper point on the same
+      stack, through the same bad link. Clinics 2 and 3 show where that recursion goes. With
+      the bounds, every load is at `fp - 8` or `fp - 16` for an `fp` at or above the first
+      frame pointer and below the stack's top: inside the one stack the walk started on,
+      which is always mapped. And the upward check makes even a corrupted chain end.
+    checks:
+      - id: lab02-12
+        level: 2
+        type: tf
+        q: |
+          True or false: if `backtrace()` were called after `panicked = 1`, it would still
+          print, because `panicked` is meant to freeze the *other* harts' output.
+        answer: false
+        why_tf: |
+          You may have trusted the comment "freeze uart output from other CPUs". The check in
+          uartputc_sync does not compare harts.
+        reasons:
+          - text: "False: uartputc_sync spins forever for any hart once panicked is set, including the one that set it."
+            correct: true
+            why: That is the reason; the recorded run of that order printed the panic message and nothing after it.
+          - text: "False: panicked turns interrupts off, and printing needs interrupts."
+            why: You may have thought console output is interrupt-driven. printk writes each character with uartputc_sync, which polls the UART's status register and does not use interrupts at all.
+          - text: "True: panicked only takes effect on harts that try to acquire pr.lock."
+            why: You may have mixed up the two flags. panicking makes printk skip pr.lock; panicked stops every character.
+          - text: "True: the panicking hart has already printed its message, so the flag is checked only once."
+            why: You may have thought the flag is checked at the start of printk. It is checked before every single character.
+        explain: |
+          `panicked` exists so that other harts cannot scribble over the panic report. Since
+          the check is in the character output routine, anything the panicking hart wants to
+          print must come before it sets the flag.
+build: |
+  **Start** from the frozen commit, in your own clone of xv6 (not this site's `xv6/`):
+
+  ```text
+  git checkout -b my-backtrace 06aad25
+  ```
+
+  **Milestones.**
+
+  1. **Read `s0`.** Add `r_fp()` to `kernel/riscv.h`. Nothing uses it yet; `make` must
+     still build (`-Werror` is on, so an unused `static inline` is fine but an unused
+     `static` function is not).
+  2. **The walk, for kernel stacks.** `backtrace()` in `kernel/printk.c`, bounded by
+     `PGROUNDUP` of the first `fp`, with the "saved `fp` must be higher" check, and its
+     prototype in `kernel/defs.h`. Nothing calls it yet; milestone 3 is its first test.
+  3. **A system call.** `kbacktrace(0)`: the number in `kernel/syscall.h`, the table entry
+     and `extern` in `kernel/syscall.c`, `entry("kbacktrace")` in `user/usys.pl`, the
+     prototype in `user/user.h` (lab 1, `trace`, explains each one), and a three-line test
+     program. You should see three addresses; symbolize them (`${TOOLPREFIX}addr2line -e
+     kernel/kernel -f -p ADDR-1`) and check that they are `sys_kbacktrace`, `syscall`,
+     `usertrap`.
+  4. **Across a trap.** The `btwant` request, the spin in `sys_kbacktrace`, and the check in
+     `kerneltrap`. Expect `kerneltrap`, `kernelvec`, `syscall`, `usertrap`.
+  5. **The scheduler stack.** Write `stacktop()` first, then the case-2 request with the
+     compare-and-swap and the sleeping wait. Expect `kerneltrap`, `kernelvec`, `main`,
+     `start`.
+  6. **panic.** One line. To see it work, break something on purpose in a scratch copy (the
+     clinic has several ideas) and check the backtrace against the panic message.
+  7. **The test**, then `usertests -q`, then the test again.
+
+  **Debugging.** Run QEMU on three harts (`make qemu` uses `CPUS := 3`). To see the frames
+  the walk should find, use gdb: `make qemu-gdb` in one terminal, `${TOOLPREFIX}gdb
+  kernel/kernel` and `target remote` with the port `make qemu-gdb` chose in another, `break
+  backtrace` *before* the first `continue` (in the recorded runs, breakpoints set after
+  attaching to an already-running QEMU did not fire), then at the breakpoint `p/x $sp`, `p/x $s0`, and `x/2gx $s0-16` to see a record.
+  Walk it by hand with `x/2gx` on each saved `s0`. `info symbol ADDR` names a return
+  address. If your walk prints one strange line and stops, compare the line with `$s0`: an
+  address that looks like a stack address means you printed the saved `fp` instead of the
+  return address (clinic 1).
+clinic:
+  - bug: The two words of the record swapped
+    change: |
+      The return address and the saved frame pointer are read from each other's slots:
+
+      ```diff
+         while (fp < top) {
+      -    printk("%p\n", (void *)*(uint64 *)(fp - 8));
+      -    uint64 prev = *(uint64 *)(fp - 16);
+      +    printk("%p\n", (void *)*(uint64 *)(fp - 16));
+      +    uint64 prev = *(uint64 *)(fp - 8);
+           if (prev <= fp)
+             break; // a caller's frame is always higher: the chain is broken
+      ```
+    symptom: |
+      $ bttest
+      bttest: from a system call, on this process's kernel stack:
+      backtrace:
+      0x0000003fffff9fc0
+      bttest: kbacktrace(0) returned 0: OK
+      bttest: from a timer interrupt during a system call:
+      backtrace:
+      0x0000003fffff9e90
+      bttest: kbacktrace(1) returned 0: OK
+      bttest: from a timer interrupt on a scheduler stack:
+      backtrace:
+      0x000000008000a750
+      bttest: kbacktrace(2) returned 0: OK
+      bttest: kbacktrace(3) returned -1: OK
+      bttest: 4 checks OK; the addresses can only be checked by symbolizing them on the host with addr2line
+    why: |
+      Each case prints exactly one line, and it is not code. `0x3fffff9fc0` is
+      `sys_kbacktrace`'s frame pointer, the saved `s0` in `backtrace`'s record (compare the
+      table in think question 3); `0x3fffff9e90` is `kerneltrap`'s frame pointer in case 1;
+      `0x8000a750` is inside hart 2's slice of `stack0`, `kerneltrap`'s frame pointer in
+      case 2. The "previous frame pointer" the walk then follows is really a return address,
+      `0x8000...`, which is *lower* than any kernel-stack address and lower than the
+      `stack0` address it came from, so the upward check stops the walk after one line.
+
+      This is the guard doing its job. Without it, the walk would treat `0x80002c46` as a
+      frame pointer, print eight bytes of the kernel's code as a "return address", and
+      follow eight more as the next pointer. Every check of `bttest`
+      passes: only the eye catches this bug, and the one-line output is the clue.
+  - bug: No bound at all, stop when fp is 0
+    change: |
+      A walk with no idea where the stack ends, stopping only at a null frame pointer:
+
+      ```diff
+         uint64 fp = r_fp();
+      -  uint64 top = stacktop(fp);
+
+         printk("backtrace:\n");
+      -  if (top == 0)
+      -    printk("fp %p is not on a kernel stack\n", (void *)fp);
+      -  while (fp < top) {
+      +  while (fp != 0) {
+           printk("%p\n", (void *)*(uint64 *)(fp - 8));
+      -    uint64 prev = *(uint64 *)(fp - 16);
+      -    if (prev <= fp)
+      -      break; // a caller's frame is always higher: the chain is broken
+      -    fp = prev;
+      +    fp = *(uint64 *)(fp - 16);
+         }
+      ```
+
+      (`stacktop` is deleted too; `-Werror` rejects an unused `static` function.)
+    symptom: |
+      (on a scheduler stack, three runs of bttest 2 on one boot, all like this one:)
+      $ bttest 2
+      bttest: from a timer interrupt on a scheduler stack:
+      backtrace:
+      0x00000000800027e0
+      0x0000000080005768
+      0x0000000080000ee4
+      0x00000000800000c2
+      0x000000008000001a
+      bttest: kbacktrace(2) returned 0: OK
+      bttest: 1 checks OK; the addresses can only be checked by symbolizing them on the host with addr2line
+
+      (on a process's kernel stack, a fresh boot:)
+      $ bttest 0
+      bttest: from a system call, on this process's kernel stack:
+      backtrace:
+      0x0000000080002bc4
+      0x0000000080002970
+      0x00000000800026b4
+      0x0000003ffffff09c
+      scause=0xd sepc=0x80000858 stval=0x3fa8
+      panic: kerneltrap
+      backtrace:
+      0x00000000800008aa
+      0x000000008000279c
+      0x0000000080005768
+      0x0000000080002bc4
+      0x0000000080002970
+      0x00000000800026b4
+      0x0000003ffffff09c
+      scause=0xd sepc=0x80000858 stval=0x3fa8
+      panic: kerneltrap
+      backtrace:
+      [...]
+      (the same scause line ten times in all, the backtrace three lines longer each time; then:)
+      scause=0xf sepc=0x80005746 stval=0x3fffff8000
+      panic: kerneltrap
+      [...]
+      scause=0xf sepc=0x80005756 stval=0x3fffff6000
+      [...]
+      scause=0xf sepc=0x80005746 stval=0x3ffff80000
+      [...]
+      scause=0xf sepc=0x80005756 stval=0x88000000
+      [...]
+      scause=0xf sepc=0x80005746 stval=0x87f43000
+      [...]
+      scause=0xf sepc=0x80005756 stval=0x80011000
+      [...]
+      scause=0xd sepc=0x800006cc stval=0x1
+      [...]
+      scause=0xf sepc=0x80005744 stval=0x80008000
+      [...]
+      0x00000000800026b4
+      0x0000003ffffff09c
+
+      (about four minutes later, gdb attached:)
+      * 1    Thread 1.1 (CPU#0 [running]) uartputc_sync (c=115) at kernel/uart.c:109
+        2    Thread 1.2 (CPU#1 [running]) acquire (lk=0x80010d68 <proc+3960>) at kernel/spinlock.c:37
+        3    Thread 1.3 (CPU#2 [running]) acquire (lk=0x80010d68 <proc+3960>) at kernel/spinlock.c:37
+      [...]
+      Thread 1 (Thread 1.1 (CPU#0 [running])):
+      $6 = 0x80007810
+    why: |
+      **On a scheduler stack** the walk ends cleanly, one line too late. After `main`'s
+      record it reads `start`'s, at the slice's top, and prints `start`'s return address,
+      `0x8000001a` (`spin`, the instruction after `call start` in [[_entry]]). `start`'s
+      saved `s0` is the value `s0` had at power-on, which in QEMU is 0, so `while (fp != 0)`
+      stops. Luck, not design.
+
+      **On a process's kernel stack** the same loop is a disaster. After `syscall`'s
+      record comes `usertrap`'s: it prints `0x3ffffff09c` (after `uservec`'s `jalr`) and follows the
+      user's `s0` (`0x3fb0` in this run).
+      The load from `0x3fb0 - 8 = 0x3fa8` under the kernel page table is a load page fault
+      (`scause` 13) at `sepc` `0x80000858`, the `ld` in `backtrace`. [[kerneltrap]] prints
+      it and panics, and [[panic]] walks again, from deeper on the same stack, through the
+      same chain, to the same fault. Each round adds 368 bytes to the stack (in this build:
+      `kernelvec` 256, `kerneltrap` 48, `panic` 32, `backtrace` 32) and three lines to every
+      later backtrace.
+
+      `backtrace`'s frame ended 144 bytes below the top. After ten rounds the eleventh
+      `kernelvec` frame still fits (a gdb rerun logged it at `sp` `0x3fffff9010`, 16 bytes
+      above the bottom of the page), but `kerneltrap`'s prologue does not: its
+      `sd s1,24(sp)` stores to `0x3fffff8ff8`, in the guard page. The guard page does not
+      stop anything. That fault traps *to `kernelvec` again*, which subtracts another 256
+      from `sp` and stores into the guard page again: 16 silent traps (counted in the gdb
+      rerun), until `sp` is inside the next kernel stack (slot 3's), where `kerneltrap`
+      finally runs. The `scause=0xf ... stval=0x3fffff8000` line reports the *last* of
+      those 16 faults (`sd t0,32(sp)` at `sp` `0x3fffff7fe0`), and the recursion continues. In the log the `stval` of
+      these reports steps down by `0x2000` at a time, one guard page per kernel stack, from
+      slot 2 through every slot below it (the last report, `0x3ffff80000`, is slot 62's
+      guard page; slot 63 follows). No other process was using those slots in this run; if
+      one had been, its saved context would have been overwritten.
+
+      Below the last kernel stack there is nothing mapped down to `PHYSTOP`, and the
+      silent traps carried `sp` all the way down (`stval=0x88000000`) into the kernel's
+      direct map of RAM. Reasoning from the memory map from here on: the recursion then
+      wrote downwards through physical memory; later faults at `0x87f43000` and
+      `0x80008000`, addresses the kernel page table maps read-write, mean that page-table
+      pages had been overwritten too; and the fault at `0x80011000` lies inside `proc[]`,
+      so the stack passed through the process table.
+
+      Logged by gdb: hart 0's `sp` was `0x80007810`, below `stack0` (`0x800078b0` in this
+      copy), among the kernel's global variables, with `scause` 13 and `stval` `0x3fa8`, and
+      it was spinning in [[uartputc_sync]] at line 109 with `c=115`, the `s` of yet another
+      `scause=` line: the loop that runs once `panicked` is nonzero. No panic had finished
+      (`panic` never returns, and every hart was still in a fault or in `acquire`), so the
+      stack's own writes had set `panicked`, at `0x80007880`, which `sp` had passed. Harts 1
+      and 2 were spinning in [[acquire]] on a `p->lock` (inferred: one whose memory the
+      stack had overwritten), and gdb could not even read `panicked`: "Cannot access memory
+      at address 0x80007880". An earlier run of the same copy, stopped earlier, had printed
+      431,519 lines of output.
+
+      The guard pages turn a stack overflow into a fault; they cannot stop a fault handler
+      that itself uses the overflowing stack.
+  - bug: PGROUNDUP as the top, on stack0 too
+    change: |
+      The bound of commit 2 (`PGROUNDUP` of the first `fp`), kept for every stack, with the
+      plain loop that many published solutions use (no upward check):
+
+      ```diff
+         uint64 fp = r_fp();
+      -  uint64 top = stacktop(fp);
+      +  uint64 top = PGROUNDUP(fp);
+
+         printk("backtrace:\n");
+      -  if (top == 0)
+      -    printk("fp %p is not on a kernel stack\n", (void *)fp);
+         while (fp < top) {
+           printk("%p\n", (void *)*(uint64 *)(fp - 8));
+      -    uint64 prev = *(uint64 *)(fp - 16);
+      -    if (prev <= fp)
+      -      break; // a caller's frame is always higher: the chain is broken
+      -    fp = prev;
+      +    fp = *(uint64 *)(fp - 16);
+         }
+      ```
+
+      In this copy `stack0` is at `0x800078b0`, so hart 0's slice is `0x800078b0` to
+      `0x800088b0`.
+    symptom: |
+      $ bttest 2
+      bttest: from a timer interrupt on a scheduler stack:
+      backtrace:
+      0x00000000800027f4
+      0x0000000080005778
+      0x0000000080000ef8
+      0x00000000800000c2
+      0x000000008000001a
+      scause=0xd sepc=0x80000868 stval=0xfffffffffffffff8
+      panic: kerneltrap
+      backtrace:
+      0x00000000800008be
+      0x00000000800027b0
+      0x0000000080005778
+      0x00000000800027f4
+      0x0000000080005778
+      0x0000000080000ef8
+      0x00000000800000c2
+      0x000000008000001a
+      scause=0xd sepc=0x80000868 stval=0xfffffffffffffff8
+      panic: kerneltrap
+      [...]
+      (five panics in all; the first four backtraces each three lines longer than the one before; the fifth:)
+      scause=0xd sepc=0x80000868 stval=0xfffffffffffffff8
+      panic: kerneltrap
+      backtrace:
+      0x00000000800008be
+      0x00000000800027b0
+      0x0000000080005778
+
+      (no more output; 15 seconds later, gdb attached:)
+      * 1    Thread 1.1 (CPU#0 [running]) panic (s=s@entry=0x80007390 "kerneltrap") at kernel/printk.c:164
+        2    Thread 1.2 (CPU#1 [halted ]) s_sstatus (x=2) at kernel/riscv.h:67
+        3    Thread 1.3 (CPU#2 [halted ]) s_sstatus (x=2) at kernel/riscv.h:67
+      [...]
+      Thread 1 (Thread 1.1 (CPU#0 [running])):
+      $6 = 0x80007f80
+      [...]
+      Thread 1 (Thread 1.1 (CPU#0 [running])):
+      #0  panic (s=s@entry=0x80007390 "kerneltrap") at kernel/printk.c:164
+      #1  0x00000000800027b0 in kerneltrap () at kernel/trap.c:160
+      #2  0x0000000080005778 in kernelvec () at kernel/kernelvec.S:38
+      Backtrace stopped: frame did not save the PC
+    why: |
+      Hart 0 took the request. **Too late first.** The walk started a few hundred bytes
+      below the slice's real top, `0x800088b0` (432 bytes below it in the reference's case
+      2), so `PGROUNDUP` gave `0x80009000`, 1872 bytes above the top. The
+      walk printed `kerneltrap`, `kernelvec`, `main` and `start` correctly, then reached
+      `start`'s frame (frame pointer `0x800088b0`, still below `0x80009000`), printed its
+      return address `0x8000001a` (`spin`), and followed its saved `s0`: 0, the value of `s0`
+      at power-on. `0 < 0x80009000`, so it loaded from `0 - 8`: `stval=0xfffffffffffffff8`,
+      at `sepc` `0x80000868`, the `ld` in `backtrace`. [[kerneltrap]] panicked, and the
+      panic's walk went the same way, one level deeper each time.
+
+      **Then too early.** Each round pushed a `kernelvec` frame and `kerneltrap`'s,
+      `panic`'s and `backtrace`'s frames onto the same slice. In the fifth round `panic`'s
+      `sp` was `0x80007f80` (gdb), so that walk started below `0x80008000`, and
+      `PGROUNDUP` gave `0x80008000`, *below* the older frames. The fifth walk printed three
+      lines and stopped there, without faulting. So `panic` went on, set `panicked`, and spun at
+      line 164, its `for (;;)`; harts 1 and 2 sat idle in `wfi`, and the console went quiet
+      with a truncated backtrace that ends in `kernelvec`.
+
+      In this run the recursion never got as far as the bottom of hart 0's slice. If it had,
+      there is no guard page: in this copy the 48 bytes right below `stack0` hold `ticks`,
+      `btwant`, `initproc`, `kernel_pagetable`, `started`, `tx_chan` and the two panic
+      flags, and the `.data` variables come next. gdb's own `bt` stops at `kernelvec`, as it
+      always does, because `kernelvec` has no unwind information.
+  - bug: Built without frame pointers
+    change: |
+      `-fno-omit-frame-pointer` removed from `CFLAGS` in the Makefile (as when you copy flags
+      from another project); the code is the reference:
+
+      ```diff
+      -CFLAGS = -Wall -Werror -Wno-unknown-attributes -O -fno-omit-frame-pointer -ggdb -gdwarf-2
+      +CFLAGS = -Wall -Werror -Wno-unknown-attributes -O -ggdb -gdwarf-2
+      ```
+    symptom: |
+      $ bttest
+      bttest: from a system call, on this process's kernel stack:
+      backtrace:
+      fp 0x00000000800100e0 is not on a kernel stack
+      bttest: kbacktrace(0) returned 0: OK
+      bttest: from a timer interrupt during a system call:
+      backtrace:
+      fp 0x0000000200000120 is not on a kernel stack
+      bttest: kbacktrace(1) returned 0: OK
+      bttest: from a timer interrupt on a scheduler stack:
+      backtrace:
+      fp 0x0000000200000120 is not on a kernel stack
+      bttest: kbacktrace(2) returned 0: OK
+      bttest: kbacktrace(3) returned -1: OK
+      bttest: 4 checks OK; the addresses can only be checked by symbolizing them on the host with addr2line
+    why: |
+      At `-O`, GCC on RISC-V omits the frame pointer by default and uses `s0` as an ordinary
+      callee-saved register. `backtrace` itself no longer sets `s0` (its prologue in this
+      build saves `s0` but has no `addi s0,...`), so `r_fp()` returns whatever value some
+      caller left in `s0`:
+
+      - In case 0 that is `0x800100e0`, which is `&proc[2]`: [[usertrap]] keeps `p`, its
+        `struct proc` pointer, in `s0` (`mv s0,a0` after `myproc()`; `lw a2,48(s0)` reads
+        `p->pid`).
+      - In cases 1 and 2 it is `0x200000120`, the `sstatus` value that [[kerneltrap]] keeps
+        in `s0` so it can restore it at the end: SPP and SPIE set, UXL = 2.
+
+      Neither is inside `stack0` or the kernel-stack area, so `stacktop()` returns 0 and the
+      walk refuses to start. With the plain `PGROUNDUP` loop of clinic 3, case 0 would have
+      read `0x800100d8` and `0x800100d0` (fields of a `struct proc`) as a return address and a
+      frame pointer and gone on from there. Checking that the starting `fp` is on a known
+      stack costs two comparisons and turns garbage into a clear message.
+  - bug: Slept while holding tickslock
+    change: |
+      In case 2's wait, the learner forgot this tree's rule that the condition lock is
+      released *before* `sleep()` (there is no `sleep(chan, lock)` here):
+
+      ```diff
+           sleep_prepare(&ticks);
+      -    release(&tickslock);
+           sleep();
+      -    acquire(&tickslock);
+         }
+      ```
+    symptom: |
+      $ bttest 2
+      bttest: from a timer interrupt on a scheduler stack:
+      panic: sched locks
+      backtrace:
+      0x000000008000092c
+      0x0000000080001f94
+      0x0000000080002034
+      0x0000000080002ce4
+      0x00000000800029f2
+      0x0000000080002736
+
+      (symbolized on the host with addr2line, each address minus 1:)
+      panic at ./kernel/printk.c:183
+      sched at ./kernel/proc.c:488
+      sleep at ./kernel/proc.c:569
+      sys_kbacktrace at ./kernel/sysproc.c:153
+      syscall at ./kernel/syscall.c:148
+      usertrap at ./kernel/trap.c:75
+
+      (a second run under gdb, breakpoint on panic; $4 is `p cpus[1].noff`, $7 is `p cpus[1].intena`:)
+      Thread 2 hit Breakpoint 1, panic (s=s@entry=0x800071e0 "sched locks") at kernel/printk.c:179
+      [...]
+      $4 = 2
+      [...]
+      $7 = 1
+    why: |
+      This is what the lab is for: the panic message alone says only that [[sched]] found the
+      wrong number of locks. The backtrace says who called `sched`: [[sleep]], called from
+      line 153 of `sysproc.c`, the `sleep()` in `sys_kbacktrace`'s case-2 loop, in a system
+      call from user space. From there the bug is one look away: `tickslock` is still held.
+
+      The chain: `sleep()` acquires the process's own `p->lock` and calls `sched()`, which
+      requires `noff == 1` ([[kernel/proc.c:487]]): exactly one spinlock, `p->lock`. With
+      `tickslock` also held, `noff` is 2. gdb on the panicking hart (hart 1) showed
+      `cpus[1].noff` = 2 and `intena` = 1 (interrupts were on when the system call took
+      `tickslock`). Note the backtrace starts at `panic`'s own call site: the first line is
+      the return address in `backtrace`'s record, inside `panic`.
+  - bug: myproc() used without checking for 0
+    change: |
+      In `kerneltrap`, the learner reads the current process's pid unconditionally, as if a
+      timer interrupt always interrupted a process:
+
+      ```diff
+         if (which_dev == 2 && btwant != 0) {
+      -    int want = myproc() != 0 ? myproc()->pid : -1;
+      +    int want = myproc()->pid;
+      ```
+    symptom: |
+      $ bttest 2
+      bttest: from a timer interrupt on a scheduler stack:
+      scause=0xd sepc=0x80002840 stval=0x30
+      scause=0xd sepc=0x80002840 stval=0xpan30
+      panic: ic: kkerneeltrneltrrapap
+
+      bacbackktractrace:
+      e:
+      00xx0000000000000800000080902c00092c
+
+      0x000000008000281e
+      0x0x000000000000080005700e8
+      0x00000000800057e8
+      0x000000000800800f606
+      0x000002800001e
+      0x0000008000000c2
+      00800057e8
+      (the capture ended here)
+
+      (a second run under gdb, breakpoint on panic:)
+        Id   Target Id                    Frame
+        1    Thread 1.1 (CPU#0 [running]) 0x0000000080000a60 in uartputc_sync (c=115) at kernel/uart.c:114
+        2    Thread 1.2 (CPU#1 [running]) acquire (lk=lk@entry=0x8000f978 <pr>) at kernel/spinlock.c:37
+      * 3    Thread 1.3 (CPU#2 [running]) panic (s=s@entry=0x800073b0 "kerneltrap") at kernel/printk.c:179
+
+      Thread 3 (Thread 1.3 (CPU#2 [running])):
+      #0  panic (s=s@entry=0x800073b0 "kerneltrap") at kernel/printk.c:179
+      #1  0x000000008000281e in kerneltrap () at kernel/trap.c:160
+      #2  0x00000000800057e8 in kernelvec () at kernel/kernelvec.S:38
+      Backtrace stopped: frame did not save the PC
+
+      Thread 2 (Thread 1.2 (CPU#1 [running])):
+      #0  acquire (lk=lk@entry=0x8000f978 <pr>) at kernel/spinlock.c:37
+      #1  0x000000008000057a in printk (fmt=fmt@entry=0x80007388 "scause=0x%lx sepc=0x%lx stval=0x%lx\n") at kernel/printk.c:71
+      #2  0x0000000080002812 in kerneltrap () at kernel/trap.c:158
+      #3  0x00000000800057e8 in kernelvec () at kernel/kernelvec.S:38
+      Backtrace stopped: frame did not save the PC
+
+      Thread 1 (Thread 1.1 (CPU#0 [running])):
+      #0  0x0000000080000a60 in uartputc_sync (c=115) at kernel/uart.c:114
+      #1  0x000000008000029e in consputc (c=<optimized out>) at kernel/console.c:43
+      #2  0x0000000080000580 in printk (fmt=fmt@entry=0x80007388 "scause=0x%lx sepc=0x%lx stval=0x%lx\n") at kernel/printk.c:76
+      [...]
+    why: |
+      On an idle hart [[myproc]] returns 0, so `myproc()->pid` loads from address `0x30`,
+      the offset of `pid` in `struct proc`: `stval=0x30`, at `sepc` `0x80002840`.
+      (`addr2line` says line 168, the compare-and-swap: the compiler moved the load of `pid`
+      from line 165 down to where it is used.) That is a page fault *inside* `kerneltrap`,
+      on the scheduler stack: `kernelvec` pushes a second frame below the first and calls a second
+      `kerneltrap`, which finds no device, prints `scause=...` and panics.
+
+      It happened on every idle hart at once. While `bttest` sleeps, all three harts are
+      idle, and their timer interrupts arrive within a hair of each other. In the gdb run,
+      hart 2 had reached `panic`, hart 1 was waiting for `pr.lock` to print its `scause`
+      line, and hart 0 was printing its own. In the console run two harts got through, and
+      once the first has set `panicking`, [[printk]] takes no lock: their messages and
+      backtraces interleave character by character. Untangled, and checked against the
+      code path, each backtrace is `0x8000092c` (in `panic`), `0x8000281e` (in the second `kerneltrap`,
+      line 160), `0x800057e8` (`kernelvec`), `0x800057e8` again, `0x80000f66` (`main`),
+      `0x800000c2` (`start`).
+
+      Two `kernelvec` lines in a row mean two nested traps. And two functions are missing,
+      both "interrupted": `scheduler` (interrupted by the timer) and the first `kerneltrap`
+      (interrupted by the fault). The first is named only by its `sepc`, which was never
+      printed; the second by the `sepc` in the `scause=` line, `0x80002840`. gdb's `bt`
+      stops at the first `kernelvec`.
+reveal:
+  - title: One instruction to read s0
+    commit: 1
+    file: kernel/riscv.h
+    lines: 330-372
+    focus: 362-372
+    diff: true
+    state:
+      hart: 2
+      mode: S
+      proc: bttest (pid 3)
+      intr: "on"
+      satp: kernel
+      locks: []
+      stack: [usertrap, syscall, sys_kbacktrace, backtrace]
+      sp: {"on": kernel, detail: "bttest's kernel stack, KSTACK(2) = 0x3fffff9000; backtrace's s0 is 0x3fffff9f90"}
+      irq: 0
+    note: |
+      The story of this tour is one run of `bttest` on three harts, recorded with gdb
+      breakpoints on `backtrace` and on `sys_kbacktrace`. `bttest` is pid 3 in proc slot 2,
+      so its kernel stack is the page at `0x3fffff9000`. Cases 0 and 1 ran on hart 2; for
+      case 2 it went to sleep on hart 0, and hart 1 printed. Every address in this tour is
+      from that build of the finished branch; earlier commits build to slightly different
+      addresses.
+
+      The first commit adds one accessor, next to `r_sp` and `r_ra`. C cannot name a
+      register, so `r_fp` is a one-instruction [[g:inline-asm|asm statement]] that copies
+      `s0` into a variable. Because it is `static inline`, the `mv` runs inside the caller,
+      after the caller's prologue: in `backtrace`, it reads `backtrace`'s own frame pointer,
+      `0x3fffff9f90` in case 0.
+
+      The state shown is that moment: hart 2 in supervisor mode on `bttest`'s kernel stack,
+      interrupts on (as in every system call after [[usertrap]]'s `intr_on`), no lock held.
+      The walk will read only memory of this stack, so it needs no lock: nothing else writes
+      a running process's kernel stack.
+    others: |
+      In case 0 nothing else was runnable (`init` and `sh` were waiting), so harts 0 and 1
+      sat idle in [[scheduler]], each on its own slice of `stack0`. Three harts means three
+      stacks in use at once, one per hart. A walk only ever reads the
+      stack of the hart it runs on.
+  - title: The record every prologue writes
+    commit: 1
+    file: Makefile
+    lines: 60-72
+    focus: 66
+    state:
+      hart: 2
+      mode: S
+      proc: bttest (pid 3)
+      intr: "on"
+      satp: kernel
+      locks: []
+      stack: [usertrap, syscall, sys_kbacktrace, backtrace]
+      sp: kernel
+      irq: 0
+    note: |
+      Nothing in this commit changes the Makefile; this is the flag the lab depends on.
+      `-fno-omit-frame-pointer` ([[g:flag-frame]]) makes every C function keep a frame
+      pointer in `s0`. `backtrace`'s own prologue in this build:
+
+      ```text
+      80000834:  7179   addi  sp,sp,-48
+      80000836:  f406   sd    ra,40(sp)
+      80000838:  f022   sd    s0,32(sp)
+      ...
+      8000083e:  1800   addi  s0,sp,48
+      ```
+
+      `s0` ends up 48 bytes above the new `sp`, at the old `sp`, with the return address at
+      `s0-8` and the caller's `s0` at `s0-16`. In case 0, gdb showed `sp` = `0x3fffff9f90` on
+      entry, so `backtrace`'s record holds `0x80002c46` (its return address in
+      `sys_kbacktrace`) at `0x3fffff9f88` and `0x3fffff9fc0` (`sys_kbacktrace`'s frame
+      pointer) at `0x3fffff9f80`.
+
+      Each saved `s0` points at the caller's record: the frames form a linked list running
+      up the stack. Without the flag, `s0` would hold some variable instead (clinic 4).
+  - title: Walking the chain
+    commit: 2
+    file: kernel/printk.c
+    lines: 137-167
+    focus: 142-156
+    diff: true
+    state:
+      hart: 2
+      mode: S
+      proc: bttest (pid 3)
+      intr: "on"
+      satp: kernel
+      locks: []
+      stack: [usertrap, syscall, sys_kbacktrace, backtrace]
+      sp: {"on": kernel, detail: "four frames; sp 160 bytes below the top 0x3fffffa000, backtrace's fp 112 below"}
+      irq: 0
+    note: |
+      The walk is a loop over records. Print the return address at `fp-8`, load the caller's
+      frame pointer from `fp-16`, repeat. Here is what it found in case 0 (gdb):
+
+      ```text
+      bttest's kernel stack (KSTACK(2), one page)
+        0x3fffffa000  top = usertrap's fp   record: ra 0x3ffffff09c, s0 0x3fd0
+        0x3fffff9fe0  syscall's fp          record: ra 0x80002736, s0 0x3fffffa000
+        0x3fffff9fc0  sys_kbacktrace's fp   record: ra 0x800029f2, s0 0x3fffff9fe0
+        0x3fffff9f90  backtrace's fp        record: ra 0x80002c46, s0 0x3fffff9fc0
+      ```
+
+      Three iterations print `0x80002c46`, `0x800029f2` and `0x80002736`; then `fp` is
+      `0x3fffffa000`, which equals `top`, and the loop ends without reading `usertrap`'s
+      record. Its contents are the subject of the next step: they are not kernel frames.
+
+      `top` is `PGROUNDUP(fp)` of the *first* `fp`: kernel stacks are exactly one page at
+      page-aligned addresses ([[proc_mapstacks]]), and `backtrace`'s own frame is strictly
+      inside the page, so the next page boundary is the top. The `prev <= fp` test is the
+      second guard: callers' frames are always higher on a downward-growing stack, so a
+      saved frame pointer that is not higher means the chain is broken, and the walk stops
+      rather than follow it. A panic is exactly when the chain may be broken.
+
+      The function goes in `printk.c` because it prints and because [[panic]] will call it,
+      and its prototype in [[kernel/defs.h]].
+  - title: The outermost record belongs to uservec
+    commit: 2
+    file: kernel/trampoline.S
+    lines: 71-99
+    focus: 98
+    state:
+      hart: 2
+      mode: S
+      proc: bttest (pid 3)
+      intr: "off"
+      satp: kernel
+      locks: []
+      stack: [uservec]
+      sp: {"on": kernel, switched: "`csrw satp` ([[kernel/trampoline.S:92]]) made the kernel stack loaded on line 76 usable", detail: "empty: sp = 0x3fffffa000, the top"}
+      irq: 0
+    note: |
+      Why must the walk stop *before* `usertrap`'s record? Because of how `usertrap` is
+      entered. Earlier in this same system call, [[uservec]] loaded `sp` with the empty
+      kernel stack's top (line 76), switched to the kernel page table (line 92), and here
+      jumps to `usertrap` with `jalr t0`. That `jalr` sets `ra` to the next instruction,
+      `0x3ffffff09c` (the trampoline page runs at `TRAMPOLINE`), and nothing in `uservec`
+      writes `s0`: it still holds the user program's frame pointer.
+
+      So `usertrap`'s prologue saves `ra` = `0x3ffffff09c` and "the caller's `s0`" =
+      `0x3fd0`, an address in `bttest`'s *user* stack. The return address is real
+      ([[usertrap]] does return here, and `uservec` falls into [[userret]]), but there is no
+      kernel frame above it. Following `0x3fd0` means loading from `0x3fc8` under the
+      kernel page table, which maps nothing there: a kernel page fault (clinic 2 shows the
+      recursion that follows).
+
+      The frame chain ends exactly where the kernel stack does, at `0x3fffffa000`. That is
+      why a stack-top bound is not just a safety net: it is the only way the walk can know
+      where the kernel's chain stops.
+  - title: A system call to try it
+    commit: 3
+    file: kernel/sysproc.c
+    lines: 101-127
+    focus: 114-127
+    diff: true
+    state:
+      hart: 2
+      mode: S
+      proc: bttest (pid 3)
+      intr: "on"
+      satp: kernel
+      locks: []
+      stack: [usertrap, syscall, sys_kbacktrace]
+      sp: kernel
+      irq: 0
+    note: |
+      A user program cannot call `backtrace()`, but it can ask the kernel to. This commit
+      adds the system call `kbacktrace(where)` with the full registration that lab 1
+      (`trace`) walks through: `SYS_kbacktrace` (23) in [[kernel/syscall.h]], `entry("kbacktrace")` in
+      [[user/usys.pl]], the prototype in [[user/user.h]], and the table entry in
+      [[kernel/syscall.c]]. For now only `where == 0` does something.
+
+      [[argint]] fetches `where` from the trapframe, and `backtrace()` walks the stack it is
+      on: `usertrap`, `syscall`, `sys_kbacktrace`, then its own frame. This is the simplest
+      case, and the one to get right first: one stack, no trap in the middle, a chain of
+      three callers.
+
+      The recorded output of case 0, on hart 2:
+
+      ```text
+      backtrace:
+      0x0000000080002c46
+      0x00000000800029f2
+      0x0000000080002736
+      ```
+  - title: Reading the lines back with addr2line
+    commit: 3
+    file: kernel/syscall.c
+    lines: 104-153
+    focus: 145-148
+    diff: true
+    state:
+      hart: 2
+      mode: S
+      proc: bttest (pid 3)
+      intr: "on"
+      satp: kernel
+      locks: []
+      stack: [usertrap, syscall]
+      sp: kernel
+      irq: 0
+    note: |
+      The diff is the table entry for 23 (line 134). The interesting line for this step is
+      148: the call through the table. The second address of case 0, `0x800029f2`, is the
+      return address of that call, and on the host:
+
+      ```text
+      $ ${TOOLPREFIX}addr2line -e kernel/kernel -f -p 0x800029f1
+      syscall at ./kernel/syscall.c:148
+      ```
+
+      Look up the address *minus one*. A return address is the instruction after the call,
+      and with `-O` that can belong to another line: `0x80002736` (in `usertrap`) gives
+      trap.c:88 as printed but trap.c:75, the `syscall()` call, minus one. The worst case
+      is case 2's `0x80000f66`, which gives `main.c:14` (`consoleinit()`), because `main`'s
+      last instruction is the call to `scheduler` on line 44, and the compiler placed the
+      code of the `cpuid() == 0` branch right after it. Minus one always lands inside the call
+      instruction (4 bytes for `jal`, 2 for `c.jalr`).
+
+      The kernel needs no symbol table at run time for any of this: `kernel/kernel` on the
+      host has them, from `-ggdb`.
+  - title: Asking the timer for a backtrace
+    commit: 4
+    file: kernel/sysproc.c
+    lines: 114-137
+    focus: 128-135
+    diff: true
+    state:
+      hart: 2
+      mode: S
+      proc: bttest (pid 3)
+      intr: "on"
+      satp: kernel
+      locks: []
+      stack: [usertrap, syscall, sys_kbacktrace]
+      sp: {"on": kernel, detail: "sys_kbacktrace's sp is 0x3fffff9f90"}
+      irq: 0
+    note: |
+      Case 1 needs a timer interrupt to arrive while a system call is running, and the walk
+      to start inside the interrupt handler. `sys_kbacktrace` records a request, its own pid,
+      in a global `btwant` (declared `volatile` in `trap.c`, so that the loop reloads it),
+      and spins until the request is gone.
+
+      The spin works only because interrupts are on: [[usertrap]] turned them on before
+      calling [[syscall]] ([[kernel/trap.c:66]]), and nothing here takes a spinlock. The
+      next timer interrupt on hart 2 (within a tenth of a second) lands somewhere in this
+      loop. In the recorded run (of the finished branch, where the loop is three lines
+      lower) it struck at `sepc` `0x80002c64`, inside the loop.
+
+      Only `bttest` can match its own pid, and a process runs on one hart at a time, so in
+      this commit a plain store can clear the request. Case 2 will change that.
+    others: |
+      The spinning process does not block anyone: when the interrupt comes, [[kerneltrap]]
+      also calls [[yield]], and `bttest` may resume on another hart, where it sees `btwant`
+      already 0 and returns. Hart 0 and hart 1, idle, take their own timer interrupts in
+      their scheduler loops; they do not match a pid, so they ignore the request.
+  - title: kernelvec pushes a frame, but no record
+    commit: 4
+    file: kernel/kernelvec.S
+    lines: 1-42
+    focus: 14-17
+    state:
+      hart: 2
+      mode: S
+      proc: bttest (pid 3)
+      intr: "off"
+      satp: kernel
+      locks: []
+      stack: [usertrap, syscall, sys_kbacktrace, kernelvec]
+      sp: {"on": kernel, detail: "kernelvec frame from 0x3fffff9e90 to 0x3fffff9f90"}
+      irq: 0
+    note: |
+      The timer interrupt traps to [[kernelvec]], on the stack the hart is already using:
+      xv6 has no interrupt stack ([[concept:stacks#same]]). Line 14 moves `sp` down 256
+      bytes, from `0x3fffff9f90` to `0x3fffff9e90`, and the stores save `ra`, `gp` and the
+      `t` and `a` registers: the caller-saved ones, which `kerneltrap` may destroy.
+
+      What it does *not* do matters for the walk. It does not save `s0` (callee-saved: the
+      C code will preserve it), and it builds no record. So when [[kerneltrap]]'s prologue
+      saves "the caller's `s0`", it saves `sys_kbacktrace`'s frame pointer, `0x3fffff9fc0`,
+      and the chain jumps straight over these 256 bytes to the interrupted function's
+      record. The only trace `kernelvec` leaves in the chain is `kerneltrap`'s return
+      address, `0x800057e8`, the instruction after `call kerneltrap` on line 38.
+
+      The `ra` saved at line 17 is the interrupted code's `ra` register, not a return
+      address of this frame; the walk never looks at it.
+  - title: kerneltrap takes the request
+    commit: 4
+    file: kernel/trap.c
+    lines: 140-175
+    focus: 161-165
+    diff: true
+    state:
+      hart: 2
+      mode: S
+      proc: bttest (pid 3)
+      intr: "off"
+      satp: kernel
+      locks: []
+      stack: [usertrap, syscall, sys_kbacktrace, kernelvec, kerneltrap]
+      sp: {"on": kernel, detail: "kernelvec frame in the middle; kerneltrap's fp 0x3fffff9e90"}
+      irq: 0
+    note: |
+      [[devintr]] returned 2 (the timer), the current process is `bttest`, and `btwant`
+      holds its pid. The request is cleared and the walk runs, from inside the interrupt
+      handler, with interrupts off and no lock held (gdb: `noff` 0). Recorded:
+
+      ```text
+      fp           function         ra in its record        saved s0
+      0x3fffffa000 usertrap         0x3ffffff09c            0x3fd0
+      0x3fffff9fe0 syscall          0x80002736 (usertrap)   0x3fffffa000
+      0x3fffff9fc0 sys_kbacktrace   0x800029f2 (syscall)    0x3fffff9fe0
+                   kernelvec's 256 bytes: no record
+      0x3fffff9e90 kerneltrap       0x800057e8 (kernelvec)  0x3fffff9fc0
+      0x3fffff9e60 backtrace        0x80002862 (kerneltrap) 0x3fffff9e90
+      ```
+
+      The console showed `0x80002862`, `0x800057e8`, `0x800029f2`, `0x80002736`:
+      `kerneltrap`, `kernelvec`, `syscall`, `usertrap`. **`sys_kbacktrace` is missing.**
+      Each line is the return address in a frame's record, which names that frame's
+      *caller*; the interrupted function was not called by `kernelvec`, so no record
+      points into it. Where it was interrupted is `sepc` (`0x80002c64`), which
+      `kerneltrap` holds in a register and never prints for an interrupt. When a fault
+      panics through here, the `scause=... sepc=...` line printed just before the panic is
+      the only place the faulting function is named.
+
+      `PGROUNDUP(0x3fffff9e60)` is still `0x3fffffa000`: a trap in the middle of a kernel
+      stack does not change its top.
+  - title: stack0, sixteen-byte aligned
+    commit: 5
+    file: kernel/entry.S
+    lines: 1-21
+    focus: 17
+    state:
+      hart: 1
+      mode: M
+      proc: none
+      intr: "off"
+      satp: bare
+      locks: []
+      stack: [_entry]
+      sp: {"on": boot, switched: "`add sp, sp, a0` ([[kernel/entry.S:17]])", detail: "top of hart 1's slice: 0x800098d0 in this build"}
+    note: |
+      Now the other kind of stack. At power-on, every hart computes its own stack from
+      `stack0`: `sp = stack0 + (hartid + 1) * 4096`. `stack0` is declared in
+      [[kernel/start.c:11]] as `__attribute__((aligned(16))) char stack0[4096 * NCPU]`:
+      aligned to 16 bytes, not to a page. In the unmodified kernel it is at `0x80007890`; in
+      this branch's build the new code moved it to `0x800078d0`. So the three slices in use
+      end at `0x800088d0`, `0x800098d0` and `0x8000a8d0`, all in the middle of pages.
+
+      This stack becomes hart 1's [[g:scheduler-stack]] when `main` calls [[scheduler]],
+      with no switch ([[concept:stacks#scheduler]]). Two frames sit at its top forever:
+      `start`'s, whose record holds the return address of `call start` (line 19, so
+      `0x8000001a`, `spin`) and whatever `s0` held at power-on (0, recorded); and
+      `main`'s, below it.
+
+      `PGROUNDUP` of a scheduler-stack address is therefore not the top. On hart 1, a walk
+      starting at `0x80009720` would stop at `0x8000a000`, 1840 bytes too high, past
+      `start`'s record; one starting below `0x80009000` would stop there, in the middle of
+      the slice. This commit's other change, in the next step, fixes the bound.
+  - title: stacktop knows both kinds
+    commit: 5
+    file: kernel/printk.c
+    lines: 137-175
+    focus: 139-153
+    diff: true
+    state:
+      hart: 1
+      mode: S
+      proc: none
+      intr: "off"
+      satp: kernel
+      locks: []
+      stack: [main, scheduler, kernelvec, kerneltrap, backtrace]
+      sp: {"on": scheduler, detail: "hart 1's slice of stack0, kernelvec frame on top; backtrace's fp 0x80009720"}
+      irq: 0
+    note: |
+      `stacktop(fp)` decides by address. Inside `stack0`'s `NCPU * 4096` bytes, the slice is
+      `(fp - base) / 4096`, and its top is one slice above that: for hart 1's `0x80009720`,
+      `0x800078d0 + 2 * 4096 = 0x800098d0`. Inside the 64 kernel stacks (from `KSTACK(63)` up
+      to `TRAMPOLINE`), the next page boundary. Anywhere else, 0, and `backtrace` prints a
+      warning instead of walking: clinic 4 shows that message saving a kernel built without
+      frame pointers.
+
+      The division is safe because the first `fp` is always strictly inside its slice:
+      `backtrace` is called by a function with a frame of its own, so its frame pointer is
+      below the caller's, which is at most the top. (Only `start`'s frame pointer equals a
+      slice's top, and the walk never starts there.)
+
+      The state is from the moment this code is first used, in case 2 in the next commit:
+      hart 1, idle, on its scheduler stack, inside the timer interrupt. gdb recorded
+      `noff` 0 and `SIE` 0 there. There is no current process (`cpus[1].proc` = 0).
+  - title: Exactly one idle hart prints
+    commit: 6
+    file: kernel/trap.c
+    lines: 143-182
+    focus: 163-172
+    diff: true
+    state:
+      hart: 1
+      mode: S
+      proc: none
+      intr: "off"
+      satp: kernel
+      locks: []
+      stack: [main, scheduler, kernelvec, kerneltrap]
+      sp: {"on": scheduler, detail: "kernelvec frame below scheduler's; kerneltrap's fp 0x80009750"}
+      irq: 0
+    note: |
+      Case 2 asks for a backtrace from *any* idle hart: `btwant` = -1. Every hart in
+      [[scheduler]] takes timer interrupts in the `intr_on(); intr_off();` window
+      ([[kernel/proc.c:441]]); in the recorded run hart 1 took this one at `sepc`
+      `0x80001ed6`, the `csrci` of `intr_off` right after `intr_on`. With no current process,
+      `want` is -1.
+
+      Several idle harts can see -1 at once. The test and the write must be one atomic
+      step: `__sync_bool_compare_and_swap(&btwant, want, -2)` succeeds on exactly one hart
+      (it compiles to an `lr.w`/`sc.w` loop). The winner prints and only then writes 0. The
+      value -2, "being printed", keeps the requester waiting until the last line is out.
+
+      What the walk found on hart 1:
+
+      ```text
+      hart 1's slice of stack0
+        0x800098d0  top = start's fp   record: ra 0x8000001a (spin), s0 0x0
+        0x800098c0  main's fp          record: ra 0x800000c2 (start), s0 0x800098d0
+        0x800098b0  scheduler's fp     record: ra 0x80000f66 (main), s0 0x800098c0
+                    kernelvec's 256 bytes
+        0x80009750  kerneltrap's fp    record: ra 0x800057e8, s0 0x800098b0
+        0x80009720  backtrace's fp     record: ra 0x80002862, s0 0x80009750
+      ```
+
+      Printed: `0x80002862`, `0x800057e8`, `0x80000f66`, `0x800000c2`, then `fp` reached
+      `0x800098d0` = `stacktop` and the walk stopped, before `start`'s record. `scheduler`
+      is missing for the same reason as `sys_kbacktrace` in case 1: it was interrupted.
+    others: |
+      While hart 1 prints, `bttest` sleeps (it went to sleep on hart 0), and harts 0 and 2
+      are idle. Their timer interrupts are not staggered, so (reasoning from the code) they
+      reach `kerneltrap` at nearly the same moment as hart 1's, find `btwant` already -2,
+      which matches nothing, and return to their loops. Clinic 6 shows what that near-simultaneity does to a bug: all three idle
+      harts crashed in the same instant.
+  - title: The requester sleeps until the print is done
+    commit: 6
+    file: kernel/sysproc.c
+    lines: 114-161
+    focus: 146-151
+    diff: true
+    state:
+      hart: 0
+      mode: S
+      proc: bttest (pid 3)
+      intr: "off"
+      satp: kernel
+      locks: [tickslock]
+      stack: [usertrap, syscall, sys_kbacktrace]
+      sp: kernel
+      irq: {noff: 1, intena: 1}
+    note: |
+      For case 2 the system call must wait while some *other* hart prints, so spinning would
+      be wrong: the requester would keep its own hart busy. It sleeps on `ticks`, exactly as
+      [[sys_pause]] does, and re-checks `btwant` each time [[clockintr]] wakes it (once per
+      tick). Recorded: `bttest` armed the request on hart 0 (`btwant` was 0 just before).
+
+      At the focus lines it holds `tickslock`: `noff` is 1, and `intena` is 1 because
+      interrupts were on when the system call took the lock. It releases the lock before
+      `sleep()` ([[concept:locks#sleep-wakeup]]); clinic 5 is what happens otherwise.
+
+      After 10 ticks with no taker, the call withdraws its request with another
+      compare-and-swap, from -1 to 0. If a hart took it in the meantime (-2), the swap fails
+      and the loop keeps waiting for 0. A version that cleared the request
+      *before* printing would be wrong: reasoning from the code, the woken `bttest` could return and
+      print its next line in the middle of the backtrace (think question 7 quotes a run).
+    others: |
+      `btwant` is not protected by `tickslock`. [[kerneltrap]] on hart 1 does not take the
+      lock; it changes `btwant` with atomic operations, and this loop only reads it. The lock
+      here protects `ticks` and the sleep/wakeup handshake on `&ticks`, as in `sys_pause`.
+  - title: A fossil at the top of every scheduler stack
+    commit: 6
+    file: kernel/start.c
+    lines: 13-52
+    focus: 43-51
+    state:
+      hart: 1
+      mode: M
+      proc: none
+      intr: "off"
+      satp: bare
+      locks: []
+      stack: [start]
+      sp: {"on": boot, detail: "start's 16-byte frame at the top of hart 1's slice"}
+    note: |
+      Case 2's last line, `0x800000c2`, comes from `main`'s record. But `start` never called
+      `main`: it reaches it with `mret` (line 51), which sets the mode and the pc and touches
+      no general register. `main`'s prologue then saves whatever `ra` holds, and the last
+      thing that wrote `ra` was the `jal timerinit` on line 44: `0x800000c2` is the
+      instruction after it (`addr2line` of `0x800000c1`: start.c:44).
+
+      So every backtrace that reaches the top of a scheduler stack ends with this line, a
+      leftover from boot. Above it is `start`'s record: return address `0x8000001a` (`spin`,
+      after `call start` in [[_entry]]) and the `s0` of power-on, 0. The walk stops at
+      `start`'s frame pointer, `0x800098d0`, before reading either, which is right: neither
+      describes a call.
+
+      The state here is the boot-time moment that created the fossil, in machine mode with
+      paging off, on what is still hart 1's boot stack.
+  - title: panic prints the chain
+    commit: 7
+    file: kernel/printk.c
+    lines: 155-187
+    focus: 177-187
+    diff: true
+    state:
+      hart: 1
+      mode: S
+      proc: bttest
+      intr: "off"
+      satp: kernel
+      locks: [tickslock, "bttest's p->lock"]
+      stack: [usertrap, syscall, sys_kbacktrace, sleep, sched, panic]
+      sp: kernel
+      irq: {noff: 2, intena: 1, note: "sched panics precisely because noff is 2: this is clinic 5's bug, recorded with gdb"}
+    note: |
+      The one-line commit the lab is named after. `panic` prints its message, then the
+      chain, then sets `panicked`. The order is forced by [[uartputc_sync]]: once `panicked`
+      is set, the next character printed by *any* hart spins forever, this one included
+      ([[kernel/uart.c:108]]). A copy with the two lines swapped printed `panic: sched
+      locks` and nothing more.
+
+      `panicking`, set first, makes [[printk]] skip `pr.lock`, so a panic on a hart that
+      already holds it (inside `printk`) still gets its backtrace out. The cost: two harts
+      panicking at once interleave character by character (clinic 6).
+
+      The state shown is a real panic: clinic 5's bug (sleeping with `tickslock` held),
+      caught with gdb on hart 1 with `noff` 2 and `intena` 1. Its backtrace, symbolized,
+      reads `panic`, `sched` (proc.c:488), `sleep` (proc.c:569), `sys_kbacktrace`
+      (sysproc.c:153), `syscall`, `usertrap`, which names the faulty line directly. The
+      walk is safe to run here because it never leaves the stack it started on: every load is
+      at `fp - 8` or `fp - 16` with `fp` strictly inside that stack. A walker that can fault
+      turns one panic into a recursion (clinics 2 and 3).
+    others: |
+      Harts 0 and 2 were idle in [[scheduler]] (gdb: `halted`, in `wfi`). If one of them
+      printed anything now, its first character would spin forever once `panicked` is set.
+  - title: bttest
+    commit: 8
+    file: user/bttest.c
+    lines: 1-49
+    focus: 25-48
+    diff: true
+    state:
+      hart: 2
+      mode: U
+      proc: bttest (pid 3)
+      intr: "on"
+      satp: user
+      locks: []
+      stack: [main]
+      sp: user
+    note: |
+      The test asks for the three backtraces in turn and checks what a program can see: the
+      return values 0, 0, 0 and -1 for an unknown `where`. `bttest N` runs only case `N`,
+      which is how the clinic runs looked at one stack at a time.
+
+      It does not, and cannot, check the addresses: they go to the console, which a program
+      cannot read, and their meaning depends on the build. So the last line says plainly
+      that the addresses must be symbolized on the host, instead of claiming that all is
+      well. The verify section below does that for the recorded run.
+
+      `$U/_bttest` is added to `UPROGS` in the Makefile, so `mkfs` puts it in `fs.img`.
+verify: |
+  On the branch, on three harts, before `usertests` (the gdb run that the reveal follows
+  printed exactly the same lines):
+
+  ```text
+  $ bttest
+  bttest: from a system call, on this process's kernel stack:
+  backtrace:
+  0x0000000080002c46
+  0x00000000800029f2
+  0x0000000080002736
+  bttest: kbacktrace(0) returned 0: OK
+  bttest: from a timer interrupt during a system call:
+  backtrace:
+  0x0000000080002862
+  0x00000000800057e8
+  0x00000000800029f2
+  0x0000000080002736
+  bttest: kbacktrace(1) returned 0: OK
+  bttest: from a timer interrupt on a scheduler stack:
+  backtrace:
+  0x0000000080002862
+  0x00000000800057e8
+  0x0000000080000f66
+  0x00000000800000c2
+  bttest: kbacktrace(2) returned 0: OK
+  bttest: kbacktrace(3) returned -1: OK
+  bttest: 4 checks OK; the addresses can only be checked by symbolizing them on the host with addr2line
+  ```
+
+  Symbolized on the host with `${TOOLPREFIX}addr2line -e kernel/kernel -f -p`, each address
+  minus one:
+
+  | case | lines |
+  |---|---|
+  | 0: system call | `sys_kbacktrace` sysproc.c:128, `syscall` syscall.c:148, `usertrap` trap.c:75 |
+  | 1: across a trap | `kerneltrap` trap.c:169, `kernelvec` kernelvec.S:38, `syscall` syscall.c:148, `usertrap` trap.c:75 |
+  | 2: scheduler stack | `kerneltrap` trap.c:169, `kernelvec` kernelvec.S:38, `main` main.c:44, `start` start.c:44 |
+
+  Each is the expected chain: case 0 stops at the top of the kernel stack; case 1 crosses
+  the `kernelvec` frame and (as it must) has no line for the interrupted `sys_kbacktrace`;
+  case 2 stops at the top of the idle hart's `stack0` slice, after `main` and the boot-time
+  return address into `start`, without reading `start`'s record.
+
+  The rest of the kernel is unharmed, in the same boot:
+
+  ```text
+  $ usertests -q
+  usertests starting
+  [...]
+  ALL TESTS PASSED
+  ```
+
+  `bttest` run again after `usertests` printed the same eleven addresses and
+  `4 checks OK`. No other program calls `kbacktrace`, so the only cost to an ordinary
+  kernel is one load of `btwant` per timer interrupt taken in the kernel.
+measure: |
+  **How deep are the stacks the walk climbs?** Measured with gdb on the branch (frame
+  pointers at the moment `backtrace` starts, against each stack's top):
+
+  | case | stack | top | `backtrace`'s fp | depth |
+  |---|---|---|---|---|
+  | 0 | `bttest`'s kernel stack | `0x3fffffa000` | `0x3fffff9f90` | 112 bytes, 3 frames |
+  | 1 | the same, with a `kernelvec` frame | `0x3fffffa000` | `0x3fffff9e60` | 416 bytes (256 of them `kernelvec`'s) |
+  | 2 | hart 1's slice of `stack0` | `0x800098d0` | `0x80009720` | 432 bytes |
+
+  **How much of the 4096 bytes does real work use?** [[kalloc]] fills every page with the
+  byte 5, including the 64 kernel stacks that [[proc_mapstacks]] allocates once at boot, and
+  `stack0` starts out zero (QEMU's RAM is zeroed, and nothing else writes it). So after a run, the lowest byte of a stack that no longer holds
+  its initial value marks the deepest point that stack ever reached (to within a few bytes,
+  if a stored value happened to end in that byte). Read with gdb after one boot running
+  `usertests -q` and then `bttest`, on the branch:
+
+  - kernel stacks: all 64 slots had been used; the deepest went **1632 bytes** down
+    (slots 1, 2 and 4), then 1232, 1200, 1152 and less. The same 1632 bytes were already
+    reached after just booting and running `echo hi`, so `usertests -q` never went deeper
+    than the shell does.
+  - scheduler stacks: hart 0 **672** bytes (all of boot ran on it), hart 1 **640**, hart 2
+    **767**.
+
+  So the deepest normal path leaves about 2.4 KiB of each 4 KiB kernel stack unused, and
+  the guard page is never approached. What fills a stack is recursion that should not
+  happen: in clinic 2, each round of fault, `kerneltrap`, `panic` and walk took 368 bytes,
+  and in the eleventh round `kerneltrap`'s frame reached the guard page.
+
+  **What PGROUNDUP gets wrong on stack0, in numbers.** In this build the slice tops are at
+  `0x...8d0`: 2256 bytes above a page boundary and 1840 bytes below the next one. A walk
+  that starts in the top 2256 bytes of a slice (every scheduler-stack walk in the recorded runs of a
+  healthy kernel: the deepest scheduler-stack use measured was 767 bytes) gets a bound 1840
+  bytes too high and reads `start`'s record; one that starts deeper gets a bound inside the
+  slice and stops early.
+  Clinic 3 recorded both in one run: five walks too long, then one too short.
+further: |
+  - **Name the interrupted function.** When the walk meets the return address into
+    `kernelvec`, the function that was interrupted is missing. Have `kernelvec` store
+    `sepc` in its frame (there is room in the 256 bytes) and print it as an extra line.
+    Teaches what unwind information is, and why gdb stops at `kernelvec`.
+  - **Backtraces of sleeping processes on Ctrl-P.** A process that is not running has its
+    frame pointer in `p->context.s0` and its return address in `p->context.ra`. Make
+    [[procdump]] walk each sleeping process's kernel stack. Teaches where a suspended
+    process lives ([[tour:47]]) and why the walk must take the stack's top from the process
+    (`p->kstack + PGSIZE`), not from the hart.
+  - **Symbols inside the kernel.** Generate a sorted table of function start addresses at
+    build time (from `${TOOLPREFIX}nm`), link it into the kernel, and print names instead of
+    numbers. Teaches a two-pass build and why the table's own size moves every address.
+  - **A stack high-water mark.** Repeat the measurement above from inside the kernel: check
+    the lowest byte still holding 5 in each kernel stack, and print it on Ctrl-P. Teaches
+    stack painting and how close the kernel runs to its guard pages.
+  - **A user-space backtrace on a fatal fault.** When [[usertrap]] kills a process for an
+    unexpected `scause`, walk the *user* stack from `p->trapframe->s0`, using [[copyin]]
+    for every load. Teaches why the kernel may never dereference a user pointer, and what
+    bounds a user stack has (one page, a guard page below, [[kernel/exec.c:91]]).

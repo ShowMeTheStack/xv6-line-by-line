@@ -1,0 +1,771 @@
+title: One hart's stacks, from power-on to the first user instruction
+group: The dance of privilege
+prerequisites: [2, 4, 41]
+summary: |
+  Every instruction a CPU executes runs with some value in `sp`, and that value is always a
+  claim: "this is my stack." This tour follows the claim on **hart 0** from the moment QEMU
+  powers it on, when `sp` is simply 0, to the moment `init` executes its first user
+  instruction on a stack that `kexec` built for it.
+
+  On the way, `sp` points into four different pieces of memory: nothing at all, hart 0's slice
+  of the boot array `stack0` (which quietly becomes the **scheduler stack**), the first
+  process's empty **kernel stack**, and finally `init`'s **user stack**. Only four instructions
+  in the whole kernel ever move `sp` from one stack to another. This tour runs three of them
+  and points at the fourth.
+
+  Every address in this tour comes from this build: `xv6/kernel/kernel.sym`, and gdb attached to
+  QEMU, stopping at each point and reading `sp`. One surprise from the measurements shapes the
+  story: the first process doesn't stay on hart 0. Partway through, the thread leaves the hart,
+  and the tour follows the *stack*, not the hart. That turns out to be the main lesson.
+cast: |
+  Three [[g:hart|harts]] power on together. All three run the same early code, each on its own
+  stack; this tour watches hart 0, which builds the kernel.
+
+  | Hart | What it is doing |
+  |---|---|
+  | 0 | The tour's hart: boots, runs [[kernel:main]]'s setup, becomes a scheduler |
+  | 1 | Boots in parallel, then spins in `main` until hart 0 says `started` |
+  | 2 | The same as hart 1 |
+steps:
+  - title: "Power-on: pc = 0x1000, sp = 0"
+    file: kernel/memlayout.h
+    lines: 1-19
+    focus: 6-13
+    state:
+      hart: 0
+      mode: M
+      proc: none
+      intr: off
+      satp: bare
+      locks: []
+      stack: []
+      sp: {"on": none, detail: "sp = 0 at reset, in our run"}
+    note: |
+      QEMU starts every hart in machine mode at `0x1000`, a small boot ROM it provides. gdb's
+      first look, before a single instruction ran:
+
+      ```text
+      0x1000: auipc t0, 0x0
+      0x1004: addi  a2, t0, 40
+      0x1008: csrr  a0, mhartid      # a0 = this hart's number
+      0x100c: ld    a1, 32(t0)       # a1 = 0x87e00000, a device-tree address
+      0x1010: ld    t0, 24(t0)       # t0 = 0x80000000
+      0x1014: jr    t0
+      ```
+
+      The two words after the code hold `0x80000000` and `0x87e00000`. So the ROM jumps every
+      hart to `0x80000000`, where the linker put [[_entry]] ([[kernel/kernel.ld]]). xv6 ignores
+      the device tree in `a1`.
+
+      At this point `sp` is **0**, on all three harts. There is no stack: nothing may call a
+      function or push anything. The ROM doesn't need one, and the first five instructions of
+      `_entry` don't either. [[tour:2]] tells the boot story; this tour watches `sp`.
+    others: |
+      Harts 1 and 2 are executing the same ROM at the same moment. In one of our runs gdb reported
+      hart 1 first, then 2, then 0; in another, 0, 1, 2. The order
+      varies, and nothing in xv6 depends on it.
+
+  - title: _entry gives each hart a slice of stack0
+    file: kernel/entry.S
+    lines: 1-21
+    focus: 12-17
+    state:
+      hart: 0
+      mode: M
+      proc: none
+      intr: off
+      satp: bare
+      locks: []
+      stack: [_entry]
+      sp: {"on": boot, switched: "`add sp, sp, a0` ([[kernel/entry.S:17]])", detail: "hart 0: 0x80008890"}
+    note: |
+      Six instructions compute `sp = stack0 + (hartid + 1) * 4096`. In this build
+      [[stack0]] is at `0x80007890` (`kernel/kernel.sym`), so:
+
+      | Hart | `sp` after line 17 (measured at `start`) |
+      |---|---|
+      | 0 | `0x80008890` |
+      | 1 | `0x80009890` |
+      | 2 | `0x8000a890` |
+
+      Why `hartid + 1`? A RISC-V stack grows **down**: a push first subtracts from `sp`. So
+      each hart's `sp` starts at the *top* of its slice, which is the bottom of the next
+      hart's slice.
+
+      This is the first of the four instructions in xv6 that move `sp` onto a different
+      stack ([[concept:stacks#switches]]). Its stack is the **boot stack**.
+
+      Every hart computes its own answer from its own `mhartid`, so no lock and no
+      coordination are needed: hardware gives each hart a different number.
+
+  - title: One array, eight slices, no guard page
+    file: kernel/start.c
+    lines: 7-12
+    focus: 10-11
+    state:
+      hart: 0
+      mode: M
+      proc: none
+      intr: off
+      satp: bare
+      locks: []
+      stack: [_entry]
+      sp: {"on": boot, detail: "0x80008890"}
+    note: |
+      `stack0` is an ordinary global array: `4096 * NCPU` bytes, and `NCPU` is 8, so 32 KiB, of
+      which three slices are used on our three-hart machine.
+    figure: t42-stack0
+    caption: |
+      [[stack0]] in this build, with what the linker put just below it (`kernel/kernel.sym`).
+      Each slice is one hart's boot stack, later its scheduler stack; `sp` starts at the top
+      of a slice and moves down.
+    others: |
+      There is **no guard page** between the slices, or below the array. A stack that grows
+      past the bottom of its slice silently writes into its neighbour:
+
+      - Hart 1 overflowing would corrupt the *top* of hart 0's slice: the dead `start`/`main`
+        frames, hart 0's scheduler frame (step 10), and below it whatever call hart 0 is in at
+        that moment (quiz 3 works out which of those matter).
+      - Hart 0 overflowing would corrupt the globals just below `0x80007890`: `ticks`
+        (`0x80007880`), `initproc` (`0x80007878`) and `kernel_pagetable` (`0x80007870`).
+
+      Kernel stacks and user stacks have guard pages, which make an overflow fault at once.
+      `stack0` doesn't, so it must simply never overflow: the boot and scheduler code use
+      only a few hundred bytes of it.
+
+  - title: start runs in machine mode on the boot stack
+    file: kernel/start.c
+    lines: 13-29
+    focus: 14-28
+    state:
+      hart: 0
+      mode: M
+      proc: none
+      intr: off
+      satp: bare
+      locks: []
+      stack: [start]
+      sp: {"on": boot, detail: "0x80008890 at entry, 0x80008880 after start's 16-byte frame"}
+    note: |
+      `call start` (entry.S line 19) puts the return address in `ra`; RISC-V's `call` pushes
+      nothing. [[kernel:start]]'s compiled prologue then takes 16 bytes of stack for itself:
+      `sp` goes from `0x80008890` to `0x80008880`.
+
+      `start` runs entirely in machine mode, with no page table (`satp` = 0: machine mode
+      doesn't translate addresses at all). It is preparing a fake trap return: `MPP = S`
+      ("the trap came from supervisor mode") and `mepc = main` ("…at this address").
+      [[tour:46]] tells that story; here, notice what `start` does *not* prepare: a new stack.
+      The `mret` ahead won't touch `sp`.
+
+      `start` also turns on two extensions in `menvcfg`: Svadu (line 41, the hardware updates
+      the accessed and dirty bits in page-table entries) and Sstc (in [[timerinit]], a
+      supervisor timer). gdb read `menvcfg = 0xa000000000000000` just before `mret`: bit 63
+      (`STCE`) and bit 61 (`ADUE`).
+
+  - title: mret changes the mode, and leaves sp alone
+    file: kernel/start.c
+    lines: 43-52
+    focus: 50-51
+    state:
+      hart: 0
+      mode: M
+      proc: none
+      intr: off
+      satp: bare
+      locks: []
+      stack: [start]
+      sp: {"on": boot, detail: "0x80008880"}
+    note: |
+      gdb on hart 0 at the `mret` (`0x800000ca`) and again at `main`'s first instruction:
+
+      | | at `mret` | at `main` |
+      |---|---|---|
+      | mode | M | **S** |
+      | `pc` | `0x800000ca` | **`0x80000e5e`** (`mepc`) |
+      | `mstatus.MPP` | 1 (S) | **0** (U: `mret` resets it to the least-privileged mode) |
+      | `mstatus.MPIE` | 0 | **1** |
+      | `sp` | `0x80008880` | `0x80008880` |
+      | `tp` | 0 | 0 |
+
+      `sp` is unchanged, so `main` starts on the same slice, just below `start`'s 16-byte frame.
+      That frame stays there forever: `start` never returns, and `main` never will either.
+
+      After this instruction, **no hart re-enters machine mode** for the rest of the run.
+      `mtvec` and `mscratch` are never written in this tree; gdb read both as 0 at `main`.
+      Every trap is delegated to supervisor mode, and the timer is a supervisor timer.
+
+  - title: main, on the boot stack with paging off
+    file: kernel/main.c
+    lines: 9-20
+    focus: 13-20
+    state:
+      hart: 0
+      mode: S
+      proc: none
+      intr: off
+      satp: bare
+      locks: []
+      irq: 0
+      stack: [main]
+      sp: {"on": boot, detail: "0x80008880 at entry; 0x80008870 after main's prologue"}
+    note: |
+      [[kernel:main]] is in supervisor mode, and `satp` is still 0, so addresses are physical.
+      Hart 0 now builds the kernel: console, allocator, page table, process table and the
+      rest, all as ordinary C calls on this 4 KiB slice. Every call pushes a frame below
+      `0x80008870` and pops it on return.
+
+      Interrupts are off (`sstatus.SIE = 0`; gdb read `sstatus = 0x200000000`), and stay off
+      until the scheduler. Nothing can interrupt the setup, so nothing needs a stack of its
+      own for interrupts yet.
+
+      The next three steps follow three things hart 0 builds that decide where `sp` will go
+      later.
+    others: |
+      Harts 1 and 2 are also in `main`, on their own slices (`0x80009880`, `0x8000a880`),
+      spinning on `started` (line 35). They push nothing during the wait, so there's nothing
+      for their stacks to do yet.
+
+  - title: The kernel stacks exist before any process does
+    file: kernel/proc.c
+    lines: 29-44
+    focus: 37-43
+    state:
+      hart: 0
+      mode: S
+      proc: none
+      intr: off
+      satp: bare
+      locks: []
+      irq: 0
+      stack: [main, kvminit, kvmmake, proc_mapstacks]
+      sp: {"on": boot, detail: "a few frames below 0x80008870"}
+    note: |
+      [[kvminit]] → [[kvmmake]] → [[proc_mapstacks]] allocates **64 pages**, one per process
+      *slot*, and maps each at `KSTACK(i)` in the kernel page table it is building:
+
+      | Slot | Kernel stack (virtual) | Top (`p->kstack + PGSIZE`) |
+      |---|---|---|
+      | 0 | `0x3fffffd000` | `0x3fffffe000` |
+      | 1 | `0x3fffffb000` | `0x3fffffc000` |
+      | 2 | `0x3fffff9000` | `0x3fffffa000` |
+
+      `KSTACK(i)` is `TRAMPOLINE - (i+1) * 2 * 4096` ([[kernel/memlayout.h:52]]): the stacks
+      are two pages apart, and the page below each one is never mapped. That unmapped page is
+      the **guard page**: an overflow faults instead of corrupting the next stack.
+
+      These stacks are allocated once, at boot, and never freed. They belong to the slot, not
+      to a process. [[allocproc]] doesn't allocate a kernel stack; it finds one waiting.
+      ([[concept:stacks#kernel]])
+    others: |
+      Each [[kalloc]] call takes `kmem.lock` briefly and releases it before returning. Nobody else can be allocating yet (harts 1 and
+      2 are spinning), but the lock costs almost nothing and keeps `kalloc` correct for later,
+      when three harts call it at once.
+
+  - title: Paging turns on, and the boot stack survives it
+    file: kernel/vm.c
+    lines: 72-84
+    focus: 80-82
+    state:
+      hart: 0
+      mode: S
+      proc: none
+      intr: off
+      satp: kernel
+      locks: []
+      irq: 0
+      stack: [main, kvminithart]
+      sp: {"on": boot, detail: "below 0x80008870, same value before and after"}
+    note: |
+      [[kvminithart]] writes `satp = 0x8000000000087fff` (measured): Sv39, root page table at
+      physical `0x87fff000`. From the next instruction on, every address hart 0 uses,
+      including `sp` and the `pc`, goes through that table.
+
+      Why doesn't the stack vanish? Because [[kvmmake]] mapped all of the kernel's data and
+      free RAM at **the same virtual address as its physical address**
+      ([[kernel/vm.c:42]]), read-write. `stack0` lives at `0x80007890`, inside that range, so
+      `sp = 0x8000886x` means the same bytes before and after the switch. The kernel's own
+      code is mapped the same way, which is why the `pc` survives too.
+
+      This `csrw satp` is the only `satp` write outside the trampoline (apart from
+      `start`'s `w_satp(0)`), and it runs once per hart. The trampoline will do the rest.
+    others: |
+      Harts 1 and 2 will each run [[kvminithart]] themselves after `started` is set, loading the
+      same root. `satp` is per hart; the page table is shared and never modified after boot.
+
+  - title: allocproc forges a context that points at an empty stack
+    file: kernel/proc.c
+    lines: 124-150
+    focus: 143-147
+    state:
+      hart: 0
+      mode: S
+      proc: none
+      intr: off
+      satp: kernel
+      locks: ["init's p->lock"]
+      irq: {noff: 1, intena: 0, note: "boot runs with SIE off, so the `acquire` in `allocproc` recorded intena 0"}
+      stack: [main, userinit, allocproc]
+      sp: {"on": boot, detail: "main's frames, below 0x80008870"}
+    note: |
+      [[userinit]] calls [[allocproc]], which takes slot 0 for pid 1, `init`. Lines 145–147 are
+      the most important lines for this tour:
+
+      ```text
+      p->context.ra = forkret          (0x8000193a)
+      p->context.sp = p->kstack + 4096 (0x3fffffe000)
+      ```
+
+      Nothing has run on this process yet, so there is no real context to save. `allocproc`
+      writes one by hand. When a scheduler later switches to it, [[swtch]] will "return"
+      to [[forkret]] with `sp` at the **top** of slot 0's kernel stack: empty.
+
+      The process also gets a trapframe page from [[kalloc]], filled with the junk byte `0x05`.
+      gdb printed every field of `init`'s trapframe as `0x0505050505050505` at this point.
+      That will matter at the very end.
+
+      `allocproc` returns holding `init`'s `p->lock`; [[userinit]] marks it `RUNNABLE` and
+      releases it.
+
+  - title: main calls scheduler, and the boot stack changes its job
+    file: kernel/main.c
+    lines: 31-45
+    focus: 44
+    state:
+      hart: 0
+      mode: S
+      proc: none
+      intr: off
+      satp: kernel
+      locks: []
+      irq: 0
+      stack: [main, scheduler]
+      sp: {"on": scheduler, detail: "0x80008870 at scheduler's entry; 0x80008810 after its 96-byte frame"}
+    note: |
+      `main` calls [[scheduler]], which never returns. No instruction moved `sp` to a new
+      stack: gdb read `0x80008870` at `scheduler`'s first instruction, just below `main`'s
+      16-byte frame. Same memory, new **role**. From now on this slice is hart 0's
+      [[concept:stacks#scheduler|scheduler stack]].
+
+      ```text
+      hart 0's slice of stack0
+        0x80008890 ─ top
+        0x80008880   start's frame   (16 bytes, dead)
+        0x80008870   main's frame    (16 bytes, dead)
+        0x80008810   scheduler's frame (96 bytes, live forever)
+        0x80007890 ─ bottom
+      ```
+
+      This is why the scheduler stack isn't part of `struct cpu` and isn't allocated anywhere:
+      it is simply the stack the hart was already standing on. The frame is 96 bytes because
+      the prologue saves `ra` and `s0`–`s9`, the callee-saved registers in which the loop keeps
+      all its variables. The functions it calls (`acquire`, `release`, `swtch`) push their own
+      frames briefly below it.
+    others: |
+      Harts 1 and 2 reach this line too, after their own setup. gdb saw their schedulers start
+      at `0x80009870` and `0x8000a870`. Three harts, three scheduler stacks, each 4 KiB, all
+      in one array.
+
+  - title: Hart 0's scheduler picks init
+    file: kernel/proc.c
+    lines: 428-454
+    focus: 446-453
+    state:
+      hart: 0
+      mode: S
+      proc: none
+      intr: off
+      satp: kernel
+      locks: ["init's p->lock"]
+      irq: {noff: 1, intena: 0, note: "acquired right after `intr_off()` on line 442: intena 0"}
+      stack: [scheduler]
+      sp: {"on": scheduler, detail: "0x80008810"}
+    note: |
+      The loop opens the interrupt window (lines 441–442, the subject of [[tour:44]]), then
+      scans the table. Slot 0 is `RUNNABLE`. Under `init`'s `p->lock`, the scheduler marks it
+      `RUNNING`, sets `c->proc`, and calls `swtch(&c->context, &p->context)`.
+
+      In our run hart 0 got there first. That isn't guaranteed: hart 0 set `started` and walked
+      straight into `scheduler()`, while harts 1 and 2 still had to print "hart N starting" and
+      set up paging, so hart 0 has a head start, but only a head start.
+
+      The lock is held *across* the switch. It will be released on the other side, by code
+      running on a different stack ([[tour:13]]).
+    others: |
+      Hart 1's scheduler may reach slot 0 a moment later. It spins in [[acquire]] on `init`'s
+      `p->lock`, and when it gets the lock it sees `RUNNING`, not `RUNNABLE`, and moves on.
+      Without the lock both harts could pick `init` and run it on **the same kernel stack** at
+      once, two threads pushing frames into one page.
+
+  - title: swtch saves where the scheduler stands
+    file: kernel/swtch.S
+    lines: 8-24
+    focus: 10-23
+    state:
+      hart: 0
+      mode: S
+      proc: init (pid 1)
+      intr: off
+      satp: kernel
+      locks: ["init's p->lock"]
+      irq: {noff: 1, intena: 0}
+      stack: [scheduler, swtch]
+      sp: {"on": scheduler, detail: "0x80008810"}
+    note: |
+      Fourteen stores into `cpus[0].context`. gdb printed the result later, from `forkret`:
+
+      | Field | Value | What it is |
+      |---|---|---|
+      | `ra` | `0x80001df0` | the instruction after `jal swtch` in [[scheduler]] |
+      | `sp` | `0x80008810` | the scheduler's frame on hart 0's slice |
+      | `s0` | `0x80008870` | the frame pointer: the frame's top |
+      | `s1` | `0x8000fdd0` | `p`, the loop variable: `&proc[0]` |
+
+      This is all the scheduler needs to continue later: where to return, which stack, and
+      its callee-saved registers. `struct context` is a **save area**, not a stack
+      ([[concept:stacks#save-areas]]).
+
+      `swtch` is plain code: no CSR, no mode change, no page-table change. It is S-mode on
+      the kernel page table before, during and after.
+
+  - title: One load, and sp is on init's kernel stack
+    file: kernel/swtch.S
+    lines: 25-40
+    focus: 26
+    state:
+      hart: 0
+      mode: S
+      proc: init (pid 1)
+      intr: off
+      satp: kernel
+      locks: ["init's p->lock"]
+      irq: {noff: 1, intena: 0, note: "the scheduler's level, now carried by `init`'s thread along with the lock; gdb read noff 1, intena 0"}
+      stack: [forkret]
+      sp: {"on": kernel, switched: "`ld sp, 8(a1)` in [[swtch]] ([[kernel/swtch.S:26]])", detail: "0x3fffffe000, top of slot 0's kernel stack: empty"}
+    note: |
+      `ld sp, 8(a1)` loads the forged `p->context.sp`: **`0x3fffffe000`**. This is the third of
+      the four stack-switching instructions. The remaining loads fill `s0`–`s11` with zeros
+      (`allocproc` cleared the context), and `ret` jumps to `ra`, which is [[forkret]].
+
+      gdb at `forkret`'s first instruction:
+
+      | Register | Value |
+      |---|---|
+      | `sp` | `0x3fffffe000` |
+      | `ra` | `0x8000193a`: `forkret` itself, not a return address |
+      | `sstatus` | `SIE = 0`, `SPIE = 1` |
+      | `cpus[0].noff`, `intena` | 1, 0 |
+
+      `forkret` has no caller. Its stack is empty, and its `ra` points at itself. It can never
+      return; it must leave some other way, and it will, through the trampoline.
+
+  - title: forkret releases the lock; interrupts stay off
+    file: kernel/proc.c
+    lines: 510-537
+    focus: 520-528
+    state:
+      hart: 0
+      mode: S
+      proc: init (pid 1)
+      intr: off
+      satp: kernel
+      locks: []
+      irq: {noff: 0, note: "line 520's `release` took noff to 0, and with intena 0 `pop_off` left SIE off"}
+      stack: [forkret]
+      sp: {"on": kernel, detail: "0x3fffffdfd0 after forkret's 48-byte frame"}
+    note: |
+      Line 520 releases the `p->lock` that hart 0's scheduler took. `release` calls `pop_off`,
+      which turns interrupts on only if `intena` is 1. It is **0**: when the scheduler did
+      `acquire`, interrupts were already off (line 442). The lock and its `noff` level crossed
+      `swtch` together, and the release brings `noff` from 1 to 0 without touching SIE
+      ([[concept:locks#handoff]], [[concept:locks#intena]]). So interrupts stay off, and they will
+      stay off for the whole of `forkret` on this first run (gdb later read `SIE = 0` inside
+      `kexec` too).
+
+      Then the one-time work: [[fsinit]] reads the superblock and recovers the log, and
+      [[kexec]] loads `/init`. Both need the disk, and the disk means **sleeping**, which
+      needs a process with a kernel stack. That is why this happens here and not in `main`
+      ([[kernel/proc.c:525]]).
+    others: |
+      `first` is a plain static, read and written without a lock. Only the very first process
+      to reach `forkret` sees 1, and the first process is the only one that exists, so no
+      second hart can be here at the same time.
+
+  - title: init sleeps, and hart 0 goes back to its own stack
+    file: kernel/proc.c
+    lines: 558-572
+    focus: 566-569
+    state:
+      hart: 0
+      mode: S
+      proc: init (pid 1)
+      intr: off
+      satp: kernel
+      locks: ["block 1's buffer (sleep-lock)", "init's p->lock"]
+      irq: {noff: 1, intena: 0, note: "the buffer's sleep-lock isn't counted; SIE has been off since `forkret`, so `sleep`'s `acquire` recorded intena 0"}
+      stack: [forkret, fsinit, readsb, bread, virtio_disk_rw, sleep]
+      sp: {"on": kernel, detail: "0x3fffffdf00 at sched's entry: five frames on slot 0's stack"}
+    note: |
+      [[readsb]] → [[bread]] → [[virtio_disk_rw]] starts a read of block 1 and must wait. In
+      [[sleep]], `init` marks itself `SLEEPING` and calls [[sched]]. gdb at `sched`'s entry
+      read `sp = 0x3fffffdf00` on hart 0. Then `swtch` loads `cpus[0].context`, and hart 0's
+      `sp` goes back to **`0x80008810`**, its scheduler stack, exactly where step 12 left it.
+
+      Here the tour has to choose between the hart and the stack. Hart 0 now loops in its
+      scheduler. `init`'s kernel stack holds five frames (`readsb` is inlined into `fsinit`), six once
+      `sched` pushes its own, and waits. When the disk interrupt
+      wakes `init`, **whichever hart's scheduler finds it first** loads `init`'s saved `sp`
+      and continues on this stack.
+
+      In our run `init` went to sleep **19 times** before it reached user mode (disk reads in
+      `fsinit` and `kexec`), and resumed on harts 0, 1 and 2 in turn. Its final stretch ran on
+      **hart 1**. (In another run it was hart 2.) The stack is the thread; the hart is only
+      where it happens to run.
+    others: |
+      | Time | Hart 0 | Hart 1 | Hart 2 |
+      |---|---|---|---|
+      | t1 | `init` sleeps; `swtch` to scheduler | scheduler loop | scheduler loop |
+      | t2 | `release(init's p->lock)` in scheduler | | disk interrupt in the scheduler window: [[wakeup]] → `RUNNABLE` |
+      | t3 | | `acquire(init's p->lock)`, `RUNNING`, `swtch`: `sp` = `init`'s saved `sp` | |
+
+      `p->lock` is what makes the handover safe: hart 0 holds it from `SLEEPING` until it is
+      standing on its own stack again, so no other hart can load `init`'s `sp` while hart 0 is
+      still using that stack.
+
+  - title: kexec builds init's user stack
+    file: kernel/exec.c
+    lines: 86-138
+    focus: 89-97
+    state:
+      hart: 1
+      mode: S
+      proc: init (pid 1)
+      intr: off
+      satp: kernel
+      locks: []
+      irq: 0
+      stack: [forkret, kexec]
+      sp: {"on": kernel, detail: "0x3fffffddb0: kexec's frames on slot 0's stack, now on hart 1"}
+    note: |
+      [[kexec]] runs on `init`'s kernel stack (on hart 1, in our run) and builds a whole new
+      address space in a page table that isn't installed anywhere. After loading the program
+      (which ends below `0x2000`), it allocates two more pages and makes the lower one a guard
+      by clearing `PTE_U` ([[uvmclear]]). gdb at line 137:
+
+      | Variable | Value |
+      |---|---|
+      | `sz` | `0x4000` |
+      | guard page | `0x2000`–`0x2fff` (no `PTE_U`) |
+      | `stackbase` | `0x3000` |
+      | user `sp` | **`0x3fe0`** |
+      | `elf.entry` | **`0xbc`**, `start` in [[user/ulib.c]] |
+      | kernel `sp` | `0x3fffffddb0` |
+
+      `0x3fe0` holds the `argv` array: `argv[0] = 0x3ff0` (the string `"/init"`, 6 bytes
+      rounded to 16), `argv[1] = 0`. Lines 136–137 store `0xbc` and `0x3fe0` into the
+      trapframe. Nothing runs on this stack yet: it is a promise, written into memory that
+      only `init`'s new page table can reach.
+    others: |
+      Where is hart 0? In its scheduler, on `0x80008810`, perhaps running nothing. `kexec`
+      took and released the inode's sleep-lock and the log (`begin_op`/`end_op`) at lines
+      79–80; at line 137 `init` holds no lock at all.
+
+  - title: prepare_return, on whatever hart this is
+    file: kernel/trap.c
+    lines: 97-132
+    focus: 108-131
+    state:
+      hart: 1
+      mode: S
+      proc: init (pid 1)
+      intr: off
+      satp: kernel
+      locks: []
+      irq: 0
+      stack: [forkret, prepare_return]
+      sp: {"on": kernel, detail: "0x3fffffdfd0 in forkret; prepare_return's frame below it"}
+    note: |
+      Back in [[forkret]], [[prepare_return]] fills in what the trap hardware and the
+      trampoline will need ([[tour:43]] walks through it CSR by CSR). On hart 1 (the CSR rows
+      measured; the trapframe rows follow from lines 117 and 119 and the junk `kalloc` left):
+
+      | Register / field | before | after |
+      |---|---|---|
+      | `stvec` | `0x800055b0` | `0x3ffffff000` |
+      | `sepc` | `0x80001e10` | `0xbc` |
+      | `trapframe->kernel_sp` | `0x0505…` | `0x3fffffe000` |
+      | `trapframe->kernel_hartid` | `0x0505…` | `1` |
+
+      `sepc` held `0x80001e10` before: an address inside hart 1's *scheduler*, left by the
+      last interrupt hart 1 took there. CSRs belong to the hart, and they hold whatever that
+      hart did last.
+
+      `kernel_sp` is the top again, `0x3fffffe000`. The next time `init` traps, its kernel
+      stack will be empty, whatever is on it now.
+
+  - title: forkret jumps into the trampoline
+    file: kernel/proc.c
+    lines: 538-543
+    focus: 539-542
+    state:
+      hart: 1
+      mode: S
+      proc: init (pid 1)
+      intr: off
+      satp: kernel
+      locks: []
+      irq: 0
+      stack: [forkret]
+      sp: {"on": kernel, detail: "0x3fffffdfd0"}
+    note: |
+      A process returning from a trap gets to [[userret]] because [[usertrap]] *returns* there
+      (its `ra` was set by `jalr` in [[uservec]]). `forkret` has no such return address, so it
+      calls `userret` directly, through a function pointer:
+
+      | | value |
+      |---|---|
+      | `trampoline_userret` | `0x3ffffff09c` (`TRAMPOLINE` + `userret`'s offset `0x9c`) |
+      | argument `satp` (`a0`) | `0x8000000000087f52`: Sv39, `init`'s root at `0x87f52000` |
+
+      The jump lands on the trampoline's *high* address. The kernel page table maps it there
+      too ([[kernel/vm.c:47]]), which is what lets the very next instruction survive the
+      switch to `init`'s page table. We checked what happens if it doesn't: with line 47
+      removed, the first thing to fail is this jump. The fetch at `0x3ffffff09c` faults
+      (`scause = 12`), and the hart loops on faults at `stvec` forever (quiz, [[tour:41]]).
+
+  - title: The page table switches; sp points at nothing
+    file: kernel/trampoline.S
+    lines: 100-113
+    focus: 111-112
+    state:
+      hart: 1
+      mode: S
+      proc: init (pid 1)
+      intr: off
+      satp: user
+      locks: []
+      irq: 0
+      stack: [userret]
+      sp: {"on": none, detail: "still 0x3fffffdfd0, which init's page table does not map"}
+    note: |
+      | Register | before line 111 | after |
+      |---|---|---|
+      | `satp` | `0x8000000000087fff` | `0x8000000000087f52` |
+      | `sp` | `0x3fffffdfd0` | `0x3fffffdfd0` |
+
+      `sp` didn't change, but its meaning did. `init`'s page table has the trampoline and
+      the trapframe at the top, and the program from `0` to `0x4000`. Nothing at
+      `0x3fffffdfd0`. From here until `sret` hart 1 has no usable stack (for five instructions
+      this unmapped address, then, from line 118, the user's `sp`), and [[userret]] uses none.
+
+      The frames still sitting on slot 0's kernel stack (`forkret`'s, `prepare_return`'s) are
+      simply abandoned. Nobody pops them. The next trap reloads `sp` from `kernel_sp`, the top,
+      and writes over them.
+
+  - title: ld sp, and init has a stack of its own
+    file: kernel/trampoline.S
+    lines: 114-153
+    focus: 118-120
+    state:
+      hart: 1
+      mode: S
+      proc: init (pid 1)
+      intr: off
+      satp: user
+      locks: []
+      irq: 0
+      stack: [userret]
+      sp: {"on": none, switched: "`ld sp, 48(a0)` in [[userret]] ([[kernel/trampoline.S:118]]) loads the user's `sp`", detail: "0x3fe0, built by kexec; supervisor code cannot use it until `sret`"}
+    note: |
+      The fourth and last stack switch: `ld sp, 48(a0)` loads `trapframe->sp`, the value
+      `kexec` stored, **`0x3fe0`**. gdb at the `sret` (`0x3ffffff120`):
+
+      | Register | Value | From |
+      |---|---|---|
+      | `sp` | `0x3fe0` | [[kernel/exec.c:137]] |
+      | `a0` | `1` | `argc`, returned by `kexec` into `trapframe->a0` |
+      | `a1` | `0x3fe0` | `argv` ([[kernel/exec.c:124]]) |
+      | `tp` | `0x0505050505050505` | nobody: `kalloc`'s junk, restored faithfully |
+      | `sepc` | `0xbc` | |
+      | `sstatus` | `SPP=0 SPIE=1 SIE=0` | |
+
+      `sp` now points into `init`'s user stack, but the hart is still in supervisor mode,
+      which cannot use user pages, so until `sret` there is no usable stack and the code
+      pushes nothing. This is the mirror of [[uservec]]'s line 76: the address is loaded first,
+      and something else (there `csrw satp`, here `sret`) makes it usable.
+
+      Every user register except `sp`, `a0` and `a1` is junk on `init`'s first entry. That's
+      harmless: `start` and `main` set what they use. The `tp` junk is inherited by every
+      process `init` forks, which is why the user `tp` we see in [[tour:43]] has the same
+      value.
+
+  - title: sret, and the first user instruction
+    file: user/ulib.c
+    lines: 8-18
+    focus: 11-16
+    state:
+      hart: 1
+      mode: U
+      proc: init (pid 1)
+      intr: on
+      satp: user
+      locks: []
+      stack: [start]
+      sp: {"on": user, switched: "`sret` ([[kernel/trampoline.S:153]]) returned to user mode, making the user stack usable", detail: "0x3fe0 → 0x3fd0 after start's addi sp, sp, -16"}
+    note: |
+      `sret` sets the mode to U, `SIE` to 1, and the `pc` to `0xbc`, and leaves `sp` alone;
+      the change of mode is what makes the user stack usable.
+      gdb, one instruction after `sret`: `pc = 0xbc`, `priv = 0`, `sp = 0x3fe0`, and the
+      instruction there is `addi sp, sp, -16`. The first thing `init` does in user mode is
+      push a frame onto the stack `kexec` built for it.
+
+      Almost. In a second run, without single-stepping, the first event at `0xbc` was a
+      **timer interrupt**: `sepc = 0xbc`, `scause = 0x8000000000000005`. Interrupts had been
+      off on this thread for its entire trip through `forkret`, so the tick was already
+      pending. In user mode, supervisor interrupts are taken regardless of `SIE`, so it fired
+      before `0xbc` executed even once. `init` went straight back through [[uservec]] onto its
+      empty kernel stack, then on to [[yield]].
+
+      The figure above shows the whole journey, as `sp` saw it.
+    figure: t42-sp-journey
+    caption: |
+      `sp` on the way from power-on to `init`'s first instruction, in our run. Only these
+      instructions move `sp` to another stack: [[kernel/entry.S:17]],
+      [[kernel/swtch.S:26]] (onto `init`'s stack on hart 0, back to hart 0's scheduler stack
+      when `init` sleeps, and onto `init`'s stack again on hart 1), and
+      [[kernel/trampoline.S:118]], whose user stack becomes usable only at the `sret` on
+      [[kernel/trampoline.S:153]]. The thread changed harts at `sleep`; the stack did not.
+    others: |
+      Three stacks, three harts, one boot. Hart 0's slice of `stack0` served as the boot
+      stack and then the scheduler stack. `init`'s kernel stack (slot 0) was used by all three
+      harts in turn. `init`'s user stack has been used by one, so far. The one stack
+      switch this tour never ran, number 2 in the list, `ld sp, 8(a0)` in [[uservec]], runs on
+      `init`'s first trap, quite possibly on this very `0xbc`.
+locks:
+  - lock: "none (stack0)"
+    where: "[[_entry]]"
+    protects: "Each hart computes its own slice from its own `mhartid`, so the stacks never overlap, and no lock is needed"
+  - lock: "kmem.lock (spinlock)"
+    where: "[[kalloc]], from [[proc_mapstacks]] and [[allocproc]]"
+    protects: "The free-page list that the kernel stacks and trapframes come from"
+  - lock: "init's p->lock (spinlock)"
+    where: "[[allocproc]], the [[scheduler]] (released in [[forkret]]), [[sleep]] (released by the scheduler)"
+    protects: "`p->state`, and with it the rule that only one hart at a time runs on `init`'s kernel stack"
+  - lock: "block 1's buffer (sleep-lock)"
+    where: "[[bread]] in [[readsb]]"
+    protects: "The buffer being filled from disk while `init` sleeps"
+  - lock: "first (no lock)"
+    where: "[[forkret]]"
+    protects: "One-time file-system setup; only the first process can be there"
+quiz:
+  - q: "When `fork` creates a child, what does the child's kernel stack hold, and where does its `sp` point the first time a scheduler switches to it?"
+    a: "Nothing: [[allocproc]] gave the child the kernel stack of a free slot and a forged context with `ra = forkret` and `sp = p->kstack + PGSIZE`, the empty top. The child's *user* stack is a copy of the parent's (part of [[uvmcopy]]), and its trapframe is a copy too, except `a0 = 0`. So it leaves `forkret` through `userret` and returns from `fork` with 0, at the parent's user `sp`."
+  - q: "Why is `sp` still valid right after `kvminithart` writes `satp`, even though every address now goes through a page table?"
+    a: "The boot stack is in `stack0` at `0x80007890`, inside the range [[kvmmake]] maps one-to-one, virtual = physical, read-write ([[kernel/vm.c:42]]). So the same `sp` value names the same bytes before and after. The kernel's code is mapped the same way, which keeps the `pc` valid too."
+  - q: "Hart 1's scheduler stack overflows by 200 bytes. What gets damaged, and when would you notice?"
+    a: "The writes land at the top of hart 0's slice, just below `0x80008890`: the dead `start`/`main` frames and `scheduler`'s frame, which is never read again because `scheduler` never returns and keeps its variables in registers (saved in `cpus[0].context`, not on the stack). So most of the damage is harmless. The danger is the bottom 72 bytes (`0x800087c8`–`0x80008810`). If hart 0 is inside `acquire`, `release` or a `kernelvec` frame there at that moment, it reloads a corrupted register within microseconds and crashes. Nothing detects the overflow, so you'd see a rare, timing-dependent crash."
+  - q: "You want a debugging function that prints which stack the current code is on. How can it decide from `sp` alone, and why can't it also print the current privilege mode?"
+    a: "Compare `sp` with known ranges: inside `stack0` (`0x80007890`–`0x8000f890`) means boot or scheduler stack, and the slice gives the hart. Inside `KSTACK(i)`'s page means slot *i*'s kernel stack. A low address under a user `satp` means a user stack. The mode is harder, because no CSR reports the current mode. `sstatus.SPP` is the mode *before the last trap*. Code that is running at all in the kernel is in S-mode, so the question only makes sense for code that runs in several modes, and there the answer has to come from context."
+  - q: "On `init`'s first run, interrupts stay off through all of `forkret`, `fsinit` and `kexec`, even across 19 sleeps. Why, and what is the visible consequence?"
+    a: "The scheduler acquired `p->lock` with interrupts already off, so `intena` was 0, and `release` in `forkret` left them off. Each `sleep` resumes through `sched`, which restores that saved `intena` (0). Disk interrupts are taken by harts idling in their schedulers, so nothing breaks. The consequence: a timer tick goes pending and stays pending, and in our run it fired the instant `init` reached user mode, before its first instruction ran."
+  - q: "Why did `init`'s first user instruction run on hart 1 in our run, not hart 0, which did all the setup?"
+    a: "`init` slept inside `fsinit` and `kexec`. Each time it was woken, whichever hart's scheduler acquired its `p->lock` and found it `RUNNABLE` first switched to it, loading its saved `sp` and continuing on its kernel stack. The kernel stack, the trapframe and the context belong to the process; the hart is interchangeable. That is also why `prepare_return` records `kernel_hartid` fresh every time."

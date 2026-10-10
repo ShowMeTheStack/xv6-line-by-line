@@ -1,0 +1,501 @@
+summary: |
+  The disk driver. xv6's disk is a [[g:virtio]] block device that QEMU provides, backed by
+  the file `fs.img` on your computer. This file is the only code in xv6 that talks to it.
+
+  It has three entry points:
+
+  - [[virtio_disk_init]], called once from [[main]] at boot: resets the device, agrees on
+    features, and sets up the [[g:virtqueue]] (a descriptor table and two rings in shared
+    memory) that carries requests.
+  - [[virtio_disk_rw]], called by the [[g:buffer-cache]] ([[bread]] and [[bwrite]]): reads or
+    writes one 1024-byte [[g:block]]. It describes the request in three descriptors, puts it
+    on the available ring, rings the device's doorbell, and then **sleeps** until the
+    request is done.
+  - [[virtio_disk_intr]], called from [[devintr]] when the disk interrupts: finds finished
+    requests on the used ring and wakes the processes waiting for them.
+
+  The device copies data straight between the disk and the buffer's memory ([[g:dma]]), so
+  the CPU never copies the block itself. One spinlock, `vdisk_lock`, protects all of the
+  driver's state.
+
+  **Read before:** [[kernel/virtio.h]] (the register offsets and structures).
+  **Read next:** [[kernel/bio.c]], the only caller of [[virtio_disk_rw]].
+
+blocks:
+  - lines: 1-6
+    title: What this driver drives
+    note: |
+      The comment's QEMU command line is how the disk gets attached, and the real Makefile
+      ([[Makefile]]) says the same: `-drive file=fs.img,...,id=x0` names the disk image, and
+      `-device virtio-blk-device,drive=x0,bus=virtio-mmio-bus.0` makes it a virtio block
+      device on QEMU's first virtio MMIO slot, whose registers appear at [[VIRTIO0]]. The
+      Makefile also adds `-global virtio-mmio.force-legacy=false`, which the comment omits,
+      so that QEMU offers the version-2 interface this driver requires (line 69).
+
+  - lines: 8-17
+    title: Headers
+    note: |
+      Besides the usual kernel headers, the driver needs [[kernel/memlayout.h]] for the
+      device address [[VIRTIO0]], [[kernel/spinlock.h]] for its lock, [[kernel/buf.h]] (and
+      [[kernel/fs.h]] and [[kernel/sleeplock.h]], which `struct buf` depends on) for the
+      buffers it fills, and [[kernel/virtio.h]] for the device's definitions.
+
+  - lines: 19-20
+    title: Reaching a device register
+    note: |
+      `R(r)` turns a register offset from [[kernel/virtio.h]] into a pointer to that
+      register, so `*R(VIRTIO_MMIO_STATUS) = 0` is a store to address `0x10001070`. The
+      kernel page table maps [[VIRTIO0]] to itself ([[kernel/vm.c:33]]), so this address works
+      both before and after paging is on.
+
+      The pointer is `uint32 *` because every virtio MMIO register is 32 bits wide, and
+      [[g:volatile]] because each access is a conversation with the device ([[g:mmio]]):
+      the compiler must perform every read and write exactly as written, never cache a
+      value or merge two stores.
+
+  - lines: 22-59
+    title: The driver's state
+    note: |
+      All of the driver's state is in one `static` struct named [[disk]]. It holds:
+
+      - pointers to the three parts of the [[g:virtqueue]], which the device also reads or
+        writes (the descriptor table, the available ring, the used ring);
+      - the driver's own bookkeeping, which the device never sees: which descriptors are
+        free, how far the driver has read the used ring, which [[buf]] each in-flight request
+        belongs to;
+      - the request headers and status bytes, which the device does read and write, but
+        which live here in kernel memory instead of in the queue pages;
+      - `vdisk_lock`, a [[g:spinlock]] that protects every other field.
+
+      The source comments call the descriptors "a set (not a ring)": descriptors are taken
+      and returned in any order through `free[]`, unlike the two rings, which are filled in
+      order.
+
+  - lines: 61-64
+    title: "virtio_disk_init(): bring up the device"
+    note: |
+      Called once, on hart 0, from [[main]] ([[kernel/main.c:30]]), before interrupts are
+      enabled and before any process exists. It follows the "Device Initialization" steps
+      of the virtio 1.1 spec (section 3.1.1) and the MMIO-specific queue setup steps
+      (section 4.2.3.2): identify the device, reset it, announce the driver, negotiate
+      features, set up queue 0, and declare the driver ready.
+
+      `status` accumulates the status bits, because each write to the status register must
+      include the bits already set.
+
+  - lines: 68-72
+    title: Make sure a virtio disk is really there
+    note: |
+      Four identification registers must hold the expected values: the magic number
+      ("virt"), interface version 2 (the modern MMIO layout this driver programs), device
+      type 2 (block device) and QEMU's vendor ID. If anything differs, for example because
+      QEMU was started without the disk or with the legacy interface, continuing would mean
+      writing to registers that mean something else, so the kernel stops with [[panic]].
+
+  - lines: 74-83
+    title: Reset, then announce the driver
+    note: |
+      Writing 0 to the status register resets the device, so the driver starts from a known
+      state whatever happened before. Then the driver sets `ACKNOWLEDGE` ("I have seen
+      you") and `DRIVER` ("I know how to drive you"), each by writing the accumulated
+      `status` back. The spec requires this order.
+
+  - lines: 85-95
+    title: Agree on features
+    note: |
+      The device offers a set of optional features; the driver writes back the subset it
+      accepts. xv6 takes the offered bits and clears every feature listed in
+      [[kernel/virtio.h]] that would change how requests or rings work, so the device falls
+      back to the basic behavior the rest of this file assumes. Offered bits that xv6 does
+      not name (for example ones that only report the disk's geometry or block size) are
+      accepted unchanged; they do not change the request format.
+
+      Only the low 32 feature bits are read and written here (the feature-select registers
+      are never touched). In particular xv6 never accepts `VIRTIO_F_VERSION_1`, bit 32,
+      which the spec says a driver must accept when offered. QEMU accepts this: it checks the
+      feature set only when the driver has accepted VERSION_1, so FEATURES_OK stays set, and
+      its feature-select registers start at 0, which is why bits 0–31 are what xv6 sees.
+      (xv6 also skips the spec's rule to write the select registers first; that works on
+      QEMU but is not guaranteed by the spec.)
+
+  - lines: 97-104
+    title: Finish negotiation, and check the device agreed
+    note: |
+      Setting `FEATURES_OK` asks the device to accept the feature set just written. A device
+      that cannot work with that set leaves the bit clear, so the spec requires the driver
+      to read the status back and check. If the bit is missing, the driver cannot use the
+      device and panics.
+
+  - lines: 106-118
+    title: Select queue 0 and check it
+    note: |
+      A block device has one request queue, number 0, unless the multi-queue feature was
+      negotiated (it was refused above). Writing 0 to `QUEUE_SEL` makes the following queue
+      registers refer to it.
+
+      Two checks follow the spec's MMIO queue-setup steps: the queue must not already be
+      ready (it should not be, right after a reset), and its maximum size must be non-zero
+      (the queue exists) and at least [[NUM]], the 8 descriptors this driver will use.
+
+  - lines: 120-128
+    title: Allocate the three parts of the queue
+    note: |
+      Each part of the [[g:virtqueue]] gets its own 4096-byte [[g:page]] from [[kalloc]]:
+      the descriptor table (8 × 16 = 128 bytes), the available ring (22 bytes) and the used
+      ring (70 bytes in the spec's layout). A page is far more than needed, but it is the unit [[kalloc]] hands
+      out, and it satisfies the spec's alignment rules (16, 2 and 4 bytes respectively)
+      with room to spare.
+
+      The spec's queue-setup steps say to zero the queue memory; what matters here is that
+      both rings' `idx` fields start at 0, matching the driver's `used_idx` (also 0, since [[disk]] is in
+      [[g:bss|.bss]]).
+
+  - lines: 130-142
+    title: Tell the device where the queue is, and enable it
+    note: |
+      The device must know the queue's size and the **physical** addresses of its three
+      parts, because it will access them directly ([[g:dma]]). The pointers from [[kalloc]]
+      are kernel virtual addresses, but the kernel maps RAM at virtual addresses equal to
+      physical ones ([[g:direct-map]]), so the same numbers are the physical addresses.
+
+      Each address is 64 bits and the registers are 32 bits, so each is written as a low
+      half (the cast to `uint32` through the `volatile uint32 *` store keeps the low 32
+      bits) and a high half (`>> 32`). On QEMU's `virt` machine the high halves are 0, since
+      RAM is below 4 GiB, but writing them keeps the driver correct.
+
+      Writing 1 to `QUEUE_READY` tells the device the queue is fully described and may be
+      used.
+
+  - lines: 144-153
+    title: Mark all descriptors free, and go live
+    note: |
+      The driver's `free[]` array starts all 1s: every descriptor is available.
+
+      Setting `DRIVER_OK` is the last step of initialization. From now on the device
+      processes requests and raises interrupts. The interrupt path is set up elsewhere,
+      as the final comment says: [[plicinit]] gives the disk's interrupt
+      ([[VIRTIO0_IRQ]]) a non-zero priority ([[kernel/plic.c:16]]), [[plicinithart]] enables
+      it for each hart, and [[devintr]] calls [[virtio_disk_intr]] when it arrives
+      ([[kernel/trap.c:201]]).
+
+  - lines: 155-166
+    title: Take one free descriptor
+    note: |
+      A linear search of `free[]` for a descriptor that is not in use; it marks it used and
+      returns its index, or -1 if all [[NUM]] are taken. The caller must hold `vdisk_lock`,
+      otherwise two processes could pick the same descriptor.
+
+  - lines: 168-182
+    title: Return one descriptor
+    note: |
+      Clears the descriptor and marks it free. The two panics catch driver bugs: an index
+      out of range, and freeing a descriptor twice.
+
+      The [[wakeup]] call is the other half of the wait loop in [[virtio_disk_rw]] (lines
+      228–236): a process that found too few free descriptors sleeps on the channel
+      `&disk.free[0]` (an address used only as a name for "descriptors became free"), and
+      this wakes it to try again. See [[g:sleep-wakeup]].
+
+  - lines: 184-197
+    title: Return a whole chain
+    note: |
+      Walks a request's chain from its first descriptor, freeing each one, following `next`
+      while the `NEXT` flag is set. It reads `flags` and `next` into local variables *before*
+      calling [[free_desc]], because [[free_desc]] zeroes them.
+
+  - lines: 199-213
+    title: Take three descriptors, or none
+    note: |
+      Every request needs exactly three descriptors (header, data, status). This takes
+      them one at a time; if it runs out partway, it gives back the ones it already took and
+      reports failure. All-or-nothing matters: if a process kept one or two descriptors
+      while sleeping for the rest, two waiting processes could each hold some, and with
+      only 8 descriptors they could block each other forever.
+
+      The three need not be adjacent; the chain links them through `next`.
+
+  - lines: 215-220
+    title: "virtio_disk_rw(): one disk request, start to finish"
+    note: |
+      Reads (`write == 0`) or writes (`write == 1`) the [[g:block]] `b->blockno` between the
+      disk and `b->data`. It is called only from [[bread]] and [[bwrite]], whose caller holds
+      the buffer's [[g:sleeplock]], so no one else touches `b` meanwhile. It returns only
+      when the transfer is complete.
+
+      The function may sleep, so it must run in a process; this is why the file system is
+      first read from [[forkret]] and not from [[main]].
+
+      The disk counts in 512-byte sectors and xv6 blocks are 1024 bytes ([[BSIZE]]), so
+      block `n` starts at sector `2n`.
+
+  - lines: 222-236
+    title: Get three descriptors, waiting if necessary
+    note: |
+      With only [[NUM]] = 8 descriptors, at most two requests fit at once; a third process
+      must wait until a request finishes and [[free_desc]] calls [[wakeup]].
+
+      The wait follows the kernel's [[g:sleep-wakeup]] pattern in this xv6 version.
+      [[sleep_prepare]] registers the process as waiting on the channel `&disk.free[0]`
+      *while `vdisk_lock` is still held*. Only then is the lock released and [[sleep]]
+      called. If [[free_desc]] runs on another hart in between, its [[wakeup]] clears the
+      registration and [[sleep]] returns immediately, so the wakeup cannot be lost. The lock
+      must be released before sleeping, because the process that will free descriptors
+      needs it, and a spinlock must never be held while sleeping
+      ([[g:interrupts-and-locks]]).
+
+      After waking, the loop re-acquires the lock and tries again: another process may have
+      taken the descriptors first.
+
+  - lines: 238-248
+    title: Fill in the request header
+    note: |
+      The first buffer of the request is the 16-byte [[virtio_blk_req]] header: read or
+      write, and the starting sector. Headers live in [[disk]]`.ops`, one per descriptor,
+      and this request uses the one with the same index as its first descriptor, so no two
+      in-flight requests share a header.
+
+      The header is in kernel memory (the [[disk]] struct in [[g:bss|.bss]]), whose virtual
+      address equals its physical address, so the device can read it.
+
+  - lines: 250-253
+    title: "Descriptor 1: the header"
+    note: |
+      Points the first descriptor at the header. No `WRITE` flag, so the device only reads
+      it. The `NEXT` flag and `next` link it to the data descriptor.
+
+  - lines: 255-262
+    title: "Descriptor 2: the data"
+    note: |
+      Points the second descriptor at the buffer's 1024 bytes. The direction flag is the
+      subtle part: `VRING_DESC_F_WRITE` means "the device writes this buffer". So a disk
+      *read* sets it (the device writes the block into memory), and a disk *write* leaves it
+      clear (the device only reads memory). Line 261 then adds `NEXT` in both cases, linking
+      to the status descriptor.
+
+      `b->data` is the kernel address of the buffer inside [[bcache]], which is also its
+      physical address.
+
+  - lines: 264-268
+    title: "Descriptor 3: the status byte"
+    note: |
+      The last buffer is one byte that the device fills in when it finishes: 0 for success.
+      xv6 stores it in [[disk]]`.info[idx[0]].status` and presets it to `0xff`, a value the
+      device never writes as a result, so that [[virtio_disk_intr]] would notice if the
+      device reported completion without writing a status (it checks for exactly 0).
+
+      The descriptor has `WRITE` (the device writes it) and no `NEXT`: the chain ends here.
+
+  - lines: 270-272
+    title: Remember which buffer this request is for
+    note: |
+      When the interrupt arrives, [[virtio_disk_intr]] learns only the number of the first
+      descriptor of a finished chain. `info[idx[0]].b` maps that number back to the buffer.
+
+      `b->disk = 1` means "the device owns this buffer now". The interrupt handler sets it
+      back to 0 when the request completes, and the wait loop below sleeps until it does.
+      Both sides read and write it only while holding `vdisk_lock`.
+
+  - lines: 274-284
+    title: Publish the request and ring the doorbell
+    note: |
+      Three steps, in an order that matters, because the device (QEMU, running on other
+      host threads) may look at the shared memory at any moment:
+
+      1. Put the chain's first descriptor number in the next free slot of the available
+         ring.
+      2. Increment the ring's `idx`. This is what makes the entry visible as a new request:
+         the device processes slots up to `idx`.
+      3. Write the queue number (0) to the notify register, telling the device to look.
+
+      The [[io_fence]] calls compile to the RISC-V `fence iorw, iorw` instruction (shown as
+      plain `fence` in `kernel/kernel.asm`), which keeps every memory and device access
+      before it ordered before every one after it ([[g:memory-barrier]]). The first one
+      makes sure the device cannot see the new `idx` before it can see the ring entry and the
+      descriptors written above, which would make it process a half-built request. The
+      second makes sure the new `idx` is visible before the doorbell write reaches the
+      device. Its `"memory"` clobber also stops the compiler from moving memory accesses
+      across it.
+
+  - lines: 286-298
+    title: Sleep until the device is done, then clean up
+    note: |
+      The process sleeps on the channel `b` until [[virtio_disk_intr]] sets `b->disk = 0`
+      and calls `wakeup(b)`. The pattern is the same as on lines 228–236: register with
+      [[sleep_prepare]] while holding `vdisk_lock`, then release and [[sleep]], so the
+      interrupt's [[wakeup]] cannot slip in unnoticed. The interrupt handler needs
+      `vdisk_lock` too, which is one reason the lock must be released before sleeping.
+
+      The loop re-checks `b->disk` after waking because [[sleep]] can return before the
+      request is complete: for example, [[kkill]] makes a sleeping process runnable without
+      any [[wakeup]]. A killed process still waits here for its disk request to finish; it
+      only exits later, on its way back to user space.
+
+      Once it is, the process clears the `info` entry and frees the three descriptors.
+      [[free_chain]] calls [[wakeup]] on `&disk.free[0]`, which lets a process waiting for
+      descriptors try again.
+
+  - lines: 300-303
+    title: "virtio_disk_intr(): the device finished something"
+    note: |
+      Called by [[devintr]] ([[kernel/trap.c:201]]) when the [[g:plic|PLIC]] reports
+      interrupt [[VIRTIO0_IRQ]]. It may run on any hart that has the disk interrupt enabled,
+      not necessarily the one whose process submitted the request.
+
+      It takes `vdisk_lock` like everything else in the driver. No deadlock with
+      [[virtio_disk_rw]] on the same hart is possible: [[acquire]] turns interrupts off on
+      the hart that holds a spinlock, so the interrupt cannot arrive there while the lock is
+      held. See [[g:interrupts-and-locks]].
+
+  - lines: 305-313
+    title: Acknowledge the interrupt
+    note: |
+      Reading the interrupt-status register says why the device interrupted (bit 0: it
+      added entries to the used ring; bit 1: its configuration changed). Writing the same
+      bits back to the acknowledge register tells the device they have been handled, which
+      clears its interrupt request. `& 0x3` keeps only those two defined bits.
+
+      The source comment explains why acknowledging *before* looking at the ring is safe:
+      if the device adds another completion just after the acknowledge, either the loop
+      below sees it now or the device raises a new interrupt for it, and handling it early
+      only means the next interrupt finds nothing to do. Acknowledging *after* the loop
+      could lose a completion that arrived in between.
+
+      The [[io_fence]] keeps the acknowledge ordered before the reads of the used ring that
+      follow.
+
+  - lines: 315-333
+    title: Handle every finished request
+    note: |
+      `disk.used_idx` counts the used-ring entries the driver has handled;
+      `disk.used->idx` counts the entries the device has added. While they differ there
+      are completions to process, possibly more than one per interrupt, and possibly in a
+      different order from submission.
+
+      For each entry, the driver:
+
+      - takes the first descriptor number `id` of the finished chain;
+      - checks the status byte the device wrote; anything other than 0 means the disk
+        operation failed, which xv6 does not try to handle;
+      - looks up the buffer, sets `b->disk = 0` (the device no longer owns it) and wakes the
+        process sleeping on `b` in [[virtio_disk_rw]].
+
+      The descriptors are *not* freed here; the woken process frees them itself (line 295).
+
+      The [[io_fence]] at the top of each iteration orders the read of `used->idx` before
+      the reads of the ring entry and the status byte, so the driver does not read an entry
+      the device has not finished writing. Its `"memory"` clobber also forces the compiler
+      to reload `disk.used->idx` from memory on every loop test; the field is not declared
+      [[g:volatile]], so without it the compiler could keep a stale copy in a register.
+
+lines:
+  28: |
+    The descriptor table: [[NUM]] entries of [[virtq_desc]], in a page from [[kalloc]].
+  34: |
+    The available ring: where the driver posts requests for the device.
+  39: |
+    The used ring: where the device posts finished requests. Only the device writes it.
+  42: |
+    1 if descriptor `i` is free, 0 if it is part of a request. Only the driver uses it.
+  43: |
+    How many used-ring entries the driver has processed so far. It is compared with the
+    device's `used->idx`. The comment's `used[2..NUM]` is a leftover from an older version
+    and does not describe anything in this code; read it as "we've processed the used ring
+    up to here".
+  48-51: |
+    Per-request information, indexed by the first descriptor of the chain: the [[buf]]
+    being transferred and the status byte that the device writes when it finishes (the
+    third descriptor points at this `status` field).
+  55: |
+    One request header per descriptor index. Only entries whose index is the first
+    descriptor of a chain are used, but sizing it like this avoids any separate allocation.
+  57: |
+    The lock protecting all of [[disk]], held by [[virtio_disk_rw]] and
+    [[virtio_disk_intr]].
+  66: |
+    Initializes the spinlock. The name "virtio_disk" appears only in debugging output.
+  75: |
+    Reset the device by writing 0 to the status register.
+  86: |
+    Read the offered features (bits 0–31). The variable is `uint64`, but the register is 32
+    bits, so the upper half is always 0.
+  95: |
+    Tell the device which features the driver accepts. The store through a
+    `volatile uint32 *` keeps only the low 32 bits of `features`.
+  102: |
+    Re-read the status register, the only way to learn whether the device accepted the
+    features.
+  107: |
+    Select queue 0 for the queue registers that follow.
+  110: |
+    `QUEUE_READY` reads back as 1 if the queue is already live, which it must not be after a
+    reset.
+  114: |
+    The largest queue size the device supports for queue 0.
+  131: |
+    Tell the device the queue has [[NUM]] (8) entries.
+  134-135: |
+    Physical address of the descriptor table, low and high 32 bits.
+  136-137: |
+    Physical address of the available ring (the spec's "driver area").
+  138-139: |
+    Physical address of the used ring (the spec's "device area").
+  142: |
+    Queue 0 is ready for use.
+  150: |
+    `DRIVER_OK`: the device is live.
+  181: |
+    Wake any process in [[virtio_disk_rw]] waiting for free descriptors.
+  218: |
+    Convert the block number into a sector number: one 1024-byte block is two 512-byte
+    sectors.
+  220: |
+    Take the driver's lock. It also disables interrupts on this hart until it is released
+    (see [[acquire]]).
+  229: |
+    Try to take three descriptors; leave the loop on success.
+  232-235: |
+    Register on the channel `&disk.free[0]`, drop the lock, sleep until a descriptor is
+    freed (or return at once if that already happened), and retake the lock.
+  241: |
+    The header for this request: the [[disk]]`.ops` entry with the same index as the first
+    descriptor.
+  264: |
+    Preset the status byte to `0xff`; the device overwrites it with 0 on success.
+  271: |
+    Mark the buffer as owned by the device until the interrupt handler says otherwise.
+  275: |
+    Put the first descriptor's number in the next available-ring slot. `idx % NUM` turns
+    the ever-increasing counter into a slot number 0–7.
+  277: |
+    Make the descriptors and the ring entry visible before the index update below.
+  280: |
+    Publish the new entry. The comment means that `idx` itself is not reduced modulo
+    [[NUM]]: the spec defines it as a free-running 16-bit counter.
+  282: |
+    Make the index update visible before notifying the device.
+  284: |
+    Ring the doorbell. The value written is the queue number, 0.
+  287-292: |
+    Sleep on channel `b` until the interrupt handler marks the request done. The
+    [[sleep_prepare]] / release / [[sleep]] order prevents a lost wakeup.
+  294: |
+    Forget the buffer; the `info` slot is free for the next request that starts at this
+    descriptor.
+  295: |
+    Return the three descriptors to the free set (and wake anyone waiting for them).
+  311: |
+    Read which interrupt causes are pending and acknowledge exactly those.
+  318: |
+    Loop while the device has reported completions the driver has not yet handled.
+  320: |
+    The first descriptor of the next finished chain. `used_idx % NUM` is the slot.
+  322-323: |
+    Status 0 is success. Any other value is a disk error, which xv6 treats as fatal.
+  326: |
+    Give the buffer back to its owner: this is the condition [[virtio_disk_rw]] is
+    sleeping on.
+  327: |
+    Wake the process sleeping on channel `b`.
+  329: |
+    Mark this used-ring entry as handled. Like the device's `idx`, it is a 16-bit counter
+    that wraps at 65536, which is consistent because [[NUM]] divides 65536.

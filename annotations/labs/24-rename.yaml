@@ -1,0 +1,2027 @@
+published: true
+title: Atomic rename
+area: File system
+stars: 4
+branch: ext/24-rename
+prerequisites: {tours: [17, 18, 31, 32, 33, 34, 35, 51], concepts: [locks]}
+summary: |
+  xv6 has no way to rename a file. You can `ln old new` and then `rm old`, which is how
+  early Unix `mv` worked, but that is two system calls and two [[g:transaction|transactions]],
+  and it cannot move a directory at all. In this lab you add `rename(old, new)`: one system
+  call that moves a name within a directory or between directories, replaces an existing
+  file in the same step, and moves whole directories, all inside one transaction of the
+  [[g:write-ahead-log|log]].
+
+  Each piece of the job looks small: write one directory entry, clear another, fix a link
+  count. The questions come from doing them together. A crash between two steps must not
+  leave both names, or neither. Two directories must be locked at once, and the tree's
+  existing rule, parent before child, says nothing about two directories that are not
+  related: what order do you pick, and what does your choice do to the code that already
+  locks inodes? How do you notice that someone is moving a directory into its own subtree,
+  when xv6 keeps no parent pointers in memory? And does all of it fit in the ten blocks a
+  transaction may write?
+
+  The reference solution is six commits. It survived 30 random kills of QEMU in the middle
+  of renaming, with the file system consistent every time, and it never deadlocked on three
+  harts under a load that, with the race window widened, deadlocked both obvious
+  alternatives.
+learn:
+  - "Why one transaction is the unit of atomicity on disk, what it costs (the number of distinct blocks one rename can dirty), and how to check that against `MAXOPBLOCKS` by counting rather than guessing."
+  - "How to order locks that the existing order does not cover, and how to check a proposed order against every piece of code that already nests the same locks, including code you did not touch."
+  - "How to ask a question about the shape of the directory tree (is this directory above that one?) without breaking the lock order, and what has to stay frozen while you ask it."
+  - "Why work done without a lock must be checked again once the lock is held, and what the check has to compare."
+  - "What a directory carries besides its name: its `..` entry and the link it adds to its parent, and what breaks, sometimes much later, when one of them is wrong."
+  - "How a sleep-lock deadlock looks on a live machine: processes asleep holding each other's locks, idle harts, and a file system that soon stops for everyone."
+spec: |
+  **The system call.** `int rename(const char *old, const char *new)` gives the file or
+  directory named `old` the name `new` and returns 0, or returns -1 and changes nothing.
+
+  - `old` and `new` may be in the same directory or in different directories.
+  - If `new` exists and is not a directory, it is replaced: its directory entry now names
+    `old`'s inode and it loses one link, in the same transaction. If that was its last link
+    and nobody has it open, it is freed.
+  - If `old` and `new` are already names for the same inode (two [[g:hard-link|hard links]],
+    or the same name twice), `rename` does nothing and returns 0, as POSIX says.
+  - Moving a directory to another parent updates its `..` entry and both parents' link
+    counts.
+  - `rename` fails, changing nothing, if: `old` does not exist; either last path element is
+    `.` or `..`; `new` is an existing directory (simplification: POSIX allows replacing an
+    empty one); `old` is a directory and `new` exists; the move would put a directory inside
+    itself or below itself; the new parent has been removed, or a directory move would push
+    its link count past `NLINK_MAX`; the new parent has no room and no free block; or a
+    concurrent create, unlink or rename changed either name between the rename's first
+    look and the moment it holds the locks (it does not retry, even where POSIX would
+    succeed).
+  - "Changes nothing" has one exception inherited from base xv6: on a disk with exactly one
+    free block left, [[bmap]] can allocate a directory's indirect block and then fail on
+    the data block; the empty indirect block stays allocated. The disk stays consistent.
+  - The two names must be on the same device (xv6 has only one, so this never fails).
+
+  **Atomicity.** The whole rename is one transaction. After a crash and recovery, exactly
+  one of the two outcomes is on disk: the state before the rename or the state after it.
+
+  **What must not change.** Every existing system call behaves as before, and **`usertests
+  -q` prints `ALL TESTS PASSED` on 3 harts.**
+
+  **The programs.** `mv old new` calls `rename` once; if `new` is an existing directory it
+  moves `old` into it, as Unix `mv` does. `renametest` checks everything above:
+
+  ```text
+  $ renametest
+  renametest: same directory: OK
+  renametest: across directories: OK
+  renametest: replace a file: OK
+  renametest: move a directory: OK
+  renametest: refuse a cycle: OK
+  renametest: refusals: OK
+  renametest: concurrent: 1600 renames, 400 refused cycles in 110 ticks
+  renametest: concurrent: OK
+  renametest: ALL OK (crash consistency: see renametest crash)
+  ```
+
+  - **same directory**, **across directories**: the inode keeps its number, link count and
+    content; the old name is gone. Across directories is tried with the new parent below,
+    beside and above the old one.
+  - **replace a file**: the replaced file, still open, reports 0 links and is still
+    readable through its file descriptor; a rename between two hard links to one file
+    changes nothing.
+  - **move a directory**: its subtree moves along, its `..` names the new parent, and the
+    parents' link counts move by one.
+  - **refuse a cycle**, **refusals**: every refused rename returns -1 and changes nothing.
+  - **concurrent**: seven processes on three harts. Two rename files between `ct/a` and
+    `ct/b` in opposite directions (`ct/a/x ↔ ct/b/y`, `ct/b/z ↔ ct/a/w`), one between
+    `ct/a/s` and `ct/a` (`ct/a/s/q ↔ ct/a/q`), and one moves the directory `m` between
+    `ct/a` and `ct/b`, each time also trying to move `m`'s parent into `m` (which must
+    fail). Meanwhile one keeps trying to `unlink("ct/a/s")`, which must always fail because
+    `ct/a/s` is not empty, and two churn names (`t`, `u`) in `ct/a` and `ct/b`. The setup
+    is chosen to catch one tempting lock order (think question 3 says which). Afterwards
+    every name, `m`'s `..` and every link count is checked. A watchdog prints
+    `not finished after 60 seconds` if the workers hang.
+
+  **Crash consistency** cannot be checked from inside: `renametest crash` moves a file
+  `f` and a directory `d` between `cr/a` and `cr/b` until the machine dies, and
+  `renametest check`, after a reboot, checks that each has exactly one name, that `d`'s
+  `..` and both parents' link counts agree with where `d` is, and that `f` still holds its
+  content. A driver outside xv6 kills QEMU at a random moment; this lab's runs did it 30
+  times, and also ran an fsck-style checker on the disk image afterwards.
+think:
+  - title: Why does rename need the kernel at all?
+    q: |
+      Early Unix had no `rename`. `mv old new` was a user program that called `link(old,
+      new)` and then `unlink(old)`. In this tree you could write that `mv` today. What can
+      go wrong with it? Think about three things: what is on the disk if the machine dies
+      between the two calls, what another process sees between them, and what `mv` does
+      when `old` is a directory. Commit to an answer before reading the hints.
+    hints:
+      - "Read [[sys_link]] and [[sys_unlink]]. Where does each one begin and end its transaction? What does [[sys_link]] do with a directory ([[kernel/sysfile.c:139]])?"
+      - "A [[g:transaction]] is all or nothing ([[tour:31]], [[tour:32]]). Two system calls are two transactions: the log guarantees each of them, never the pair."
+      - "A rename has to be one transaction that removes one directory entry and adds another, so it has to live in the kernel, between one [[begin_op]] and one [[end_op]]."
+    answer: |
+      Three things go wrong.
+
+      - **A crash between the calls** leaves both names. The `link` transaction committed,
+        the `unlink` one never started. The file system is consistent (the inode has two
+        entries and `nlink` 2), but the rename has half happened, and a program that
+        expected exactly one of the names to exist can find both.
+      - **Another process sees the half-done state** even without a crash: between the two
+        calls both names exist. Worse, to replace an existing `new`, the user-space `mv`
+        must first `unlink(new)` (`link` refuses an existing name), and then there is a moment
+        with *no* file named `new` at all. A program that reopens a configuration file by
+        name can fail in that moment.
+      - **Directories cannot move at all.** [[sys_link]] refuses `T_DIR`
+        ([[kernel/sysfile.c:139]]): hard links to directories would turn the tree into a
+        graph. And even if it allowed them, the directory's `..` entry would still name the
+        old parent.
+
+      So `rename` is a system call whose whole body sits inside one transaction: one
+      [[begin_op]], every directory and inode change, one [[end_op]]. The log then
+      guarantees what no sequence of user-level calls can: after a crash, the disk shows
+      the state before the rename or the state after it. Inside the kernel the half-done
+      state is also invisible to other processes, as long as the right inode locks are held
+      while it exists.
+
+      Note what "inside one transaction" does *not* mean: it does not order the writes for
+      crash safety. All of a transaction's blocks reach their home locations only after the
+      commit record is on disk ([[kernel/log.c:207]]), so the order in which the rename
+      writes its blocks into the buffer cache does not matter for crashes. (It does matter
+      for *failures*, the next question.)
+    checks:
+      - id: lab24-01
+        level: 1
+        type: choice
+        q: |
+          A user-space `mv` does `link("a/f", "b/f")` and then `unlink("a/f")`. The machine
+          loses power after `link` returned and before `unlink` began. After the reboot and
+          log recovery, what is on the disk?
+        options:
+          - text: "Both a/f and b/f exist, naming the same inode, whose nlink is 2."
+            correct: true
+            why: |
+              The `link` transaction committed: a new entry and `nlink` 2. The `unlink`
+              transaction never began, so nothing undoes the first. The disk is consistent;
+              the rename is half done.
+          - text: "Only a/f exists, because recovery rolls back the incomplete rename."
+            why: |
+              You may have thought the log knows about the rename as a whole. It only knows
+              transactions, and here there were two. The first one is complete and stays.
+          - text: "Both names exist, but nlink is 1, so the file system is corrupt."
+            why: |
+              That is what a *kernel* rename split into two transactions without touching
+              `nlink` leaves behind (clinic 4). `link` raises `nlink` in the same
+              transaction that adds the entry, so here the count is right.
+          - text: "Neither name exists, because the inode was being moved."
+            why: |
+              You may be picturing the inode as moving. Nothing moves: entries name inodes,
+              and the first transaction only added a name.
+        explain: |
+          Each system call is its own transaction ([[sys_link]] and [[sys_unlink]] each call
+          [[begin_op]] and [[end_op]]). Recovery replays committed transactions and ignores
+          the rest ([[tour:32]]); it never combines two. A rename needs both changes in one
+          transaction, which only the kernel can arrange.
+      - id: lab24-02
+        level: 2
+        type: tf
+        q: |
+          True or false: a user-space `mv` built from `link` and `unlink` can move a
+          directory, as long as it also fixes the directory's `..` entry afterwards.
+        answer: false
+        why_tf: |
+          You may have assumed `link` works on any inode. In this kernel it refuses
+          directories outright, before any `..` question arises.
+        reasons:
+          - text: "sys_link refuses to link a directory (kernel/sysfile.c:139), so the first step already fails."
+            correct: true
+            why: Right. Directory hard links would let the tree become a graph with cycles.
+          - text: "A user program cannot write a directory's entries, so it cannot fix `..`."
+            why: |
+              True as far as it goes (user programs only read directories), but it is not
+              the first obstacle: `link` already fails.
+          - text: "It can; this is how mv worked on early Unix."
+            why: |
+              Early Unix `mv` used `link` and `unlink` for files. Moving directories needed
+              privileged tricks, and the race and crash windows are exactly why `rename`
+              became a system call.
+        explain: |
+          [[sys_link]] returns -1 for a `T_DIR` inode ([[kernel/sysfile.c:139]]). Moving a
+          directory needs the kernel: it must rewrite the directory's `..` entry and move a
+          link from one parent's count to the other's, all with the entry changes, in one
+          transaction.
+  - title: What has to change on disk, and in which order?
+    q: |
+      Start with the easy case: both names in one directory, `rename("a/x", "a/y")`. List
+      every on-disk change. Then: `a/y` already exists and is a file. What else changes, and
+      what if some process has `a/y` open? Which of your steps can fail after the
+      transaction has begun, and what must the order of your steps be so that a failure
+      leaves nothing changed? Finally, which inode locks do you need, and in what order?
+    hints:
+      - "Look at what [[dirlink]] ([[kernel/fs.c:620]]) and [[sys_unlink]] ([[kernel/sysfile.c:235]]-[[kernel/sysfile.c:246]]) do to a directory, and which of their calls can fail. And look at [[iput]] ([[kernel/fs.c:349]]): when does an inode really get freed?"
+      - "Within a transaction there is no undo: every change you have made will be committed. So arrange the steps so that only the first one can fail. A new entry may need a new block ([[bmap]] → [[balloc]]); clearing or rewriting an existing entry cannot run out of space."
+      - "Write the new name first: if it does not exist, add an entry (this is the step that can fail); if it exists, rewrite its entry's inode number in place and drop the replaced file's link count. Then clear the old entry. Lock the directory, then a child, as [[sys_unlink]] does."
+    answer: |
+      For a same-directory rename of a file, the inode itself does not change at all: one
+      name disappears and one appears, so its `nlink` stays the same. On disk:
+
+      1. **The new name.** If `y` does not exist, a new entry `y → x's inode` is written into
+         a free slot of `a`, which may need a new block for `a` if every slot is taken. If
+         `y` exists and is a file, its entry is rewritten in place to name `x`'s inode, and
+         the file that was `y` loses one link (`nlink--`, written back with [[iupdate]]).
+      2. **The old name.** The entry for `x` is cleared (inode number 0), as [[sys_unlink]]
+         does.
+      3. **A freed file, maybe.** If the old `y` had no other links and nobody had it open,
+         its last [[iput]] frees its blocks and its inode. That [[iput]] must come before
+         [[end_op]], so the freeing is part of the same transaction. If someone has it open,
+         `ref > 1`: it lives on with `nlink` 0 until the last `close`, whose [[iput]] frees it
+         in that process's own transaction, exactly as for an unlinked open file
+         ([[tour:33]]). After a crash before that close, [[ireclaim]] finds it at boot.
+
+      **The order.** Step 1 is the only step that can fail: [[dirlink]] may need a block,
+      and [[balloc]] may find none. Steps 2 and 3 only rewrite blocks that already exist. So
+      the reference does step 1 first, and gives up with nothing changed if it fails. Done
+      the other way round, a full disk would leave the file with no name at all, and its
+      blocks unreachable for good.
+
+      **Locks.** One directory lock covers both entries. The replaced file's lock is needed
+      to change its `nlink`; take it after the directory's, parent before child, the order
+      [[sys_unlink]] and [[create]] use ([[tour:18]]).
+
+      **Two more cases** to decide before writing code: `rename(x, x)`, or two names that are
+      hard links to the same inode, must do nothing and succeed (POSIX); naively you would
+      decrement the link count of the inode you are renaming. And replacing a directory, or
+      replacing a file *with* a directory, is refused in this lab.
+    checks:
+      - id: lab24-03
+        level: 2
+        type: order
+        q: |
+          Put the reference's steps for `rename("a/x", "a/y")`, where `a/y` exists and is a
+          file nobody has open, in the order they happen.
+        items:
+          - text: "begin_op"
+          - text: "lock a"
+          - text: "point the entry y at x's inode and decrement the old y's nlink"
+            why: "This is the step that might have failed if y had not existed (a new entry may need a block), so it goes first."
+          - text: "clear the entry x"
+            why: "Clearing an existing entry cannot fail, so it comes after the step that can."
+          - text: "unlock a"
+          - text: "iput the old y, which frees it"
+            why: "The free must happen inside the transaction, before end_op, or a crash could leave an inode with nlink 0 and blocks still allocated until the next boot's ireclaim."
+          - text: "end_op"
+        why_wrong: |
+          Think about which steps can fail (only the new name can) and which must be inside
+          the transaction (all of them, including the free in iput).
+        explain: |
+          Everything between [[begin_op]] and [[end_op]] commits together, so the order
+          inside does not matter for crashes. It matters for failures: the only fallible
+          step goes first, so a failure leaves nothing to undo. [[iput]] frees an inode with
+          `nlink` 0 and `ref` 1, and must run inside a transaction ([[kernel/fs.c:347]]).
+      - id: lab24-04
+        level: 2
+        type: choice
+        q: |
+          Process A has `a/y` open for reading. Process B runs `rename("a/x", "a/y")`. What
+          happens to the file that used to be `a/y`?
+        options:
+          - text: "Its nlink drops to 0, A keeps reading it, and it is freed when A closes it."
+            correct: true
+            why: |
+              `ref` is still 1 for A's open file after B's [[iput]], so nothing is freed yet.
+              A's final `close` drops the last reference, and that [[iput]] frees it.
+          - text: "rename fails, because a file that is open cannot be replaced."
+            why: |
+              You may be thinking of other operating systems. In Unix (and xv6) names and
+              open files are independent; [[sys_unlink]] works on open files too.
+          - text: "It is freed at once, and A's next read returns garbage."
+            why: |
+              That would happen if [[iput]] freed on `nlink == 0` alone. It also requires
+              `ref == 1` ([[kernel/fs.c:357]]).
+          - text: "It is freed at once, but A's reads still work because the data is cached."
+            why: |
+              Nothing is freed at once. Relying on the cache would be a bug: the blocks could
+              be reallocated and overwritten.
+        explain: |
+          This is the unlink-while-open behaviour of [[tour:33]]. `renametest replace a file`
+          checks it: through the old file descriptor, `fstat` reports `nlink` 0 and `read`
+          still returns the old content.
+      - id: lab24-05
+        level: 1
+        type: line
+        q: |
+          [[sys_unlink]] holds two inode locks at once when it removes a directory. Click the
+          line where it takes the second one.
+        code: kernel/sysfile.c:212-233
+        answer: 226
+        lines:
+          218: |
+            You may have picked the first lock. Line 218 locks the parent directory `dp`;
+            the child comes later.
+          224: |
+            You may have thought [[dirlookup]] locks what it finds. It returns the inode
+            referenced but unlocked ([[kernel/fs.c:610]]); line 226 locks it.
+        why_wrong: |
+          Look for the second [[ilock]]: the parent `dp` is locked first, the child `ip`
+          after it is found.
+        explain: |
+          Parent first (line 218), then child (line 226): the inode order for the whole file
+          system ([[tour:18]], rule 3). A rename within one directory follows it too: the
+          directory, then the file being replaced.
+  - title: Two directories, two locks. In what order?
+    q: |
+      Now `rename("a/x", "b/y")`: both `a` and `b` must be locked while the two entries
+      change, or another process could see neither name or both. Suppose every rename locks
+      the old parent, then the new parent. On another hart, at the same moment, someone runs
+      `rename("b/z", "a/w")`. What happens? The file system already has an order for inode
+      locks: what is it, and does it say anything about `a` and `b`? Propose a rule that
+      works for every pair of directories, and check it against the code that already
+      holds two inode locks. One more pair to check it against: `rename("a/s/q", "a/q")`
+      on one hart while [[sys_unlink]] tries to remove the directory `a/s` on another.
+    hints:
+      - "The existing rule is in [[tour:18]] (rule 3): [[sys_unlink]] and [[create]] lock the parent, then the child. Which pairs of directories does that rule order?"
+      - "A lock order has to be one order that every path agrees with. \"Higher in the tree first\" agrees with parent-before-child. It says nothing about two directories where neither is above the other, and it is only well defined if the tree cannot change while you use it."
+      - "Something must stop the tree from changing while you decide an order, and the order itself must agree with parent-before-child wherever the two directories are related. Then ask what is left for two unrelated directories, and who else could ever hold two of those."
+    answer: |
+      **The naive order deadlocks.** One rename locks `a` then `b`; the other locks `b` then
+      `a`:
+
+      | time | hart 0: `rename(a/x, b/y)` | hart 1: `rename(b/z, a/w)` |
+      |---|---|---|
+      | 1 | locks `a` | locks `b` |
+      | 2 | `ilock(b)`: sleeps, held by hart 1's process | `ilock(a)`: sleeps, held by hart 0's process |
+      | 3 | asleep forever | asleep forever |
+
+      Inode locks are [[g:sleeplock|sleep-locks]], so neither hart spins: both processes are
+      `SLEEPING` in [[acquiresleep]] and the harts go idle. Soon the whole file system stops:
+      both processes are inside a transaction, so no commit can happen, and every other
+      process blocks in [[begin_op]]. Clinic 1 shows exactly this, recorded with gdb (with a
+      delay loop added between the two locks: without it the window is a few instructions
+      wide and our runs did not hit it).
+
+      The naive order also breaks the existing rule. `rename("a/s/q", "a/q")` locks `a/s`
+      (old parent) then `a` (new parent): **child before parent**. [[sys_unlink]] of `a/s`
+      locks `a`, then `a/s` ([[kernel/sysfile.c:218]], [[kernel/sysfile.c:226]]). That pair
+      deadlocks too; clinic 1 caught it once.
+
+      **What the tree gives you.** "Lock the directory higher in the tree first" agrees with
+      every existing path: [[sys_unlink]] and [[create]] hold a parent and its child,
+      [[namex]] holds one directory at a time, [[sys_link]] never holds two
+      ([[kernel/sysfile.c:153]]). So for renames where one parent is above the other, lock
+      that one first. That leaves two problems.
+
+      1. *Unrelated directories*, like `a` and `b`: neither is above the other.
+      2. *The tree changes*: a rename on another hart can move `a` under `b` while you are
+         deciding.
+
+      **The reference's rule.** A global sleep-lock, `renamelock`, is taken by every rename
+      between two directories, after [[begin_op]] and before any inode lock, and held to
+      the end. Under it:
+
+      - The tree's shape is frozen: only a two-directory rename can change which directory
+        is above which ([[sys_unlink]] removes only empty directories, [[create]] adds only
+        new, empty ones, a rename within one directory does not change a `..`).
+      - If one parent is above the other, it is locked first: consistent with
+        parent-before-child.
+      - If they are unrelated, the old parent is locked first. That is safe because the only
+        code that ever holds two *unrelated* directories is a two-directory rename, and there
+        is only one of those at a time. A cycle in the waits-for graph would need someone
+        else holding `b` while waiting (directly or not) for `a`; every other path only waits
+        downwards, and nothing below `b` is `a` or above it.
+
+      This is what Linux does: renames between directories take a per-file-system mutex
+      (`s_vfs_rename_mutex`) and lock the ancestor first.
+
+      **Why not inode-number order?** It is the textbook answer for unrelated locks, and it
+      fails here. `ct/a/s` can have a lower inode number than its parent `ct/a` (create
+      `s` first, then move it under `a`; `renametest` does exactly that). Then
+      `rename("ct/a/s/q", "ct/a/q")` locks `s` then `a`, while [[sys_unlink]] of `ct/a/s`
+      locks `a` then `s`. A rule for renames must agree with the order the rest of the file
+      system already uses, and inode numbers know nothing about the tree. Clinic 2 records
+      this deadlock.
+
+      **Why a sleep-lock, and why after [[begin_op]]?** It is held across disk reads (directory
+      lookups, the walk of the next question), so it cannot be a spinlock. It is taken after
+      [[begin_op]] because only [[nameiparent]] tells the rename whether two directories are
+      involved, and [[nameiparent]] must run inside a transaction (its [[iput]] may free an
+      inode). That position is safe: nobody holding an inode lock ever waits for
+      `renamelock`, and its holder never waits for log space or a commit before releasing
+      it. (Taking it before [[begin_op]] in every rename would also be deadlock-free; a
+      variant that did that passed `renametest`, `usertests -q` and two runs of
+      `renametest concurrent 1000`.) The price of the reference's order: a rename waiting
+      for `renamelock` already holds a log reservation. The log admits at most three
+      operations at once (30 log blocks, 10 reserved each), so two renames queued on the
+      lock can occupy two of the three slots while other file-system calls wait in
+      [[begin_op]].
+    checks:
+      - id: lab24-06
+        level: 2
+        type: choice
+        q: |
+          With the naive order (old parent, then new parent), `rename(ct/a/x, ct/b/y)` and
+          `rename(ct/b/z, ct/a/w)` deadlock on two harts. What does gdb show when attached a
+          minute later?
+        options:
+          - text: "Both processes SLEEPING in acquiresleep, each holding one directory's sleep-lock; all three harts idle; other file-system processes asleep in begin_op."
+            correct: true
+            why: |
+              Sleep-locks put waiters to sleep, so the harts have nothing to run. The two
+              processes are inside their transactions, so the log can never commit and every
+              later [[begin_op]] waits.
+          - text: "Two harts spinning in acquire at 100% CPU, the third running other processes."
+            why: |
+              That is a spinlock deadlock. Inode locks are sleep-locks: [[acquiresleep]]
+              calls `sleep()` while the lock is taken, and a sleeping process uses no hart.
+          - text: "panic: sched locks"
+            why: |
+              You may have thought sleeping while holding a lock is forbidden. It is for
+              spinlocks; sleep-locks are held across sleeps all the time
+              ([[concept:locks#sleep-locks]]).
+          - text: "Both renames fail with -1 after a timeout."
+            why: |
+              Nothing in xv6 times out a lock. A deadlock lasts forever.
+        explain: |
+          Clinic 1 has the recorded dump. Notice the second-order effect: because the two
+          processes are inside transactions, [[end_op]] never runs for them, the outstanding
+          count never reaches 0, and [[begin_op]] blocks everybody else. A sleep-lock
+          deadlock in the file system freezes the file system, not the CPUs.
+      - id: lab24-07
+        level: 3
+        type: choice
+        q: |
+          A classmate proposes: "lock the two parents in inode-number order, lower first,
+          with the global rename lock as well". Which existing operation can deadlock with
+          such a rename?
+        options:
+          - text: "unlink of a directory, which locks the parent and then the child, when the child has the lower inode number."
+            correct: true
+            why: |
+              Inode numbers are not related to tree position. A rename between `a/s` and `a`
+              would lock `s` first; unlink of `a/s` locks `a` first.
+          - text: "None: the global rename lock serializes everything that holds two directories."
+            why: |
+              It serializes renames only. [[sys_unlink]] and [[create]] hold two inodes
+              without it.
+          - text: "Another rename between the same two directories."
+            why: |
+              Two renames cannot both hold directories: they are serialized by the global
+              lock, and both would use the same numeric order anyway.
+          - text: "Path lookup, which locks each directory on the path in turn."
+            why: |
+              [[namex]] holds one directory at a time: it unlocks each before locking the
+              next ([[kernel/fs.c:720]]).
+        explain: |
+          A new lock order has to be consistent with every place that already nests the same
+          locks. Inode locks are already ordered by the tree (parent before child), so
+          "higher in the tree first" is the only rule that cannot contradict it.
+      - id: lab24-08
+        level: 1
+        type: tf
+        q: |
+          True or false: while two processes are deadlocked on two inode sleep-locks, the
+          harts they ran on are spinning at full speed.
+        answer: false
+        why_tf: |
+          You may be thinking of spinlocks. A process that cannot get a sleep-lock calls
+          `sleep()` and gives up its hart.
+        reasons:
+          - text: "acquiresleep sleeps while the lock is held, so the harts run other processes or wait for interrupts in the scheduler."
+            correct: true
+            why: Right. gdb shows every hart `[halted]` in the scheduler's idle loop.
+          - text: "Interrupts are off while a sleep-lock is held, so the harts stop."
+            why: |
+              Holding a sleep-lock leaves interrupts on (noff is 0); only its inner
+              spinlock, held for a few instructions, turns them off.
+          - text: "The harts run the deadlock detector."
+            why: "xv6 has none."
+        explain: |
+          See [[acquiresleep]]: `sleep_prepare`, release the inner spinlock, `sleep()`. In
+          clinic 1's dump all three harts are `halted`, the scheduler's idle state.
+  - title: Which directory is above which?
+    q: |
+      Your rule needs one fact: is `b` above `a` in the tree (or the other way round)? xv6
+      keeps no parent pointers in memory. How do you find out, which locks may you hold while
+      you do, and why is the answer still true a moment later when you use it? And since the
+      answer must be known *before* the parents are locked: what about the lookups of `x`
+      and `y` themselves, which also need a directory lock?
+    hints:
+      - "Every directory has a `..` entry ([[kernel/sysfile.c:302]]), and [[namex]] follows `..` like any other name, holding one directory lock at a time ([[kernel/fs.c:702]]-[[kernel/fs.c:720]])."
+      - "Locking an ancestor while holding one of its descendants is the reverse of parent-before-child. So whatever walks up the tree may hold no other inode lock; and only a two-directory rename changes which directory is inside which."
+      - "The question has to be answered before the parents are locked, with as little held as possible. Anything you learned while not holding a lock may be stale once you do hold it."
+    answer: |
+      **Walk up.** Starting from `b`, read its `..` entry, then that directory's `..`, and so
+      on, until you reach `a` (so `a` is above `b`) or the root (it is not). The reference's
+      `isancestor(a, b)` does that. It locks each directory only while reading its `..`, like
+      [[namex]]. It must not run while the rename holds the parents' locks: walking up from
+      `b` while holding `b` locks `b`'s parent while holding `b`, child before parent, and
+      [[sys_unlink]] of `b` (parent, then `b`) would deadlock with it.
+
+      **Why the answer stays true.** The walk's result describes the tree at the moment of
+      the walk. It is still true when the parents are locked only because `renamelock` is
+      held the whole time: no other two-directory rename can move a directory, and nothing
+      else changes the chain of `..` entries above a live directory. (A directory with
+      `nlink` 0 has been removed; the walk stops there, and the rename fails later, at its
+      checks under the locks.)
+
+      **The names, again.** The walk happens before the parents are locked, and the cycle
+      check of the next question needs to know which inode `x` is. So the reference looks
+      up both names first, each with only its directory locked for a moment, decides
+      everything about the tree, and only then locks the parents. Between the lookup and
+      the lock, another process may have changed a name: `unlink(a/x)`, or `create(b/y)`.
+      So, with the parents locked, it looks both names up again and compares the results
+      with what it decided on (`samename`). If either name now leads somewhere else, the
+      rename returns -1.
+
+      The comparison is by in-memory inode pointer, and that is safe: the rename holds a
+      reference to each inode it looked up, so neither can be freed and its inode number
+      reused in the meantime ([[iput]] frees only at `ref` 1).
+
+      Also note what the lookup does *not* do: it never holds `a` while locking `x`. To learn
+      `x`'s type it locks `x` alone, for a moment (`itype`): an inode's type never changes
+      while someone holds a reference to it. So the rename never holds two *files* at once,
+      which matters because hard links can make the same two files siblings in two
+      directories, in opposite roles. It does hold one parent and then a child of the other
+      parent (`dp2`, then the moved directory, in a later step), and those can be siblings
+      with no tree order between them: that, too, is safe only because `renamelock` keeps
+      every other two-directory rename out.
+    checks:
+      - id: lab24-09
+        level: 2
+        type: tf
+        q: |
+          True or false: it would be fine to walk up through `..` while holding the locks of
+          both parents, since the walk only reads directories.
+        answer: false
+        why_tf: |
+          You may have thought read-only code cannot deadlock. Reading a directory requires
+          its lock, and taking that lock is what can deadlock.
+        reasons:
+          - text: "Walking up locks an ancestor while holding its descendant, the reverse of the parent-before-child order that unlink and create use."
+            correct: true
+            why: Right. With [[sys_unlink]] holding the ancestor and waiting for the descendant, both would sleep forever.
+          - text: "dirlookup would panic on a locked directory."
+            why: |
+              [[dirlookup]] requires the directory to be locked by the caller; nothing
+              panics.
+          - text: "The walk would return a wrong answer because the parents are locked."
+            why: |
+              The answer would be right, if the walk ever finished. The problem is that it
+              may not.
+        explain: |
+          Lock order is about acquiring, not about what you do once you hold the lock. The
+          reference walks with only `renamelock` and one directory at a time held, then
+          locks the parents.
+      - id: lab24-10
+        level: 3
+        type: choice
+        q: |
+          After locking both parents, the reference looks up `old` and `new` again and gives
+          up if either now names a different inode than in its first lookup. Which
+          interleaving is this check for?
+        options:
+          - text: "Another process unlinked or replaced one of the names (or created new) after the first lookup, while neither parent was locked."
+            correct: true
+            why: |
+              The first lookups held each directory only briefly. Same-directory renames,
+              unlinks and creates do not take the global rename lock.
+          - text: "Another two-directory rename moved one of the parents."
+            why: |
+              That cannot happen: the global rename lock is held from before the first
+              lookup to the end.
+          - text: "The inode was freed and its number reused for a new file with the same name."
+            why: |
+              The rename holds a reference to the inode it looked up, so it cannot be freed;
+              its number cannot be reused while that reference exists.
+          - text: "None; it is only a sanity check."
+            why: |
+              It is the only thing that makes unlocked lookups safe to act on.
+        explain: |
+          Anything decided without a lock must be re-checked under the lock, and the check
+          must compare the thing the decision was about: here, which inode each name leads
+          to.
+  - title: Moving a directory into itself
+    q: |
+      `mv a a/c/b`: the directory `a` would become an entry inside its own subdirectory.
+      Suppose nothing stops it. Work out what the tree looks like afterwards: what can `ls`
+      reach, what are the link counts of `a` and `a/c`, and can xv6 ever reclaim those
+      inodes? Then: how do you detect such a move, and what about `mv a a/b`, where the
+      new parent *is* `a`?
+    hints:
+      - "You already have a way to ask whether one directory is above another."
+      - "The move is bad exactly when the directory being moved is the new parent, or above it. Think about which inode locks a rename would try to take in the `mv a a/b` case if nothing refused it."
+      - "It is a question about the tree, so it belongs with the other tree questions, before any parent is locked."
+    answer: |
+      Unchecked, `mv a a/c/b` does exactly what it is told. The entry `b → a` goes into
+      `a/c`, the root's entry `a` is cleared, and `a`'s `..` is pointed at `a/c`. Now `a`
+      and `a/c` form a loop that nothing outside reaches: `ls` shows no `a`, and `ls a/c/b`
+      fails, because the path starts at the root. Their link counts stay positive: `a` is
+      named by the entry `b` in `a/c` and by `a/c`'s `..` (`nlink` 2), and `a/c` by its
+      entry in `a` and by `a`'s new `..` (`nlink` 2). Neither can ever reach 0, since no path
+      leads to them to unlink anything, and [[ireclaim]] at boot only looks at `nlink == 0`.
+      The inodes and their blocks are lost for good. Clinic 3 shows it: an fsck-style
+      checker reports three unreachable inodes with positive link counts.
+
+      `mv a a/b` is worse in a different way: the new parent *is* `a`, so the rename locks
+      the root, then `a` as the new parent, and then `a` again to rewrite its `..`. A
+      sleep-lock has no owner check in [[acquiresleep]]: the process sleeps waiting for
+      itself, forever (clinic 3 again).
+
+      **Detection** is the walk from the previous question: refuse if `isancestor(ip, dp2)`,
+      that is, if the moved directory is the new parent or above it. That covers both
+      cases. It needs `renamelock` for the same reason as before: two renames each passing
+      the check on their own, `rename(a, b/a2)` and `rename(b, a/b2)`, would together make
+      the loop. Under the lock, the second one sees the first one's result.
+
+      Files cannot form cycles, so the check runs only for directories, and only when the
+      parents differ (within one directory a directory keeps its parent).
+    checks:
+      - id: lab24-11
+        level: 2
+        type: choice
+        q: |
+          A kernel without the cycle check runs `mkdir a; mkdir a/c; echo hi > a/c/f; mv a
+          a/c/b`. What does an fsck-style check of the disk report afterwards?
+        options:
+          - text: "a, a/c and a/c/f are allocated, have positive link counts, and are not reachable from /."
+            correct: true
+            why: |
+              The loop keeps every link count above 0, and no path from the root leads into
+              it. They are leaked for good.
+          - text: "Nothing: the disk is consistent, a has just moved."
+            why: |
+              Every entry and every count is internally consistent, which is what makes it
+              nasty, but a checker that walks from the root finds three inodes it cannot
+              reach.
+          - text: "a's link count is 0, so ireclaim frees it at the next boot."
+            why: |
+              You may have expected the moved directory to lose its link. It gains one in
+              `a/c` (the entry `b`) and keeps one from `c`'s `..`.
+          - text: "The kernel panics during the rename."
+            why: |
+              Nothing panics. (The shallower `mv a a/b` does go wrong in a different way: it
+              hangs, sleeping on its own lock.) This deeper move completes and returns 0.
+        explain: |
+          Clinic 3 has the recorded run and the checker's output. [[ireclaim]] only frees
+          inodes with `nlink` 0, so nothing in xv6 recovers these.
+  - title: What else moves with a directory?
+    q: |
+      `mv a/d b/d`, where `d` is a directory. Its entry moves, as for a file. What else on
+      disk names `a` because of `d`, and must now name `b`? How do the link counts of `a`
+      and `b` change, and why? What limit applies to `b`? Finally, suppose you forget one of
+      these: which later operations go wrong, and is one of them a check you wrote yourself?
+    hints:
+      - "Look at what [[create]] does for a new directory ([[kernel/sysfile.c:300]]-[[kernel/sysfile.c:313]]) and what [[sys_unlink]] undoes ([[kernel/sysfile.c:238]]-[[kernel/sysfile.c:241]])."
+      - "A directory's `nlink` counts its entry in its parent plus one for each subdirectory's `..`. And the upward walk you wrote reads `..` entries."
+      - "Three things change besides the entries, and one of them has an upper limit. All of them belong in the same transaction, under locks taken in an order you can justify."
+    answer: |
+      `d`'s `..` entry names `a`, and that entry is also one of `a`'s links: in xv6, a
+      directory's `nlink` is 1 (its entry in its parent) plus one for each subdirectory,
+      whose `..` names it ([[create]] does `dp->nlink++` for that reason). So a directory
+      move does three more things than a file move:
+
+      - rewrite `d`'s `..` to name `b`;
+      - `a->nlink--`, `b->nlink++`, both written back with [[iupdate]];
+      - refuse first if `b->nlink` is already `NLINK_MAX` (the same guard as
+        [[kernel/sysfile.c:274]]).
+
+      Rewriting `..` needs `d`'s lock, taken after both parents. That is safe: anyone holding
+      `d` waits only for `d`'s descendants, and by the cycle check neither parent is below
+      `d`. `d` and `b` are often unrelated (in `rename("a/d", "a/e/d")` the rename holds `a/e`
+      and then locks its sibling `a/d`); that is safe only because `renamelock` keeps every
+      other two-directory rename out. The moved directory's own `nlink` does not change.
+
+      **Forgetting `..`** is the instructive bug (clinic 5). At first everything looks fine:
+      `ls b/d` works. But:
+
+      - `cd b/d; cd ..` lands in `a`.
+      - The link was moved but the `..` was not: `a`'s `nlink` no longer counts `d`'s `..`,
+        which still names it. When `a` is empty it can be removed, and `d`'s `..` then names
+        a freed inode. The next lookup of `b/d/..` panics with `ilock: no type`.
+      - **Your own cycle check breaks.** It walks `..` entries. With `d`'s `..` still naming
+        `a`, the walk from inside `b/d` goes to `a` and never meets `b`, so `mv b b/d/x` is
+        allowed, and `b` disappears into a loop. In the clinic run, `renametest` reports
+        `refuse a cycle: FAIL` for exactly this reason.
+
+      All of it is in the same transaction as the entry changes, so a crash cannot separate
+      the new entry from the new `..` or the counts.
+    checks:
+      - id: lab24-12
+        level: 2
+        type: match
+        q: |
+          `rename("a/d", "b/d")` where `d` is a directory with no subdirectories. Match each
+          inode to what happens to its `nlink`.
+        pairs:
+          - left: "a"
+            right: "decreases by 1"
+            why: "d's `..` no longer names a."
+          - left: "b"
+            right: "increases by 1"
+            why: "d's `..` now names b."
+          - left: "d"
+            right: "does not change"
+            why: "d loses one entry (in a) and gains one (in b); its own `..`s are its subdirectories'."
+        explain: |
+          A directory's link count is its entry in its parent plus its subdirectories' `..`
+          entries. `renametest move a directory` checks all three numbers.
+      - id: lab24-13
+        level: 3
+        type: tf
+        q: |
+          True or false: if a rename forgets to rewrite a moved directory's `..` (but fixes
+          the link counts), the only symptom is that `cd ..` from inside it goes to the wrong
+          place.
+        answer: false
+        why_tf: |
+          You may have thought `..` is only used by `cd`. The kernel itself reads it: path
+          lookup, and the rename's own cycle check.
+        reasons:
+          - text: "The cycle check walks `..` entries, so it can be fooled into allowing a move that creates a loop; and the old parent can be removed while `..` still names it."
+            correct: true
+            why: "Right. Clinic 5 shows both, ending in `panic: ilock: no type`."
+          - text: "It is harmless, because fsck would repair it at the next boot."
+            why: "xv6 has no fsck; only ireclaim, which looks at nlink 0 only."
+          - text: "The kernel panics with rename: .. at once."
+            why: |
+              That panic is a sanity check in the reference, inside the code that rewrites
+              `..`. Forget the rewrite and you have probably forgotten the check too.
+        explain: |
+          A redundant structure (`..` duplicates information that the parent's entry already
+          holds) must be kept consistent everywhere, because some code will trust it.
+  - title: Does one rename fit in one transaction?
+    q: |
+      A transaction may write at most `MAXOPBLOCKS` distinct blocks ([[kernel/param.h:9]]).
+      Count them for the most expensive rename you can construct: moving a directory from one
+      parent to another. Which blocks get written? Can the new parent grow? Can the count
+      ever exceed 10? Count, don't guess.
+    hints:
+      - "Read how [[begin_op]] reserves space ([[kernel/log.c:138]]) and how [[log_write]] counts blocks ([[kernel/log.c:234]]-[[kernel/log.c:238]]): a block written twice in one transaction is logged once."
+      - "Follow every write: an entry write is [[writei]], which may call [[bmap]] → [[balloc]] (the bitmap block, and the new block itself through `bzero`) and always ends with [[iupdate]] of the directory ([[kernel/fs.c:576]]). Inodes live 16 to a block. The whole bitmap of this 2000-block disk is one block."
+      - "Worst case for a directory move: the new parent's entry needs a new data block and, beyond 12 blocks, the indirect block too; plus the bitmap, the old parent's data block, the moved directory's first block (for `..`), and the inode blocks of the three directories, if they are all different."
+    answer: |
+      The blocks a directory move can dirty, each logged once however often it is written:
+
+      | block | when |
+      |---|---|
+      | the new parent's data block that receives the entry | always: a block with a free slot, or a new block if every slot is in use |
+      | the new parent's indirect block | only if the new block lies beyond the 12 direct blocks (allocated first if it is the 13th) |
+      | the bitmap block | only if a block was allocated (one bitmap block covers all 2000 blocks) |
+      | the old parent's data block | always: the cleared entry |
+      | the moved directory's first data block | always: its `..` entry |
+      | the new parent's inode block | always: [[writei]] rewrites the inode, and `nlink + 1` |
+      | the old parent's inode block | always: [[writei]] and `nlink - 1` |
+      | the moved directory's inode block | always: [[writei]] rewrites it after the `..` change |
+
+      At most 8, and fewer when blocks coincide: the three inode blocks are distinct only if
+      the three inode numbers fall in three different groups of 16. A counting copy of the
+      kernel printed the logged blocks for each rename at its [[end_op]]:
+
+      | rename | blocks logged |
+      |---|---|
+      | a file, within one directory | 2 |
+      | a file, to another directory | 3 |
+      | replacing a 3-block file in another directory | 5 |
+      | a directory, to another parent | 5 |
+      | a directory, into a parent whose last block is full | 5 |
+      | a directory, into a parent with 12 full blocks, three inodes in three inode blocks | **8** |
+
+      The last line is the worst case: new data block, indirect block, bitmap, three inode
+      blocks, the old parent's block and the moved directory's block. 8 ≤ 10: it fits, and
+      [[begin_op]]'s reservation of 10 per operation is never exceeded. A file replacement
+      can dirty at most 6 (two directories' data and inode blocks, the replaced file's inode
+      block, the bitmap block for its freed blocks; the replaced file's indirect block is
+      only read).
+
+      Two things make the count small: absorption (the three directories' inodes often
+      share an inode block, which is why ordinary moves cost 3 to 5), and the fact that the
+      replaced file's blocks are freed by clearing bits in one bitmap block, not by writing
+      the blocks themselves.
+    checks:
+      - id: lab24-14
+        level: 2
+        type: number
+        q: |
+          On the counting kernel, what is the largest number of distinct blocks one rename
+          logged (a directory moved into a parent that needed its indirect block, with the
+          three directories' inodes in three different inode blocks)?
+        answer: 8
+        wrong:
+          10: |
+            You may have assumed the worst case is exactly `MAXOPBLOCKS`. That constant is a
+            budget, not a measurement; the rename stays below it.
+          9: |
+            You may have counted the new parent's last, full block as well as the new block.
+            [[dirlink]] only reads the full block while it searches for a free slot; the
+            entry is written into the new block. And the bitmap is one block for both
+            allocations.
+          6: |
+            That is the worst case for replacing a file, which never allocates a block in
+            the new parent.
+        why_wrong: |
+          Count: new data block, indirect block, bitmap block, three inode blocks, the old
+          parent's data block and the moved directory's data block.
+        explain: |
+          Log absorption ([[kernel/log.c:234]]-[[kernel/log.c:238]]) makes repeated writes
+          to one block free. The measured worst case is 8 of the 10 that [[begin_op]]
+          reserves per operation ([[kernel/log.c:138]]).
+      - id: lab24-15
+        level: 2
+        type: multi
+        q: |
+          The counting kernel logged 3 blocks for `rename("m/g", "m/a/g")`, a file moving
+          from `m` to `m/a`, where the inodes of `m` and `m/a` are in the same inode block.
+          Which blocks were they?
+        options:
+          - text: "m's data block (the cleared entry)"
+            correct: true
+            why: "The old entry is set to inode 0."
+          - text: "m/a's data block (the new entry)"
+            correct: true
+            why: "The new entry is written into a free slot of an existing block."
+          - text: "the inode block holding m and m/a"
+            correct: true
+            why: "Each writei to a directory ends with iupdate of that directory."
+          - text: "g's data block"
+            why: |
+              You may have thought the file moves. Its data never changes; only names do.
+          - text: "the bitmap block"
+            why: |
+              Nothing was allocated (m/a had a free slot) and nothing was freed.
+        explain: |
+          The logged block numbers were 1160, 34 and 1157: `m/a`'s data block, the inode
+          block (inodes 16 to 31), and `m`'s data block. `g`'s own inode is in block 34 too,
+          but rename never writes it: its `nlink` does not change.
+build: |
+  **Start.**
+
+  ```text
+  git checkout -b my-rename 06aad25
+  ```
+
+  Add the test program first: copy the spec's checks into `user/renametest.c`, add
+  `$U/_renametest\` and `$U/_mv\` to `UPROGS` in the `Makefile`. It will not compile until
+  `rename` exists, which is milestone 1.
+
+  **Milestones, in an order that keeps the system bootable after each one.**
+
+  1. **The plumbing.** `SYS_rename` in [[kernel/syscall.h]], the table entry in
+     [[kernel/syscall.c]], `entry("rename")` in [[user/usys.pl]], the prototype in
+     [[user/user.h]], and a `sys_rename` in `sysfile.c` that fetches both strings with
+     [[argstr]] and returns -1. Test: `usertests -q`; `renametest` prints `FAIL` lines.
+  2. **One directory.** Same parent only (return -1 otherwise). Lock the directory, look up
+     both names, handle the "same inode" case, write the new name first, then clear the old
+     one. A small helper that rewrites one existing entry in place (by offset) serves both
+     the replace case and, later, `..`. Test: `renametest`'s first test, `usertests -q`.
+  3. **Two directories, files only.** The global sleep-lock (initialize it at boot, after
+     [[iinit]]), the upward walk, lookups before locking, the parent order, the re-check
+     under the locks. Refuse directories across parents for now. Test: `renametest`'s first
+     three tests and `concurrent`, then `usertests -q`.
+  4. **Directories.** The cycle check, `..`, the two link counts. Test: all of
+     `renametest`, then `usertests -q`, then `renametest` again.
+  5. **Crash consistency.** Run `renametest crash`, then kill QEMU from another terminal on
+     the host: `pkill -KILL -f qemu-system-riscv64` works on Linux, macOS and WSL alike.
+     Boot the same `fs.img` again (`make qemu` does not rebuild it when nothing changed) and
+     run `renametest check`. Repeat with random delays; a small `python3` script using only
+     the standard library (`subprocess`, `random`, `time`) can start QEMU, type the command,
+     sleep a random time and call `Popen.kill()`, on any of the three.
+
+  **Debugging advice.**
+
+  - **A hang** in `concurrent`: the watchdog prints `not finished after 60 seconds`. Attach
+    gdb to the running QEMU and dump the process table (`state`, `chan`) and every inode
+    whose `lock.locked` is set, with `lock.pid`. A process sleeping on an inode lock's
+    address holds another lock that someone else wants: you have a cycle, and the dump
+    names it. The kernel stack of a sleeping process can be walked from `p->context.s0`
+    with the frame pointers (`*(fp-8)` is the return address, `*(fp-16)` the caller's
+    `fp`).
+  - **Rare deadlocks** need volume: `renametest concurrent 1000` runs only the concurrent
+    part, 1000 rounds. Several QEMUs in parallel help more than one long run.
+  - **Crashes at a chosen moment**: start QEMU halted (`make qemu-gdb`), `break sys_rename`,
+    `continue`, then a breakpoint in [[commit]] before or after [[write_head]]
+    ([[kernel/log.c:207]]), and gdb's `kill` ends QEMU on the spot.
+  - **Checking a disk image**: an fsck-style script on the host (walk from inode 1,
+    compare link counts with the entries found, check `..`, compare the bitmap with the
+    blocks in use) finds what `ls` cannot: unreachable loops and wrong counts. Written in
+    `python3` with only the standard library (`struct` to decode `fs.img`), it runs the
+    same on Linux, macOS and WSL.
+  - `panic: rename: ..` (the reference's sanity check) means a directory's `..` did not
+    name its old parent when you went to rewrite it: an earlier bug left it wrong.
+clinic:
+  - bug: The naive order, old parent then new parent
+    change: |
+      No global lock and no tree order: lock the parent of `old`, then the parent of `new`
+      (everything else as in the reference). The recorded runs also had a delay loop between
+      the two locks, an experiment to make the race likely (see why):
+
+      ```diff
+         twodirs = (dp1 != dp2);
+      -  if (twodirs)
+      -    acquiresleep(&renamelock);
+      ...
+      -  if (twodirs && isancestor(dp2, dp1)) {
+      +  ilock(dp1);
+      +  for (volatile int w_ = 0; w_ < 1000000; w_++) // widen the window
+      +    ;
+      +  if (twodirs)
+           ilock(dp2);
+      -    ilock(dp1);
+      -  } else {
+      -    ilock(dp1);
+      -    if (twodirs)
+      -      ilock(dp2);
+      -  }
+      ...
+       out:
+      -  if (twodirs)
+      -    releasesleep(&renamelock);
+      ```
+    symptom: |
+      $ renametest concurrent 1000
+      renametest: concurrent: not finished after 300 seconds
+
+      # gdb, attached to the running QEMU:
+      [...]
+      === harts ===
+        Id   Target Id                    Frame 
+      * 1    Thread 1.1 (CPU#0 [halted ]) s_sstatus (x=2) at kernel/riscv.h:67
+        2    Thread 1.2 (CPU#1 [halted ]) s_sstatus (x=2) at kernel/riscv.h:67
+        3    Thread 1.3 (CPU#2 [halted ]) s_sstatus (x=2) at kernel/riscv.h:67
+      === processes ===
+      proc[0] pid 1 init state 2 chan 0x80010e00
+      proc[1] pid 2 sh state 2 chan 0x80010f68
+      proc[2] pid 3 renametest state 2 chan 0x800110d0
+      proc[3] pid 4 renametest state 2 chan 0x800209a0
+      proc[4] pid 5 renametest state 2 chan 0x8001f0b8
+      proc[5] pid 6 renametest state 2 chan 0x8001f140
+      proc[6] pid 7 renametest state 2 chan 0x800209a0
+      proc[7] pid 8 renametest state 2 chan 0x800209a0
+      proc[8] pid 9 renametest state 2 chan 0x800209a0
+      proc[9] pid 10 renametest state 2 chan 0x800209a0
+      proc[10] pid 11 renametest state 2 chan 0x800209a0
+      === held sleep-locks ===
+      renamelock: locked 0 pid 0 at 0x80021aa0
+      inode 28 (type 1): lock at 0x8001f0b8 held by pid 6
+      inode 29 (type 1): lock at 0x8001f140 held by pid 5
+      === kernel stacks of sleeping renametest processes (frame-pointer walk) ===
+      [...]
+      pid 5:
+      sleep + 32 in section .text
+      acquiresleep + 44 in section .text
+      ilock + 26 in section .text
+      sys_rename + 322 in section .text
+      syscall + 58 in section .text
+      usertrap + 166 in section .text
+      No symbol matches $ra.
+      pid 6:
+      sleep + 32 in section .text
+      acquiresleep + 44 in section .text
+      ilock + 26 in section .text
+      sys_rename + 322 in section .text
+      syscall + 58 in section .text
+      usertrap + 166 in section .text
+      No symbol matches $ra.
+      pid 7:
+      sleep + 32 in section .text
+      begin_op + 100 in section .text
+      sys_rename + 54 in section .text
+      [...]
+      pid 9:
+      sleep + 32 in section .text
+      begin_op + 100 in section .text
+      sys_open + 46 in section .text
+      [...]
+    why: |
+      Read the dump as a waits-for graph. `renametest concurrent` creates `ct`, `ct/s`, `ct/a`
+      and `ct/b` in that order, so `ct/a` is inode 28 and `ct/b` inode 29; their locks are at
+      `0x8001f0b8` and `0x8001f140`. The workers are pids 5 to 11 (pid 4 is the watchdog).
+      pid 5 moves `x` between `ct/a` and `ct/b`: it holds `ct/b` and sleeps on `ct/a`'s lock,
+      so it was in `rename("ct/b/y", "ct/a/x")`, old parent first. pid 6 moves `z` the other
+      way: it holds `ct/a` and sleeps on `ct/b`'s lock, in `rename("ct/a/w", "ct/b/z")`.
+      `sys_rename + 322` returns to the second `ilock` (line 390 of this copy). Each holds
+      what the other wants: the deadlock of think question 3, exactly.
+
+      Everything else follows from it:
+
+      - **The harts are idle**, not spinning. Inode locks are sleep-locks, so both waiters
+        are `SLEEPING` (state 2) and the scheduler has nothing to run: each hart is
+        `halted` at the instruction after `wfi` in [[scheduler]] (the inlined `intr_on` that
+        gdb shows as `s_sstatus`).
+      - **The file system stops.** pids 5 and 6 are inside their transactions and will
+        never call [[end_op]], so the log can never commit. Every other worker sleeps in
+        [[begin_op]] on `0x800209a0`, which is `&log`: pids 7 and 8 (the `ct/a/s` renamer and
+        the directory mover) in `sys_rename`, pids 9 to 11 (the unlinker and the two
+        churners, in their `exists("ct/stop")` checks, which open a file) in `sys_open`. So
+        does pid 4, the watchdog: it printed its message and then called `exit`, which needs
+        a transaction to drop its working directory. Any new command that touches the file
+        system would join them.
+      - **Nothing panics, nothing prints** except the watchdog's line.
+
+      **How often.** Without the delay loop, this kernel passed all 4 runs of `renametest
+      concurrent 1000`: the window is the few instructions between the two `ilock` calls.
+      With the delay loop after the first lock, 4 of 6 runs deadlocked: twice the two file
+      movers (this dump), twice a file mover against the directory mover. The reference
+      kernel with the same delay loop finished both of its `concurrent 1000` runs. (With a
+      simpler test that had no directory mover or churners, the unwidened naive kernel
+      deadlocked once in 11 runs, between the `ct/a/s` renamer and the unlinker: the
+      child-before-parent case.)
+
+      The lesson of lab 11's clinic 1 again: a lock order that is wrong can pass a test
+      many times. You find this bug by reasoning about the order, and you confirm it by
+      making the window wide.
+  - bug: Inode-number order instead of the tree
+    change: |
+      The global lock stays; the parents are locked lower inode number first. As in clinic
+      1, the recorded runs had a delay loop between the two locks:
+
+      ```diff
+      -  if (twodirs && isancestor(dp2, dp1)) {
+      +  if (twodirs && dp2->inum < dp1->inum) {
+           ilock(dp2);
+      +  for (volatile int w_ = 0; w_ < 1000000; w_++) // widen the window
+      +    ;
+           ilock(dp1);
+         } else {
+           ilock(dp1);
+      +  for (volatile int w_ = 0; w_ < 1000000; w_++) // widen the window
+      +    ;
+           if (twodirs)
+             ilock(dp2);
+      ```
+    symptom: |
+      $ renametest concurrent 1000
+      renametest: concurrent: not finished after 300 seconds
+
+      # gdb, attached to the running QEMU:
+      [...]
+      === harts ===
+        Id   Target Id                    Frame 
+      * 1    Thread 1.1 (CPU#0 [halted ]) s_sstatus (x=2) at kernel/riscv.h:67
+        2    Thread 1.2 (CPU#1 [halted ]) s_sstatus (x=2) at kernel/riscv.h:67
+        3    Thread 1.3 (CPU#2 [halted ]) s_sstatus (x=2) at kernel/riscv.h:67
+      === processes ===
+      proc[0] pid 1 init state 2 chan 0x80010e00
+      proc[1] pid 2 sh state 2 chan 0x80010f68
+      proc[2] pid 3 renametest state 2 chan 0x800110d0
+      proc[3] pid 4 renametest state 2 chan 0x800209a0
+      proc[4] pid 5 renametest state 2 chan 0x800209a0
+      proc[5] pid 6 renametest state 2 chan 0x800209a0
+      proc[6] pid 7 renametest state 2 chan 0x8001f0b8
+      proc[7] pid 8 renametest state 2 chan 0x800209a0
+      proc[8] pid 9 renametest state 2 chan 0x8001f030
+      proc[9] pid 10 renametest state 2 chan 0x800209a0
+      proc[10] pid 11 renametest state 2 chan 0x800209a0
+      === held sleep-locks ===
+      renamelock: locked 1 pid 7 at 0x80021aa0
+      inode 27 (type 1): lock at 0x8001f030 held by pid 7
+      inode 28 (type 1): lock at 0x8001f0b8 held by pid 9
+      === kernel stacks of sleeping renametest processes (frame-pointer walk) ===
+      [...]
+      pid 7:
+      sleep + 32 in section .text
+      acquiresleep + 44 in section .text
+      ilock + 26 in section .text
+      sys_rename + 906 in section .text
+      syscall + 58 in section .text
+      usertrap + 166 in section .text
+      No symbol matches $ra.
+      [...]
+      pid 9:
+      sleep + 32 in section .text
+      acquiresleep + 44 in section .text
+      ilock + 26 in section .text
+      sys_unlink + 120 in section .text
+      syscall + 58 in section .text
+      usertrap + 166 in section .text
+      No symbol matches $ra.
+      [...]
+    why: |
+      This time the deadlock is not between two renames: it cannot be, `renamelock` is
+      held (by pid 7) and serializes them. It is between a rename and **unlink**, code the
+      lab never touched.
+
+      `renametest` creates `ct/s` before `ct/a` and then moves it to `ct/a/s`, so in this run
+      `ct/a/s` is inode 27 and its parent `ct/a` is inode 28. pid 7, the worker that moves
+      `q` between `ct/a/s` and `ct/a`, locked 27 first (the lower number), then waits for 28
+      (`sys_rename + 906` returns to the second `ilock`, line 392 of this copy). pid 9, the
+      unlinker, runs [[sys_unlink]] on `ct/a/s`: it locked the parent `ct/a` (28) at
+      [[kernel/sysfile.c:218]] and waits for the child at [[kernel/sysfile.c:226]]
+      (`sys_unlink + 120`). Child before parent against parent before child. Everyone else
+      waits in [[begin_op]] (`0x800209a0` is `&log`), as in clinic 1.
+
+      Inode numbers say when an inode was allocated, not where it sits in the tree, and any
+      rename can make a child older than its parent. The rule that cannot contradict the
+      file system's existing order is the tree itself.
+
+      **How often.** With the delay loop, 2 of 4 runs of `renametest concurrent 1000`
+      deadlocked like this, and neither of 2 runs of the full `renametest`. Without it,
+      all 4 runs of `concurrent 1000` passed. The reference with the same delay loop never
+      deadlocked.
+  - bug: No cycle check
+    change: |
+      The test that refuses to move a directory into its own subtree is missing:
+
+      ```diff
+      -  if (twodirs && type1 == T_DIR && isancestor(ip, dp2))
+      -    goto out;
+      ```
+    symptom: |
+      $ mkdir a
+      $ mkdir a/c
+      $ echo hi > a/c/f
+      $ ls a/c
+      .              1 27 48
+      ..             1 26 48
+      f              2 28 3
+      $ mv a a/c/b
+      $ ls a
+      ls: cannot open a
+      $ ls a/c/b
+      ls: cannot open a/c/b
+      $ mkdir a
+      $ ls a
+      .              1 29 32
+      ..             1 1 1024
+      $
+
+      # the disk image afterwards, checked on the host:
+      fsck: inode 26 (type 1, nlink 2) is not reachable from /
+      fsck: inode 27 (type 1, nlink 2) is not reachable from /
+      fsck: inode 28 (type 2, nlink 1) is not reachable from /
+      fsck: 29 inodes in use, 26 reachable, 1071 data blocks; 3 problems
+
+      # another boot: mkdir a, then mv a a/b; the shell never returns. gdb:
+      proc[2] pid 4 mv state 2 chan 0x8001f030
+      === held sleep-locks ===
+      renamelock: locked 1 pid 4 at 0x80021aa0
+      inode 1 (type 1): lock at 0x8001ef20 held by pid 4
+      inode 26 (type 1): lock at 0x8001f030 held by pid 4
+      pid 4:
+      sleep + 32 in section .text
+      acquiresleep + 44 in section .text
+      ilock + 26 in section .text
+      sys_rename + 588 in section .text
+    why: |
+      **`mv a a/c/b`** completes and returns 0. `a` (inode 26) is now the entry `b` inside
+      `a/c` (inode 27), and its `..` names `a/c`; the root lost its entry `a`. Nothing on a
+      path from `/` leads into the pair any more: `ls a` and `ls a/c/b` fail, and a new
+      `mkdir a` gets a fresh inode (29).
+
+      The link counts explain why the loss is permanent. `a` has `nlink` 2: one for the
+      entry `b` in `a/c` (the rename moved it there from the root) and one for `a/c`'s
+      `..`. `a/c` has `nlink` 2: its entry in `a`, plus `a`'s `..`, which the rename
+      pointed at it (and added to its count). The file `f` keeps 1. No count can ever reach
+      0, because no path reaches them to unlink anything, and [[ireclaim]] only collects
+      inodes with `nlink` 0. The checker (a script on the host that walks the image from
+      inode 1) finds three allocated, unreachable inodes; their blocks are lost too.
+      Nothing in xv6 notices.
+
+      **`mv a a/b`** never returns. The new parent `dp2` is `a` itself and `ip` is `a`.
+      The rename locks the root (`dp1`, inode 1) and `a` (`dp2`, inode 26), then reaches the
+      code that rewrites the moved directory's `..` and calls `ilock(ip)`: `a` again.
+      [[acquiresleep]] finds the lock taken and sleeps; the holder is pid 4 itself (gdb:
+      the lock at `0x8001f030` is held by pid 4, which sleeps on that same address). All
+      three harts are idle: gdb shows each one `halted` just after the `wfi` in
+      [[scheduler]]'s idle loop.
+      `sys_rename + 588` returns into that `ilock(ip)` (line 417 of the clinic copy, 419 on
+      the branch). The root stays locked forever, so the next command that looks up any
+      absolute path would hang too, and since pid 4 never reaches [[end_op]], the log can
+      never commit again: soon every file-system call waits in [[begin_op]].
+
+      One check, `isancestor(ip, dp2)`, refuses both: in the first case the walk from
+      `a/c` goes `c` → `a` and meets `ip`; in the second `dp2` *is* `ip`.
+  - bug: Two transactions, to make the new name durable first
+    change: |
+      A tempting idea: commit the new entry before removing the old one, so the file can
+      never be lost. It ends the transaction in the middle (all locks still held):
+
+      ```diff
+         } else if (dirlink(dp2, name2, ip->inum) < 0) {
+           goto unlock; // no free block for the new entry: nothing changed
+         }
+      +  end_op(); // make the new name durable first
+      +  begin_op();
+         dirset(dp1, off1, 0); // old disappears
+      ```
+
+      To crash at exactly the wrong moment: QEMU started halted under gdb, a breakpoint on the
+      new `begin_op()` line, `renametest crash`, and gdb's `kill` at the first hit. Then the
+      same disk image was booted twice more.
+    symptom: |
+      Thread 2 hit Breakpoint 1, sys_rename () at kernel/sysfile.c:415
+      [...]
+      pid 3 (renametest): rename("cr/a/f", "cr/b/f")
+      log: lh.n 0, outstanding 0, committing 0
+      [Inferior 1 (process 1) killed]
+
+      # boot 2, same fs.img:
+      $ renametest check
+      renametest: failed: f has not exactly one name
+      renametest: check: f in cr/a (2 names), d in cr/a (1 name)
+      renametest: check: FAIL
+      $ ls cr/a
+      .              1 27 64
+      ..             1 26 64
+      f              2 29 5
+      d              1 30 32
+      $ ls cr/b
+      .              1 28 48
+      ..             1 26 64
+      f              2 29 5
+      # the image after boot 2, checked on the host:
+      fsck: inode 29 /cr/b/f: nlink 1, but 2 links found
+      fsck: 30 inodes in use, 30 reachable, 1072 data blocks; 1 problems
+
+      # boot 3, same fs.img:
+      $ rm cr/a/f
+      $ cat cr/b/f
+      panic: ilock: no type
+    why: |
+      At the breakpoint the first transaction has committed and been installed: `log.lh.n`
+      is 0 and nothing is outstanding, so the disk already holds the entry `cr/b/f → 29`.
+      The second transaction, which would clear `cr/a/f`, never begins. After the reboot both
+      names exist (`ls` shows inode 29 in both directories), and `renametest check` says so.
+
+      Unlike the user-space `link` + `unlink` of the first question, this is not just a
+      half-done rename: **the link count is wrong.** A rename does not touch the inode's
+      `nlink`, because it removes one name for every name it adds; split in two, the first
+      half adds a name without counting it. Inode 29 has two entries and `nlink` 1, which
+      the host checker reports.
+
+      The damage shows up later and somewhere else. `rm cr/a/f` drops `nlink` to 0, and
+      [[iput]] frees the inode and its blocks: the file system believes the file is gone.
+      `cr/b/f` still names inode 29. `cat cr/b/f` looks it up, [[ilock]] reads the on-disk
+      inode, finds type 0 (free), and panics with `ilock: no type`
+      ([[kernel/fs.c:316]]). Had another file been created first, inode 29 would have been
+      reused, and `cr/b/f` would silently have become someone else's file.
+
+      The same crash test against the reference's single transaction: 30 kills at random
+      moments, 30 consistent disks (see verify). Holding the locks across the gap does not
+      help: locks protect against other processes, not against a crash. Only the log does,
+      and only within one transaction. (Calling [[begin_op]] with inode locks held also
+      breaks rule 2 of [[tour:18]]: with other file-system activity it can deadlock.)
+  - bug: Forgetting to fix `..`
+    change: |
+      The directory's link counts move from the old parent to the new one, but its `..`
+      entry is not rewritten:
+
+      ```diff
+         if (twodirs && type1 == T_DIR) {
+           // ip's ".." must name its new parent, and the link that ".."
+           // is moves from dp1 to dp2.
+      -    ilock(ip);
+      -    if ((pp = dirlookup(ip, "..", &off)) != dp1)
+      -      panic("rename: ..");
+      -    iput(pp);
+      -    dirset(ip, off, dp2->inum);
+      -    iunlock(ip);
+           dp1->nlink--;
+           iupdate(dp1);
+      ```
+    symptom: |
+      $ renametest
+      renametest: same directory: OK
+      renametest: across directories: OK
+      renametest: replace a file: OK
+      renametest: failed: rt/c/d/.. is not rt/c
+      renametest: move a directory: FAIL
+      renametest: failed: moved rt/c below itself
+      renametest: refuse a cycle: FAIL
+      renametest: failed: replaced a directory
+      renametest: refusals: FAIL
+      renametest: failed: a worker's rename or unlink did the wrong thing
+      renametest: concurrent: 1600 renames, 400 refused cycles in 70 ticks
+      renametest: concurrent: FAIL
+      renametest: SOME TESTS FAILED
+
+      # another boot:
+      $ mkdir a
+      $ mkdir b
+      $ mkdir a/d
+      $ mv a/d b
+      $ ls b/d/..
+      .              1 26 48
+      ..             1 1 1024
+      $ rm a
+      $ ls b/d/..
+      panic: ilock: no type
+
+      # the disk image after the panic, checked on the host:
+      fsck: /b/d: entry '..' -> free inode 26
+      fsck: inode 27 /b: nlink 2, but 1 links found
+      fsck: 27 inodes in use, 27 reachable, 1069 data blocks; 2 problems
+    why: |
+      `move a directory: FAIL` is the direct effect: after `rename("rt/a/d", "rt/c/d")`,
+      `rt/c/d/..` still leads to `rt/a`.
+
+      `refuse a cycle: FAIL` is the interesting one: **the cycle check trusts `..`**. The
+      test asks for `rename("rt/c", "rt/c/d2/e/x")`. The walk starts at `rt/c/d2/e`, goes up
+      to `d2` (correct, `e` never moved), and from `d2` (the moved `d`, renamed within `rt/c`)
+      to... `rt/a`, its stale `..`, then `rt`, then the root. It never meets `rt/c`, so the
+      kernel allows the move, and `rt/c` disappears into a loop of its own subtree.
+      `refusals: FAIL` follows: with `rt/c` gone, `rename("rt/g", "rt/c")` is no longer a
+      rename onto a directory, so it succeeds.
+
+      `concurrent: FAIL` is, by our reading of the code, the same hole found by a different
+      route (the test only reports that some worker failed). The directory mover
+      moves `ct/a/m` to `ct/b/m`, and `m`'s `..` keeps naming `ct/a`. Its next cycle
+      attempt, `rename("ct/b", "ct/b/m/x")`, walks up from `m`, follows the stale `..` to
+      `ct/a`, then `ct`, then the root, never meets `ct/b`, and succeeds. The worker counts
+      that as a failure.
+
+      The second run shows the slower failure. `mv a/d b` moved `a`'s link count to `b`
+      (`a` now has `nlink` 1, just its entry in the root), while `b/d/..` still names `a`
+      (inode 26: `ls b/d/..` lists `a`'s contents). `rm a` sees an empty directory with
+      one link and frees it. `b/d/..` now names a free inode; looking it up reads an
+      on-disk inode of type 0, and [[ilock]] panics ([[kernel/fs.c:316]]). The host checker
+      sees both halves of the inconsistency: `b/d/..` names a free inode, and `b` has `nlink`
+      2 (it got `d`'s link) although no `..` names it.
+reveal:
+  - title: A system call that refuses everything
+    commit: 1
+    file: kernel/sysfile.c
+    lines: 255-270
+    focus: 258-268
+    diff: true
+    state:
+      hart: 0
+      mode: S
+      proc: mv (pid 7)
+      intr: "on"
+      satp: kernel
+      locks: []
+      irq: 0
+      stack: [usertrap, syscall, sys_rename]
+      sp: {"on": kernel, detail: "mv's kernel stack; `sp` = `0x3fffff9e40` in the recorded run"}
+    note: |
+      The story of this tour was recorded on three harts with gdb attached to the finished
+      branch: at a fresh shell you type `mkdir a`, `mkdir b`, `mkdir a/d`, `echo hi > a/x`,
+      then `mv a/x a/y` (pid 7), `mv a/y b/y` (pid 8), `echo old > b/t`, `mv b/y b/t`
+      (pid 10), `mv a/d b` (pid 11), `mv b b/d/e` (pid 12, refused) and `mv b/d a` (pid 13).
+      In this image `a` is inode 26, `b` 27, `a/d` 28, `x` 29 and `t` 30. Later steps add
+      `renametest`'s crash runs.
+
+      Commit 1 is the plumbing, the same five places as any new system call
+      ([[tour:5]]): `SYS_rename` is 23 in [[kernel/syscall.h]], the table in
+      [[kernel/syscall.c]] gets `[SYS_rename] = sys_rename`, [[user/usys.pl]] emits the
+      `li a7, SYS_rename; ecall` stub, and [[user/user.h]] declares
+      `int rename(const char *, const char *)`.
+
+      The handler fetches both paths with [[argstr]], which copies them from user memory
+      into kernel arrays of `MAXPATH` bytes, and fails. Two paths cost 256 bytes of
+      kernel stack, out of 4096.
+
+      The state is pid 7's, recorded at the start of `sys_rename` on the finished branch:
+      hart 0, no lock held, interrupts on (as for every system call after [[usertrap]]'s
+      `intr_on`), noff 0.
+  - title: Rewriting one directory entry in place
+    commit: 2
+    file: kernel/fs.c
+    lines: 617-664
+    focus: 648-664
+    diff: true
+    state:
+      hart: 0
+      mode: S
+      proc: mv (pid 7)
+      intr: "on"
+      satp: kernel
+      locks: ["a's inode lock (inode 26, sleep-lock)"]
+      irq: 0
+      stack: [usertrap, syscall, sys_rename, dirset]
+      sp: {"on": kernel}
+    note: |
+      Commit 2 adds one helper next to [[dirlink]]. `dirset(dp, off, inum)` reads the entry
+      at byte offset `off`, changes its inode number, and writes it back: inode 0 frees the
+      entry (zeroing the name too, exactly as [[sys_unlink]] does,
+      [[kernel/sysfile.c:235]]-[[kernel/sysfile.c:237]]); any other number makes the same
+      name refer to another inode.
+
+      Compare it with [[dirlink]] just above. [[dirlink]] looks for a free slot and may
+      extend the directory, which can need a new block and fail. `dirset` only touches an
+      entry that exists, inside the directory's size, so [[writei]]'s [[bmap]] finds a
+      block already allocated: it cannot run out of space, and a short write is a kernel
+      bug, hence `panic`. That difference decides the order of the rename's steps.
+
+      The caller holds the directory's lock, as [[readi]] and [[writei]] require. In the
+      recorded `mv a/x a/y`, pid 7 held `a` (inode 26) when it cleared the old entry at
+      offset 48: `x` was the fourth entry, after `.`, `..` and `d`. Holding a sleep-lock
+      does not turn interrupts off: noff stayed 0 and SIE 1 ([[concept:locks#sleep-locks]]).
+  - title: "Same directory: one lock covers both names"
+    commit: 2
+    file: kernel/sysfile.c
+    lines: 278-311
+    focus: 300-310
+    diff: true
+    state:
+      hart: 0
+      mode: S
+      proc: mv (pid 7)
+      intr: "on"
+      satp: kernel
+      locks: ["a's inode lock (inode 26, sleep-lock)"]
+      irq: 0
+      stack: [usertrap, syscall, sys_rename]
+      sp: {"on": kernel}
+    note: |
+      The whole body is one transaction: [[begin_op]] on line 291, [[end_op]] at the end.
+      Inside, [[nameiparent]] resolves both paths to their parent directories and last
+      names. Line 295 refuses `.` and `..` as either last name, as [[sys_unlink]] does
+      ([[kernel/sysfile.c:221]]): renaming `a/.` would mean locking `a` twice. Line 297
+      refuses two directories for now.
+
+      Line 300 locks the directory, and the rest of this step happens under that one lock,
+      so no other process can see a moment where `x` is gone and `y` is not there yet.
+
+      - [[dirlookup]] finds `x` and its offset (`off1`), and `y` if it exists (`off2`).
+        Both come back referenced but unlocked.
+      - `tp == ip`: the two names already lead to the same inode (`mv a/x a/x`, or two hard
+        links). POSIX says do nothing and succeed. Without this test, the code below would
+        point `y`'s entry at the same inode, drop its link count by one and then clear `x`:
+        one name and an `nlink` one too low.
+      - Replacing is allowed only for a non-directory with a non-directory. To read a type
+        you need the inode's lock; `itype` takes it alone for a moment. That is parent
+        before child, and the type cannot change while the rename holds a reference.
+
+      For `mv a/x a/y`, gdb recorded pid 7 on hart 0 here with `a`'s lock and nothing else;
+      `x` is inode 29, `y` did not exist (`tp` 0).
+  - title: The new name first, the old name second
+    commit: 2
+    file: kernel/sysfile.c
+    lines: 300-337
+    focus: 312-317
+    state:
+      hart: 2
+      mode: S
+      proc: mv (pid 10)
+      intr: "on"
+      satp: kernel
+      locks: ["b's inode lock (inode 27, sleep-lock)", "t's inode lock (inode 30, sleep-lock)"]
+      irq: 0
+      stack: [usertrap, syscall, sys_rename]
+      sp: {"on": kernel}
+    note: |
+      The scene is `mv b/y b/t` (pid 10, on hart 2): `t` exists, a file containing `old`.
+      Its entry, at offset 48 of `b`, is pointed at `y`'s inode (29) with `dirset`, and the
+      file that was `t` (inode 30) loses a link. That needs `t`'s lock, taken after `b`'s:
+      parent, then child, the order of [[sys_unlink]]. gdb saw exactly these two
+      sleep-locks held by pid 10.
+
+      If `t` had not existed, [[dirlink]] (line 318) would have added the entry. It is the
+      only step that can fail (a new block for the directory), so it comes first; on
+      failure nothing has been changed. Then line 321 clears `y`'s old entry, which cannot
+      fail.
+
+      Notice what is *not* here: no write to inode 29. A rename takes one name away and
+      gives one, so the moved inode's `nlink` stays as it was.
+
+      Line 328 is where the replaced file dies. `t` has `nlink` 0 now and nobody has it
+      open, so this [[iput]] frees its block and its inode, still inside the transaction,
+      before [[end_op]]. At [[end_op]] gdb read `log.lh.n` = 3 for this rename; by our
+      count they are `b`'s data block, the inode block holding inodes 16 to 31 (`b`, `y`,
+      `t`), and the bitmap block, for `t`'s freed data block.
+    others: |
+      Another process reading `b` (an `ls b` on hart 1, say) sleeps in [[ilock]] until the
+      rename is done, and sees `y` and `t`-the-old-file, or `t`-the-new-file and no `y`;
+      never something in between. A process that had `t` open keeps reading the old
+      content; its `close` would free it instead.
+  - title: A global lock for renames between directories
+    commit: 3
+    file: kernel/sysfile.c
+    lines: 255-276
+    focus: 258-268
+    diff: true
+    state:
+      hart: 0
+      mode: S
+      proc: none (boot)
+      intr: "off"
+      satp: kernel
+      locks: []
+      irq: 0
+      stack: [main, renameinit]
+      sp: {"on": boot, detail: "hart 0's slice of `stack0`"}
+    note: |
+      Commit 3 allows two different parent directories, and the first thing it needs is a
+      way to order two directory locks that the tree does not order (think question 3).
+      `renamelock` is one sleep-lock for the whole file system, taken by every rename
+      between two directories before it looks at the tree and held to the end. Linux has the
+      same thing, `s_vfs_rename_mutex`.
+
+      It is a sleep-lock because its holder reads directories from disk while holding it:
+      the lookups, and the walk two steps from now. A spinlock would forbid that (`sched`
+      panics with `sched locks`).
+
+      [[main]] calls `renameinit` on hart 0 right after [[fileinit]], one new line in
+      `main.c`, with interrupts still off and the other harts waiting for `started`.
+      [[initsleeplock]] only fills in the fields; nothing is shared yet.
+
+      Its place in the lock order: after [[begin_op]], before every inode lock. After
+      [[begin_op]], because only [[nameiparent]] tells the rename whether two directories
+      are involved, and [[nameiparent]] must run inside a transaction (its [[iput]] may free
+      an inode). It is safe there because nobody holding an inode lock waits for it, and
+      its holder never waits for log space or a commit before releasing it. (Taking it
+      before [[begin_op]] in every rename would also be deadlock-free; the cost of this
+      order is that a rename waiting for the lock already holds one of the log's three
+      reservations.)
+  - title: Walking up the tree, one lock at a time
+    commit: 3
+    file: kernel/sysfile.c
+    lines: 303-341
+    focus: 321-341
+    diff: true
+    state:
+      hart: 2
+      mode: S
+      proc: mv (pid 11)
+      intr: "on"
+      satp: kernel
+      locks: [renamelock (sleep-lock), "b's inode lock (inode 27, sleep-lock)"]
+      irq: 0
+      stack: [usertrap, syscall, sys_rename, isancestor]
+      sp: {"on": kernel}
+    note: |
+      `isancestor(a, b)`: is directory `a` the same as `b`, or above it? xv6 keeps no
+      parent pointers in memory, so the only way to know is to read `..` entries from `b`
+      up to the root, as [[namex]] does for a path with `..` in it.
+
+      The rules this function follows are the ones that make it safe:
+
+      - **No other inode lock is held** by the caller. Line 329 locks one directory to read
+        its `..`, and line 335 unlocks it before the next one is locked. Locking a parent
+        while holding a child is the reverse of the file system's order.
+      - **`renamelock` is held**, so no directory can move during the walk, and the answer
+        is still true when the rename uses it.
+      - A directory with `nlink` 0 has been removed; its `..` may point at an inode that has
+        since been freed and reused. The walk stops and says no; the rename then fails at
+        its re-checks under the locks (`samename`, or `dp2->nlink == 0`).
+
+      The comparison `ip != a` is between in-memory inode pointers: one inode has one
+      table entry while anyone holds a reference, and the caller holds references to both.
+
+      Recorded: `mv a/d b` (pid 11, hart 2) inside a walk, holding `renamelock` and only `b`
+      (inode 27). This walk is commit 4's cycle check, "is `d` above `b`?": `b`'s `..` leads
+      to the root, so no. Its second walk, for the lock order ("is `b` above `a`?"), locked
+      only `a`. noff 0, SIE 1 throughout.
+  - title: Look first, under the global lock only
+    commit: 3
+    file: kernel/sysfile.c
+    lines: 343-382
+    focus: 363-379
+    diff: true
+    state:
+      hart: 0
+      mode: S
+      proc: mv (pid 8)
+      intr: "on"
+      satp: kernel
+      locks: [renamelock (sleep-lock)]
+      irq: 0
+      stack: [usertrap, syscall, sys_rename, lookup]
+      sp: {"on": kernel}
+    note: |
+      The new shape of `sys_rename`. Everything that depends on the shape of the tree is
+      decided *before* any parent is held, because deciding it needs walks that may hold no
+      inode lock.
+
+      `twodirs` is decided by pointer: [[nameiparent]] returns referenced inodes, and the
+      same directory always comes back as the same table entry. Only then is `renamelock`
+      taken (line 365), so renames within one directory never wait for it.
+
+      `lookup` locks a directory, finds the name, and unlocks; `itype` locks the found
+      inode alone. So the code never holds a directory and a child, or two children, at this
+      stage. The results are references, not locks: they guarantee the inodes cannot be
+      freed, not that the names still lead to them a moment later.
+
+      Line 380 keeps directories out for one more commit.
+
+      gdb, `mv a/y b/y` (pid 8, hart 0), inside the first `lookup`: `renamelock` is held by
+      pid 8, `log.outstanding` is 1 (this rename's transaction), and no inode lock yet.
+    others: |
+      A second `mv` between two other directories, started on hart 1 now, would sleep in
+      [[acquiresleep]] on `renamelock` until pid 8 has finished, and do nothing else: it
+      holds no inode lock while it waits, so it blocks nobody. A rename within one
+      directory, or an unlink, never waits for `renamelock` (only, as always, for the inode
+      locks it needs).
+  - title: Lock the higher directory first
+    commit: 3
+    file: kernel/sysfile.c
+    lines: 383-410
+    focus: 386-393
+    state:
+      hart: 0
+      mode: S
+      proc: mv (pid 8)
+      intr: "on"
+      satp: kernel
+      locks: [renamelock (sleep-lock), "a's inode lock (inode 26, sleep-lock)", "b's inode lock (inode 27, sleep-lock)"]
+      irq: 0
+      stack: [usertrap, syscall, sys_rename]
+      sp: {"on": kernel}
+    note: |
+      The heart of the lab, in eight lines. If the new parent `dp2` is above the old parent
+      `dp1`, lock it first; otherwise lock `dp1` first. Three cases:
+
+      | parents | order | why it cannot deadlock |
+      |---|---|---|
+      | `dp1` above `dp2` (`a` → `a/b`) | `dp1`, `dp2` | parent before child, like [[sys_unlink]] |
+      | `dp2` above `dp1` (`a/b` → `a`) | `dp2`, `dp1` | the same rule |
+      | unrelated (`a` → `b`) | `dp1`, `dp2` | only one two-directory rename at a time holds two unrelated directories |
+
+      The naive "always `dp1` first" differs only in the second row, and that row is the
+      one that collides with [[sys_unlink]] (clinic 1); the unrelated row collides with
+      another rename going the other way, which `renamelock` now excludes.
+
+      Recorded for `mv a/y b/y`: pid 8 holds `renamelock`, `a` (26) and `b` (27), all
+      sleep-locks; noff 0. For `mv b/d a` (pid 13), the unrelated case again, the walk
+      `isancestor(a, b)` locked only `b`, whose `..` is the root, so the answer was no and
+      the order was `dp1` first: `b`, then `a`.
+    others: |
+      What the other harts can be doing at this moment, and why it is safe:
+
+      | hart 1 | waits for | safe because |
+      |---|---|---|
+      | `rm a/z` | `a` (it holds nothing else) | parent first, then its child; it never wants `b` |
+      | `mv b/q b/r` | `b` | a one-directory rename holds one directory and children |
+      | `mv a/k b/k` | `renamelock` | it holds no inode lock while it waits |
+      | `cat a/x` | `a`, in [[namex]] | one directory at a time |
+  - title: Did the names change while we were not looking?
+    commit: 3
+    file: kernel/sysfile.c
+    lines: 394-429
+    focus: 396-398
+    state:
+      hart: 0
+      mode: S
+      proc: mv (pid 8)
+      intr: "on"
+      satp: kernel
+      locks: [renamelock (sleep-lock), "a's inode lock (inode 26, sleep-lock)", "b's inode lock (inode 27, sleep-lock)"]
+      irq: 0
+      stack: [usertrap, syscall, sys_rename, samename]
+      sp: {"on": kernel}
+    note: |
+      The lookups were made with each directory locked for a moment. Since then another
+      process may have unlinked `a/y`, renamed it within `a`, or created `b/y`; none of
+      those take `renamelock`. So with both parents locked, `samename` looks both names up
+      again and compares with the inodes the decisions were made about. Any difference: -1,
+      nothing changed. The comparison is safe because the rename holds references to `ip`
+      and `tp`, so neither inode can be freed and its number reused for something else.
+
+      The same lines check that `dp2` still has links: a directory removed after
+      [[nameiparent]] returned it must not receive an entry (the same guard as
+      [[create]] and [[sys_link]], [[kernel/sysfile.c:161]]).
+
+      From here the code is commit 2's, with `dp2` in place of `dp1` for the new name.
+      The cleanup at `out` releases `renamelock` *after* the parents are unlocked, and the
+      [[iput]] of a replaced file still comes before [[end_op]].
+
+      Recorded: `mv a/y b/y`, pid 8 in `samename` with `renamelock`, `a` and `b`. At its
+      [[end_op]], `log.lh.n` was 3: by our count `b`'s data block, the inode block of `a`
+      and `b`, and `a`'s data block.
+  - title: Refuse to move a directory below itself
+    commit: 4
+    file: kernel/sysfile.c
+    lines: 367-395
+    focus: 380-383
+    diff: true
+    state:
+      hart: 0
+      mode: S
+      proc: mv (pid 12)
+      intr: "on"
+      satp: kernel
+      locks: [renamelock (sleep-lock), "b/d's inode lock (inode 28, sleep-lock)"]
+      irq: 0
+      stack: [usertrap, syscall, sys_rename, isancestor]
+      sp: {"on": kernel}
+    note: |
+      Commit 4 lets directories move between parents. The first condition: the directory
+      being moved (`ip`) must not be the new parent or above it. The walk is the one commit
+      3 wrote for the lock order, and it runs at the same point, before any parent is
+      locked.
+
+      `mv b b/d/e` (pid 12): `ip` is `b` (27), `dp2` is `b/d` (28). gdb stopped in the walk
+      with `renamelock` and `b/d` locked: the next `..` is `b`, which is `ip`, so the
+      answer is yes and the rename returns -1 (`mv b b/d/e: failed` on the console). It
+      logged 0 blocks.
+
+      Without this line, clinic 3: `mv a a/c/b` detaches `a` and everything below it into
+      a loop that no path reaches and no link count ever releases, and `mv a a/b` locks `a`
+      twice and sleeps on itself.
+
+      Why `renamelock` is essential here, and not just for the lock order: `rename(a, b/a2)`
+      and `rename(b, a/b2)` could each pass this check if they ran at the same time, and
+      together build the loop. With the lock, the second sees the first's result.
+  - title: The new parent must have room for one more link
+    commit: 4
+    file: kernel/sysfile.c
+    lines: 396-416
+    focus: 401-403
+    state:
+      hart: 2
+      mode: S
+      proc: mv (pid 11)
+      intr: "on"
+      satp: kernel
+      locks: [renamelock (sleep-lock), "a's inode lock (inode 26, sleep-lock)", "b's inode lock (inode 27, sleep-lock)"]
+      irq: 0
+      stack: [usertrap, syscall, sys_rename]
+      sp: {"on": kernel}
+    note: |
+      A moved directory's `..` will add one to the new parent's link count, and `nlink` is
+      a `short`: [[create]] already refuses a new subdirectory when the parent is at
+      `NLINK_MAX` ([[kernel/sysfile.c:274]]-[[kernel/sysfile.c:278]]). The same guard, at
+      the same moment: under the parent's lock, before anything is written.
+
+      `mv a/d b` (pid 11) passed it with `b` at `nlink` 1. gdb recorded pid 11 here holding
+      `renamelock`, `a` (26) and `b` (27), and then at [[dirlink]] adding `d` to `b`; the
+      old entry was cleared at offset 32 of `a`.
+  - title: "A directory carries its `..` and a link"
+    commit: 4
+    file: kernel/sysfile.c
+    lines: 405-449
+    focus: 416-429
+    state:
+      hart: 2
+      mode: S
+      proc: mv (pid 11)
+      intr: "on"
+      satp: kernel
+      locks: [renamelock (sleep-lock), "a's inode lock (inode 26, sleep-lock)", "b's inode lock (inode 27, sleep-lock)", "d's inode lock (inode 28, sleep-lock)"]
+      irq: 0
+      stack: [usertrap, syscall, sys_rename]
+      sp: {"on": kernel}
+    note: |
+      The entries have moved; now the directory's own bookkeeping. `d`'s `..` names `a`,
+      and that entry is one of `a`'s links (a directory's `nlink` is its entry in its
+      parent plus its subdirectories' `..`). Both must move to `b`.
+
+      Line 419 locks `d`, after both parents. Anyone holding `d` waits only for `d`'s
+      descendants, and after the cycle check neither parent is below `d`; that `d` and `b`
+      may be unrelated is safe because of `renamelock`. [[dirlookup]] finds
+      `..` (offset 16: the second entry, as [[create]] wrote it) and the sanity check makes
+      sure it names the old parent; `dirset` points it at `b`. Then `a` loses a link and `b`
+      gains one.
+
+      This is the most locks one rename holds: gdb saw pid 11 with four sleep-locks and the
+      log already holding 3 blocks of this transaction (`b`'s and `a`'s data blocks and
+      their shared inode block). The `..` write adds `d`'s first block: 4 at [[end_op]],
+      within the 10 of [[kernel/param.h:9]]. Think question 7 has the worst case, 8.
+
+      Counted the way [[tour:51]] counts (buffer sleep-locks included), this rename reaches
+      five sleep-locks at once: `renamelock`, `a`, `b`, `d`, and `d`'s buffer inside
+      `dirset`'s [[writei]]. (The worst-case `dirlink` reaches five too: `renamelock`, both
+      parents, the indirect block's buffer and the bitmap's.) Tour 51's measured workload
+      never held more than three in one process, four only with a program built to force
+      it. Every pair in this chain is ordered: by the tree, by `renamelock`, or inode before
+      buffer.
+    others: |
+      `cd ..` from inside `d` on another hart, at this moment, runs [[namex]], which wants
+      `d` to read its `..`: it sleeps until line 424, then reads `b`. Before this commit's
+      line 423 existed, it would have read `a` forever after (clinic 5).
+  - title: The commit point, and two crashes on either side of it
+    commit: 4
+    file: kernel/log.c
+    lines: 152-212
+    focus: 203-211
+    state:
+      hart: 1
+      mode: S
+      proc: renametest (pid 3)
+      intr: "on"
+      satp: kernel
+      locks: []
+      irq: 0
+      stack: [usertrap, syscall, sys_rename, end_op, commit]
+      sp: {"on": kernel}
+    note: |
+      Nothing in `log.c` changes; this is why the rename is atomic. Every block the rename
+      wrote sits pinned in the buffer cache, listed in `log.lh`. At [[end_op]], with no other
+      operation outstanding, [[commit]] copies them into the log ([[write_log]]), writes the
+      header with their count ([[write_head]], line 207), copies them home, and clears the
+      header. The header write is the one moment the rename happens on disk.
+
+      We crashed the reference on both sides of it. QEMU halted under gdb, `renametest crash`
+      (pid 3), `break sys_rename`, then a breakpoint in [[commit]], and gdb's `kill` on the
+      first hit, with `log.lh.n` 3: `cr/b`'s data block (1116), the inode block (34) and
+      `cr/a`'s data block (1115), for `rename("cr/a/f", "cr/b/f")`.
+
+      - **Killed at line 207**, before the header write: the reboot printed no recovery
+        lines, and `renametest check` found `f in cr/a (1 name)`. The rename never happened.
+      - **Killed at line 208**, after it: the reboot printed `recovering tail 0 dst 1116`,
+        `tail 1 dst 34`, `tail 2 dst 1115`, and the check found `f in cr/b (1 name)`. The
+        rename happened completely, although none of its blocks had reached its home
+        location before the kill.
+
+      Both disks passed the host checker. (In the first run the process had moved from hart 1,
+      where it entered `sys_rename`, to hart 0 by the time it committed: it had slept on a
+      disk read in between. The state shown is from the second run.)
+  - title: mv
+    commit: 5
+    file: user/mv.c
+    lines: 1-38
+    focus: 18-36
+    diff: true
+    state:
+      hart: any
+      mode: U
+      proc: mv
+      intr: "on"
+      satp: user
+      locks: []
+      stack: [main]
+      sp: {"on": user}
+    note: |
+      The user command is short because the kernel does the work. The one thing it adds is
+      Unix `mv`'s convenience: if `new` is an existing directory, the target becomes
+      `new/<last element of old>`, so `mv a/d b` means `rename("a/d", "b/d")`. The kernel's
+      `rename` never does that itself; it refuses to replace a directory.
+
+      [[user:stat]] costs a lookup of `new` before the rename, outside the rename's
+      transaction: if another process removes `b` in between, the rename fails, which is
+      the right answer for the state the kernel then sees.
+  - title: Seven processes, three harts, one lock order
+    commit: 6
+    file: user/renametest.c
+    lines: 234-310
+    focus: 253-306
+    diff: true
+    state:
+      hart: any
+      mode: U
+      proc: renametest
+      intr: "on"
+      satp: user
+      locks: []
+      stack: [main, concurrent]
+      sp: {"on": user}
+    note: |
+      The concurrent test is built from the deadlocks of think question 3 and the races of
+      questions 4 and 5. Two workers rename files between `ct/a` and `ct/b` in opposite
+      directions: with the naive order, that is the unrelated-directories deadlock. One
+      renames between `ct/a/s` and `ct/a`: the child-before-parent case. One moves the
+      directory `m` between `ct/a` and `ct/b` and each time tries to move `m`'s current
+      parent into `m`, which must fail: concurrent directory moves and the cycle check. Until
+      those four finish, one worker tries `unlink("ct/a/s")` (it must always fail, the
+      directory is not empty, but it locks `ct/a` and then `ct/a/s`, the existing order), and
+      two churn the names `t` and `u`, so that names change between a rename's first look
+      and its locks. Line 255 creates `s` before `a`, giving it the lower inode number: that
+      is what an inode-number order gets wrong (clinic 2), and line 264 checks the setup.
+      After the run every name, `m`'s `..`, and every link count is checked.
+
+      A watchdog child prints a message if the workers are not done after `3 * rounds`
+      ticks; a deadlock otherwise just hangs. Be honest about its power: neither wrong lock
+      order deadlocked in our runs without help, because the window between the two `ilock`
+      calls is a few instructions wide. With a delay loop widening it, both did (clinics 1
+      and 2), and the reference did not. The concurrent part did fail on clinic 5's kernel (the
+      `..` bug) in our run: there, a cycle attempt can succeed.
+
+      On the reference, the 200-round run (1600 renames and 400 refused cycles) took 110 and
+      121 ticks in the verify runs; the time varies a lot from run to run.
+  - title: Testing a crash from inside the machine that crashes
+    commit: 6
+    file: user/renametest.c
+    lines: 343-391
+    focus: 346-371
+    state:
+      hart: any
+      mode: U
+      proc: renametest
+      intr: "on"
+      satp: user
+      locks: []
+      stack: [main, crash]
+      sp: {"on": user}
+    note: |
+      A program cannot kill the machine it runs on at a random moment and then check the
+      result, so the crash test has two halves and a driver outside. `renametest crash`
+      builds `cr/a/f` and the directory `cr/a/d` (once), then moves both back and forth
+      between `cr/a` and `cr/b` forever, starting from wherever they are. The driver, a
+      `python3` script on the host using only the standard library (so it runs on Linux,
+      macOS and WSL), starts QEMU, sends the command, waits a random 0.2 to 4 seconds, and
+      kills QEMU with `SIGKILL` (`Popen.kill()`). Then it boots the same disk image and runs
+      `renametest check`, which tests the invariants a half-done rename would break: each
+      name exactly once, `d`'s `..` naming the directory it is in, the parents' link counts
+      matching, `f`'s content intact. Finally a checker on the host walks the image.
+
+      In 30 such runs, every disk was consistent; 14 of the reboots replayed a committed
+      rename from the log (4 times 3 blocks, a file move; 10 times 4 blocks, a directory
+      move), so the kills did land inside renames, after their commit point. The plain
+      `renametest` run says only that this exists (`see renametest crash`): it cannot claim
+      what it did not check.
+verify: |
+  On the branch (`ext/24-rename`, 6 commits), built with the project toolchain and run on 3
+  harts (`-smp 3 -m 128M`), in one boot:
+
+  ```text
+  $ renametest
+  renametest: same directory: OK
+  renametest: across directories: OK
+  renametest: replace a file: OK
+  renametest: move a directory: OK
+  renametest: refuse a cycle: OK
+  renametest: refusals: OK
+  renametest: concurrent: 1600 renames, 400 refused cycles in 110 ticks
+  renametest: concurrent: OK
+  renametest: ALL OK (crash consistency: see renametest crash)
+  $ usertests -q
+  usertests starting
+  test copyin: OK
+  [...]
+  test unlinkcwd: OK
+  ALL TESTS PASSED
+  $ renametest
+  [...]
+  renametest: concurrent: 1600 renames, 400 refused cycles in 121 ticks
+  renametest: concurrent: OK
+  renametest: ALL OK (crash consistency: see renametest crash)
+  $ renametest concurrent 1000
+  renametest: concurrent: 8000 renames, 2000 refused cycles in 471 ticks
+  renametest: concurrent: OK
+  ```
+
+  The host checker on that disk image afterwards: `fsck: 29 inodes in use, 29 reachable,
+  1072 data blocks; clean`. `usertests -q` also passed at each of commits 1 to 5 (commit 6
+  only adds the test program), so every intermediate state of the branch is a working
+  kernel.
+
+  **Crash consistency**, 30 runs of: fresh disk image, `renametest crash`, `SIGKILL` to
+  QEMU after a random 0.2 to 4 seconds, reboot on the same image, `renametest check`, then
+  the host checker. Three of the 30 summary lines, as the driver wrote them:
+
+  ```text
+  run 1 delay 0.3 last=[] recovered_blocks=4 renametest: check: f in cr/b (1 name), d in cr/b (1 name) renametest: check: OK  | fsck: 30 inodes in use, 30 reachable, 1074 data blocks; clean
+  run 2 delay 3.28 last=[] recovered_blocks=0 renametest: check: f in cr/a (1 name), d in cr/b (1 name) renametest: check: OK  | fsck: 30 inodes in use, 30 reachable, 1074 data blocks; clean
+  run 4 delay 2.71 last=[] recovered_blocks=4 renametest: check: f in cr/a (1 name), d in cr/a (1 name) renametest: check: OK  | fsck: 30 inodes in use, 30 reachable, 1074 data blocks; clean
+  ```
+
+  All 30 checks printed `OK` and all 30 images were `clean`. `recovered_blocks` counts the
+  `recovering tail` lines at boot: 14 of the 30 kills landed after a rename's commit
+  record and before the log was cleared, and the reboot finished that rename (3 blocks for
+  a file move, 4 for a directory move); the other 16 found an empty log. The two
+  gdb-controlled kills of the reveal (just before and just after [[write_head]]) gave the
+  old state and the new state respectively, each with exactly one name.
+
+  What this shows: the rename is all-or-nothing on disk; the `..` entry and both link
+  counts always agree with where the directory is, also after concurrent directory moves
+  and refused cycles; nothing that `usertests` exercises changed; and seven processes on
+  three harts finish. What it does not show: `renametest`'s concurrent part would not have
+  caught the naive or the inode-number order without help (clinics 1 and 2). The argument
+  that the reference cannot deadlock is the lock order, not the test.
+
+measure: |
+  **Blocks per rename.** A copy of the kernel printed `log.lh.n` and the logged block
+  numbers at each rename's [[end_op]], with a scratch program (not on the branch) that
+  sets up each case:
+
+  | rename | dp1, dp2, moved inode | blocks logged | which |
+  |---|---|---|---|
+  | file, same directory | 27, 27, 30 | 2 | 1157 (`m` data), 34 (inodes 16 to 31) |
+  | file, `m` → `m/a` | 27, 31, 30 | 3 | 1160, 34, 1157 |
+  | file replacing a 3-block file, `m/a` → `m/b` | 31, 32, 30 (replaced: 33) | 5 | 1161, 35, 1160, 34, 46 (bitmap) |
+  | directory, `m/a` → `m/b` | 31, 32, 33 | 5 | 1161, 35, 1160, 34, 1162 (its `..`) |
+  | directory into a parent with one full block | 32, 34, 33 | 5 | 46, 1164 (new block), 35, 1161, 1162 |
+  | directory into a parent with 12 full blocks, inodes in 3 inode blocks | 51, 85, 68 | **8** | 46, 1179 (indirect), 1180 (new block), 38, 1165, 36, 1166, 37 |
+
+  In this image the inode blocks start at block 33 (16 inodes each) and the bitmap is
+  block 46. The worst case is 8 of the 10 blocks [[begin_op]] reserves. The replaced
+  file's three data blocks cost one block (46): freeing clears bits in the bitmap.
+
+  **What a split transaction costs.** The same 30-kill crash test against clinic 4's
+  kernel (new entry committed, then the old one removed in a second transaction): 17 of
+  30 checks failed, every time with one inode under two names and a link count of 1
+  (`f in cr/a (2 names)` or `d in cr/a (2 names)`); the host checker flagged each of
+  those 17 images (1 to 3 problems: a wrong link count, a directory reached twice, a
+  wrong `..`). The single transaction: 0 of 30.
+
+  **Deadlocks found** (all on 3 harts, final `renametest`):
+
+  | kernel | runs | deadlocked |
+  |---|---|---|
+  | naive order | 4 × `concurrent 1000` | 0 |
+  | naive order, delay after the first lock | 6 × `concurrent 1000` | 4 (2 file mover vs file mover, 2 file mover vs directory mover) |
+  | inode-number order | 4 × `concurrent 1000` | 0 |
+  | inode-number order, delay after the first lock | 2 × `renametest`, 4 × `concurrent 1000` | 2 (rename vs unlink, both in `concurrent 1000`) |
+  | reference, delay after the first lock | 2 × `concurrent 1000` | 0 |
+
+  **Time.** The 200-round concurrent part (1600 renames, 400 refused cycles) took 110 and
+  121 ticks in the two verify runs, and `renametest concurrent 1000` 471 ticks; across the
+  other runs above, `concurrent 1000` took between 371 and 790 ticks (measured while the
+  computer was busy with other work; your times will differ).
+  These numbers vary too much to compare the lock orders by speed; correctness is the
+  point here.
+further: |
+  - **Replace an empty directory.** POSIX allows `rename(dir1, dir2)` when `dir2` is an
+    empty directory. You must lock `dir2` (a child of the new parent) and check it is empty
+    under its lock, as [[sys_unlink]] does, and `nlink` bookkeeping now involves four
+    inodes. It also teaches why `isdirempty` must be checked with the lock held.
+  - **Atomic replace for applications.** Write a small "save" program: write a new file
+    `x.tmp`, then `rename("x.tmp", "x")`. Kill QEMU at random moments and show that `x` is
+    always the complete old or the complete new content. This is how real editors save.
+    (Which ordering guarantee does xv6's log give between the data writes and the rename?)
+  - **A finer lock.** `renamelock` serializes all two-directory renames in the file
+    system. Measure how often `concurrent` waits for it (count sleeps in [[acquiresleep]]
+    on it), then think about what a per-subtree scheme would need, and why Linux kept a
+    single per-file-system mutex.
+  - **Lockdep for sleep-locks.** Lab 21's lock-order checker records orders between inode
+    sleep-locks too. Combine it with this lab, run `renametest concurrent` with the naive
+    order, and see it report the cycle *before* the deadlock happens.
+  - **An in-kernel fsck.** Port the host checker's ideas into a boot-time check that
+    walks from the root and reports unreachable inodes and wrong link counts, like
+    [[ireclaim]] but for more than `nlink == 0`.

@@ -1,0 +1,543 @@
+summary: |
+  The C half of trap handling. Every [[g:trap]] ends up in one of two functions here:
+
+  - [[usertrap]], for traps from user mode. [[uservec]] in [[kernel/trampoline.S]] saves the
+    user registers and calls it. It handles a [[g:system-call]] (`scause` 8), a
+    [[g:device-interrupt]] or timer interrupt, or a page fault on lazily allocated memory,
+    and kills the process for anything else. It then calls [[prepare_return]] and returns
+    the user page table's `satp` value to [[userret]], which goes back to user mode.
+  - [[kerneltrap]], for traps while the kernel itself runs. [[kernelvec]] in
+    [[kernel/kernelvec.S]] saves registers and calls it. Only interrupts are expected here;
+    anything else is a kernel bug and panics.
+
+  Both use [[devintr]] to recognize and dispatch interrupts, and [[clockintr]] to count
+  time and schedule the next timer interrupt. On a timer interrupt, both give up the CPU
+  with [[yield]]: this is how xv6 shares a CPU among processes even if a program never
+  makes a system call.
+
+  The complete round trip of a system call is: user stub (`li a7, n; ecall`, from
+  [[user/usys.pl]]) → [[uservec]] → [[usertrap]] → [[syscall]] → `sys_*` function →
+  back in `usertrap` → [[prepare_return]] → [[userret]] → `sret` → the instruction after
+  `ecall`, with the result in `a0`.
+
+  **Read before:** [[kernel/trampoline.S]]. **Read next:** [[kernel/syscall.c]],
+  [[kernel/plic.c]].
+
+blocks:
+  - lines: 1-7
+    title: Headers
+    note: |
+      The usual kernel headers. [[kernel/proc.h]] is needed for `struct proc` and
+      [[kernel/proc.h:40|struct trapframe]]; [[kernel/memlayout.h]] for [[TRAMPOLINE]] and
+      the IRQ numbers; [[kernel/riscv.h]] for the CSR access functions.
+
+  - lines: 9-10
+    title: The clock
+    note: |
+      [[ticks]] counts timer interrupts on hart 0 since boot, roughly 10 per second (see
+      [[clockintr]]). It is xv6's only notion of time: [[sys_uptime]] returns it and
+      [[sys_pause]] sleeps until it has advanced far enough.
+
+      [[tickslock]] is the [[g:spinlock]] that protects it. Both are global, not
+      `static`, because [[kernel/sysproc.c]] uses them; [[kernel/defs.h:142]] declares
+      them `extern`. The address of `ticks` doubles as the [[g:sleep-wakeup]] channel for
+      processes waiting for time to pass.
+
+  - lines: 12-17
+    title: Names defined in assembly
+    note: |
+      `trampoline` and `uservec` are labels in [[kernel/trampoline.S]]. Declaring them as
+      `char` arrays is a common trick for linker-provided addresses: the name of an array
+      *is* its address, and pointer arithmetic on `char` counts bytes, so
+      `uservec - trampoline` is the byte offset of `uservec` within the trampoline page.
+
+      `kernelvec` is in [[kernel/kernelvec.S]]; declaring it as a function lets C take its
+      address. `void kernelvec();` with empty parentheses is an
+      [[g:old-style-decl|old-style declaration]]. `devintr` is defined at the end of this
+      file; line 17 lets [[usertrap]] call it before its definition. (The `extern` is
+      redundant on a function declaration.)
+
+  - lines: 19-23
+    title: "trapinit(): once, on hart 0"
+    note: |
+      Called from [[main]] ([[kernel/main.c:23]]). Its only job is to initialize
+      [[tickslock]]; the name `"time"` shows up in debugging output.
+
+  - lines: 25-30
+    title: "trapinithart(): route kernel traps to kernelvec"
+    note: |
+      Called on every hart during boot ([[kernel/main.c:24]] and
+      [[kernel/main.c:40]]). Writing the address of [[kernelvec]] into
+      [[g:csr:stvec|stvec]] makes any trap taken while this hart runs kernel code go to
+      `kernelvec`. Each hart has its own `stvec`, so each must do this.
+
+      `stvec` does not stay that way: [[prepare_return]] points it at the trampoline before
+      every return to user mode, and [[usertrap]] points it back here as its first act.
+
+  - lines: 32-39
+    title: "usertrap(): every trap from user mode"
+    note: |
+      [[uservec]] calls this function after saving the user's registers in the
+      [[g:trapframe]] and switching to the kernel page table and the process's kernel stack.
+      Interrupts are off (the hardware cleared `sstatus.SIE` on trap entry).
+
+      As the comment says, it returns to [[kernel/trampoline.S]]: `uservec` called it with
+      `jalr`, which left [[userret]]'s address in `ra`, so the C `return` at the end lands
+      in `userret` with the return value, the `satp` for the user page table, in `a0`.
+      If the process exits instead, `usertrap` never returns.
+
+  - lines: 40-47
+    title: Check where the trap came from, and redirect kernel traps
+    note: |
+      `which_dev` will record what [[devintr]] found: 0 nothing, 1 a device, 2 the timer.
+
+      Line 42 is a sanity check. The hardware sets `sstatus.SPP` to the mode the trap came
+      from; 0 means user mode. `stvec` points at `uservec` only while user code runs
+      (interrupts are off from the moment [[prepare_return]] sets it), so a trap from
+      supervisor mode arriving here would mean that invariant was broken.
+
+      Line 47 points [[g:csr:stvec|stvec]] back at [[kernelvec]]. From now on the hart runs
+      kernel code, and a trap here (for example a timer interrupt once line 66 enables
+      interrupts) must go to the kernel handler. If `stvec` still pointed at `uservec`,
+      such a trap would run the trampoline code meant for user traps while the kernel page
+      table is installed. There [[TRAPFRAME]] is unmapped (it is the guard gap between the
+      trampoline and the first kernel stack), so the very first store in [[uservec]]
+      faults, and that fault goes to `uservec` again: the hart is stuck in an endless loop
+      of faults.
+
+  - lines: 49-52
+    title: Save the user PC
+    note: |
+      [[myproc]] returns the process running on this hart. [[g:csr:sepc|sepc]] holds the
+      address of the user instruction that trapped (or, for an interrupt, the instruction
+      that was about to run). It must be copied into `trapframe->epc` now, because `sepc`
+      is a single per-hart CSR that the next trap overwrites: a timer interrupt during the
+      system call, or another process returning to user mode on this hart after a
+      [[yield]], both rewrite it. [[prepare_return]] puts the saved value back just before
+      returning.
+
+  - lines: 54-68
+    title: A system call
+    note: |
+      [[g:csr:scause|scause]] 8 means "environment call from U-mode": the program executed
+      [[g:insn:ecall|ecall]] (see [[g:trap-cause]]).
+
+      - If the process has already been killed (by another process calling `kill`), it
+        exits at once instead of running the system call. [[kexit]] never returns.
+      - `sepc` points at the `ecall` itself. Returning there would execute it again,
+        forever. `ecall` is always 4 bytes (it has no compressed form), so adding 4 makes
+        the return land on the next instruction. This is done *before* [[syscall]], because
+        `exec` replaces `epc` with the new program's entry point and must not be shifted.
+      - [[intr_on]] enables interrupts for the rest of the system call. Some calls take a
+        long time (reading the disk, waiting for input) and the hart must still respond to
+        timer and device interrupts meanwhile. It comes only now because an interrupt
+        overwrites `sepc`, `scause` and `sstatus`, and the code above has finished reading
+        them. Such an interrupt goes to [[kernelvec]], thanks to line 47.
+      - [[syscall]] looks up the number in `a7` and runs the handler; its result is put in
+        `trapframe->a0`.
+
+  - lines: 69-70
+    title: A device or timer interrupt
+    note: |
+      If it was not a system call, ask [[devintr]] whether it was an interrupt it
+      recognizes, and handle it. A non-zero result means "handled": 1 for a device, 2 for
+      the timer. Interrupts stay off throughout this path.
+
+  - lines: 71-74
+    title: A page fault on lazily allocated memory
+    note: |
+      `scause` 13 is a load [[g:page-fault]], 15 a store page fault. When a program grows
+      its memory with `sbrklazy`, [[sys_sbrk]] only raises `p->sz` and maps nothing. The
+      first access to such a page faults and arrives here. [[vmfault]] checks that the
+      faulting address ([[g:csr:stval|stval]]) is below `p->sz` and not already mapped,
+      allocates a zeroed page, and maps it. If that succeeds, the trap is handled:
+      returning to user mode re-executes the faulting instruction, which now works.
+
+      The fourth argument says whether the fault was a load, but [[vmfault]] ignores it.
+      An instruction page fault (`scause` 12) is not handled: running code from a lazily
+      allocated page kills the process. So does a store to a mapped read-only page, since
+      `vmfault` refuses addresses that are already mapped.
+
+  - lines: 75-79
+    title: Anything else kills the process
+    note: |
+      An illegal instruction, a fault outside the process's memory, a misaligned access...
+      xv6 prints the cause, the PC and [[g:csr:stval|stval]], and marks the process killed
+      with [[setkilled]]. It does not exit here; line 81 does that.
+
+  - lines: 81-82
+    title: Exit if killed
+    note: |
+      A process can be marked killed by line 78, by a `kill` from another process during a
+      system call, or by the system call itself. This is the point where the kill takes
+      effect: [[kexit]] does not return, the process becomes a [[g:zombie]], and its parent
+      collects it with `wait`. Checking here means a process killed before this point
+      never returns to user mode; a kill that arrives later (for example while it waits in
+      [[yield]] below) takes effect at its next trap, at most about one timer tick later.
+
+  - lines: 84-86
+    title: Preempt on a timer interrupt
+    note: |
+      A timer interrupt means this hart's 0.1 s tick has come around; the process may have
+      run for anything up to that long. [[yield]]
+      marks it `RUNNABLE` and switches to the [[scheduler]], which may run another process.
+      When this process is chosen again, perhaps on another hart, `yield` returns here and
+      the return to user mode continues. This is what stops a program that loops forever
+      without system calls from monopolizing a CPU.
+
+  - lines: 88-95
+    title: Return to user mode via the trampoline
+    note: |
+      [[prepare_return]] turns interrupts off, sets `stvec` back to the trampoline, fills in
+      the trapframe's kernel fields, and sets `sstatus` and `sepc` for `sret`.
+
+      [[MAKE_SATP]] builds the [[g:csr:satp|satp]] value (Sv39 mode in the top bits, the
+      page table's physical page number in the low bits) for this process's page table.
+      It is computed here, after the system call, so that after an `exec` it is the *new*
+      page table. Returning it puts it in `a0`, where [[userret]] expects it.
+
+  - lines: 97-103
+    title: "prepare_return(): get ready to enter user mode"
+    note: |
+      Called from two places: the end of [[usertrap]], and [[forkret]]
+      ([[kernel/proc.c:539]]), which sends a new process to user mode for the first time.
+      It prepares everything that [[userret]] and the next [[uservec]] depend on. (Older
+      xv6 versions called this function `usertrapret`, and it also jumped to the
+      trampoline itself.)
+
+  - lines: 105-108
+    title: Interrupts off before changing stvec
+    note: |
+      Line 112 is about to point `stvec` at `uservec`, but the hart is still running kernel
+      code, with the kernel page table, until `sret`. If an interrupt arrived in between, it
+      would go to `uservec` while the kernel page table is installed. There [[TRAPFRAME]]
+      is unmapped (a guard gap), so `uservec`'s first store faults, and that fault goes to
+      `uservec` again: an endless loop of faults. As the comment says, a disaster. With `sstatus.SIE` clear no interrupt is taken;
+      `sret` turns them back on at the same moment it enters user mode.
+
+  - lines: 110-112
+    title: Send the next trap to the trampoline
+    note: |
+      `uservec` must be addressed through its [[g:trampoline]] mapping, because the user
+      page table maps only that copy, not the kernel's direct-mapped one at
+      `0x80006000`. The trampoline page starts at [[TRAMPOLINE]], so `uservec` is at
+      `TRAMPOLINE` plus its offset within the page (0 in this build).
+
+  - lines: 114-119
+    title: Leave notes for the next uservec
+    note: |
+      [[uservec]] cannot compute anything before switching page tables: it has one free
+      register. So the kernel leaves it the four values it needs in the
+      [[g:trapframe]]:
+
+      | Field | Offset | Value | Used at |
+      |---|---|---|---|
+      | `kernel_satp` | 0 | the current `satp`: the kernel page table | [[kernel/trampoline.S:85]] |
+      | `kernel_sp` | 8 | top of this process's [[g:kernel-stack]] | [[kernel/trampoline.S:76]] |
+      | `kernel_trap` | 16 | address of [[usertrap]] | [[kernel/trampoline.S:82]] |
+      | `kernel_hartid` | 32 | this hart's ID, from `tp` | [[kernel/trampoline.S:79]] |
+
+      The kernel stack is one page at virtual address `p->kstack`; a stack grows down, so
+      its starting `sp` is the page's end. The hart ID is refreshed on every return because
+      the process may run on a different hart each time; it will trap on the hart it is
+      returned to now.
+
+  - lines: 121-128
+    title: Make sret enter user mode with interrupts on
+    note: |
+      [[g:insn:sret|sret]] takes its target mode from `sstatus.SPP` and its new interrupt
+      enable from `sstatus.SPIE`. `SPP` may hold 1 here: it is a per-hart bit, and any trap
+      the kernel took on this hart since this process entered (for example a timer
+      interrupt during another process's system call, followed by a switch to this one)
+      sets it. So it is always cleared explicitly; [[forkret]]'s path needs this too.
+
+      - Clearing `SPP` ([[SSTATUS_SPP]], bit 8) selects user mode.
+      - Setting `SPIE` ([[SSTATUS_SPIE]], bit 5) makes `sret` set `SIE` to 1.
+
+      (Simplified in the comment: the RISC-V specification says supervisor interrupts are
+      globally enabled while the hart is in user mode, whatever `SIE` says; each is still
+      subject to its own bit in [[g:csr:sie|sie]], which [[start]] sets for timer and
+      external interrupts. What `SPIE`
+      really controls is the value `SIE` has after `sret`; with 1 it is consistent with
+      interrupts being on for the user program. The hardware copies `SIE` back into `SPIE`
+      on the next trap.)
+
+  - lines: 130-132
+    title: Return to the saved user PC
+    note: |
+      `sret` jumps to [[g:csr:sepc|sepc]], so put the user PC there: the instruction after
+      `ecall` for a system call, the interrupted instruction for an interrupt or a resolved
+      page fault, or the entry point for a program [[kexec]] just loaded
+      ([[kernel/exec.c:136]]).
+
+  - lines: 134-138
+    title: "kerneltrap(): traps from kernel code"
+    note: |
+      [[kernelvec]] calls this after saving the caller-saved registers on the current
+      kernel stack. It runs with interrupts off. Interrupts are only on in a few places in
+      the kernel: during a system call after [[usertrap]] calls [[intr_on]], in the
+      [[scheduler]] loop, and whenever [[pop_off]] restores them after the last lock is
+      released. So in practice this function sees timer and device interrupts that arrive
+      in those windows.
+
+  - lines: 139-142
+    title: Copy the trap CSRs before anything can change them
+    note: |
+      `sepc`, `sstatus` and `scause` are per-hart CSRs, and a [[yield]] below lets other
+      code run on this hart, including code that takes traps and returns to user mode,
+      which rewrites all three. Keeping copies in local variables (on this thread's
+      stack) lets lines 162–163 restore them.
+
+  - lines: 144-147
+    title: Sanity checks
+    note: |
+      `SPP` set means the trap came from supervisor mode, as it must when `stvec` points
+      at [[kernelvec]]. And `SIE` must be clear, because the hardware clears it on every
+      trap; if it were set, something has enabled interrupts inside the handler.
+
+  - lines: 149-154
+    title: Only interrupts are allowed
+    note: |
+      [[devintr]] returns 0 if the trap was not a timer or device interrupt, which means
+      an exception in kernel code: a page fault on a bad pointer, an illegal instruction,
+      and so on. The kernel has no way to recover, so it prints the cause, the faulting PC
+      and [[g:csr:stval|stval]] (usually the bad address), and calls [[panic]]. These three
+      numbers are the starting point for debugging a kernel crash: look up the `sepc`
+      value in `kernel/kernel.asm`.
+
+  - lines: 156-158
+    title: Preempt kernel code on a timer interrupt
+    note: |
+      As in [[usertrap]], a timer interrupt gives up the CPU, so a process doing a long
+      computation inside the kernel also shares the CPU. `myproc() != 0` excludes
+      interrupts taken in the [[scheduler]]'s own loop, where no process is running and
+      there is nothing to yield.
+
+      This kernel thread is suspended in the middle of `kerneltrap`, on its own kernel
+      stack, and may resume on a different hart. That is safe because everything it needs
+      is on its stack, and [[kernelvec]] deliberately does not restore `tp`.
+
+  - lines: 160-164
+    title: Restore the trap CSRs for sret
+    note: |
+      [[kernelvec]] ends with `sret`, which uses `sepc` and `sstatus`. The [[yield]] may
+      have overwritten them, so they are put back from the copies taken on lines 140–141.
+      Restoring `sstatus` brings back `SPP` = supervisor (so `sret` stays in the kernel)
+      and `SPIE` (so interrupts come back on exactly if they were on before the trap).
+
+      The comment says "kernelvec.S's sepc instruction"; it means its `sret` instruction.
+
+  - lines: 166-168
+    title: "clockintr(): one timer tick"
+    note: |
+      Called from [[devintr]] on every supervisor timer interrupt, on every hart. Each hart
+      has its own timer, set up by [[timerinit]] at boot.
+
+  - lines: 169-174
+    title: Count the tick, on one hart only
+    note: |
+      All harts get timer interrupts at about the same rate, so if each one incremented
+      [[ticks]], time would run *N* times too fast. Only hart 0 counts.
+
+      The increment happens under [[tickslock]] because [[sys_pause]] and [[sys_uptime]]
+      read `ticks` from other harts. [[wakeup]] wakes every process sleeping on the channel
+      `&ticks` (that is, in [[sys_pause]]) so it can check whether it has slept long
+      enough.
+
+  - lines: 176-180
+    title: Schedule the next tick
+    note: |
+      With the [[g:sstc|Sstc]] extension, a supervisor timer interrupt is pending exactly
+      while [[g:csr:time|time]] ≥ [[g:csr:stimecmp|stimecmp]]. Setting `stimecmp` to a
+      time in the future therefore does two things, as the comment says: it clears the
+      pending interrupt (otherwise it would fire again the moment interrupts are
+      re-enabled) and it arms the next one. `time` counts at 10 MHz on QEMU, so 1,000,000
+      ticks is 0.1 s. [[timerinit]] armed the first one the same way
+      ([[kernel/start.c:65]]).
+
+  - lines: 182-189
+    title: "devintr(): recognize and dispatch an interrupt"
+    note: |
+      Called by both [[usertrap]] and [[kerneltrap]]. It reads
+      [[g:csr:scause|scause]] and handles the two kinds of interrupt xv6 enables
+      ([[kernel/start.c:33]]). The return value tells the caller what happened, so it can
+      decide whether to [[yield]].
+
+      The comment's "or software interrupt" is out of date. This version does not use
+      supervisor software interrupts; it handles the *timer* interrupt instead (older xv6
+      versions forwarded timer ticks from machine mode as software interrupts).
+
+  - lines: 192-212
+    title: A device interrupt via the PLIC
+    note: |
+      `0x8000000000000009`: bit 63 set means interrupt, code 9 is "supervisor external
+      interrupt", the line the [[g:plic|PLIC]] raises when an enabled device wants
+      attention (see [[g:trap-cause]] and [[g:device-interrupt]]).
+
+      The CPU only knows "some device"; [[plic_claim]] asks the PLIC which one. The
+      claim returns the highest-priority pending source and marks it as being served.
+      xv6 enables two sources: [[UART0_IRQ]] (10), the console [[g:uart]] (a key was
+      pressed, or the UART can accept more output), handled by [[uartintr]]; and
+      [[VIRTIO0_IRQ]] (1), the disk (a request has completed), handled by
+      [[virtio_disk_intr]].
+
+      A claim can return 0 when another hart has already claimed the interrupt; there is
+      nothing to do then. Otherwise [[plic_complete]] tells the PLIC the device has been
+      served; until then the PLIC will not deliver another interrupt from that source.
+
+  - lines: 213-220
+    title: A timer interrupt, or something else
+    note: |
+      `0x8000000000000005`: interrupt, code 5, "supervisor timer interrupt". Handle the
+      tick and report 2, which makes both callers [[yield]].
+
+      Anything else (every exception, and any interrupt xv6 did not enable) returns 0 and
+      is the caller's problem: [[usertrap]] goes on to check for a page fault and otherwise
+      kills the process; [[kerneltrap]] panics.
+
+lines:
+  9: |
+    The lock protecting [[ticks]].
+  10: |
+    The tick counter. `uint` is 32 bits, so it would wrap after about 13 years at 10
+    ticks per second; [[sys_pause]]'s unsigned subtraction copes with that.
+  12: |
+    Labels from [[kernel/trampoline.S]]; see the block note.
+  15: |
+    The kernel trap entry in [[kernel/kernelvec.S]].
+  22: |
+    Initialize [[tickslock]] ([[initlock]]).
+  29: |
+    `stvec = kernelvec`. The cast turns the function's address into a number for
+    [[w_stvec]].
+  42: |
+    Did the trap come from user mode? `SPP` ([[SSTATUS_SPP]], bit 8) is 0 if so.
+  47: |
+    From now on, traps go to [[kernelvec]]. (`//DOC: kernelvec` is a marker in the comment
+    used by the xv6 book's tooling; it has no effect.)
+  49: |
+    The current process. [[myproc]] reads `mycpu()->proc` with interrupts briefly
+    disabled.
+  52: |
+    Save the user PC from [[g:csr:sepc|sepc]] into the trapframe before anything can
+    overwrite it.
+  54: |
+    Cause 8: `ecall` from user mode, a system call.
+  57: |
+    [[killed]] reads `p->killed` under `p->lock`.
+  58: |
+    Exit with status -1. Never returns.
+  62: |
+    Skip over the 4-byte `ecall` so the program continues after it.
+  66: |
+    Enable interrupts ([[intr_on]] sets `sstatus.SIE`). Safe now that `sepc`, `scause` and
+    `sstatus` have been read.
+  68: |
+    Dispatch the system call. See [[syscall]].
+  69: |
+    Handle the interrupt if it is one; `which_dev` becomes 1 or 2.
+  71-73: |
+    A load (13) or store (15) page fault, and [[vmfault]] managed to map a page at the
+    faulting address [[g:csr:stval|stval]], which must lie below `p->sz`.
+  76: |
+    Report an unhandled trap. `%lx` prints a `long` in hex.
+  78: |
+    Mark the process to be killed ([[setkilled]]); line 81 acts on it.
+  81: |
+    Re-check: the process may have been killed during the system call or by line 78.
+  85: |
+    `which_dev == 2` means a timer interrupt.
+  86: |
+    Give up the CPU for one scheduling round. See [[yield]].
+  88: |
+    Set up the CPU state for the return to user mode.
+  91: |
+    The `satp` value for this process's page table ([[MAKE_SATP]]).
+  94: |
+    Return to [[userret]], which receives this value in `a0`.
+  103: |
+    The current process; its trapframe is filled in below.
+  108: |
+    Clear `sstatus.SIE` ([[intr_off]]). Interrupts stay off until `sret`.
+  111: |
+    The address of [[uservec]] in the trampoline mapping. `uservec - trampoline` is a byte
+    offset within the page.
+  112: |
+    `stvec = uservec` (trampoline address). The next trap from user mode goes there.
+  116: |
+    The kernel page table, as currently installed in `satp`.
+  117: |
+    The top of this process's kernel stack. [[PGSIZE]] is 4096.
+
+    Always the top, never where `sp` is now: by the time the process traps again, nothing on
+    its kernel stack is needed any more (the frames were popped, or abandoned by
+    [[forkret]]), so the next trap starts on an empty stack.
+    This line only prepares the value; [[kernel/trampoline.S:76]] loads it into `sp`
+    ([[concept:stacks#kernel]]).
+  118: |
+    The address of [[usertrap]], for `uservec` to jump to.
+  119: |
+    This hart's ID ([[r_tp]] reads `tp`), for `uservec` to restore into `tp`.
+  125: |
+    Read [[g:csr:sstatus|sstatus]] into a local variable.
+  126: |
+    `SPP = 0`: `sret` will switch to user mode.
+  127: |
+    `SPIE = 1`: `sret` will set `SIE` to 1.
+  128: |
+    Write the modified value back. Interrupts are still off: only `SIE` controls that, and
+    it is still 0.
+  131: |
+    `sepc = trapframe->epc`: where `sret` will jump in user mode.
+  140: |
+    Copy of [[g:csr:sepc|sepc]]: the kernel instruction that was interrupted.
+  141: |
+    Copy of [[g:csr:sstatus|sstatus]], including `SPP` and `SPIE`.
+  142: |
+    Copy of [[g:csr:scause|scause]], for the error message on line 151.
+  144: |
+    `SPP` is 0 would mean the trap came from user mode, which should have gone to
+    `uservec`.
+  146: |
+    [[intr_get]] reports `sstatus.SIE`; it must be 0 inside a trap handler.
+  149: |
+    Handle the interrupt; 0 means it was not one.
+  157: |
+    A timer interrupt, and a process is running on this hart.
+  162: |
+    Put back the `sepc` saved on line 140.
+  163: |
+    Put back the `sstatus` saved on line 141.
+  169: |
+    Only hart 0 counts ticks ([[cpuid]]).
+  171: |
+    One more tick.
+  172: |
+    Wake processes in [[sys_pause]] sleeping on `&ticks`.
+  179: |
+    Next interrupt about 0.1 s from now ([[r_time]], [[w_stimecmp]]). This also clears the
+    current one.
+  190: |
+    Read the cause once.
+  192: |
+    Interrupt (bit 63) with code 9: a supervisor external interrupt from the PLIC.
+  196: |
+    Ask the [[g:plic|PLIC]] which device interrupted ([[plic_claim]]).
+  198: |
+    The UART: keyboard input or output progress. See [[uartintr]].
+  200: |
+    The virtio disk: a request completed. See [[virtio_disk_intr]].
+  202-203: |
+    A source xv6 did not enable; should not happen.
+  209-210: |
+    Tell the PLIC this interrupt has been handled, so the device can interrupt again.
+  212: |
+    1 = a device interrupt.
+  213: |
+    Interrupt (bit 63) with code 5: the supervisor timer.
+  215: |
+    Count the tick and schedule the next one.
+  216: |
+    2 = a timer interrupt; the caller will [[yield]].
+  218: |
+    0 = not an interrupt this function knows.

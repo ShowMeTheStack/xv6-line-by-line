@@ -1,0 +1,2039 @@
+published: true
+title: Swapping to disk
+area: Memory
+stars: 5
+branch: ext/16-swap
+prerequisites: {tours: [10, 16, 17, 20, 25, 26, 27, 28, 29], concepts: [stacks, locks]}
+summary: |
+  In this tree a process can use only as much memory as there are free pages. When
+  [[kalloc]] finds its free list empty, `sbrk` fails and a lazy page fault kills the process.
+  In this lab you make the kernel take a page that some process has not used for a while,
+  write it to a reserved area at the end of the disk, and give its physical page to whoever
+  needs it. When the owner touches that page again, it takes a [[g:page-fault]], and the
+  kernel reads the page back in. The test program writes and checks 36,000 pages on a
+  machine with 32,768 pages of RAM.
+
+  Swapping touches more of the kernel than any lab before it, because it moves pages *out
+  from under* processes that are not expecting it. Where on the disk do the pages go, and
+  through which layer? How does a PTE say "this page is on disk, in slot 2128"? Which page
+  do you pick, and how do you get from a physical page to the PTE that maps it? The page you
+  pick may belong to a process that is running on another [[g:hart]] at that very moment:
+  what does that hart's [[g:tlb]] still believe? Eviction needs the disk, and the disk
+  sleeps: from which of [[kalloc]]'s many callers is that allowed? The kernel copies into
+  user memory while holding spinlocks: what if the page it copies to is on disk? The think
+  section asks these questions in the order a designer meets them.
+
+  The reference solution is twelve commits. It passes `usertests -q` on three harts, and
+  during that run it writes about 49,000 pages to swap without anyone noticing.
+learn:
+  - "Where evicted pages can live on a disk that already holds a file system, which of the file system's layers they should go through, and how a whole physical page can reach the disk."
+  - "How a PTE with V clear becomes the kernel's own storage, and which existing code walks user page tables and has to learn what such an entry means."
+  - "What the hardware records about the use of a page, how a kernel can turn that into a choice of victim, and how to get from a physical page back to the PTE that maps it."
+  - "What a TLB is allowed to remember after a PTE changes, and what that means for which pages may be taken at all."
+  - "Which allocation sites may wait for a disk and which may not, and how the ones that may not still find memory when RAM is full."
+  - "What a physical address obtained from a PTE is worth once pages can move, and how the kernel's own copies to and from user memory have to protect themselves."
+  - "What `fork`, `exit` and `exec` must do with pages that are not in memory, and how two processes can share one copy on disk."
+spec: |
+  **Behaviour.** When memory runs low, the kernel picks a user page, writes it to a free
+  *slot* of a swap area on the disk, marks the PTE that mapped it as "in swap, slot *s*", and
+  frees the physical page. When the process touches the page again (a load, a store or an
+  instruction fetch), or the kernel copies to or from it for a system call, the page is read
+  back into a free page and mapped again with the same permissions. A program cannot tell,
+  except by the time it takes.
+
+  - The swap area holds 8,192 slots of one page each (32 MiB), on `fs.img`. Files must never
+    be given its blocks, and swapping must never disturb files (where it lives, and how it is
+    read and written, is question 1).
+  - `fork` of a process with pages in swap gives the child the same contents: both
+    processes must see their pages, and neither may see the other's later writes.
+  - `exit`, `exec` and `sbrk(-n)` give back the slots of the pages they discard. Nothing leaks:
+    free pages plus free slots are the same after a test as before it.
+  - When both memory and swap are full, a process that needs a page is killed (a fault) or
+    gets an error (`sbrk`, `read`), as before: the kernel must not panic.
+  - A new system call `swapstat(struct swapstat *)` reports free pages, slots in use, and the
+    pages written out and read in since boot.
+
+  **What must not change.** Every program behaves as before. **`usertests -q` must print `ALL
+  TESTS PASSED` on 3 harts**, with swapping active: several of its tests use up all of memory
+  on purpose.
+
+  **The test program**, `swaptest`, prints one line per check (counts vary from run to run;
+  this is the reference branch):
+
+  ```text
+  $ swaptest
+  swaptest: big: wrote 36000 pages: 3710 out, 0 in
+  swaptest: big: checked 36000 pages, 0 wrong: 32299 out, 32299 in
+  swaptest: big: OK
+  swaptest: syscalls: copied 32 pages, 0 wrong; 5 sources and 4 destinations were in swap
+  swaptest: syscalls: OK
+  swaptest: fork: 21 slots in use at fork
+  swaptest: fork: child ok, parent 0 wrong, 26 pages read in
+  swaptest: fork: OK
+  swaptest: procs: 15838 out, 13651 in
+  swaptest: procs: OK
+  swaptest: free pages + free slots: 40594 before, 40594 after
+  swaptest: leak: OK
+  swaptest: 62267 pages written out, 45992 read in
+  swaptest: ALL OK
+  ```
+
+  - **big**: write 36,000 pages (more than the 32,768 pages of RAM) with a pattern that
+    depends on the page and the word, then check every word of every page, the last page
+    first.
+  - **syscalls**: the kernel reads from and writes to pages that are in swap: pages go
+    through a pipe, 512 bytes at a time, until `write` has had to read 4 source pages from
+    swap and `read` 4 destination pages.
+  - **fork**: fill 2,000 pages, use enough memory to push some of them out, give that memory
+    back, `fork`. The child checks every page and overwrites half of them; then the parent
+    checks every page.
+  - **procs**: three processes of 12,500 pages each, started together, so that they evict
+    each other's pages. It fails if nothing was written out.
+  - **leak**: free pages plus free slots, before and after.
+think:
+  - title: Where do evicted pages go, and through which layer?
+    q: |
+      An evicted page's 4,096 bytes must be stored off RAM and found again later by a number.
+      The only storage is the disk, which already holds a file system with a log
+      ([[tour:31]]) and a buffer cache ([[tour:30]]) in front of the driver. Where on the
+      disk do you put swapped pages, and how do you read and write them: as a file, through
+      the log, through the buffer cache, or some other way? Commit to an answer, then
+      check it against what each layer is *for*.
+    hints:
+      - "Look at the disk layout in [[mkfs/mkfs.c:25]] and at what the superblock's `size` means to [[balloc]] ([[kernel/fs.c:68]]). Then look at what [[virtio_disk_rw]] needs from its `struct buf` ([[kernel/virtio_disk.c:216]])."
+      - "Ask what must survive a crash. After a reboot every process is gone, so the contents of swap are worthless: swap needs no crash consistency. The log exists only for crash consistency (and lets one operation write at most `MAXOPBLOCKS` = 10 blocks); the buffer cache holds 30 blocks, and [[bread]] always reads a block before you can change it."
+      - "Reserve a region after the file system that the file system never allocates, and move pages between it and memory with the disk driver itself: one page-sized request per page, straight from the physical page."
+    answer: |
+      The reference reserves **8,192 slots of one page** right after the file system: slot
+      *s* is blocks `2000 + 4s` to `2000 + 4s + 3`. `mkfs` makes `fs.img` that much longer
+      (34,768 blocks, 35,602,432 bytes) but leaves `sb.size` at 2,000, so [[balloc]] never
+      hands out a swap block. This is a *swap partition*, in miniature.
+
+      None of the file system's layers helps, and each one hurts:
+
+      - **The log** makes multi-block updates atomic across a crash. Swap contents die with
+        the processes at a crash, so there is nothing to protect. The log would write every
+        page twice, and a page is 4 blocks of the 10 one operation may log.
+      - **The buffer cache** keeps recently used blocks for the file system. A swapped page is
+        read back at most once per eviction, so caching it is useless; worse, its 4 blocks
+        would push 4 file-system blocks out of a 30-block cache. And [[bread]] reads a block
+        from the disk before you may write it: an eviction would read 4 blocks it is about to
+        overwrite.
+      - **A file** would bring inode locks, [[bmap]] and transactions into a path that must
+        run when memory is already short.
+
+      So the reference goes to the driver. [[virtio_disk_rw]] already builds a request from a
+      sector number, an address and a length; its body becomes `disk_rw`, and a new
+      `virtio_disk_rwpage` asks for 4,096 bytes at the slot's first block, with the data
+      descriptor pointing at the physical page itself (the device uses physical addresses,
+      and the kernel's direct map makes the page's kernel address equal to its physical
+      one). One request per page, no copy. A `struct buf` is still passed, only so that the
+      caller can sleep on it until the interrupt says the request is done.
+
+      Swap I/O is done one page at a time, under a sleep-lock (`swapio.lock`). That is the
+      simplest correct choice; a later question shows it also solves a race.
+    checks:
+      - id: lab16-01
+        level: 1
+        type: number
+        q: |
+          `FSSIZE` is 2,000 blocks of 1,024 bytes, and the swap area holds `NSWAP` = 8,192
+          slots of one page each, starting at block `SWAPSTART` = `FSSIZE`. How many blocks
+          long is `fs.img` on the reference branch?
+        answer: 34768
+        wrong:
+          10192: |
+            You may have counted one block per slot. A slot holds a page, 4,096 bytes, and
+            a block is 1,024 bytes (`BSIZE`): 4 blocks per slot.
+          32768: |
+            You may have counted only the swap area: 8,192 × 4 = 32,768 blocks. The file
+            system's 2,000 blocks come first.
+          8192: |
+            You may have counted slots, not blocks, and forgotten the file system.
+        why_wrong: "The image is the file system (2,000 blocks) followed by 8,192 slots of 4 blocks each."
+        explain: |
+          2,000 + 8,192 × 4 = 34,768 blocks, which is 35,602,432 bytes: the size of the
+          `fs.img` this branch builds. `mkfs` creates it by writing the last block of the
+          swap area, right after the loop that writes the file system's blocks
+          ([[mkfs/mkfs.c:114]]).
+      - id: lab16-02
+        level: 2
+        type: choice
+        q: |
+          A classmate suggests writing evicted pages with [[bwrite]] through the buffer
+          cache, "so the driver code stays untouched". Which is the strongest reason the
+          reference does not?
+        options:
+          - text: "To change a block through the cache you must bread it first, which reads from the disk the 4 blocks you are about to overwrite, and the 4 buffers then push useful file-system blocks out of a 30-block cache."
+            correct: true
+            why: |
+              Right. The cache is designed for data that is read again soon. Swap blocks
+              are written once and read back at most once.
+          - text: "bwrite cannot write blocks beyond sb.size."
+            why: |
+              You may have assumed the cache checks the file-system size. [[bread]] and
+              [[bwrite]] take any block number; it is [[balloc]] that stays below
+              `sb.size`.
+          - text: "bwrite would put the page in the log."
+            why: |
+              You may be mixing up [[bwrite]] and [[log_write]]. Only `log_write` records a
+              block in the log; `bwrite` writes the buffer to its home block at once.
+          - text: "The buffer cache cannot be used while memory is short, because bget allocates a page."
+            why: |
+              The buffer cache's 30 buffers are static arrays in `bcache`; [[bget]] never
+              calls [[kalloc]].
+        explain: |
+          Swap needs neither caching nor crash safety, so it should bypass both layers. See
+          [[tour:30]] for what the cache is for and [[tour:29]] for the driver's request.
+  - title: How does a PTE say "this page is in slot 1069"?
+    q: |
+      After eviction the process must fault on its next access, and the fault handler must
+      find the slot. Where do you keep the slot number? Then list the code that already walks
+      user page tables. What does each one do today with the entry you just designed, and
+      which ones will misbehave?
+    hints:
+      - "Look at the PTE bits ([[kernel/riscv.h:395]]). What does the hardware do with a PTE whose V bit is clear? Then find every function in `vm.c` that walks a user page table, and note what each one decides when an entry has no V."
+      - "The RISC-V privileged spec says that when V is 0, all other bits of the PTE are ignored by the hardware and free for software. But a PTE of all zeros already has a meaning in this tree: \"nothing here yet\" (a lazy page)."
+      - "V clear, one bit that says \"in swap\" (an RSW bit, 8), the slot number in the PPN field, the permission bits kept for later. Then teach uvmunmap to free the slot, uvmcopy to share it, and vmfault to read it back."
+    answer: |
+      The PTE itself is the natural place: it is exactly what the fault handler looks up. A
+      swapped-out PTE in the reference has:
+
+      | bits | value |
+      |---|---|
+      | 0 (V) | 0: the hardware faults on any access and ignores everything else |
+      | 1–4 (R W X U) | the permissions the page will get back |
+      | 8 (`PTE_SWAP`, an RSW bit) | 1: "this is a page in swap", as opposed to a zero, lazy PTE |
+      | 10 and up (the PPN field) | the slot number |
+
+      Three existing functions read user PTEs and would get it wrong:
+
+      - [[uvmunmap]] skips PTEs without V. Every page in swap at `exit`, `exec` or `sbrk(-n)`
+        would keep its slot forever: swap fills up (clinic 4).
+      - [[uvmcopy]] skips them too. The child would have *no* PTE for the page; its first
+        access would look like a lazy page to [[vmfault]], which hands it a zero-filled page.
+        The child silently reads zeros (clinic 3).
+      - [[vmfault]] sees "not mapped, below `p->sz`" and would also allocate a zero page,
+        losing the data and the slot.
+
+      [[walkaddr]] needs no change: it returns 0 for a page without V, which already makes
+      [[copyin]] and [[copyout]] call [[vmfault]]. [[mappages]] is never asked to map over a
+      swapped PTE: swap-in writes the PTE directly. [[freewalk]] runs after [[uvmunmap]] has
+      cleared all leaves.
+
+      Sharing in `fork`: the child cannot read the page in to copy it, because [[kfork]]
+      holds the child's `np->lock` across [[uvmcopy]] (no sleeping). So the reference copies
+      the PTE and counts one more reference to the slot. The slot allocator keeps a
+      reference count per slot (`uchar ref[NSWAP]`, under the spinlock `slots.lock`), and a
+      slot is free when no PTE refers to it. Each process reads its own copy in later.
+    checks:
+      - id: lab16-03
+        level: 2
+        type: bits
+        q: |
+          On the reference branch, gdb stopped in `swapin` and printed the PTE of the page
+          being read back: `0x10b516`. Decode it.
+        value: "0x10b516"
+        fields:
+          - label: "V (bit 0)"
+            options: ["0", "1"]
+            answer: "0"
+            why: "0x116 in binary is 1 0001 0110: bit 0 is 0. A page in swap must fault on every access, so V is clear."
+          - label: "W (bit 2)"
+            options: ["0", "1"]
+            answer: "1"
+            why: "0x6 = 0110: bits 1 and 2 are set, R and W. It was a writable data page, and it will be writable again."
+          - label: "U (bit 4)"
+            options: ["0", "1"]
+            answer: "1"
+            why: "0x10 is set: a user page."
+          - label: "bit 8 (PTE_SWAP)"
+            options: ["0", "1"]
+            answer: "1"
+            why: "0x100 is set. Without it the kernel could not tell this PTE from a lazy one; the hardware ignores the bit (and, with V clear, all the others too)."
+          - label: "the slot number (PTE >> 10)"
+            options: ["0x10b5", "1069", "0x10b", "2138"]
+            answer: "1069"
+            why: "0x10b516 >> 10 = 0x42d = 1069. You may have shifted by 12, as for a physical address (that gives 0x10b), or by 8 (0x10b5)."
+        explain: |
+          `0x10b516 & 0x3ff` = `0x116` = R (2) + W (4) + U (0x10) + `PTE_SWAP` (0x100), V clear.
+          The slot is `0x10b516 >> 10` = 1,069, at blocks 2,000 + 4 × 1,069 = 6,276 to 6,279.
+          See [[g:pte]] and [[kernel/riscv.h:395]].
+      - id: lab16-04
+        level: 2
+        type: multi
+        q: |
+          Before any other change, the kernel starts producing swapped-out PTEs (V clear,
+          `PTE_SWAP` set, slot in the PPN field). Which **unchanged** functions of this tree
+          then lose data or slots?
+        options:
+          - text: "uvmunmap"
+            correct: true
+            why: "It skips any PTE without V ([[kernel/vm.c:205]]), so the slot is never freed."
+          - text: "uvmcopy"
+            correct: true
+            why: "It skips any PTE without V ([[kernel/vm.c:309]]): the child gets no PTE, and later a zero-filled lazy page in its place."
+          - text: "vmfault"
+            correct: true
+            why: "It treats a PTE without V below `p->sz` as a lazy page ([[kernel/vm.c:466]]) and maps a zero page over it."
+          - text: "walkaddr"
+            why: |
+              You may have expected it to need a special case. It already returns 0 when V
+              is clear, which is what its callers ([[copyin]], [[copyout]]) take as "call
+              vmfault". The repair happens in vmfault.
+          - text: "freewalk"
+            why: |
+              It runs only after [[uvmunmap]] has emptied the leaves, and it panics only on a
+              *valid* leaf. Once uvmunmap clears swapped PTEs, freewalk never sees one.
+        explain: |
+          Every function that interprets "V clear" as "nothing here" must learn the third
+          state, "here, but on disk". The reference changes [[uvmunmap]], [[uvmcopy]] and
+          [[vmfault]], and nothing else that walks page tables.
+  - title: Which page do you take, and how do you find its PTE?
+    q: |
+      Memory is full and you need one page. You would like one that has not been used for a
+      while. What does the hardware tell you about use? And once you have chosen a physical
+      page, how do you find the PTE that maps it, so that you can change it?
+    hints:
+      - "Read [[kernel/start.c:41]] and look up `menvcfg.ADUE` and the PTE bits 6 and 7 (A, D). Then: a page table maps virtual to physical. What maps physical to virtual?"
+      - "With ADUE set, the hardware sets A in the PTE in memory whenever it walks the page table for an access through it, and never clears it. The kernel may clear it and see whether it comes back. In this kernel a user page is mapped by exactly one PTE (fork copies pages), so the reverse map is a function: one (process, address) per physical page."
+      - "A table indexed by physical page number holding (process, virtual address); a hand that goes round it; a page with A set gets its A cleared and is passed over, a page with A clear is the victim."
+    answer: |
+      **Use.** `start` sets `menvcfg.ADUE` ([[kernel/start.c:41]]), so the hardware keeps the
+      accessed bit (A, bit 6) and dirty bit (D, bit 7) of every PTE it uses up to date in
+      memory. We checked this on QEMU 10.2.1: gdb stopped in the reference's clock and found
+      `0x21fc78d7` there, flags `0xd7` = V R W U **A** D, a page used since the hand last
+      cleared its A. Nothing in the base tree ever reads these bits.
+
+      **The clock algorithm** (second chance) turns one bit into an approximation of "least
+      recently used". A hand goes round all pages; at each one:
+
+      - A set: used since the hand last passed. Clear A and move on.
+      - A clear: not used for a whole lap. That is the victim.
+
+      **The reverse map.** A page table answers "which page is at this address?"; eviction
+      asks the opposite. The reference keeps a frame table with one entry per physical page
+      of RAM (32,768 entries of 16 bytes: 512 KiB, 128 pages of kernel `.bss`): the process
+      and the virtual address that map it, or 0 for a page that is not a user page. Every
+      place that maps a fresh user page records it ([[uvmalloc]], [[vmfault]]'s lazy path,
+      [[uvmcopy]], swap-in); [[uvmunmap]] clears the entry when it frees the page. Page-table
+      pages, trapframes, kernel stacks and pipe buffers are never recorded, so they can never
+      be evicted.
+
+      **Locks.** The table and the hand are protected by a spinlock `ft.lock`. To change the
+      victim's PTE you also need its process locked (next question). [[freeproc]] frees a
+      zombie's pages holding `p->lock`, and freeing clears frame-table entries, so the order
+      `p->lock` → `ft.lock` already exists. The hand must therefore read an entry under
+      `ft.lock`, *release it*, take the owner's `p->lock`, then take `ft.lock` again and
+      check that the entry has not changed meanwhile. Taking `p->lock` while holding
+      `ft.lock` would be the reverse order: a deadlock waiting to happen.
+    checks:
+      - id: lab16-05
+        level: 2
+        type: tf
+        q: |
+          True or false: with the clock algorithm, a page whose PTE has A set when the hand
+          reaches it can never be evicted.
+        answer: false
+        why_tf: |
+          You may have read "second chance" as "never". A set only buys one lap.
+        reasons:
+          - text: "The hand clears A and moves on; if the page is not used again before the hand comes back, A is still clear then and the page is taken."
+            correct: true
+            why: Right. A means "used since the hand last passed", nothing more.
+          - text: "The hardware clears A after a while, so the page becomes evictable on its own."
+            why: |
+              The hardware only *sets* A. Only software clears it; in this lab only the
+              clock does.
+          - text: "A is ignored; only D (dirty) matters for eviction."
+            why: |
+              D tells whether the page changed since it was mapped. The reference does not
+              use it (every eviction writes the page); a real kernel uses it to avoid
+              rewriting a page whose copy on disk is still good.
+        explain: |
+          Clinic 5 removes the line that clears A: every page that has ever been used keeps A
+          set forever, the hand never finds a victim, and a process that needs memory is
+          killed although 8,192 slots are free.
+      - id: lab16-06
+        level: 3
+        type: choice
+        q: |
+          A classmate's clock holds `ft.lock` while it takes the owner's `p->lock`:
+          `acquire(&ft.lock); p = ft.f[i].proc; acquire(&p->lock); ...`. Meanwhile, on
+          another hart, the shell runs [[kwait]] and frees a zombie, the same `p`, holding
+          its `p->lock`. What can happen?
+        options:
+          - text: "A deadlock: the clock holds ft.lock and waits for p->lock, while freeproc → uvmunmap holds p->lock and waits for ft.lock to clear the frame-table entry."
+            correct: true
+            why: |
+              Right. Two locks taken in opposite orders on two harts: each holds what the
+              other needs.
+          - text: "Nothing: spinlocks cannot deadlock, they only spin."
+            why: |
+              Spinning forever *is* the deadlock. Neither hart can release what it holds
+              until it gets the other lock ([[tour:18]]).
+          - text: "acquire panics because p->lock is held by another hart."
+            why: |
+              [[acquire]] panics only if *this* hart already holds the lock. A lock held
+              elsewhere just makes it spin.
+          - text: "The zombie's page is evicted after it was freed."
+            why: |
+              That would be a different bug (not rechecking the entry). With both locks taken
+              in this order, the problem comes earlier: neither hart gets past its acquire.
+        explain: |
+          The lock order `p->lock` → `ft.lock` comes from [[freeproc]] (via [[uvmunmap]]),
+          which runs with the zombie's `p->lock` held ([[kernel/proc.c:384]]). The clock
+          follows the same order and rechecks the entry, the same pattern as [[bget]]
+          releasing `bcache.lock` before it sleeps on a buffer ([[tour:51]]).
+  - title: Whose pages may you take?
+    q: |
+      The hand reaches a page of `hog`, which is running in user mode on hart 2 at this very
+      moment. You clear V in its PTE, write the page to slot *s*, and put the physical page on
+      the free list, where someone else gets it. What does hart 2 do on `hog`'s next store to
+      that page? Which processes' pages is it safe to take, and why?
+    hints:
+      - "Find every `sfence.vma` in this tree: [[kernel/trampoline.S:89]], [[kernel/trampoline.S:95]], [[kernel/trampoline.S:110]], [[kernel/trampoline.S:112]], [[kvminithart]]. Which hart does each one flush?"
+      - "A hart may keep a translation in its TLB after the PTE changes, until that hart executes `sfence.vma`. An `sfence.vma` on hart 0 does nothing to hart 2's TLB; asking hart 2 to flush needs an interprocessor interrupt, which this kernel does not have. And a process that is SLEEPING or RUNNABLE entered the kernel through [[uservec]], which flushed."
+      - "Take pages only from processes that are SLEEPING or RUNNABLE (checked under their p->lock, which they need to run again), or from the evicting process itself, which will flush in [[userret]]."
+    answer: |
+      Hart 2 may not even look at the PTE. Its TLB can still hold the old translation
+      `va → old page, writable`, and RISC-V lets it keep using that entry until hart 2
+      itself executes `sfence.vma`. `hog`'s store lands in a page that is now free, or
+      already someone else's: the other process's data is corrupted, and `hog`'s write is
+      lost, because the copy on disk was taken before it. Nothing faults, nothing panics.
+
+      Hart 0 cannot fix this by flushing: `sfence.vma` only affects the TLB of the hart that
+      executes it. Real kernels send an interprocessor interrupt (a "TLB shootdown") and wait
+      for every hart that may cache the translation to flush. This kernel has no such
+      mechanism, so the reference designs around it:
+
+      - A process that is **SLEEPING or RUNNABLE** entered the kernel through [[uservec]],
+        which switched to the kernel page table and executed `sfence.vma`
+        ([[kernel/trampoline.S:89]]–[[kernel/trampoline.S:95]]). No hart holds its user
+        translations. It cannot run again while the evicting hart holds its `p->lock`,
+        because [[scheduler]] needs that lock to switch to it; and when it does run, its next
+        return to user mode goes through [[userret]], which flushes again.
+      - **The evicting process itself** is in the kernel, on the kernel page table; its return
+        to user mode flushes in [[userret]].
+      - A process that is **RUNNING** on another hart is never touched, whether it is in user
+        mode (the TLB problem) or in the kernel (it may be in the middle of using a physical
+        address it got from its page table: a later question).
+
+      The same rule covers clearing A: the clock only clears A in PTEs of processes that
+      hold no translation in any TLB, so the next access really walks the table and sets A
+      again.
+
+      **Observed.** In clinic 1 the state check is replaced by "any live process". A gdb
+      breakpoint caught that kernel evicting pages of a process that was running on another
+      hart (that hart's pc was `0x11e`, user code; 22 such evictions in two runs). `swaptest` still passed every time: the
+      damage needs the victim to use the page again through its stale entry before its next
+      trap flushes it (at most one timer tick, 0.1 s), and the test's processes do not
+      revisit a page that soon. A race no test caught is exactly why this rule must come
+      from reasoning, not from testing.
+    checks:
+      - id: lab16-07
+        level: 2
+        type: choice
+        q: |
+          Hart 0 evicts a page of process P, which is RUNNING in user mode on hart 2, and
+          executes `sfence.vma` right after changing P's PTE. Is P now safe?
+        options:
+          - text: "No: sfence.vma only flushes hart 0's TLB; hart 2 may still use its cached translation."
+            correct: true
+            why: |
+              Right. Each hart flushes only itself. Without an interprocessor interrupt,
+              hart 0 cannot make hart 2 flush.
+          - text: "Yes: sfence.vma flushes the TLBs of all harts."
+            why: |
+              You may have thought the TLB is shared. Each hart has its own, and
+              `sfence.vma` orders and flushes only the executing hart's view.
+          - text: "Yes: hart 2 rereads the PTE on every access."
+            why: |
+              That is what a TLB exists to avoid. A cached translation is used without
+              touching the page table.
+          - text: "No, but only because hart 0 should have used `sfence.vma` with P's address instead of zero, zero."
+            why: |
+              The arguments only narrow *which* entries hart 0 flushes. No form of the
+              instruction reaches another hart.
+        explain: |
+          This kernel flushes in exactly three places: [[kvminithart]] at boot, [[uservec]] on
+          every entry from user mode, [[userret]] on every return. All three flush the hart
+          that runs them. That is why the clock only takes pages of processes that are not
+          running anywhere, or of itself.
+      - id: lab16-08
+        level: 3
+        type: multi
+        q: |
+          The clock reaches a page of process P while holding P's `p->lock`. For which
+          states of P may it evict the page?
+        options:
+          - text: "SLEEPING"
+            correct: true
+            why: "P entered the kernel through uservec (which flushed) and cannot run until someone takes its p->lock."
+          - text: "RUNNABLE"
+            correct: true
+            why: "Same as SLEEPING: it is waiting for a scheduler, which needs P's p->lock to switch to it."
+          - text: "RUNNING on another hart"
+            why: |
+              You may have thought holding P's `p->lock` stops P. A running process does not
+              need its own lock to keep running, and its hart's TLB may hold the translation.
+          - text: "RUNNING, and P is the process doing the eviction"
+            correct: true
+            why: "It is in the kernel on the kernel page table; userret flushes before it runs in user mode again."
+          - text: "ZOMBIE"
+            why: |
+              Its pages are about to be freed by its parent's [[kwait]]: writing them to
+              swap would be pure waste. The reference skips anything that is not SLEEPING,
+              RUNNABLE or itself.
+        explain: |
+          The condition in the reference is `p->state == SLEEPING || p->state == RUNNABLE ||
+          p == me`, evaluated with `p->lock` held so that the state cannot change before the
+          PTE does.
+  - title: Where may eviction run?
+    q: |
+      The obvious place to evict is [[kalloc]]: when the free list is empty, write some page
+      out and return its frame. List [[kalloc]]'s callers and what each one holds when it
+      calls. What does an eviction have to do that some of them cannot allow? And if
+      [[kalloc]] does not evict, how do those callers still find memory when user pages fill
+      RAM?
+    hints:
+      - "Search for `kalloc()`: [[uvmcopy]] (in [[kfork]], holding the child's `np->lock`), [[allocproc]] (holding the new `p->lock`), [[walk]] (page-table pages, called from [[mappages]] by all of the others), [[pipealloc]], [[uvmalloc]] (from `sbrk` and [[kexec]]), [[vmfault]], [[virtio_disk_init]]."
+      - "Writing to the disk sleeps ([[virtio_disk_rw]] waits for the interrupt). [[sched]] panics with `sched locks` when a process sleeps holding any spinlock but its own `p->lock` ([[kernel/proc.c:487]])."
+      - "Two allocators: plain kalloc never evicts and never sleeps; a new one for user pages, used only where no spinlock is held, evicts first whenever fewer than a small reserve of pages are free, so that the reserve is there for kalloc's other callers."
+    answer: |
+      Eviction writes to the disk, and writing to the disk sleeps. Several of [[kalloc]]'s
+      callers hold spinlocks: [[uvmcopy]] runs under the child's `np->lock`, [[allocproc]]
+      under the new process's `p->lock`, and [[walk]] (allocating a page-table page) can be
+      reached from both. Sleeping there panics ([[sched]]: `sched locks`). So [[kalloc]]
+      itself must never evict.
+
+      The reference adds **`ualloc`**, the allocator for user pages: while fewer than
+      `FREELOW` = 32 pages are free it evicts one page, then it calls [[kalloc]]. It is used
+      for user pages: by [[uvmalloc]] (`sbrk`, and [[kexec]], which holds only sleep-locks
+      and a log reservation, neither of which the swap code needs), by [[vmfault]]'s lazy
+      path, and by swap-in itself. The lazy path can be reached from a copy made under a
+      spinlock (a lazy page of a pipe reader's buffer), so `ualloc` checks first: if this
+      hart holds a spinlock it does not evict, and only takes what is free, as [[kalloc]]
+      did there before. Every other caller keeps calling [[kalloc]] and lives off the
+      reserve that `ualloc` keeps refilled: page-table pages, the trapframe and page table of
+      a new process, pipe buffers, the pages `fork` copies.
+
+      The alternative is a swapper kernel thread that wakes when free memory falls below a
+      low-water mark and evicts up to a high-water mark, the way Linux's `kswapd` does. It
+      needs a kernel thread, which xv6 does not have; and allocators that may sleep would
+      still have to wait for it. Direct reclaim in `ualloc` is simpler.
+
+      What this costs: `fork` cannot evict, so forking a big process when memory is full
+      fails (`fork` returns -1): it needs a free page for every resident page of the parent.
+      `swaptest fork` frees memory first. Copy-on-write ([[tour:20]], lab 11) would remove
+      most of this cost.
+    checks:
+      - id: lab16-09
+        level: 2
+        type: state
+        q: |
+          `swaptest` (pid 3) forks while one of its pages is in swap. Fill in the state of the
+          hart at the moment [[uvmcopy]] copies the swapped-out PTE into the child's page
+          table.
+        code: kernel/proc.c:258-276@266-271
+        state:
+          mode: S
+          stack: kernel
+          sie: "off"
+          noff: 1
+          intena: 1
+        why:
+          noff: |
+            [[allocproc]] returned with the child's `np->lock` held, and [[kfork]] keeps it
+            through [[uvmcopy]]. That one spinlock is noff 1 (gdb recorded noff 1 here). This
+            is why [[uvmcopy]] cannot read the page in to copy it.
+          intena: |
+            `fork` is a system call: [[usertrap]] turned interrupts on before [[syscall]], so
+            the first [[acquire]] recorded SIE as 1.
+          sie: |
+            Any spinlock held means interrupts are off on this hart.
+          stack: |
+            A system call runs on the process's kernel stack: `usertrap → syscall → sys_fork
+            → kfork → uvmcopy`.
+          mode: |
+            Kernel code runs in supervisor mode.
+        why_wrong: "Follow ecall → usertrap (intr_on) → sys_fork → kfork → allocproc (acquire np->lock) → uvmcopy."
+        explain: |
+          Any eviction here would sleep with `np->lock` held and panic in [[sched]]. So
+          [[uvmcopy]] copies the swapped PTE and calls `swapdup` (a spinlock only), and copies
+          resident pages with plain [[kalloc]], which takes from the reserve.
+      - id: lab16-10
+        level: 2
+        type: multi
+        q: |
+          Which callers may use `ualloc` (which can evict, and so sleep) instead of
+          [[kalloc]]?
+        options:
+          - text: "uvmalloc, when growproc calls it for sbrk"
+            correct: true
+            why: "sys_sbrk holds no lock."
+          - text: "uvmalloc, when kexec calls it"
+            correct: true
+            why: "kexec holds the program's inode sleep-lock and is inside a log transaction. Sleeping is allowed under both, and the swap code takes neither."
+          - text: "vmfault, allocating a lazy page"
+            correct: true
+            why: "From usertrap it holds nothing. A copy under pi->lock can also reach it, for a lazy page of its buffer, so ualloc checks noff first: it evicts only when no spinlock is held, and otherwise takes what is free, as kalloc did."
+          - text: "uvmcopy"
+            why: "It runs under the child's np->lock."
+          - text: "allocproc, for the trapframe"
+            why: "It holds the new process's p->lock."
+          - text: "walk, for a page-table page"
+            why: "It is called from mappages under np->lock in uvmcopy, among others; it cannot know whether its caller holds a spinlock."
+        explain: |
+          The rule is the one [[sched]] enforces: no sleeping with a spinlock other than
+          `p->lock` held across [[swtch]]. Sleep-locks and a log reservation do not count.
+          See [[concept:locks#rules]].
+  - title: The kernel's own copies
+    q: |
+      [[copyout]] already calls [[vmfault]] when [[walkaddr]] returns 0, so a `read` into a
+      buffer that is in swap will bring it back from inside [[copyout]]. On which paths does
+      [[copyout]] (or [[copyin]]) run with a spinlock held, and what happens if the page is
+      in swap there? Then a quieter problem: [[copyout]] gets a physical address from the
+      PTE, then copies to it. What can happen between those two steps now that pages move,
+      even when no lock is held?
+    hints:
+      - "Search for the callers of [[copyin]], [[copyout]], [[either_copyin]] and [[either_copyout]], and note what locks each one holds at the call. And: a system call runs with interrupts on ([[kernel/trap.c:66]]); a timer interrupt in the kernel ends in [[yield]] ([[kernel/trap.c:158]])."
+      - "Reading a page from swap sleeps. A pipe reader may sleep a long time waiting for data before it copies, and pages can be evicted meanwhile. A process preempted by a timer is RUNNABLE, which makes its pages fair game for the clock."
+      - "Before those system calls take their locks, bring back the buffer's pages that are in swap and mark the pages in memory as pinned (the other RSW bit); have the clock skip pinned PTEs, and unpin when the call returns. Pin no more than the copy can need. In copyin and copyout, keep interrupts off from the translation to the end of the copy."
+    answer: |
+      **Copies under a spinlock.** Four paths copy while holding a spinlock: [[piperead]] and
+      [[pipewrite]] (`pi->lock`), [[consoleread]] (`cons.lock`) and [[kwait]] (`wait_lock`
+      and the child's `p->lock`). If the page is in swap there, [[vmfault]] reads it back and
+      sleeps for the disk with the spinlock held: `panic: sched locks`. Clinic 2 shows exactly
+      that, from `swaptest syscalls`.
+
+      They are reached through three system calls: `read` and `write` on a pipe or the
+      console, and `wait`. Before the copy starts, the reference goes through the user
+      buffer once (`uvmpin`): a page that is in swap is read back in, and every page that is
+      in memory gets `PTE_PIN` (bit 9, the other RSW bit), which the clock respects;
+      `uvmunpin` clears the bits when the call returns. A pipe reader may sleep for minutes
+      between the two; the pin is what keeps its buffer in memory all that time.
+
+      What the pin leaves alone matters as much:
+
+      - **Files.** [[readi]] and [[writei]] copy holding only sleep-locks, so a page that is
+        missing there may be read back in during the copy. `read` and `write` on a file pin
+        nothing.
+      - **Pages that do not exist yet.** A lazy page of the buffer is left to the copy, which
+        allocates it as the original kernel did, under the spinlock, with whatever memory is
+        free (`ualloc` does not evict when its caller holds a spinlock). The pin brings back
+        only pages the process has used before, which in the original kernel would all have
+        been in memory anyway.
+      - **Pages beyond `p->sz`, and pages without `PTE_U`**: the copy fails there, as before.
+
+      So every program sees what it saw before. A probe program, `pinread`, reads the 2,441-byte
+      `README` into a lazy buffer of 1, 1,000, 34,000 and 100,000 pages: the original kernel
+      and the reference both return 2441 every time (`pinread` in the measure section).
+
+      Two simpler designs fail. Pinning the whole *process* during these calls leaves a
+      process that is the only big one with nothing it may evict to make room for its own
+      buffer: with that design `swaptest syscalls` hung, QEMU idle (reasoned from the code,
+      not traced: a `write` failed for lack of memory and the test then waited on a `read`
+      forever). Pinning and faulting in the whole *buffer*, lazy pages included, for every
+      `read` and `write` changes what programs see: reading `README` into a 34,000-page lazy
+      buffer returned -1 instead of 2441, because 34,000 pinned pages are more than memory
+      and swap can hold. A pin is a promise of memory; promise only what the copy will
+      need.
+
+      **Between translation and copy.** [[copyout]] does `pa0 = walkaddr(...)`, then
+      `memmove(pa0 + ...)`. With interrupts on, a timer interrupt can arrive in between and
+      [[yield]]: the process is RUNNABLE, the clock on another hart may evict that very page,
+      and someone else may get the physical page before `memmove` writes into it. The
+      reference keeps interrupts off ([[push_off]]) from [[walkaddr]] to the end of
+      `memmove` in [[copyin]], [[copyout]] and [[copyinstr]]: the process stays RUNNING on
+      this hart, and RUNNING pages are not taken. [[vmfault]] may sleep, so it is called with
+      interrupts on, and the loop then translates again. `uvmpin` uses the same trick between
+      "this page is in memory" and setting `PTE_PIN`.
+
+      The general rule this lab teaches: **a physical address read from a user PTE is only
+      good while nothing can evict that page**, either because the process cannot stop
+      running (interrupts off), or because the page is pinned.
+    checks:
+      - id: lab16-11
+        level: 2
+        type: choice
+        q: |
+          The reference without the pin in `sys_write` (clinic 2). `swaptest syscalls` writes
+          512 bytes from a page that is in swap to a pipe. What happens?
+        options:
+          - text: "panic: sched locks, from pipewrite → copyin → vmfault → swapin → … → sleep with pi->lock held"
+            correct: true
+            why: |
+              Right. The disk read sleeps, and [[sched]] finds noff 2: `pi->lock` plus the
+              process's own `p->lock`, which [[sleep]] took.
+          - text: "write returns -1, because copyin refuses pages that are in swap"
+            why: |
+              [[copyin]] has no such test: it calls [[vmfault]] for any page that
+              [[walkaddr]] does not find, and [[vmfault]] reads swapped pages back.
+          - text: "A deadlock: the process waits for pi->lock, which it holds"
+            why: |
+              Nothing in the swap path takes `pi->lock`. The process does not wait for a
+              lock; it tries to sleep for the disk, which [[sched]] forbids.
+          - text: "It works, only more slowly, because sleep releases pi->lock"
+            why: |
+              You may be remembering the MIT book's `sleep(chan, lk)`. In this tree `sleep()`
+              takes no lock argument and releases nothing but `p->lock` across [[swtch]].
+        explain: |
+          The recorded backtrace: `sched ← sleep ← disk_rw ← virtio_disk_rwpage ← swaprw ←
+          swapin ← vmfault ← copyin ← pipewrite ← filewrite ← sys_write`, noff 2 on hart 0.
+          Bringing the page back and pinning it before [[filewrite]] takes `pi->lock` rules the
+          path out.
+      - id: lab16-12
+        level: 3
+        type: state
+        q: |
+          On the reference branch, `swaptest` writes to a pipe from a buffer that `sys_write`
+          has pinned. Fill in the hart's state while [[copyin]] runs its `memmove` inside
+          [[pipewrite]].
+        code: kernel/pipe.c:76-108@94-101
+        state:
+          mode: S
+          satp: kernel
+          sie: "off"
+          noff: 2
+          intena: 1
+        why:
+          noff: |
+            Two levels: `pi->lock` (taken by [[pipewrite]]) and the [[push_off]] the
+            reference adds in [[copyin]] around the translation and the copy.
+          intena: |
+            intena is recorded by the *outermost* push_off. `write` is a system call, and
+            [[usertrap]] turned interrupts on before [[syscall]], so `acquire(&pi->lock)`
+            recorded 1.
+          sie: |
+            Off: a spinlock is held (and the push_off would turn interrupts off anyway).
+          satp: |
+            The kernel runs on the kernel page table and reaches the user page through the
+            direct map, at the physical address [[walkaddr]] returned.
+        why_wrong: "Count the push_offs: acquire(&pi->lock) in pipewrite, then copyin's own push_off."
+        explain: |
+          The `push_off` in [[copyin]] costs nothing here (interrupts were already off), but on
+          paths without a lock it is what keeps the process from being preempted, and its page
+          from being evicted, between [[walkaddr]] and `memmove`.
+  - title: fork, exit, exec, and a page still on its way out
+    q: |
+      Go through the rest of a process's life with pages in swap. What must `fork` give the
+      child for a swapped-out page, and who frees the slot in the end? What must `exit`,
+      `exec` and `sbrk(-n)` do? [[kexec]] builds the new image in a new page table while the
+      old one is still `p->pagetable`, and [[loadseg]] sleeps in [[readi]] with a physical
+      page of the new image in hand: could the clock take that page? Last: the clock has just
+      marked a page "in slot *s*" and started writing it out, and its owner wakes up and
+      touches it. What does the owner read?
+    hints:
+      - "[[loadseg]] gets `pa` from [[walkaddr]] on the *new* page table ([[kernel/exec.c:164]]) and then sleeps in [[readi]] ([[kernel/exec.c:171]]); `p->pagetable` changes only at [[kernel/exec.c:134]]. The clock finds a PTE through `p->pagetable`."
+      - "A slot may be referred to by two PTEs after fork. And the PTE says \"in slot s\" before the slot's contents are on the disk."
+      - "Count references per slot: fork adds one, uvmunmap and swap-in each drop one. The clock must check that the PTE it finds really maps the frame. Hold the swap I/O sleep-lock from before the PTE changes until the write is done, and take it in swap-in too."
+    answer: |
+      **fork** copies the swapped PTE into the child and adds one reference to the slot.
+      Whichever process touches the page first reads its own copy in and drops its
+      reference; the second one does the same, and the slot is free when the count reaches 0.
+      Neither process can see the other's later writes: each has its own physical page. The
+      count is a `uchar` under `slots.lock`; at most 64 processes can share a slot, far below
+      255.
+
+      **exit, exec, sbrk(-n)** all free user memory through [[uvmunmap]], which now drops
+      the slot's reference for a swapped PTE. `exit`'s pages are freed by the parent in
+      [[kwait]] → [[freeproc]], holding spinlocks, which is why the slot count is protected
+      by a spinlock and freeing a slot never sleeps.
+
+      **exec.** The frame table records the new image's pages under the process as they are
+      allocated, but the clock looks the PTE up through `p->pagetable`, which is still the
+      old page table. There the address maps a different page (or nothing), so the reference
+      checks that the PTE it found has V set and maps *this* frame, and skips the frame
+      otherwise. The new image becomes evictable at the moment [[kexec]] installs it.
+
+      **A page on its way out.** `evict` takes `swapio.lock` (a sleep-lock) *before* the clock
+      rewrites the PTE, and releases it only after the write has completed. Swap-in takes the
+      same lock before it reads. So an owner that faults at once sleeps in `swapin` until its
+      page is on the disk, then reads it: the right contents. Without that, it could read a
+      slot that still holds whatever was written there last. Freeing a slot while it is being
+      written (the owner exits) is harmless too: slots are only allocated by `evict`, under
+      the same sleep-lock, so nobody can reuse the slot before the write is done.
+    checks:
+      - id: lab16-13
+        level: 2
+        type: number
+        q: |
+          A process has one page in slot 7. It forks twice; then the first child exits; then
+          the parent touches the page (reading it back in). What is `slots.ref[7]` now?
+        answer: 1
+        wrong:
+          2: |
+            You may have forgotten that swap-in drops the reading process's reference: the
+            parent now has its own page in memory, and only the second child still refers to
+            slot 7.
+          0: |
+            You may have thought the parent's swap-in frees the slot outright. It drops one
+            reference; the second child still needs the slot.
+          3: |
+            That is the count after the two forks: parent plus two children. The child's
+            exit ([[uvmunmap]]) and the parent's swap-in each drop one.
+        why_wrong: "Start at 1, add one per fork, subtract one for the exit and one for the swap-in."
+        explain: |
+          1 → 2 → 3 (two forks) → 2 (exit, through [[uvmunmap]]) → 1 (the parent's swap-in).
+          The second child will read the page in, or exit, and bring it to 0.
+      - id: lab16-14
+        level: 3
+        type: order
+        q: |
+          Put the steps of one eviction by `evict` in the order the reference performs them.
+        items:
+          - text: "acquiresleep(&swapio.lock)"
+            why: "It comes first, so that nobody can read the slot back before the page is on the disk."
+          - text: "allocate a free slot"
+            why: "The slot number must be known before the PTE is rewritten: it goes into the PTE."
+          - text: "the clock picks a victim and rewrites its PTE to \"in swap, slot s\""
+            why: "The PTE changes before the write, so the owner stops using the page at once (it will fault)."
+          - text: "write the page to the slot"
+            why: "The page must not be freed before its contents are on the disk."
+          - text: "releasesleep(&swapio.lock)"
+            why: "Only now may a faulting owner read the slot back."
+          - text: "kfree the physical page"
+            why: "The page goes back to the free list last, when nobody refers to it any more."
+        why_wrong: "Think about who might look at the page, the PTE and the slot at each moment, and what they would see."
+        explain: |
+          The lock spans the PTE change and the write; the free comes last. See `evict` in the
+          reveal, and the gdb record of `swapio.lock` held (`locked = 1, pid = 4`) during the
+          write.
+build: |
+  **Start.**
+
+  ```text
+  git checkout -b my-swap 06aad25
+  ```
+
+  Write the test first: copy the spec's checks into `user/swaptest.c` and add
+  `$U/_swaptest\` to `UPROGS`. You will need a way to see what the kernel does: add the
+  `swapstat` system call early (milestone 1), even though its counters stay at zero until the
+  end. Until eviction exists, `swaptest big` must be killed (`usertrap(): unexpected scause
+  0xf`) once its pages outnumber the free ones: that is the test working.
+
+  **Milestones, in an order that keeps the system bootable after each one.**
+
+  1. **The swap area and the disk.** `NSWAP` and `SWAPSTART` in `param.h`; `mkfs` writes the
+     last block of the swap area so that `fs.img` grows by 32 MiB (check with `ls -l
+     fs.img`: 35,602,432 bytes). Split [[virtio_disk_rw]] so that a page-sized request can be
+     made. Test: boot, `usertests -q`. A quick self-test helps: at boot, write a page with a
+     pattern to slot 0, read it into another page, compare, print one line, then remove it.
+  2. **Slots and the frame table.** A slot allocator with reference counts; one frame-table
+     entry per physical page, set wherever a fresh user page is mapped and cleared where
+     [[uvmunmap]] frees it. Nothing uses them yet. Test: `usertests -q`.
+  3. **The swapped-out PTE.** The bits in `riscv.h`; [[uvmunmap]] frees the slot;
+     [[uvmcopy]] shares it. Still nothing creates such a PTE. Test: it compiles, `usertests -q`.
+  4. **Swap-in.** [[vmfault]] recognises the PTE and reads the page back; [[usertrap]] also
+     sends instruction faults (`scause` 12) there, and saves `scause` and `stval` before
+     anything can sleep. Test: `usertests -q`.
+  5. **Protect the kernel's copies.** Interrupts off between translation and copy in
+     [[copyin]], [[copyout]] and [[copyinstr]]; pin the buffer in `read`, `write` and `wait`.
+     Test: `usertests -q`.
+  6. **Eviction.** The clock, `evict`, and an allocator for user pages that evicts when
+     memory is low, used by [[uvmalloc]], [[vmfault]] and swap-in. This switches swapping on.
+     Test: `swaptest`, then `usertests -q`, then `swaptest` again.
+
+  **Debugging advice.** `make qemu-gdb` starts QEMU halted and waiting for gdb (its port
+  is written to `.gdbinit`); in another terminal, run `${TOOLPREFIX}gdb
+  kernel/kernel` and `continue`. `TOOLPREFIX` is your RISC-V toolchain's prefix, the same
+  one xv6's Makefile detects (`riscv64-unknown-elf-`, `riscv64-linux-gnu-` or
+  `riscv64-elf-`); set it with `export TOOLPREFIX=riscv64-unknown-elf-` or whichever you
+  have. On Debian/Ubuntu/WSL, `gdb-multiarch` also works as the debugger.
+
+  - Do not call `myproc()` or `mycpu()` from gdb while the kernel is stopped: `myproc()` does
+    a `push_off`/`pop_off`, and the `pop_off` can turn interrupts on in the stopped context.
+    Read `cpus[$tp].proc`, `cpus[$tp].noff` and `cpus[$tp].intena` instead (`tp` holds the
+    hart number in the kernel).
+  - A breakpoint on the line of the clock that rewrites the PTE, with `p/x *pte` and `p
+    p->state`, shows every victim; a condition such as `if p != me` picks out evictions of
+    other processes' pages. Conditions are evaluated with QEMU stopped, so expect the run to
+    slow down until the breakpoint is disabled.
+  - `panic: sched locks` means something slept with a spinlock held: `break panic`, then
+    `bt`. The frames between the lock holder and [[sleep]] tell you which path needs a pin
+    or must not evict.
+  - A process killed with `unexpected scause 0xf` or `0xd` at an address it owns, while
+    swap is not full, means eviction found no victim: print the free-page count and
+    `slots.nused`, and check that the clock clears A.
+  - Wrong data with no crash: make the test print the first wrong word and its page. A
+    wrong word at a fixed offset in every bad page (word 128, for instance) points at the
+    size of the disk transfer; zeros point at a PTE the kernel lost (fork, or a lazy page
+    mapped over a swapped one).
+  - `swaptest` takes about a minute, `usertests -q` about one and a half: slower than on
+    the original kernel, because several of its tests fill memory, and now fill swap too.
+    (Timings on QEMU depend on your computer and on what else it is doing.)
+clinic:
+  - bug: Taking pages from a process that is running on another hart
+    change: |
+      The clock's test on the owner's state is "any live process" instead of "not running,
+      or myself":
+
+      ```diff
+      -  struct proc *me = myproc();
+      ...
+      -    if (p->state == SLEEPING || p->state == RUNNABLE || p == me) {
+      +    if (p->state != USED && p->state != ZOMBIE) {
+      ```
+    symptom: |
+      $ swaptest
+      [...]
+      swaptest: procs: 17135 out, 14004 in
+      swaptest: procs: OK
+      swaptest: free pages + free slots: 40594 before, 40594 after
+      swaptest: leak: OK
+      swaptest: 63564 pages written out, 46345 read in
+      swaptest: ALL OK
+      [...]
+
+      # another boot, gdb: break swap.c:175 if p->state == RUNNING && p != cpus[$tp].proc
+      [...]
+      === EVICT RUNNING
+      $91 = (void *) 0x0
+      $92 = 11
+      $93 = 10
+      $94 = "swaptest\000\000\000\000\000\000\000"
+      $95 = <optimized out>
+      $96 = 0x2132a497
+        Id   Target Id                    Frame 
+      * 1    Thread 1.1 (CPU#0 [running]) clock (s=<optimized out>) at kernel/swap.c:175
+        2    Thread 1.2 (CPU#1 [halted ]) s_sstatus (x=2) at kernel/riscv.h:67
+        3    Thread 1.3 (CPU#2 [running]) 0x000000000000011e in ?? ()
+      [...]
+    why: |
+      Honest summary first: **we never saw this bug break anything.** Three runs of
+      `swaptest` in one boot printed `ALL OK` (the end of the first is shown; the other two
+      are elided at `[...]`), and so did two more runs in another boot with gdb attached,
+      which caught 22 such evictions.
+      What gdb did show is the bug *happening*: in the record above (the 16th of the 22),
+      hart 0 (`$91`), running for pid 11 (`$92`), is about to evict a page of pid 10 (`$93`).
+      Pid 10 is RUNNING, and the only other hart that is running is hart 2, at pc `0x11e`, a
+      user address (inside `swaptest`'s `check` loop): pid 10 is executing user code at that
+      moment. `$96` is the PTE just before the rewrite: physical page `0x84ca9000`, flags
+      `0x97` (V, R, W, U and D; A is clear, which is why the clock chose it). All 22
+      evictions were in the `procs` test (pids 9 to 11 in the first run, 18 to 20 in the
+      second), where three processes run on three harts and evict each other's pages.
+
+      Why it did no visible harm here: for damage, pid 10 has to touch the page again
+      through the stale translation in hart 2's TLB, before hart 2 flushes it. Hart 2
+      flushes on every trap from user mode ([[uservec]]), and the timer alone causes one
+      every 0.1 s. `swaptest`'s processes walk their pages in order and do not come back to
+      a page that soon. A program that keeps a small working set hot (a hash table, a
+      stack) would: its stores would land in a page already freed and perhaps handed to
+      another process, and its copy on disk would miss them. No fault, no panic, two
+      processes' memory silently wrong.
+
+      This bug has a second, quieter side: a RUNNING process may be inside the kernel with
+      a physical address of its own page in hand, between [[walkaddr]] and `memmove` in
+      [[copyout]], or in the middle of [[uvmcopy]] reading the parent's pages. The
+      `push_off` there keeps *its own* hart from switching away, but does nothing against
+      another hart that ignores the RUNNING state.
+
+      The lesson is the one the think section argues: TLB rules have to come from reasoning
+      about which hart may hold which translation. A test passing three times proves only
+      that the window was not hit.
+  - bug: write does not pin its buffer
+    change: |
+      The pin is left out of `sys_write` (read and wait keep theirs):
+
+      ```diff
+      -  // as in sys_read: pipewrite copies in holding a spinlock.
+      -  pin = n > 0 && f->type != FD_INODE;
+      -  if (pin && uvmpin(p, n) < 0)
+      -    return -1;
+         r = filewrite(f, p, n);
+      -  if (pin)
+      -    uvmunpin(p, n);
+         return r;
+      ```
+    symptom: |
+      $ swaptest
+      swaptest: big: wrote 36000 pages: 3710 out, 0 in
+      swaptest: big: checked 36000 pages, 0 wrong: 32299 out, 32299 in
+      swaptest: big: OK
+      panic: sched locks
+
+      # gdb, another boot, break panic:
+      [...]
+      $1 = (void *) 0x0
+      $2 = 2
+      $3 = 1
+      $4 = 5
+      $5 = "swaptest\000\000\000\000\000\000\000"
+      #0  panic (s=s@entry=0x800081a8 "sched locks") at kernel/printk.c:139
+      #1  0x0000000080002118 in sched () at kernel/proc.c:488
+      #2  0x00000000800021b8 in sleep () at kernel/proc.c:569
+      #3  0x0000000080005be2 in disk_rw (b=b@entry=0x80021c18 <swapio+48>, sector=sector@entry=7536, data=data@entry=0x800c2000 [...]
+      #4  0x0000000080005e60 in virtio_disk_rwpage (b=b@entry=0x80021c18 <swapio+48>, blockno=blockno@entry=3768, pa=pa@entry=0x800c2000, write=write@entry=0) at kernel/virtio_disk.c:312
+      #5  0x0000000080005f4e in swaprw (s=s@entry=442, pa=pa@entry=0x800c2000, write=write@entry=0) at kernel/swap.c:132
+      #6  0x00000000800063f4 in swapin (pagetable=pagetable@entry=0x87f43000, va=va@entry=45056) at kernel/swap.c:252
+      #7  0x000000008000163e in vmfault (pagetable=pagetable@entry=0x87f43000, psz=psz@entry=147476480, va=va@entry=45056, read=read@entry=1) at kernel/vm.c:551
+      #8  0x00000000800017e8 in copyin (pagetable=0x87f43000, psz=147476480, dst=dst@entry=0x3fffff7ebf "", srcva=srcva@entry=45056, len=len@entry=1) at kernel/vm.c:419
+      #9  0x0000000080004926 in pipewrite (pi=0x81d1a000, addr=45056, n=512) at kernel/pipe.c:96
+      #10 0x0000000080004666 in filewrite (f=0x80020b58 <ftable+104>, addr=45056, n=512) at kernel/file.c:143
+      #11 0x0000000080005120 in sys_write () at kernel/sysfile.c:102
+      #12 0x0000000080002b36 in syscall () at kernel/syscall.c:148
+      #13 0x00000000800028bc in usertrap () at kernel/trap.c:73
+      #14 0x0000003ffffff09c in ?? ()
+    why: |
+      (In the symptom, the first `[...]` stands for gdb's breakpoint lines before `$1`, and
+      the `[...]` in frame #3 for the rest of that line: gdb's dump of the page's bytes.)
+
+      `swaptest syscalls` (pid 5, `$4`) writes 512 bytes from address `0xb000` (45,056) to a
+      pipe. That page is in swap. [[pipewrite]] takes `pi->lock` and copies byte by byte
+      with [[copyin]] ([[kernel/pipe.c:96]]); [[copyin]] finds no mapping and calls
+      [[vmfault]], which calls `swapin`. `swapin` gets a free page (its `ualloc` sees that a
+      spinlock is held and does not try to evict) and reads slot 442 (blocks 3,768 to 3,771,
+      sectors 7,536 on) into it. The driver sleeps until the read is done. [[sleep]] takes
+      the process's own `p->lock`, and [[sched]] finds noff 2 (`$2`) on hart 0 (`$1`):
+      `pi->lock` is still held. It panics, exactly as it should; without that check, this
+      hart would switch away with interrupts off and `pi->lock` held, and any other process
+      touching the pipe would spin forever.
+
+      The cure is to bring the page in before any spinlock is taken, and to keep it in
+      memory (pinned) until the copy is done. The other pinned calls, `read` and `wait`,
+      would fail the same way through [[piperead]], [[consoleread]] and [[kwait]].
+  - bug: fork forgets pages that are in swap
+    change: |
+      [[uvmcopy]] has no case for a swapped-out PTE, so it does what the original code does
+      with any PTE without V: skips it.
+
+      ```diff
+      -  pte_t *pte, *npte;
+      +  pte_t *pte;
+      ...
+      -    if (*pte & PTE_SWAP) {
+      -      // the child shares the slot; each process will read
+      -      // its own copy in when it uses the page.
+      -      if ((npte = walk(new, i, 1)) == 0)
+      -        goto err;
+      -      *npte = *pte;
+      -      swapdup(PTE2SLOT(*pte));
+      -      continue;
+      -    }
+           if ((*pte & PTE_V) == 0)
+             continue; // physical page hasn't been allocated
+      ```
+    symptom: |
+      $ swaptest
+      swaptest: big: wrote 36000 pages: 3710 out, 0 in
+      swaptest: big: checked 36000 pages, 0 wrong: 32299 out, 32299 in
+      swaptest: big: OK
+      swaptest: syscalls: copied 0 pages, 0 wrong; 0 sources and 0 destinations were in swap
+      swaptest: syscalls: FAIL
+      swaptest: fork: 1958 slots in use at fork
+      swaptest: page 7 word 0 is 0
+      swaptest: page 8 word 0 is 0
+      swaptest: page 9 word 0 is 0
+      swaptest: fork: child FAILED, parent 0 wrong, 1950 pages read in
+      swaptest: fork: FAIL
+      swaptest: procs: 17503 out, 17502 in
+      swaptest: procs: OK
+      swaptest: free pages + free slots: 40594 before, 40594 after
+      swaptest: leak: OK
+      swaptest: 60220 pages written out, 51754 read in
+      swaptest: SOME TESTS FAILED
+    why: |
+      The child gets no PTE at all for a page that was in swap. Its first touch of that
+      page is a fault on an address below `p->sz` with no mapping, which is exactly what a
+      lazy page looks like, so [[vmfault]] maps a fresh zero-filled page. No error anywhere;
+      the data is simply gone.
+
+      **fork**: the forking process had filled 2,000 pages and then pushed most of them out
+      (1,958 slots in use). Pages 0 to 6 were still in memory and were copied; page 7 was
+      the first in swap, and the child reads 0 where the pattern should be. The parent's
+      check passes: its PTEs still say "in slot *s*", and its 1,950 swap-ins bring back the
+      right data.
+
+      **syscalls** fails first, and more strangely: "copied 0 pages". Each test runs in a
+      child forked from `swaptest`'s main process, and that process's data page (`0x2000`,
+      which holds the global `npages = 36000`) had been evicted while it waited for the
+      `big` test (its PTE was in swap at the fork: gdb records exactly that page being
+      shared in the reference, step "fork shares the slot"). The child got a zero page
+      instead: `npages` was 0, so the copy loop ran zero times and the test, rightly,
+      refused to call that a pass. `procs` passed only because it does not read `npages`.
+
+      Nothing leaks, which makes this bug easy to miss with a leak check alone: the slots
+      the child should have shared are still owned by the parent and are freed when the
+      parent exits.
+  - bug: Slots are not freed when a process lets go of its pages
+    change: |
+      [[uvmunmap]] keeps skipping PTEs without V, as in the original tree, so a page in
+      swap keeps its slot forever when a process exits, execs, or shrinks:
+
+      ```diff
+      -    if (*pte & PTE_SWAP) { // the page is in swap, not in memory
+      -      if (do_free)
+      -        swapfree(PTE2SLOT(*pte));
+      -      *pte = 0;
+      -      continue;
+      -    }
+           if ((*pte & PTE_V) == 0) // has physical page been allocated?
+             continue;
+      ```
+    symptom: |
+      $ swaptest
+      swaptest: big: wrote 36000 pages: 3710 out, 0 in
+      swaptest: big: checked 36000 pages, 0 wrong: 32299 out, 32299 in
+      swaptest: big: OK
+      swaptest: syscalls: copied 32 pages, 0 wrong; 5 sources and 4 destinations were in swap
+      swaptest: syscalls: OK
+      usertrap(): unexpected scause 0xf pid=6
+                  sepc=0x476 stval=0x8162000
+      swaptest: fork: FAIL
+      usertrap(): unexpected scause 0xf pid=9
+                  sepc=0x7c stval=0x2833000
+      usertrap(): unexpected scause 0xf pid=10
+                  sepc=0x7c stval=0x2535000
+      swaptest: procs: 0 out, 0 in
+      swaptest: procs: FAIL
+      swaptest: free pages + free slots: 40594 before, 32410 after
+      swaptest: leak: FAIL
+      swaptest: 40503 pages written out, 32312 read in
+      swaptest: SOME TESTS FAILED
+      $ swaptest
+      usertrap(): unexpected scause 0xf pid=12
+                  sepc=0x7c stval=0x7e54000
+      swaptest: big: FAIL
+      [...]
+      swaptest: free pages + free slots: 32409 before, 32408 after
+      swaptest: leak: FAIL
+      swaptest: 5 pages written out, 2 read in
+      swaptest: SOME TESTS FAILED
+    why: |
+      Every test exits with pages still in swap: `big` ends with about 3,700 of its pages out,
+      `syscalls` with a similar number. Their slots are never given back. The first two tests
+      still pass, because 8,192 slots are enough for them, but by the `fork` test the swap
+      area is full: free pages plus free slots went from 40,594 to 32,410, so 8,184 of the
+      8,192 slots are lost. With nothing left to write to, `evict` fails, `ualloc` drains the
+      reserve, and the next fault on a fresh page cannot be served: the `fork` test's process
+      is killed at `0x8162000` (virtual page 33,122; page 33,117 of its region, which starts at
+      `0x5000`), and `procs`' children are killed too.
+
+      The second run is the steady state of the broken kernel: no swap at all. `big` is
+      killed at `0x7e54000`, virtual page 32,340 (page 32,335 of its region): exactly where
+      physical memory runs out. The other tests' processes are killed the same way as soon
+      as they need a page more than RAM holds (each failed `evict` first scans the frame
+      table twice), but the kernel itself keeps running and the shell prompts again. The
+      leak check catches it at once; this is the kind of bug that check exists for.
+  - bug: The second chance does not clear A
+    change: |
+      The clock tests A but forgets to clear it:
+
+      ```diff
+               if (*pte & PTE_A) {
+      -          *pte &= ~PTE_A; // second chance
+      +          ; // second chance
+               } else {
+      ```
+    symptom: |
+      $ swaptest
+      usertrap(): unexpected scause 0xf pid=4
+                  sepc=0x7c stval=0x7e52000
+      swaptest: big: FAIL
+      usertrap(): unexpected scause 0xf pid=5
+                  sepc=0x7c stval=0x7e50000
+      swaptest: syscalls: FAIL
+      usertrap(): unexpected scause 0xf pid=6
+                  sepc=0x476 stval=0x7e51000
+      swaptest: fork: FAIL
+      usertrap(): unexpected scause 0xf pid=10
+                  sepc=0x7c stval=0x1c8a000
+      swaptest: procs: 0 out, 0 in
+      swaptest: procs: FAIL
+      swaptest: free pages + free slots: 40594 before, 40594 after
+      swaptest: leak: OK
+      swaptest: 5 pages written out, 2 read in
+      swaptest: SOME TESTS FAILED
+    why: |
+      The hardware sets A in every PTE it uses, and only software clears it. With this
+      change nobody does, so every page a program has ever touched keeps A set forever, and
+      the clock gives it a "second chance" on every lap. Only a few pages that no user
+      instruction has touched since they were mapped have A clear: 5 pages in this run, out
+      of the 36,000 that `big` alone needed to move.
+
+      So, as far as the clock can tell, there is no victim: `evict` scans the table twice,
+      gives up, `ualloc` hands out the reserve, and the next fault cannot be served. `big` is
+      killed at `0x7e52000`, page 32,338, where RAM runs out, with 8,192 empty slots. It
+      looks just like clinic 4's second run (killed there two pages further on, at
+      `0x7e54000`), and the leak line tells them apart: here
+      free pages plus free slots are unchanged, nothing was lost, swap was simply never used.
+      (The whole run takes 12 s instead of about a minute: two full scans per failed
+      eviction are cheaper than writing pages to the disk.)
+  - bug: The page request moves one block instead of a page
+    change: |
+      The length of the page-sized request in the driver is left at `BSIZE`, copied from
+      [[virtio_disk_rw]]:
+
+      ```diff
+       virtio_disk_rwpage(struct buf *b, uint blockno, void *pa, int write)
+       {
+      -  disk_rw(b, (uint64)blockno * (BSIZE / 512), (char *)pa, PGSIZE, write);
+      +  disk_rw(b, (uint64)blockno * (BSIZE / 512), (char *)pa, BSIZE, write);
+       }
+      ```
+    symptom: |
+      $ swaptest
+      swaptest: big: wrote ^E^E^E^E^E pages: ^E^E^E^E out, ^E in
+      swaptest: page ^E^E^E^E^E word ^E^E^E is ^E^E^E^E^E^E^E^E^E^E^E^E^E^E^E
+      swaptest: page ^E^E^E^E^E word ^E^E^E is ^E^E^E^E^E^E^E^E^E^E^E^E^E^E^E
+      swaptest: page ^E^E^E^E^E word ^E^E^E is ^E^E^E^E^E^E^E^E^E^E^E^E^E^E^E
+      usertrap(): unexpected scause 0xc pid=4
+                  sepc=0x505050505050504 stval=0x505050505050504
+      usertrap(): unexpected scause 0xf pid=3
+                  sepc=0x1010 stval=0x1
+    why: |
+      (Each `^E` above is one byte `0x05` on the console, shown the way `cat -v` prints it.
+      Three boots of this kernel printed exactly these lines, and nothing after them: no
+      new prompt appeared.)
+
+      Each page now goes to the disk as its first 1,024 bytes only, and comes back the same
+      way: the other 3,072 bytes of the page that receives it keep whatever [[kalloc]] left
+      there, its junk fill of `0x05` bytes. No error is reported anywhere: the disk did
+      exactly what it was asked.
+
+      The first casualty is not the test's data but the test's own program. Somewhere in its fill, `big`
+      (pid 4) had its own text page 1 evicted (its own pages are among those the clock may
+      take), and got it back three quarters junk; the output proves the round trip, gdb did
+      not record it. `printf`'s table of digit
+      characters, `"0123456789ABCDEF"`, sits at `0x1468` in `swaptest`, offset 1,128 in that
+      page: past the first 1,024 bytes. So every digit prints as the byte `0x05`. The
+      numbers are still there, in length: `wrote` five digits (36000), `3710` four. And the
+      check's complaint has the shape of the bug: page *five* digits, word *three* digits,
+      value fifteen: word 128 is the first word past byte 1,024, and `0x0505050505050505`
+      has fifteen hex digits.
+
+      Then the code: pid 4 jumps to `0x505050505050504`, an address made of junk bytes
+      (cause 12, instruction page fault). Its parent (pid 3) dies on a store to address
+      `0x1`. The shell never prompts again: reasoned, not checked, its pages went through the
+      same broken round trip.
+
+      A partial transfer is the worst kind of I/O bug: every individual operation
+      "succeeds". The test's full-page pattern is what makes it visible; a test that checked
+      one word per page, at offset 0, would pass.
+reveal:
+  - title: A swap area the file system never sees
+    commit: 1
+    file: mkfs/mkfs.c
+    lines: 108-126
+    focus: 115-121
+    diff: true
+    state:
+      hart: "-"
+      proc: "mkfs, on the build machine (not xv6)"
+      locks: []
+    note: |
+      The story of this tour comes from gdb runs of the reference branch on three harts
+      (QEMU 10.2.1), mostly while `swaptest` runs: its `big` test (pid 4)
+      writes and checks 36,000 pages, the main `swaptest` process (pid 3) waits for it, and
+      later tests fork, use a pipe, and run three big processes at once. Where a state below
+      was not recorded, the note says so.
+
+      Commit 1 changes no kernel code. `mkfs` used to write exactly `FSSIZE` = 2,000 blocks;
+      now it also writes the very last block of a swap area of `NSWAP` = 8,192 slots of 4,096
+      bytes. The file grows to 34,768 blocks (35,602,432 bytes); the blocks in between are
+      never written by `mkfs` and read back as zeros. `param.h` gains `NSWAP` and `SWAPSTART`
+      (= `FSSIZE`), shared by `mkfs` and the kernel.
+
+      The superblock's `size` stays 2,000. That one decision is the whole protection: the
+      kernel's [[balloc]] only hands out blocks below `sb.size`
+      ([[kernel/fs.c:74]]), so no file can ever be given a block of the swap area, and no
+      code path except the swapping code will ever name one.
+
+      QEMU's virtio disk takes its size from the image file, so the bigger file is all the
+      device needs. (A smaller image would make the device fail the request; the driver then
+      panics with `virtio_disk_intr status`; reasoned from the driver, not run.)
+  - title: One request for a whole page
+    commit: 2
+    file: kernel/virtio_disk.c
+    lines: 286-313
+    focus: 300-313
+    diff: true
+    state:
+      hart: "-"
+      proc: "(definitions; called by swap.c from commit 6 on)"
+      locks: []
+    note: |
+      [[virtio_disk_rw]] used to take its sector, data address and length from the buffer:
+      `b->blockno`, `b->data`, `BSIZE`. Its body is now `disk_rw` (line 218), which takes
+      them as arguments; `virtio_disk_rw` passes the old values, so the file system sees no
+      change.
+
+      `virtio_disk_rwpage` asks for `PGSIZE` = 4,096 bytes starting at `blockno`, four
+      consecutive blocks, in one request. The data descriptor points at the physical page
+      itself (line 255 of `disk_rw`): the device reads or writes guest physical memory, and
+      in the kernel's direct map a page's address *is* its physical address. No copy through
+      a buffer.
+
+      The `struct buf` argument survives for one reason: the completion protocol. `disk_rw`
+      sets `b->disk = 1`, sleeps on `b`, and [[virtio_disk_intr]] clears `b->disk` and wakes
+      `b` (lines 287–292 and [[kernel/virtio_disk.c:326]]). The swap code passes a
+      `struct buf` of its own, used only as that sleep channel and flag; its 1,024-byte
+      `data` array is never touched.
+
+      Getting `PGSIZE` wrong here (clinic 6) loses three quarters of every page, silently.
+  - title: Slots, with a count of their users
+    commit: 3
+    file: kernel/swap.c
+    lines: 15-70
+    focus: 18-47
+    diff: true
+    state:
+      hart: "-"
+      proc: "(definitions)"
+      locks: []
+    note: |
+      The new file starts with the slot allocator. `SLOTBLOCK(s)` is the first block of slot
+      *s*: 2,000 + 4*s*.
+
+      A slot is not just used or free: `ref[s]` counts the PTEs that refer to it, because
+      `fork` will let a parent and a child share one swapped-out page (commit 5). `swapalloc`
+      takes the first slot with count 0 and sets it to 1; `swapdup` adds one; `swapfree`
+      drops one, and the slot is free again at 0. A `uchar` is enough: one slot can be shared
+      by at most `NPROC` = 64 processes, and `swapdup` panics before the count could wrap.
+
+      The lock is a spinlock, `slots.lock`, and that is a requirement, not a convenience:
+      `swapfree` will be called from [[uvmunmap]], and when [[kwait]] frees a zombie it runs
+      [[uvmunmap]] holding `wait_lock` and the child's `p->lock`. A sleep-lock there would
+      panic in [[sched]]. Nothing inside the critical sections sleeps or takes another lock.
+
+      `swapalloc` scans from slot 0 every time: at most 8,192 bytes, under a lock that is
+      held only by eviction. Simple beats clever here.
+  - title: The frame table, a map from pages back to PTEs
+    commit: 4
+    file: kernel/swap.c
+    lines: 26-65
+    focus: 26-39
+    diff: true
+    state:
+      hart: "-"
+      proc: "(definitions)"
+      locks: []
+    note: |
+      A page table maps a virtual address to a physical page. Eviction needs the opposite:
+      given a physical page, which PTE maps it? In this kernel a user page is mapped by
+      exactly one PTE (fork copies pages), so the answer is one (process, virtual address)
+      pair per page. `ft.f` has one entry for every page from [[KERNBASE]] to [[PHYSTOP]]:
+      32,768 entries of 16 bytes, 512 KiB of `.bss`. In this build `ft` is `0x80020`
+      bytes, and the kernel's `end` moves from `0x80020bb0` to `0x800a40b8` with all the
+      branch's additions: 131 fewer free pages, 128 of them this table.
+
+      `FRAME(pa)` is the index, `FRAMEPA(i)` the way back. An entry with `proc` = 0 is not a
+      user page: page-table pages, trapframes, kernel stacks, pipe buffers and free pages are
+      never recorded, and so can never be chosen for eviction.
+
+      `ft.lock` protects the entries (and, from commit 9, the clock hand). Its place in the
+      lock order is fixed by its users: [[uvmunmap]] clears entries while [[freeproc]] holds
+      the zombie's `p->lock`, so `p->lock` comes *before* `ft.lock`. Commit 9 has to respect
+      that.
+  - title: Every fresh user page is recorded
+    commit: 4
+    file: kernel/vm.c
+    lines: 202-244
+    focus: 228-242
+    diff: true
+    state:
+      hart: 1
+      mode: S
+      proc: swaptest (pid 4)
+      intr: "on"
+      satp: kernel
+      locks: []
+      irq: 0
+      stack: [usertrap, syscall, sys_sbrk, growproc, uvmalloc]
+      sp: {"on": kernel, detail: "pid 4's kernel stack"}
+    note: |
+      [[uvmalloc]] records each page right after [[mappages]] has mapped it: `ftset(mem,
+      myproc(), a)` (line 241). The same call appears in [[vmfault]]'s lazy path and in
+      [[uvmcopy]], which now receives the child (`np`) as a fourth argument, because the
+      pages it maps belong to the child, not to `myproc()`. Swap-in will be the fourth place.
+      [[uvmunmap]] clears the entry just before it frees the page (line 209).
+
+      `myproc()` in [[uvmalloc]] is right for both of its callers: `sbrk` grows the calling
+      process, and [[kexec]] allocates the new image for the calling process. The new image
+      is mapped in a page table that is not yet `p->pagetable`: the entry says "pid 4, va
+      *a*" while `p->pagetable` maps something else at *a*. Commit 9's clock checks for
+      exactly that.
+
+      (State: a lazy `sbrk` never reaches [[uvmalloc]]; this is the eager path, as in
+      `usertests`' `sbrkmuch`. Reasoned from the code, not recorded.)
+  - title: What a page in swap looks like
+    commit: 5
+    file: kernel/riscv.h
+    lines: 393-415
+    focus: 401-407
+    diff: true
+    state:
+      hart: "-"
+      proc: "(definitions)"
+      locks: []
+    note: |
+      When V is clear, the RISC-V page-table walk stops and faults without looking at any
+      other bit of the PTE: the rest is the kernel's. The reference uses it as follows:
+
+      | bits | in a swapped-out PTE |
+      |---|---|
+      | 0 V | 0 |
+      | 1–4 R W X U | the permissions the page will get back |
+      | 8 `PTE_SWAP` | 1 |
+      | 10 and up | the slot number (`SLOT2PTE`, `PTE2SLOT`) |
+
+      `PTE_SWAP` is bit 8, one of the two RSW bits reserved for supervisor software. Any
+      bit would do when V is clear, but a dedicated, named bit is what lets the code tell a
+      swapped page from a zero PTE, which in this tree already means "lazily allocated, not
+      touched yet".
+
+      A real one, recorded by gdb in `swapin`: `0x10b516` = slot `0x10b516 >> 10` = 1,069,
+      flags `0x116` = R W U `PTE_SWAP`. Slot 1,069 is blocks 6,276 to 6,279 of `fs.img`.
+  - title: uvmunmap gives slots back
+    commit: 5
+    file: kernel/vm.c
+    lines: 190-220
+    focus: 202-212
+    diff: true
+    state:
+      hart: 0
+      mode: S
+      proc: "sh (pid 2), reaping a zombie"
+      intr: "off"
+      satp: kernel
+      locks: [wait_lock, "the zombie's p->lock"]
+      irq: {noff: 2, intena: 1}
+      stack: [usertrap, syscall, sys_wait, kwait, freeproc, proc_freepagetable, uvmfree, uvmunmap]
+      sp: {"on": kernel}
+    note: |
+      Every path that gives back user memory ends here: `exit` (through the parent's
+      [[kwait]] → [[freeproc]]), [[kexec]] dropping the old image, `sbrk(-n)` through
+      [[uvmdealloc]]. A swapped PTE now has its own case, *before* the V test that used to
+      skip it: drop the PTE's reference to the slot (if the caller frees memory at all) and
+      clear the PTE.
+
+      The state shown is the worst case, reasoned from the code: a parent reaping a zombie
+      holds `wait_lock` and the zombie's `p->lock` (noff 2), and `swapfree` adds `slots.lock`
+      for a moment (noff 3). That is why slot counts are protected by a spinlock and
+      `swapfree` never sleeps.
+
+      Without these six lines, nothing crashes at first. Clinic 4 removes them: after two
+      tests the swap area is full, and the third test's process is killed for lack of
+      memory, with 8,184 of the 8,192 slots owned by processes that no longer exist.
+  - title: fork shares the slot
+    commit: 5
+    file: kernel/vm.c
+    lines: 300-344
+    focus: 314-325
+    diff: true
+    state:
+      hart: 1
+      mode: S
+      proc: swaptest (pid 3)
+      intr: "off"
+      satp: kernel
+      locks: ["np->lock (the child's)"]
+      irq: {noff: 1, intena: 1}
+      stack: [usertrap, syscall, sys_fork, kfork, uvmcopy]
+      sp: {"on": kernel, detail: "pid 3's kernel stack"}
+    note: |
+      [[uvmcopy]] runs under the child's `np->lock` (from [[allocproc]] until
+      [[kernel/proc.c:294]]), so it may not sleep, and reading a page from the disk sleeps.
+      It does not need to: it gives the child the same PTE, slot number and permissions
+      included, and counts one more reference. Each process will read its own copy when it
+      touches the page; the second reader finds the slot still there because the count kept
+      it alive.
+
+      Recorded: `swaptest`'s main process (pid 3) forks a test child, and its data page
+      `0x2000` is in swap: `*pte` = `0x116`, slot 0, flags R W U `PTE_SWAP`. gdb printed
+      `slots.ref[0]` = 1 just before `swapdup` (line 323), and noff 1, intena 1, SIE 0, on
+      hart 1. Page `0x2000` holds the program's globals, `npages` among them: this exact
+      sharing is what keeps the child's `npages` at 36,000. Clinic 3 removes the case, the
+      child gets a zero page there, and the `syscalls` test copies 0 pages.
+
+      `walk(new, i, 1)` may allocate page-table pages for the child with [[kalloc]]: that is
+      the reserve of free pages at work (commit 10), since no eviction is possible under
+      `np->lock`. If it fails, the error path's [[uvmunmap]] drops the references the child
+      already holds, slots included.
+  - title: "vmfault: a third kind of missing page"
+    commit: 6
+    file: kernel/vm.c
+    lines: 472-503
+    focus: 484-491
+    diff: true
+    state:
+      hart: 2
+      mode: S
+      proc: swaptest (pid 4)
+      intr: "off"
+      satp: kernel
+      locks: []
+      irq: 0
+      stack: [usertrap, vmfault]
+      sp: {"on": kernel, detail: "`0x3fffff7fa0`, in pid 4's kernel stack"}
+    note: |
+      [[vmfault]] already handles every user page fault and every [[copyin]] or
+      [[copyout]] that finds no mapping. It now asks one more question before the old ones:
+      is there a PTE marked `PTE_SWAP`? If so the page exists, on disk, and `swapin` brings it
+      back. Only then come the old cases: mapped (decline) or lazy (allocate a zero page).
+      Without the new test, the lazy branch would map a zero page over the swapped PTE and
+      the data would be lost.
+
+      Recorded: pid 4 (`swaptest big`, checking its pages) loads from `0x5da1000`, whose PTE
+      is `0xe6d16`: slot 923, R W U. Hart 2, noff 0, `sstatus` = `0x200000020` (SIE clear, SPIE
+      set): as in every page fault ([[tour:26]]), [[usertrap]] left interrupts off, and
+      [[vmfault]] will sleep with them off. That is allowed: [[sleep]] only requires that no
+      spinlock but `p->lock` be held, and the scheduler turns interrupts on for itself.
+  - title: swapin
+    commit: 6
+    file: kernel/swap.c
+    lines: 115-150
+    focus: 130-149
+    diff: true
+    state:
+      hart: 0
+      mode: S
+      proc: swaptest (pid 4)
+      intr: "off"
+      satp: kernel
+      locks: []
+      irq: 0
+      stack: [usertrap, vmfault, swapin]
+      sp: {"on": kernel}
+    note: |
+      The order of the steps is the point:
+
+      1. Get a page (line 137). From commit 10 this is `ualloc`, which may evict another page
+         first, so `swapin` must not hold `swapio.lock` yet: the eviction takes it too.
+      2. Read the slot into it, holding the sleep-lock `swapio.lock` (lines 142–144). Swap I/O
+         is one page at a time; and, more important, a page that is still being written out
+         holds that lock until its write completes (commit 9), so this read can never see a
+         half-written slot.
+      3. Only then rebuild the PTE: the new page, the saved permissions, V (line 146). Until
+         this line, an access from anywhere would still fault and land here again.
+      4. Record the page in the frame table and drop this PTE's reference to the slot.
+
+      Recorded right after the read, at the PTE line (line 256 in the branch head): pid 4, va
+      `0x5d0f000`, slot 1,069, `*pte` = `0x10b516`, the new page at `0x83074000`. gdb showed
+      `swapio.lock` free again (`locked = 0`), noff 0, interrupts off, hart 0.
+
+      Between step 1 and step 3, could anyone change this PTE? Only pid 4 itself: it is
+      RUNNING, so other harts' evictions leave its pages alone (commit 9), and a sleep in
+      step 2 does not matter because a swapped PTE has nothing to evict.
+  - title: usertrap keeps its fault registers
+    commit: 6
+    file: kernel/trap.c
+    lines: 49-88
+    focus: 54-57
+    diff: true
+    state:
+      hart: 1
+      mode: S
+      proc: swaptest (pid 4)
+      intr: "off"
+      satp: kernel
+      locks: []
+      irq: 0
+      stack: [usertrap]
+      sp: {"on": kernel}
+    note: |
+      Two small changes, both because a page fault can now sleep.
+
+      `scause` and `stval` are read once, into locals, before anything else. While pid 4
+      sleeps in `swapin`, its hart runs other processes, which trap and overwrite those
+      registers; pid 4 may even resume on another hart. The old code read them again after
+      [[vmfault]] returned, to print the kill message. The message now prints the saved
+      values and `p->trapframe->epc`.
+
+      The fault test (lines 76–77) now also accepts `scause` 12, an instruction page fault: a
+      text page can be evicted like any other, and fetching an instruction from it must
+      bring it back. In the recorded run the clock took one of pid 3's text pages
+      (`0x21fc881b`: V R X U) while pid 3 slept in `wait`; its next fetch from that page
+      will be a cause-12 fault. Before this lab such a fault was always fatal. A fetch from a lazy
+      heap page still ends in a kill, one fault later: [[vmfault]] maps it without X, the
+      fetch faults again, and the page is now mapped.
+  - title: copyout keeps its page by staying on its hart
+    commit: 7
+    file: kernel/vm.c
+    lines: 360-403
+    focus: 373-396
+    diff: true
+    state:
+      hart: any
+      mode: S
+      proc: swaptest
+      intr: "off"
+      satp: kernel
+      locks: []
+      irq: {noff: 1, intena: 1, note: "copyout's own push_off (line 375); reasoned, not recorded"}
+      stack: [usertrap, syscall, sys_swapstat, copyout]
+      sp: {"on": kernel}
+    note: |
+      [[copyout]] turns a user address into a physical one with [[walkaddr]], then writes
+      there through the kernel's direct map. That physical address is only good while the
+      page stays where it is. A system call runs with interrupts on; a timer interrupt
+      between [[walkaddr]] and `memmove` would [[yield]], making the process RUNNABLE, and
+      another hart's clock could then evict the page and give it to someone else. The
+      `memmove` would write into a stranger's memory.
+
+      [[push_off]] at line 375 closes that window: with interrupts off no timer can preempt
+      this hart, the process stays RUNNING, and RUNNING processes' pages are not taken. The
+      translation, the `PTE_W` check and the copy all happen inside it. [[vmfault]] can
+      sleep, so the loop pops out (line 378), lets it bring the page in, and then translates
+      again from the top (line 382): it does not trust the physical address [[vmfault]]
+      returned, because the page may have moved again before the `push_off`.
+
+      The state shown is reasoned, not recorded: `swapstat`'s [[copyout]] runs with no lock,
+      so after line 375 noff is 1 and intena 1 (interrupts were on). [[copyin]] and
+      [[copyinstr]] get the same treatment.
+  - title: copyin under pi->lock
+    commit: 7
+    file: kernel/vm.c
+    lines: 405-433
+    focus: 413-427
+    state:
+      hart: 1
+      mode: S
+      proc: swaptest (pid 5)
+      intr: "off"
+      satp: kernel
+      locks: [pi->lock]
+      irq: {noff: 2, intena: 1, note: "pi->lock plus copyin's own push_off (line 415); recorded by gdb at line 426"}
+      stack: [usertrap, syscall, sys_write, filewrite, pipewrite, copyin]
+      sp: {"on": kernel}
+    note: |
+      Recorded in the branch head, during `swaptest syscalls`: pid 5 writes from `0x5000` to
+      a pipe; [[pipewrite]] holds `pi->lock` and calls [[copyin]] for one byte at a time
+      ([[kernel/pipe.c:96]]). At the `memmove` (line 426) gdb showed noff 2 (`pi->lock` and
+      this `push_off`), intena 1, SIE 0, `pa0` = `0x804f3000`, on hart 1. The page is in
+      memory because `sys_write` pinned it first (commit 8).
+
+      Here the `push_off` adds nothing: the spinlock already keeps interrupts off. What
+      matters is the other branch (line 417): if this page were not in memory, [[vmfault]]
+      would read it from the disk *with `pi->lock` held*, and [[sched]] would panic. Nothing
+      in commit 7 prevents that. Commit 8 makes sure that, on this path, the page is always
+      there.
+    others: |
+      `pi->lock` is held for the whole 512-byte write. A reader of the same pipe on another
+      hart spins in [[piperead]]'s [[acquire]] until it is released: each byte is a
+      translation and a one-byte copy, never a disk wait.
+  - title: Pinning a buffer
+    commit: 8
+    file: kernel/vm.c
+    lines: 486-533
+    focus: 501-517
+    diff: true
+    state:
+      hart: 0
+      mode: S
+      proc: swaptest (pid 4)
+      intr: "off"
+      satp: kernel
+      locks: []
+      irq: {noff: 1, intena: 1, note: "uvmpin's own push_off (line 502); recorded by gdb at line 514"}
+      stack: [usertrap, syscall, sys_write, uvmpin]
+      sp: {"on": kernel}
+    note: |
+      `uvmpin` walks the pages of the user buffer. For each one:
+
+      - In swap (line 504): let [[vmfault]] bring it back (it may sleep, and may evict other
+        pages, even this process's, but never a pinned one), then look at the same page
+        again.
+      - In memory and user-accessible (line 513): set `PTE_PIN`, bit 9. The test and the set
+        are done with interrupts off (line 502), the copyout trick again, so the page cannot
+        be evicted between "it is here" and "it is pinned".
+      - Anything else: leave it. A page that does not exist yet (lazy) is allocated by the
+        copy itself, under the lock, from free memory, exactly as in the original kernel; a
+        page without `PTE_U`, or beyond `p->sz`, makes the copy fail as it always did.
+
+      Only the first case costs anything, and it brings back pages the process had before,
+      which in the original kernel would all have been in memory. So `uvmpin` never asks for
+      more memory than the program already used. If it cannot bring a page back (memory and
+      swap both exhausted), the pins already set are removed and the call returns -1.
+
+      Recorded: pid 4 calls `write` (a `printf` from `swaptest big`) with its buffer on the
+      stack page `0x4000`, PTE `0x203d00d7` (V R W U A D) just before the pin. Hart 0, noff 1
+      (this `push_off`), intena 1: the system call had interrupts on.
+
+      Why pin instead of "bring in and hope": a pipe reader brings its buffer in, then sleeps
+      in [[piperead]] until data arrives, possibly for minutes. Memory pressure meanwhile
+      would evict an unpinned buffer, and the copy that follows, under `pi->lock`, would need
+      the disk.
+  - title: read, write and wait pin, then unpin
+    commit: 8
+    file: kernel/sysfile.c
+    lines: 68-110
+    focus: 79-87
+    diff: true
+    state:
+      hart: 0
+      mode: S
+      proc: swaptest (pid 3)
+      intr: "off"
+      satp: kernel
+      locks: [wait_lock, "pid 4's p->lock"]
+      irq: {noff: 2, intena: 1}
+      stack: [usertrap, syscall, sys_wait, kwait]
+      sp: {"on": kernel}
+    note: |
+      `sys_read` and `sys_write` pin `[p, p+n)` before they call [[fileread]] /
+      [[filewrite]], and unpin afterwards, but only when the file is not an inode
+      (`FD_INODE`): a pipe or a device. [[readi]] and [[writei]] copy holding sleep-locks
+      only, so their copies may bring a page back from swap themselves, and pinning a whole
+      buffer for them would only waste memory. `sys_wait` pins the 4-byte status, because
+      [[kwait]] copies it out holding `wait_lock` and the child's `p->lock`. Together these
+      cover every copy this kernel makes under a spinlock: [[piperead]], [[pipewrite]],
+      [[consoleread]] and [[kwait]].
+
+      The design's test is the probe `pinread` (measure section): `read` of the 2,441-byte
+      `README` into a lazy buffer of 1, 1,000, 34,000 or 100,000 pages returns 2441 every
+      time, as on the original kernel. Pinning the whole buffer, lazy pages included, would
+      have returned -1 for the two big ones.
+
+      The state shown is the other end of the story, recorded inside [[kwait]] just after its
+      [[copyout]] (`pp->parent = 0`, [[kernel/proc.c:397]] in the branch): pid 3 has waited
+      for pid 4; hart 0, noff 2, intena 1. The status address `0x4f1c` is on pid 3's stack
+      page, whose PTE was `0x21fc72d7`: flags `0x2d7`, V R W U A D and `PTE_PIN`. The page had
+      been pinned for the whole time pid 3 slept in `wait`, while `big` evicted thousands of
+      pages; in another run gdb caught one of pid 3's text pages being taken at such a
+      moment (next step).
+  - title: The clock hand, and the lock dance
+    commit: 9
+    file: kernel/swap.c
+    lines: 128-163
+    focus: 144-160
+    diff: true
+    state:
+      hart: 1
+      mode: S
+      proc: swaptest (pid 4)
+      intr: "off"
+      satp: kernel
+      locks: ["swapio.lock (sleep-lock)", "pid 3's p->lock", ft.lock]
+      irq: {noff: 2, intena: 0}
+      stack: [usertrap, vmfault, swapin, ualloc, evict, clock]
+      sp: {"on": kernel}
+    note: |
+      Each step of the hand takes three locks, in an order dictated by the rest of the
+      kernel:
+
+      1. `ft.lock` alone (lines 145–150): read entry *i* and advance the hand.
+      2. Release it, then take the owner's `p->lock` (line 155). The order `p->lock` →
+         `ft.lock` comes from [[freeproc]], which clears frame-table entries while holding the
+         zombie's `p->lock`; taking them the other way round here could deadlock with it.
+      3. Check the owner (line 156): SLEEPING, RUNNABLE, or the caller itself. Then take
+         `ft.lock` again and check that entry *i* still names this process and address: in
+         the gap, the page may have been freed and reused.
+
+      The state check is the TLB rule of the think section. A SLEEPING or RUNNABLE process
+      flushed its translations when it entered the kernel through [[uservec]], and it
+      cannot run again while this hart holds its `p->lock`: [[scheduler]] would need that
+      lock to switch to it. Its PTE can be changed safely. A RUNNING process on another hart
+      is skipped, whatever it is doing.
+
+      Recorded at the eviction a few lines further on: hart 1 runs pid 4 (`big`, inside a
+      swap-in from a load fault), and the hand has stopped on a page of pid 3, SLEEPING in
+      `wait`. Its PTE `0x21fc881b` has flags `0x1b`, V R X U: a text page, A clear. noff 2
+      (pid 3's `p->lock` and `ft.lock`), intena 0 because a page fault left interrupts off.
+      `swapio.lock`, a sleep-lock, is not counted in noff.
+    others: |
+      Meanwhile gdb showed hart 0 and hart 2 "halted", QEMU's word for a hart waiting in
+      `wfi`, which in this kernel only [[scheduler]]'s idle loop executes: pid 3 is asleep,
+      and pid 4 is the only process that wants to run. Had another hart called [[wakeup]] for pid 3 at this
+      moment, it would spin in `acquire(&p->lock)` ([[kernel/proc.c:581]]) until the clock
+      releases it: pid 3 cannot change state while its PTE is being rewritten.
+  - title: Second chance, or victim
+    commit: 9
+    file: kernel/swap.c
+    lines: 154-182
+    focus: 164-175
+    state:
+      hart: 0
+      mode: S
+      proc: swaptest (pid 4)
+      intr: "off"
+      satp: kernel
+      locks: ["swapio.lock (sleep-lock)", "pid 4's p->lock", ft.lock]
+      irq: {noff: 2, intena: 0}
+      stack: [usertrap, vmfault, swapin, ualloc, evict, clock]
+      sp: {"on": kernel}
+    note: |
+      The PTE must still be valid, be a user page, map exactly frame *i*, and not be pinned
+      (lines 164–165). "Map exactly frame *i*" is what makes `exec` safe: while [[kexec]]
+      builds a new image, its pages are recorded under the process, but `p->pagetable` is
+      still the old one, and the PTE found there maps something else. `PTE_U` excludes the
+      stack guard page, which is valid but never usable from user mode: writing it out would
+      only cost a disk write now and a read back later.
+
+      Then the clock algorithm proper. A set: clear it, move on. The hardware sets A in the
+      PTE whenever it walks the page table for an access (`menvcfg.ADUE`,
+      [[kernel/start.c:41]]); gdb found `0x21fc78d7` here (hart 2), flags `0xd7` = V R W U
+      **A** D, a page of pid 4 used since the last lap. A clear: the victim. Its PTE becomes
+      "in slot *s*": V off, R W X U kept, `PTE_SWAP`, slot number (line 169), and the
+      frame-table entry is cleared.
+
+      Recorded victim: pid 4's own page (pid 4 is RUNNING, but it is the caller: allowed),
+      PTE `0x20c1d497` (V R W U D, A clear), frame `0x3075`, slot 1,069, on hart 0. noff 2,
+      intena 0.
+
+      No `sfence.vma` follows the PTE change, and none is needed. pid 4 is in the kernel, on
+      the kernel page table since [[uservec]] flushed; [[userret]] flushes again before it
+      runs a user instruction. For a SLEEPING or RUNNABLE owner the same two flushes apply.
+      That is the whole TLB argument, and it is why the state test cannot be relaxed (clinic
+      1).
+  - title: evict writes, then frees
+    commit: 9
+    file: kernel/swap.c
+    lines: 184-207
+    focus: 193-206
+    state:
+      hart: 0
+      mode: S
+      proc: swaptest (pid 4)
+      intr: "off"
+      satp: kernel
+      locks: ["swapio.lock (sleep-lock)"]
+      irq: 0
+      stack: [usertrap, vmfault, swapin, ualloc, evict]
+      sp: {"on": kernel, detail: "`0x3fffff7ee0` in pid 4's kernel stack (`p->kstack` = `0x3fffff7000`)"}
+    note: |
+      `evict` takes `swapio.lock` first, then a slot, then lets the clock rewrite a PTE, then
+      writes the page, releases the lock, and frees the page last:
+
+      - The slot comes before the clock, because its number goes into the PTE.
+      - The PTE changes before the write: the owner stops using the page at once (its next
+        access faults).
+      - The lock spans the PTE change and the write: an owner that faults at once sleeps in
+        `swapin`'s `acquiresleep` until the page is on the disk.
+      - [[kfree]] comes last, when no PTE and no I/O refers to the page.
+
+      Recorded at the write (line 203 here, line 210 in the head): hart 0, pid 4, slot 1,069,
+      page `0x83075000` (frame `0x3075` of the previous step). gdb printed `swapio.lock` as
+      `locked = 1, pid = 4`, noff 0: no spinlock is held across the disk I/O, only the
+      sleep-lock, which is what makes sleeping here legal.
+
+      If the clock finds nothing (every page pinned, running, or used within the last lap,
+      twice round), `evict` returns 0 and frees the slot it took.
+  - title: ualloc, and the reserve kalloc lives on
+    commit: 10
+    file: kernel/swap.c
+    lines: 213-255
+    focus: 213-230
+    diff: true
+    state:
+      hart: 0
+      mode: S
+      proc: swaptest (pid 4)
+      intr: "off"
+      satp: kernel
+      locks: []
+      irq: 0
+      stack: [usertrap, vmfault, swapin, ualloc]
+      sp: {"on": kernel}
+    note: |
+      The switch. `ualloc` evicts pages until `FREELOW` = 32 are free, or until nothing more
+      can be evicted, then takes one with [[kalloc]]. From this commit, [[uvmalloc]],
+      [[vmfault]]'s lazy path and `swapin` (line 242) use it. [[kalloc]] gains a free-page
+      counter (`kmem.nfree`, under `kmem.lock`) and nothing else: it still never evicts and
+      never sleeps.
+
+      One of those callers can hold a spinlock: a copy under `pi->lock` or `cons.lock` that
+      reaches a lazy page of its buffer (`uvmpin` leaves those alone) allocates it through
+      [[vmfault]]. So `ualloc` first asks whether this hart holds a spinlock (lines
+      224–226: noff above 1, counting its own [[push_off]]), and if so it does not evict,
+      it only takes what is free, which is what the original kernel did there.
+
+      So there are two kinds of allocation. Those that may sleep evict, and keep 32 pages in
+      reserve. Those that may not (page-table pages in [[walk]], the trapframe in
+      [[allocproc]], the pages [[uvmcopy]] copies, pipe buffers, lazy pages under a lock)
+      take from that reserve. When the reserve is gone and nothing can be evicted, both
+      kinds fail exactly as in the original kernel: `sbrk` returns -1, a faulting process is
+      killed, `fork` returns -1.
+
+      The state shown is the moment before the eviction recorded in the two previous steps:
+      a swap-in from a page fault, no lock held, so `ualloc` evicts.
+    others: |
+      Three harts may be in `ualloc` at once. They do not race for the same victim: each
+      `evict` holds `swapio.lock` across its whole selection and write, so evictions are
+      serialized. The free-page count may change between the test on line 227 and the
+      [[kalloc]], so the reserve is approximate: harts racing here can take it a few pages
+      below 32, which is harmless as long as it is not zero.
+  - title: The test that the original kernel cannot run
+    commit: 11
+    file: user/swaptest.c
+    lines: 172-213
+    focus: 189-206
+    diff: true
+    state:
+      hart: any
+      mode: U
+      proc: swaptest
+      intr: "on"
+      satp: user
+      locks: []
+      stack: [main, run, procstest]
+      sp: {"on": user}
+    note: |
+      `swaptest`'s five checks follow the think section: `big` writes 36,000 pages and
+      checks every word, newest first; `syscalls` makes the kernel read and write pages that
+      are in swap; `fork` forks a process that is partly in swap; `procs`, shown here, makes
+      three processes evict *each other's* pages; and a leak check compares free pages plus
+      free slots before and after (a page that moves between memory and swap changes both by
+      one).
+
+      `procs` has to make sure the three children overlap. Started simply, they can finish
+      one after another and never need swap at all: a version without the handshake printed
+      `procs: 0 out, 0 in`. So each child fills its 12,500 pages, reports through `ready`,
+      and waits on `go` until all three have filled: 37,500 pages must exist at the same moment, more than the
+      32,768 of RAM, so they must take pages from each other, and the test fails if nothing
+      was written out. A killed child closes its end of `ready` by exiting, so the parent's
+      `read` returns 0 instead of waiting forever. (Without the `close` calls, the kernel of
+      clinic 4, whose children are killed, leaves the parent waiting there for good.)
+
+      Blocked in `read(go[0])`, each child has one page pinned (its 1-byte buffer); the rest
+      of its 12,500 pages are fair game for the other two, which are running.
+verify: |
+  On the branch (`ext/16-swap`, 12 commits), built with the project toolchain and run on 3
+  harts (`-smp 3 -m 128M`), one boot:
+
+  ```text
+  $ swaptest
+  swaptest: big: wrote 36000 pages: 3710 out, 0 in
+  swaptest: big: checked 36000 pages, 0 wrong: 32299 out, 32299 in
+  swaptest: big: OK
+  swaptest: syscalls: copied 32 pages, 0 wrong; 5 sources and 4 destinations were in swap
+  swaptest: syscalls: OK
+  swaptest: fork: 21 slots in use at fork
+  swaptest: fork: child ok, parent 0 wrong, 26 pages read in
+  swaptest: fork: OK
+  swaptest: procs: 15838 out, 13651 in
+  swaptest: procs: OK
+  swaptest: free pages + free slots: 40594 before, 40594 after
+  swaptest: leak: OK
+  swaptest: 62267 pages written out, 45992 read in
+  swaptest: ALL OK
+  $ usertests -q
+  usertests starting
+  test copyin: OK
+  test copyout: OK
+  ...
+  test kernmem: usertrap(): unexpected scause 0xd pid=6485
+  ...
+  test sbrkfail: OK
+  ...
+  test lazy_sbrk: OK
+  ...
+  ALL TESTS PASSED
+  $ swaptest
+  swaptest: big: wrote 36000 pages: 3708 out, 0 in
+  swaptest: big: checked 36000 pages, 0 wrong: 16073 out, 16073 in
+  swaptest: big: OK
+  swaptest: syscalls: copied 31 pages, 0 wrong; 4 sources and 4 destinations were in swap
+  swaptest: syscalls: OK
+  swaptest: fork: 22 slots in use at fork
+  swaptest: fork: child ok, parent 0 wrong, 24 pages read in
+  swaptest: fork: OK
+  swaptest: procs: 14608 out, 14603 in
+  swaptest: procs: OK
+  swaptest: free pages + free slots: 40594 before, 40594 after
+  swaptest: leak: OK
+  swaptest: 44807 pages written out, 30716 read in
+  swaptest: ALL OK
+  ```
+
+  What this shows, check by check:
+
+  - **big**: 36,000 pages of 4,096 bytes, every 8-byte word checked, in a machine with 32,768
+    pages of RAM and 32,403 free at boot. Writing them needed 3,710 evictions. Checking them
+    newest first moved 32,299 pages in and out in the first run and 16,073 in the second:
+    which pages are out depends on where the clock hand happens to be (next section).
+  - **syscalls**: `write` read 5 source pages back from swap, `read` 4 destination pages, all
+    before the copy itself, which runs under `pi->lock`; no panic, no wrong byte.
+  - **fork**: 21 slots were in use when the process forked (most of them its own pages); the
+    child read every page correctly through the shared slots, its writes did not reach the
+    parent, and the parent then read its own pages back (26 swap-ins).
+  - **procs**: three processes, 37,500 pages in all, evicted each other's pages (15,838 pages
+    written out) and all read back correct.
+  - **leak**: free pages plus free slots, 40,594 before and after. The checks run in child
+    processes, so their page-table pages, which `sbrk(-n)` does not free, are gone too.
+  - **usertests -q** passes with swapping active. The `usertrap()` lines are the expected
+    kills of tests such as `kernmem`, `MAXVAplus`, `stacktest` and `nowrite`. Several tests
+    (`sbrkfail`, `execout`, the `countfree` at the start and end) use up all of memory on
+    purpose; with swap they also fill the swap area first, and their final count of free
+    pages before and after still matches.
+
+  `usertests -q` also passes at commits 8, 9 and 10 alone, and other boots of the head ran
+  `swaptest` three more times: `ALL OK` each time.
+measure: |
+  The numbers below come from a copy of the branch with two extra programs, not part of
+  the branch: `pinread` and `sstat`.
+
+  **Reading into a lazy buffer, as before.** `pinread` reads the 2,441-byte `README` into a buffer reserved with `sbrklazy` and never touched,
+  of 1, 1,000, 34,000 and 100,000 pages. On the original kernel and on the reference branch
+  the output is the same:
+
+  ```text
+  pinread: read(README, 1-page lazy buffer) = 2441
+  pinread: read(README, 1000-page lazy buffer) = 2441
+  pinread: read(README, 34000-page lazy buffer) = 2441
+  pinread: read(README, 100000-page lazy buffer) = 2441
+  ```
+
+  `read` on a file pins nothing, and the copy allocates only the one page it fills. (With a
+  pin of the whole buffer, the last two lines read `= -1`.)
+
+  **How much `usertests -q` swaps.** `sstat` prints `swapstat`'s numbers. In one boot the
+  copy ran `pinread`, `sstat`,
+  `usertests -q`, `sstat`, `swaptest`, `sstat`:
+
+  ```text
+  sstat: free 32403 slots 0/8192 out 0 in 0 uptime 6
+  [...]
+  ALL TESTS PASSED
+  sstat: free 32404 slots 1/8192 out 49160 in 34 uptime 873
+  [...]
+  swaptest: ALL OK
+  sstat: free 32406 slots 3/8192 out 98391 in 33303 uptime 1378
+  ```
+
+  | | pages written out | pages read in | time |
+  |---|---|---|---|
+  | `usertests -q` | 49,160 | 34 | 867 ticks (about 87 s); 89.9 s by the wall clock |
+  | `swaptest` (that run) | 49,231 | 33,269 | 505 ticks (about 50 s) |
+  | `usertests -q` on the original kernel | 0 | 0 | 54.1 s by the wall clock |
+
+  `usertests` writes out about 49,000 pages and reads back 34: the tests that fill memory
+  (`sbrkfail`, `execout` with its 15 rounds, `countfree`) push their own pages out and then
+  exit, and freeing a page that is in swap costs no I/O, only `swapfree`. That is probably
+  most of the extra half minute. (These timings were measured while the computer was busy
+  with other work; your times will differ, but the page counts will not change much.)
+
+  **What a page costs.** In the `swaptest` run above, 82,500 page transfers took about 50 s
+  of wall time, including everything else the test did: at most about 0.6 ms per transfer,
+  one 4,096-byte virtio request each, on QEMU's emulated disk.
+
+  **The clock and a sequential scan.** `big` writes pages 0 to 35,999 and then checks them
+  from 35,999 down. A scan larger than memory is the classic bad case for LRU-like policies.
+  On a freshly booted kernel the check moved 32,299 pages each way in every recorded run;
+  run again in the same boot, it moved about 16,000 (16,073 and 16,095), because the clock
+  hand starts from wherever the last test left it. The hand goes round physical pages, not
+  virtual addresses, so the pages in swap are not simply "the oldest" ones. A real kernel
+  adds read-ahead and smarter aging; see *further*.
+
+  **What it costs in memory.** The frame table is 512 KiB (128 pages), the slot counts
+  8 KiB, and `swapio`'s unused buffer 1 KiB: the kernel image ends at `0x800a40b8` instead of
+  `0x80020bb0`, 131 pages more. 32 pages are kept free by `ualloc` as a reserve.
+further: |
+  - **Skip clean pages.** Keep the slot of a page that was read in, and clear D when you do;
+    if D is still clear when the page is evicted again, the copy on disk is still good and no
+    write is needed. This is the *swap cache*, and it is where the D bit, which the hardware
+    already maintains, pays off.
+  - **A swapper thread.** Move eviction into a kernel thread that wakes when free memory
+    drops below a low-water mark and evicts up to a high-water mark. `ualloc` then only waits,
+    and `fork` could wait for it too instead of failing when memory is full.
+  - **Let fork make room.** `fork` cannot evict under `np->lock`. Count the parent's resident
+    pages first and evict until that many are free, *before* [[allocproc]]; or combine with
+    copy-on-write (lab 11), which makes `fork` need almost no pages at all.
+  - **TLB shootdowns.** Add an interprocessor interrupt (the SBI or the CLINT's software
+    interrupts) that makes another hart execute `sfence.vma` and acknowledge it, and then
+    allow evicting pages of processes that are running. Measure what the round trip costs,
+    and see why real kernels batch shootdowns.
+  - **Several requests in flight.** `swapio.lock` allows one page transfer at a time. The
+    virtio queue has room for more; give each eviction its own buffer and a per-slot "being
+    written" flag, and measure `swaptest` again.

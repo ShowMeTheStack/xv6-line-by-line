@@ -1,0 +1,317 @@
+summary: |
+  The kernel's own `printf`. The kernel cannot use the C library's `printf` (there is no C
+  library in a [[g:freestanding]] kernel), so this file provides [[printk]], a small
+  formatted-output function, and [[panic]], which prints a message and stops.
+
+  [[printk]] is a [[g:variadic-function]]: it walks its [[g:format-string]] and prints
+  ordinary characters as they are, while each `%` directive takes the next argument and
+  prints it as a decimal or hexadecimal number, a pointer, a character or a string. The
+  helpers [[printint]] and [[printptr]] do the number conversions. Every character goes out
+  through [[consputc]] in [[kernel/console.c]], which writes it to the UART by busy-waiting,
+  so `printk` never sleeps and is safe to call from anywhere in the kernel, including
+  interrupt handlers and code holding spinlocks.
+
+  A lock, `pr.lock`, keeps messages from different CPUs from being mixed character by
+  character. During a [[panic]] that lock is bypassed, and two flags, [[panicking]] and
+  [[panicked]], change how printing behaves across all CPUs.
+
+  (In older versions of xv6 this function was called `printf`, like the user-space one in
+  [[user/printf.c]]. In this version the kernel's is `printk`, the name Linux uses.)
+
+  **Read before:** [[kernel/console.c]] and [[kernel/uart.c]].
+
+blocks:
+  - lines: 1-3
+    title: What this file is
+    note: |
+      Kernel output: [[printk]] for messages, [[panic]] for unrecoverable errors.
+
+  - lines: 5-16
+    title: Headers
+    note: |
+      `<stdarg.h>` is one of the few standard headers a [[g:freestanding]] program may use:
+      it comes with the compiler, not with a C library, and provides `va_list`, `va_start`,
+      `va_arg` and `va_end` for reading a [[g:variadic-function|variable argument list]].
+      The rest are xv6's own headers, needed for `struct spinlock` and the prototypes in
+      [[kernel/defs.h]].
+
+  - lines: 18-19
+    title: The two panic flags
+    note: |
+      [[panicking]] is set when [[panic]] starts printing its message; [[panicked]] is set
+      when it has finished. Both are global, shared by all CPUs:
+
+      - While `panicking` is 1, [[printk]] does not take `pr.lock` and [[uartputc_sync]]
+        does not touch the interrupt-enable bookkeeping, on every CPU.
+      - Once `panicked` is 1, any thread that tries to print a character spins forever
+        inside [[uartputc_sync]] ([[kernel/uart.c:108]]), so the panic message stays the
+        last thing on the console. Interrupts stay off there only if the caller had
+        already disabled them, so the CPU itself may be moved on to other code by a
+        timer interrupt.
+
+      They are [[g:volatile]] because one CPU writes them while others read them in loops;
+      `volatile` forces the compiler to read memory each time instead of reusing a value
+      it loaded earlier. (Simplified: `volatile` alone does not order these writes against
+      other memory accesses the way an [[g:atomic|atomic]] operation would; for a pair of
+      flags that only ever go from 0 to 1, xv6 accepts that.)
+
+  - lines: 21-24
+    title: The print lock
+    note: |
+      Several CPUs may call [[printk]] at the same moment. Without a lock, their characters
+      would come out interleaved, such as `hhaarrtt 12 ssttaarrttiinngg`. Holding
+      `pr.lock` for a whole call makes each message come out in one piece. Messages printed
+      through `printk` stay intact; bytes from user programs ([[uartwrite]]) and echoed
+      keystrokes do not take this lock and can still appear between them.
+
+      It is a [[g:spinlock]], wrapped in an unnamed struct, the same pattern as [[cons]] in
+      [[kernel/console.c]] (where the struct also holds data). `static` makes `pr` private to
+      this file.
+
+  - lines: 26
+    title: Digit characters
+    note: |
+      Indexing this string with a value from 0 to 15 gives its digit: `digits[10]` is
+      `'a'`. Both decimal (base 10) and hexadecimal (base 16) conversions use it, so hex
+      digits come out in lowercase.
+
+  - lines: 28-34
+    title: "printint(): print an integer in base 10 or 16"
+    note: |
+      `xx` is the value, `base` is 10 or 16, and `sign` says whether to treat `xx` as
+      signed. Taking a `long long` (64 bits) lets one function handle every integer size
+      [[printk]] supports: smaller values are widened by the caller.
+
+      `buf` holds the digits. 20 characters is enough for the longest case: the largest
+      unsigned 64-bit number has 20 decimal digits, and the most negative signed one has 19
+      digits plus the minus sign.
+
+  - lines: 35-38
+    title: Separate the sign from the magnitude
+    note: |
+      Line 35 does two things in one condition. If `sign` is nonzero, it then *assigns*
+      `sign = (xx < 0)`, so from here on `sign` means "this number is negative". For a
+      negative number the magnitude `-xx` is stored in the unsigned `x`; otherwise `x` is
+      `xx` reinterpreted as unsigned.
+
+      The unsigned case matters for `%u`, `%lu` and `%x`: a 64-bit value with the top bit
+      set arrives here as a negative `long long`, and converting it back to `unsigned long
+      long` restores the original bits, so it prints as the large positive number it is.
+
+      One corner case: for the most negative `long long`, `-xx` does not fit in a `long
+      long`, which C formally leaves undefined. In practice RISC-V's two's-complement
+      negation produces the right bit pattern, and the number prints correctly.
+
+  - lines: 40-50
+    title: Produce the digits, then print them reversed
+    note: |
+      Repeated division yields digits from least significant to most significant: `x %
+      base` is the last digit, then `x /= base` removes it. The digits go into `buf` in that
+      backwards order, the minus sign last, and the final loop prints `buf` from the end to
+      the start, which puts everything in the right order.
+
+      The loop is a `do ... while`, not a `while`, so that the value 0 still produces one
+      digit, `"0"`.
+
+  - lines: 52-60
+    title: "printptr(): print a 64-bit value as 0x and 16 hex digits"
+    note: |
+      Used for `%p`. Unlike `%lx`, it always prints all 16 hex digits, including leading
+      zeros, after `0x`: a pointer to `0x80001000` prints as `0x0000000080001000`. Fixed
+      width makes addresses line up in debugging output.
+
+      It prints from the most significant end. `x >> 60` (that is, `sizeof(uint64) * 8 - 4`)
+      is the top 4 bits, one hex digit; then `x <<= 4` shifts the next digit into the top.
+      The loop runs `sizeof(uint64) * 2` = 16 times.
+
+  - lines: 62-72
+    title: "printk(): formatted output"
+    note: |
+      Called all over the kernel: boot messages in [[main]], warnings, [[procdump]] and
+      [[panic]]. Its prototype in [[kernel/defs.h]] carries
+      `__attribute__((format(printf, 1, 2)))` ([[g:attribute]]), which tells the compiler
+      to check every call's arguments against the format string as if this were `printf`.
+      Since the kernel is built with `-Werror`, a mismatch such as `%d` with a pointer
+      argument stops the build.
+
+      The `...` makes it a [[g:variadic-function]]. `va_list ap` is the cursor through the
+      unnamed arguments; `va_start(ap, fmt)` (line 73) points it just after `fmt`, the last
+      named parameter.
+
+      It takes `pr.lock` for the whole message, except while a panic is being printed: the
+      panic could have happened *inside* a `printk` on this CPU, which already holds the
+      lock (for instance [[pop_off]] panicking within [[uartputc_sync]]); [[acquire]] would
+      then panic again, forever. Or another CPU might hold the lock and be stuck. Skipping
+      the lock lets the panic message out in both cases.
+
+  - lines: 73-78
+    title: Copy ordinary characters
+    note: |
+      The loop walks the format string one character at a time until the terminating zero.
+      `fmt[i] & 0xff` keeps only the low 8 bits, so `cx` is 0–255 whether or not the
+      compiler treats `char` as signed (on RISC-V it is unsigned). Any character other than
+      `%` is printed as is, and the loop moves on.
+
+  - lines: 79-85
+    title: Look ahead at up to three characters
+    note: |
+      After a `%`, `i` advances to the directive. `c0`, `c1` and `c2` are the next three
+      characters, enough to recognize the longest directive, `%llx`. The look-ahead stops at
+      the end of the string: `c1` is read only if `c0` is not the terminating zero, and `c2`
+      only if `c1` is not, so the code never reads past the end of `fmt`.
+
+  - lines: 86-128
+    title: Interpret one directive
+    note: |
+      Each branch reads one argument with `va_arg(ap, type)` and prints it. The type given
+      to `va_arg` must match what the caller passed (after C's usual promotion of small
+      types to `int`); reading the wrong type is undefined behavior, which is why the
+      compile-time format check matters. The directives this `printk` understands:
+
+      | Directive | Argument read as | Printed as |
+      |---|---|---|
+      | `%d` | `int` | signed decimal |
+      | `%ld`, `%lld` | `uint64` | signed decimal (64-bit) |
+      | `%u` | `uint32` | unsigned decimal |
+      | `%lu`, `%llu` | `uint64` | unsigned decimal (64-bit) |
+      | `%x` | `uint32` | lowercase hex, no `0x`, no leading zeros |
+      | `%lx`, `%llx` | `uint64` | the same, 64-bit |
+      | `%p` | `uint64` | `0x` plus exactly 16 hex digits |
+      | `%c` | `uint` | one character |
+      | `%s` | `char *` | the string; `(null)` for a null pointer |
+      | `%%` | none | a single `%` |
+
+      On RV64 both `long` and `long long` are 64 bits, so `l` and `ll` mean the same here.
+      Branches that consumed an `l` or `ll` advance `i` past those extra characters; the
+      loop's own `i++` then skips the final letter.
+
+      There are no field widths, padding, precision or flags: `%5d` or `%08x` are not
+      understood. An unknown directive is printed literally (`%` followed by the character,
+      line 125) so that the mistake is visible. A `%` at the very end of the string stops the
+      loop (line 121); without that `break`, the `i++` would step past the terminating zero.
+
+  - lines: 129-135
+    title: Finish
+    note: |
+      `va_end` ends the use of `ap`, as the C standard requires. The lock is released only
+      if it was taken. [[panicking]] goes from 0 to 1 once and is never cleared, so the test
+      on line 131 agrees with the one on line 70 unless another CPU starts a panic while
+      this call is printing. In that case this call took the lock but now skips the
+      release, leaving `pr.lock` held (and this CPU's interrupts off). That matters little:
+      while panicking, no `printk` takes the lock again.
+
+      It always returns 0. The standard `printf` returns the number of characters printed;
+      no caller in the kernel uses the return value.
+
+  - lines: 137-146
+    title: "panic(): report a fatal error and stop"
+    note: |
+      The kernel calls [[panic]] when it finds itself in a state it cannot recover from: a
+      corrupted lock, a failed consistency check, an unexpected trap in the kernel. It
+      prints `panic: ` and the message, then the panicking thread spins forever. Its prototype in
+      [[kernel/defs.h]] is marked `noreturn`, so the compiler knows calls to it never come
+      back.
+
+      The order of steps matters. [[panicking]] is set *first*, so that both `printk` calls
+      skip `pr.lock` and cannot block or recurse on it. [[panicked]] is set only *after*
+      the message is out, because from that moment any CPU that prints, including this one,
+      freezes in [[uartputc_sync]].
+
+      `panic` does not stop the other CPUs directly, and it does not turn off interrupts on
+      its own CPU. Any CPU, including this one if its interrupts happen to be on, keeps
+      running other code until that code tries to print, at which point that thread
+      freezes. The system as a whole stops making visible progress, which is the goal.
+
+  - lines: 148-152
+    title: "printkinit(): initialize the lock"
+    note: |
+      Called by [[main]] on hart 0, right after [[consoleinit]] and before the first
+      [[printk]] ([[kernel/main.c:15]]). It gives `pr.lock` its name for debugging.
+
+lines:
+  29: |
+    `static`: only this file calls [[printint]]. `long long` is 64 bits on RV64.
+  31: |
+    Up to 20 characters: digits and an optional minus sign.
+  33: |
+    The magnitude, always non-negative, so that `%` and `/` below behave simply.
+  42: |
+    Store the lowest digit, as a character from [[digits]].
+  43: |
+    Drop the lowest digit; stop when nothing is left.
+  45: |
+    The number was negative: add the minus sign (it ends up in front after the reversal).
+  48: |
+    Walk `buf` backwards, printing each character with [[consputc]].
+  56: |
+    Print the `0x` prefix, then the digits.
+  58: |
+    16 iterations, one per hex digit; after each, shift the next digit up to the top.
+  59: |
+    Print the top 4 bits of `x` as one hex digit.
+  64: |
+    The `...` means "any number of further arguments, of any type"; see
+    [[g:variadic-function]].
+  66: |
+    The cursor through the variable arguments.
+  70: |
+    Serialize messages from different CPUs, unless a panic is being printed. [[acquire]]
+    also disables interrupts on this CPU until the matching release.
+  73: |
+    Start reading the arguments that follow `fmt`.
+  74: |
+    Loop over the format string; `cx` is the current character, 0–255.
+  76: |
+    An ordinary character: print it with [[consputc]].
+  79: |
+    Step past the `%` to the directive letter.
+  80: |
+    The first character of the directive.
+  87: |
+    `%d`: an `int`, converted to `long long` (sign-extended), printed in decimal as signed.
+  89: |
+    `%ld`: a 64-bit value, printed as signed decimal. Reading it as `uint64` and passing it
+    to a `long long` parameter keeps the bits, so negative numbers still print with a
+    minus sign.
+  90: |
+    Skip the `l`; the loop's `i++` skips the `d`.
+  95: |
+    `%u`: a 32-bit unsigned value, decimal.
+  103: |
+    `%x`: a 32-bit unsigned value, hex. A negative `int` such as -1 prints as `ffffffff`.
+  111: |
+    `%p`: a pointer, read as a 64-bit integer (pointers are 64 bits on RV64), printed by
+    [[printptr]].
+  113: |
+    `%c`: a `char` argument arrives promoted to `int`; it is read as `uint` (same size)
+    and printed as one character.
+  115: |
+    `%s`: read the string pointer; substitute `"(null)"` for a null pointer instead of
+    crashing on it.
+  117: |
+    Print the string's characters up to its terminating zero.
+  120: |
+    `%%`: print one `%`; no argument is used.
+  122: |
+    The format ended right after a `%`: stop instead of stepping past the end.
+  125: |
+    An unknown directive: print it literally so the mistake shows up in the output.
+  129: |
+    Finish with the argument list.
+  132: |
+    Release `pr.lock` (and restore this CPU's interrupt state).
+  140: |
+    From now on [[printk]] and [[uartputc_sync]], on every CPU, skip their locking and
+    interrupt bookkeeping.
+  141: |
+    Print the prefix. Two calls are made, so another CPU's output could in principle
+    land between them now that the lock is not used.
+  142: |
+    Print the message and a newline.
+  143: |
+    Freeze every thread that tries to print from now on, so nothing buries the message.
+  144: |
+    Spin forever. The `for (;;)` with an empty body is the conventional C idiom for an
+    endless loop.
+  151: |
+    Initialize `pr.lock` with [[initlock]].

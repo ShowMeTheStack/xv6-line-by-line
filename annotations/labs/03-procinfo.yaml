@@ -1,0 +1,1771 @@
+published: true
+title: "ps: a safe snapshot of the process table"
+area: The system-call and trap path
+stars: 2
+branch: ext/03-procinfo
+prerequisites: {tours: [5, 6, 12, 13, 18, 20, 21, 28], concepts: [locks]}
+summary: |
+  You add a system call, `procinfo(struct pinfo *buf, int max)`, that copies one record per
+  in-use slot of the process table into a user buffer: pid, parent's pid, state, size, name,
+  and the [[g:hart]] the process is running on. On top of it you write `ps`.
+
+  Copying fields out of `proc[]` sounds like ten lines of code. It is, but the table is
+  being changed by three harts while you read it: processes are created, scheduled,
+  put to sleep, turned into [[g:zombie|zombies]] and reaped, and each field is guarded by a
+  different rule. So the real questions are about reading shared state. Which lock, if any,
+  protects each field you want? In which order may you take two of them? Is it safe to
+  touch user memory while you hold one, in this kernel? What can a "snapshot" promise when
+  the table never stands still, and what can it not? And why does the kernel's own
+  [[procdump]] get away with taking no lock at all?
+
+  You will answer each of these by reading the code, then check your answers against real
+  runs on three harts: a deadlock caught with [[g:gdb]] on all three harts, records torn in
+  half by a missing lock, and a snapshot that honestly shows four processes running on a
+  three-hart machine.
+learn:
+  - "How to find out which lock, if any, protects each field of `struct proc`, from the code that writes it rather than from the comments alone."
+  - "How the order of `wait_lock` and `p->lock` is fixed by code that already exists, and what three harts do when a new path takes the two locks the other way round."
+  - "What [[copyout]] can and cannot do in this tree (sleep? fault? take locks?), and what that means for calling it with a lock held."
+  - "What can a snapshot gathered one slot at a time promise, while three harts keep changing the table, and what can it not?"
+  - "How the scheduler's `c->proc` tells you which hart runs a process, and why the answer stops being true the moment you let go of the lock."
+  - "Why a debugging aid that runs from an interrupt handler on a possibly stuck machine follows different rules from a system call."
+spec: |
+  **The system call.** `int procinfo(struct pinfo *buf, int max)` fills `buf` with at most
+  `max` records, one for each slot of `proc[]` that is not `UNUSED`, in slot order, and
+  returns the number of records written. It returns -1 if `max` is negative or if `buf`
+  cannot be written; `max` larger than `NPROC` is treated as `NPROC`. `max == 0` writes
+  nothing and returns 0. The number is 23.
+
+  **The record** (`kernel/pinfo.h`, shared by the kernel and user programs):
+
+  ```c
+  struct pinfo {
+    int pid;
+    int ppid;      // parent's pid, 0 if none
+    int state;     // enum procstate in proc.h: 1 USED .. 5 ZOMBIE
+    int cpu;       // hart running it if RUNNING, else -1
+    uint64 sz;     // size of user memory (bytes)
+    char name[16]; // always NUL-terminated
+  };
+  ```
+
+  **What a record must get right.** `pid` and `state` belong to the same moment. `cpu` is a
+  hart number exactly when `state` is RUNNING, and -1 otherwise. A non-zero `ppid` is the
+  pid of the process's parent. `name` is always a terminated string.
+  The kernel must never write more than `max` records into the user's buffer.
+
+  **The program.** `ps` prints one line per record:
+
+  ```text
+  $ ps
+  PID   PPID  STATE   CPU  SIZE    NAME
+  1     0     sleep   -    16384   init
+  2     1     sleep   -    20480   sh
+  3     2     run     1    16384   ps
+  ```
+
+  **The test.** `procinfotest` checks five things and prints `OK` or `FAIL` for each: its
+  own record (RUNNING, on a hart, with its name); a child seen as SLEEPING, then ZOMBIE,
+  then gone after `wait`; that `max` limits what is written and returned; that bad buffers
+  return -1 and a lazily allocated one works; and, for 20 ticks while other processes fork
+  and exit as fast as they can, that every snapshot (taken with room for all `NPROC` slots)
+  has valid pids and states, no pid twice, a hart exactly in the RUNNING records, and every
+  non-zero `ppid` present in the same snapshot, and that at least 100 processes were really
+  created meanwhile. Every check is made by the program itself, so the last line says
+  `5 checks OK` only if all five held. (It does not check that names are terminated; `ps`
+  relies on that.)
+
+  **Constraints.** Existing behaviour must not change, and `usertests -q` must still print
+  `ALL TESTS PASSED` on three harts. Do not change any lock rule of `struct proc`.
+think:
+  - title: Which lock protects each field you want to report?
+    q: |
+      Your record has six fields: pid, parent's pid, state, size, name, and the hart a
+      process is running on. For each one, find every piece of code that **writes** it and
+      note which lock that code holds while it writes. Which fields can a lock you take make
+      safe to read, and which can't?
+    hints:
+      - |
+        Start with the comments inside `struct proc` ([[kernel/proc.h:85]] to
+        [[kernel/proc.h:103]]), then check them against the writers: search the kernel for
+        `->state =`, `->pid =`, `->parent =`, `->sz` and `->name`. The hart is not in
+        `struct proc` at all; look at `struct cpu` in the same header.
+      - |
+        A lock protects a field only against writers that take the same lock. If even one
+        writer stores to the field without it, holding the lock while you read does not stop
+        that store.
+      - |
+        You should end up with four groups: fields every writer changes under `p->lock`, one
+        field every writer changes under `wait_lock`, fields the process writes about itself
+        with no lock, and one field outside `struct proc` written by the scheduler.
+    answer: |
+      | Field | Written by | Lock the writer holds |
+      |---|---|---|
+      | `state` | [[allocproc]], [[userinit]], [[kfork]], [[kexit]], [[yield]], [[sleep]], [[wakeup]], [[kkill]], [[scheduler]], [[freeproc]] | that process's `p->lock`, always |
+      | `pid` | [[allocproc]] ([[kernel/proc.c:125]]), [[freeproc]] ([[kernel/proc.c:165]]) | `p->lock` |
+      | `parent` | [[kfork]] ([[kernel/proc.c:297]]), [[reparent]] ([[kernel/proc.c:316]]), [[kwait]] ([[kernel/proc.c:397]]) | `wait_lock` |
+      | `sz` | [[growproc]] ([[kernel/proc.c:252]]), lazy `sbrk` ([[kernel/sysproc.c:62]]), [[kexec]] ([[kernel/exec.c:135]]); also `kfork` for the child and `freeproc` | **none** for the process's own writes |
+      | `name` | [[kexec]] ([[kernel/exec.c:130]]); also `kfork` for the child and `freeproc` (`name[0] = 0`) | **none** for `kexec` |
+      | hart | `c->proc = p` and `c->proc = 0` in [[scheduler]] ([[kernel/proc.c:452]], [[kernel/proc.c:460]]) | the `p->lock` of the process `c->proc` points to |
+
+      So `p->lock` makes `state`, `pid` and the hart readable together, `wait_lock` makes
+      `parent` readable, and nothing you can take makes `sz` and `name` safe: their owner
+      writes them while it runs, perhaps on another hart at this very moment, without any
+      lock. The comment in `proc.h` calls them "private to the process", which is exactly
+      right for the process itself and exactly the problem for anybody else. (`kfork` and
+      `freeproc` write them under `p->lock`, but that only covers a child that cannot run yet
+      and a slot that is being freed.)
+    checks:
+      - id: lab03-01
+        level: 1
+        type: match
+        q: |
+          Match each field with what protects it against concurrent writers.
+        pairs:
+          - left: "`p->state`"
+            right: the process's own `p->lock`, held by every writer
+            why: |
+              You may have thought `state` is private because a process changes its own
+              state in `yield` and `sleep`. Other code changes it too: [[wakeup]] and
+              [[kkill]] on any hart, and the scheduler. All of them hold `p->lock`.
+          - left: "`p->parent`"
+            right: "`wait_lock`"
+            why: |
+              You may have expected `p->lock`, since `parent` is in `struct proc`. The comment
+              at [[kernel/proc.h:92]] and every writer ([[kfork]], [[reparent]], [[kwait]])
+              use `wait_lock`, the lock that also keeps a parent's `wait` from missing a child's `exit`.
+          - left: "`p->name`"
+            right: "nothing: `kexec` writes it while the process runs"
+            why: |
+              You may have assumed every field of `struct proc` is covered by `p->lock`.
+              [[kexec]] copies the new name at [[kernel/exec.c:130]] holding no lock at all.
+          - left: "`cpus[i].proc`"
+            right: the `p->lock` of the process it points to
+            why: |
+              You may have thought `struct cpu` needs no lock because each hart owns its own.
+              Only that hart writes it, but it writes `c->proc = p` and `c->proc = 0` while
+              holding `p->lock` ([[kernel/proc.c:446]] to [[kernel/proc.c:463]]), and that
+              is what a reader on another hart can rely on.
+        explain: |
+          The comments in `struct proc` are a good start, but the truth is in the writers.
+          A reader is protected only against writers that take the same lock. See
+          [[concept:locks#lock-proc]] and [[concept:locks#lock-wait_lock]].
+      - id: lab03-02
+        level: 2
+        type: tf
+        q: |
+          True or false: if `procinfo` holds `p->lock` while it copies `p->name`, it can never
+          see a name that is half the old program's and half the new one's.
+        answer: false
+        why_tf: |
+          You may have thought that holding a process's lock freezes the whole `struct proc`.
+          A lock only excludes code that takes the same lock.
+        reasons:
+          - text: "False: `kexec` writes `p->name` without taking `p->lock`, so the copy can overlap the write."
+            correct: true
+            why: |
+              This is the reason. [[kexec]] runs as the process itself, on its own hart, and
+              treats the name as private ([[kernel/exec.c:130]]).
+          - text: "True: `p->lock` disables interrupts, so the process cannot run while you copy."
+            why: |
+              You may have thought interrupts are off on every hart. `acquire` turns them off
+              only on the hart that calls it; the process keeps running on its own hart.
+          - text: "True: a process cannot run while another hart holds its `p->lock`."
+            why: |
+              You may have confused "the scheduler cannot pick it" with "it cannot run". A
+              process that is already RUNNING keeps running; it takes its own lock only for
+              short operations such as giving up the CPU.
+          - text: "False: names are written one byte at a time by `printk`."
+            why: |
+              You may have mixed up writing a name with printing it. The writer is `kexec`'s
+              `safestrcpy`, not `printk`.
+        explain: |
+          `p->lock` gives you `state`, `pid`, `chan`, `killed`, `xstate` and the scheduler's
+          `c->proc`. `name` and `sz` are written by their owner with no lock, so any reader on
+          another hart races with those writes. The design must live with that (question 7).
+  - title: What do max and the return value mean?
+    q: |
+      The caller passes a buffer with room for `max` records. The table may hold more in-use
+      slots than that, or fewer, and it can change between two calls. Decide what the kernel
+      writes, what it returns, and what it does with a negative `max`, with `max == 0` and with
+      `max` larger than the table.
+    hints:
+      - |
+        Look at how existing calls report sizes: `read` never stores more than it was asked
+        for, and returns how much it stored. Then think about the loop `ps` will run over the
+        result.
+      - |
+        The caller allocated exactly `max` records. Whatever you return, a caller will most
+        likely use it as the number of valid records.
+      - |
+        Write at most `max` records and return the number written; refuse a negative `max`;
+        clamp `max` to `NPROC`, the most the table can ever hold.
+    answer: |
+      The reference contract is the one `read` uses: **at most `max` records are written, and
+      the return value is the number written**. A caller that wants to know whether it saw
+      everything compares the result with `max` (and retries with a bigger buffer if they are
+      equal).
+
+      - `max < 0` returns -1. `max` is an `int`, and a negative count has no meaning.
+      - `max == 0` writes nothing and returns 0, which is consistent with the rule.
+      - `max > NPROC` is clamped to `NPROC`: the table has 64 slots, so the kernel never needs
+        room for more, and the kernel's own buffer can have a fixed size.
+
+      The obvious alternative is to return the *total* number of in-use slots, as `snprintf`
+      returns the length it wanted, so that the caller learns the size it needs. It is a
+      legitimate design, but it makes the result mean two things, and every caller that loops
+      `for (i = 0; i < n; i++)` over its buffer reads past what was written. Clinic 5 runs that
+      version; clinic 4 runs the worse one that ignores `max` altogether.
+    checks:
+      - id: lab03-03
+        level: 1
+        type: number
+        q: |
+          Five slots of `proc[]` are in use. A program calls `procinfo(buf, 2)`. With the
+          reference contract, what does the call return?
+        answer: 2
+        wrong:
+          5: |
+            You may have thought the call reports how many processes exist. That is the
+            `snprintf`-style alternative; here the return value counts the records written,
+            and only 2 fit.
+          0: |
+            You may have thought a buffer too small for the whole table is refused. The call
+            fills what fits and says how much that was.
+          -1: |
+            You may have thought a short buffer is an error. Only a negative `max` or an
+            unwritable buffer is.
+        why_wrong: |
+          Count what the kernel is allowed to write: at most `max` records, and it returns how
+          many it wrote.
+        explain: |
+          The return value is the number of valid records in `buf`, never more than `max`. A
+          caller that gets back exactly `max` knows the table may have had more.
+  - title: How do you read the parent's pid, and in what order do you take the locks?
+    q: |
+      `parent` is protected by `wait_lock`, the rest of the record by `p->lock`. Where do you
+      take `wait_lock`: once around the whole scan, once per slot just before its `p->lock`,
+      or per slot after its `p->lock`? What does each choice guarantee, and what does it cost?
+      And once you have the parent *pointer*, may you read the parent's `pid` without holding
+      the parent's `p->lock`?
+    hints:
+      - |
+        Read the comment above `wait_lock` ([[kernel/proc.c:23]]) and the code that holds
+        both kinds of lock: [[kwait]], [[kexit]] and the second half of [[kfork]].
+      - |
+        Two locks taken in opposite orders on two harts can [[g:deadlock]]. Find the order
+        those functions use. For the parent's pid: list every writer of `pid` and ask whether
+        any of them can run while you hold `wait_lock`.
+      - |
+        Use the order those functions use, and hold the outer lock for as long as the parent
+        links must not move. For `pid`: can an UNUSED slot be anybody's parent? Which function
+        frees a process that has had children, and what does it hold while it does?
+    answer: |
+      The order is fixed by the code that already holds both. [[kwait]] holds `wait_lock` and
+      acquires each child's `p->lock` ([[kernel/proc.c:384]]), and while still holding it calls
+      [[killed]], which takes its own `p->lock` ([[kernel/proc.c:408]]). [[kexit]] holds
+      `wait_lock` while [[wakeup]] takes every `p->lock` in turn ([[kernel/proc.c:353]]), then
+      takes its own ([[kernel/proc.c:355]]). The comment says it plainly: `wait_lock` "must be
+      acquired before any p->lock". [[kfork]] even releases the child's lock (line 294) before
+      taking `wait_lock`, to obey it. So `procinfo` takes `wait_lock` first.
+
+      Taking it inside the loop, after `p->lock`, closes a cycle:
+
+      | Time | Hart 1: `kwait` in a parent | Hart 2: `procinfo` (wrong order) |
+      |---|---|---|
+      | 1 | acquires `wait_lock` | acquires the parent's `p->lock` (slot 4) |
+      | 2 | `killed(p)`: wants slot 4's `p->lock`, spins | wants `wait_lock`, spins |
+      | 3 | spins forever | spins forever |
+
+      Clinic 2 is a recording of exactly this, with the third hart caught too.
+
+      Taking `wait_lock` per slot, **before** that slot's `p->lock`, respects the order and
+      keeps each hold short, and it still gives every record a correct `ppid` for the moment
+      it was read. What it loses is the table-wide part: between two slots a parent can exit
+      and be reaped, so a child's `ppid` may name a process missing from the snapshot.
+      Holding `wait_lock` around the whole scan buys exactly that: no parent link can change,
+      no process can become a zombie ([[kexit]] sets ZOMBIE under it) and none can be reaped
+      until the scan is over, so the parent column is consistent across the snapshot. That
+      guarantee is why the reference holds it for the whole scan.
+
+      The cost is that every `fork`, `exit` and `wait` on the other harts waits for the scan.
+      That is the same kind of hold the kernel already makes: [[kexit]] holds `wait_lock`
+      across `wakeup(p->parent)`, a scan of all 64 `p->lock`s, and [[kwait]] scans every slot
+      under it. An instrumented run under `procinfotest`'s fork/exit churn measured
+      `procinfo`'s scan at about 50 to 80 µs on average, comparable to how long `kfork`,
+      `kexit` and `kwait` each already wait for `wait_lock` under that churn without any
+      `procinfo` (means of about 40 to 95 µs); with `procinfo` called back to back, forks per
+      20 ticks fell by 0 to 35% across runs (noisy).
+
+      **The parent's pid needs no second `p->lock`.** `pid` is written by [[allocproc]], on a
+      slot that is UNUSED and so nobody's parent, and by [[freeproc]]. A process that has
+      children is freed only by [[kwait]], under `wait_lock`; its children were handed to
+      `init` by [[reparent]] in its `kexit`, also under `wait_lock`. (`freeproc` is also called
+      on a half-built child when `allocproc` or `kfork` fails, but such a slot has no children.)
+      So while you hold `wait_lock`, no writer of the parent's `pid` can run. Taking the
+      parent's `p->lock` as well would mean holding two `p->lock`s at once, which nothing in
+      xv6 does and which no rule orders: better not to invent that.
+    checks:
+      - id: lab03-04
+        level: 3
+        type: multi
+        q: |
+          A buggy `procinfo` on hart 2 holds slot 4's `p->lock` and spins waiting for
+          `wait_lock`. Which of these, running on another hart, can be the other half of a
+          deadlock with it?
+        options:
+          - text: "`kwait` in slot 4's parent, holding `wait_lock`, reaching slot 4 in its scan of children"
+            correct: true
+            why: It holds `wait_lock` and wants slot 4's `p->lock` ([[kernel/proc.c:384]]); each hart waits for the other.
+          - text: "`kwait` in the process in slot 4 itself, calling `killed(p)` while holding `wait_lock`"
+            correct: true
+            why: |
+              [[killed]] takes the caller's own `p->lock`, and `kwait` calls it with `wait_lock`
+              held ([[kernel/proc.c:408]]). This is the cycle clinic 2 recorded.
+          - text: "`kexit` in some process, whose `wakeup(p->parent)` scans every `p->lock` while holding `wait_lock`"
+            correct: true
+            why: "[[wakeup]] takes every slot's lock in turn, slot 4's included, and [[kexit]] calls it with `wait_lock` held."
+          - text: The scheduler on hart 0, reaching slot 4 in its scan
+            why: |
+              You may have counted every hart that ends up stuck. The scheduler spins on slot
+              4's lock, but it holds no `wait_lock`, so it is a victim, not part of the cycle:
+              if `procinfo` could get `wait_lock`, it would finish and release slot 4.
+        explain: |
+          A deadlock needs a cycle: each party holds what the next one wants. Every path that
+          holds `wait_lock` and then takes some `p->lock` closes the cycle with a `procinfo`
+          that holds a `p->lock` and wants `wait_lock`. Victims that merely spin on one of the
+          locks make the hang spread but are not the cause. See [[tour:18]] and
+          [[concept:locks#order]].
+      - id: lab03-05
+        level: 2
+        type: tf
+        q: |
+          True or false: to read `p->parent->pid`, `procinfo` must also hold the parent's
+          `p->lock`, because `pid` is in the `p->lock` section of `struct proc`.
+        answer: false
+        why_tf: |
+          You may have applied the `proc.h` comment mechanically. A lock is needed when some
+          writer could run concurrently; here none can.
+        reasons:
+          - text: "False: the parent's pid can only change when the parent is freed, and that happens only in kwait, under wait_lock, which procinfo holds."
+            correct: true
+            why: |
+              This is the reason. [[allocproc]] writes `pid` only on an UNUSED slot, which is
+              nobody's parent, and a parent is freed only by [[kwait]] under `wait_lock`.
+          - text: "False: pids are never reused, so a stale pid is harmless."
+            why: |
+              You may have been thinking of what `ps` prints. Without `wait_lock` the parent's
+              slot could be freed and reused, and you would read the *new* process's pid,
+              which is a wrong answer, not a stale one.
+          - text: "True: another hart could exec the parent and change its pid."
+            why: |
+              You may have thought `exec` assigns a new pid. [[kexec]] keeps the process's
+              pid; it changes the memory image and the name.
+          - text: "True: reading any field of another process without its lock is a data race."
+            why: |
+              You may have thought every field needs its own lock. A read races only with a
+              concurrent write, and the writers of `pid` cannot run while `wait_lock` is held.
+        explain: |
+          Locks protect against particular writers. Before taking a lock, find the writers
+          and check whether any can run; nesting two `p->lock`s, which no rule in xv6 orders,
+          would add risk for nothing.
+  - title: Where do the records wait, and when do they reach user memory?
+    q: |
+      You will be holding locks while you read each slot. The records must end up in the
+      user's buffer, and only [[copyout]] can write there. Is it safe, **in this kernel**, to
+      call `copyout` while holding a spinlock? Whatever your answer, where should the records
+      live until they are copied, and why there?
+    hints:
+      - |
+        Read `copyout` and everything it can call: [[walkaddr]], [[vmfault]], [[kalloc]],
+        [[mappages]]. Then read the checks at the top of [[sched]]. Finally, look through
+        `proc.c` for a place where the kernel already calls `copyout` with spinlocks held.
+      - |
+        The rule is "never sleep holding a spinlock": `sched` panics if `noff` is not exactly
+        1. So ask whether anything `copyout` calls can sleep, or take a page fault. Then ask
+        what *else* holding the locks longer costs, and what would happen if `copyout` changed
+        one day.
+      - |
+        Gather the records into a kernel buffer while holding the locks, release everything,
+        then make one `copyout`. For the buffer (64 records of 40 bytes), compare three homes:
+        the kernel stack, a global array, a page from the allocator.
+    answer: |
+      **The truth in this tree: `copyout` never sleeps and never faults.** It looks the page up
+      with [[walkaddr]]. If the page is lazily allocated and below `sz`, [[vmfault]] calls
+      [[kalloc]] (which only spins on `kmem.lock`), zeroes the page and maps it with
+      [[mappages]] (which may `kalloc` page-table pages). Then it copies with `memmove` to
+      the *physical* address, through the kernel's [[g:direct-map]]: the kernel never touches
+      the user virtual address, so there is nothing to fault on. No path sleeps. The kernel
+      relies on this already: [[kwait]] calls `copyout` for the exit status while holding
+      `wait_lock` **and** the child's `p->lock` ([[kernel/proc.c:391]]). Clinic 1 ran a
+      `procinfo` that copies each record out under both locks: every test passed, and the
+      measured lock-hold times were no different.
+
+      So why does the reference gather first and copy once, after releasing?
+
+      - **It keeps the locked code independent of `copyout`'s insides.** In a kernel where a
+        user page can be somewhere slow (on disk, in a file), the fault path sleeps, and a
+        `copyout` under a spinlock would panic in [[sched]] with `sched locks`. That is
+        reasoned, not run here, but it is the reason the rule exists.
+      - **Error handling stays simple.** A failed `copyout` in the middle of the scan has to
+        release two locks before returning; one `copyout` after the scan has nothing to undo.
+      - **The scan stays short.** While it runs, interrupts are off on this hart and every
+        `fork`, `exit` and `wait` on the other harts waits for `wait_lock`.
+
+      Where the records live meanwhile:
+
+      | Home | Problem |
+      |---|---|
+      | an array on the kernel stack | 2,560 bytes of a 4,096-byte [[g:kernel-stack]]. In the recorded run the kernel stack was 224 bytes deep inside `procinfo` (its own frame is 96 bytes), so it would fit today, but it leaves little room, and with 128 slots it would run into the [[g:guard-page]] |
+      | a global array | three harts can call `procinfo` at once; they would overwrite each other's records unless a lock serialized them, and that lock would have to be held across the `copyout` |
+      | a page from `kalloc` | private to this call, 4,096 bytes ≥ 2,560, freed right after the `copyout` |
+
+      The reference uses a page from [[kalloc]], and checks once that `sizeof(struct pinfo) *
+      NPROC` fits in it (the compiler evaluates that test at compile time; the build contains
+      no call for it).
+    checks:
+      - id: lab03-06
+        level: 3
+        type: choice
+        q: |
+          In a variant of the lab, `procinfo` calls `copyout` for each record while holding
+          `wait_lock` and that slot's `p->lock`. The user's buffer is in lazily allocated
+          memory that has never been touched. What happens in this tree?
+        options:
+          - text: It works. copyout's fault path only calls kalloc and mappages, which spin briefly but never sleep, so no lock rule is broken.
+            correct: true
+            why: |
+              [[vmfault]] allocates and maps the page on the spot; `kalloc` takes `kmem.lock`
+              (a spinlock nested inside the other two, `noff` 3) and returns. Nothing reaches
+              `sched`. [[kwait]] does the same kind of `copyout` under two spinlocks.
+          - text: "The kernel panics with `sched locks`, because the lazy page must be read in and copyout sleeps."
+            why: |
+              That would be true in a kernel that keeps user pages on disk. Here a lazy page
+              is just a page nobody allocated yet: [[vmfault]] allocates a zeroed one without
+              sleeping.
+          - text: "It deadlocks: kalloc needs `kmem.lock`, and kmem is never taken under `p->lock`."
+            why: |
+              You may have thought this creates a new lock-order edge. `kfork` already takes
+              `kmem.lock` under the child's `p->lock`, and `kwait` takes it under `wait_lock`
+              and `p->lock` (`freeproc` → `kfree`). `kmem.lock` takes nothing else, so no
+              cycle is possible.
+          - text: "The kernel takes a page fault in supervisor mode on the user address and panics in kerneltrap."
+            why: |
+              You may have pictured the kernel storing to the user virtual address. `copyout`
+              translates the address itself and writes the physical page through the direct
+              map, so the hardware never sees the user address.
+        explain: |
+          In this tree `copyout` is safe under spinlocks; the kernel itself relies on that in
+          [[kwait]]. Keeping it outside the locks is a design choice for robustness and for
+          short critical sections, not a rule this kernel would enforce. See [[tour:28]].
+      - id: lab03-07
+        level: 2
+        type: state
+        q: |
+          `sys_procinfo` has called `procinfo`, which released every lock, and is now inside
+          the single `copyout` at the end. Fill in the state of the hart running it.
+        state: {mode: S, stack: kernel, satp: kernel, sie: "on", noff: "0", intena: "-"}
+        why:
+          mode: You may have thought copying to user memory needs user mode. The kernel copies in supervisor mode, translating the user address itself.
+          stack: You may have thought user memory work happens on the user stack. The system call runs on the process's own kernel stack, which `uservec` switched to.
+          satp: You may have thought the user page table must be installed to reach user memory. `copyout` walks the user page table in software and writes through the kernel's direct map.
+          sie: You may have thought interrupts stay off after the scan. The last `release` brought `noff` back to 0, and `intena` was 1 (interrupts were on when the system call took its first lock), so `pop_off` turned them back on.
+          noff: You may have thought some lock is still held. `procinfo` released every `p->lock` and then `wait_lock`; that is the point of gathering first.
+          intena: With `noff` 0 there is no saved state to report.
+        why_wrong: |
+          Ask which locks are held at this line (none), then what that means for interrupts.
+          The recorded run showed `noff 0` and `sstatus` 0x200000022 (SIE set) here.
+        explain: |
+          The copy happens with no lock held and interrupts on, like any ordinary part of a
+          system call. If it took a while (a lazy page to allocate, a timer interrupt and a
+          yield), nobody else would be waiting for this hart.
+  - title: How can you tell which hart is running a process?
+    q: |
+      `struct proc` has no "hart" field. Where is that information, who writes it, under which
+      lock, and how long does the answer you copy stay true?
+    hints:
+      - |
+        Look at `struct cpu` in [[kernel/proc.h]] and at the loop in [[scheduler]].
+      - |
+        The scheduler writes `c->proc` twice for every stretch a process runs. Which lock does
+        it hold both times?
+      - |
+        Put the two facts together: for a process whose lock you hold, what is the relation
+        between its `state` and the harts' `c->proc` values? Which records then need a search,
+        and over what?
+    answer: |
+      Each hart's `struct cpu` has a `proc` pointer. [[scheduler]] sets `c->proc = p` right
+      after setting `p->state = RUNNING` ([[kernel/proc.c:451]] and [[kernel/proc.c:452]]), and
+      clears it after the process has given the CPU back ([[kernel/proc.c:460]]), both while
+      holding `p->lock`. A RUNNING process stops running only through [[yield]], [[sleep]] or
+      [[kexit]], and each of them takes its own `p->lock` first. So while `procinfo` holds
+      `p->lock`, `p` is RUNNING exactly when one hart's `c->proc` points at it, and neither can
+      change. Reading `cpus[i].proc` of another hart is fine for the same reason: it can change
+      *to* or *from* `p` only under the lock you hold.
+
+      The answer stays true until the `release`. A moment later the process may take a timer
+      interrupt and yield, or sleep, and later resume on another hart. The caller itself is the
+      one process certain to be RUNNING when its own slot is read: in the recorded run, `ps`
+      (pid 3, slot 2) read its own record on hart 1 and found `cpus[1].proc` pointing at slot 2.
+      After the system call returns it may be moved anywhere.
+
+      `NCPU` is 8 but QEMU starts three harts here; `cpus[3]` to `cpus[7]` keep `proc` 0, so
+      the loop over all eight is harmless.
+    checks:
+      - id: lab03-08
+        level: 2
+        type: choice
+        q: |
+          `procinfo` holds `p->lock`, finds `p->state == RUNNING`, and loops over `cpus[]`
+          comparing each `cpus[i].proc` with `p`. It holds no lock of the other harts. Why is
+          the answer reliable?
+        options:
+          - text: "Because a hart's `c->proc` can change to or from `p` only while `p->lock` is held, and procinfo holds it."
+            correct: true
+            why: The scheduler sets and clears `c->proc` with that process's lock held, so the pair (state, c->proc) is frozen for `p`.
+          - text: Because acquire turns interrupts off on every hart, so no scheduler can run.
+            why: |
+              You may have thought SIE is global. It is per hart; the other harts keep
+              scheduling while `procinfo` runs.
+          - text: Because `cpus[]` is protected by `wait_lock`.
+            why: |
+              You may have assumed every shared array has a lock. `cpus[i]` is written only by
+              hart *i*, and the `proc` field only under the `p->lock` of the process involved.
+          - text: Because a hart's `c->proc` never changes during a system call.
+            why: |
+              You may have been thinking of the calling hart. The other harts switch processes
+              whenever they like; only changes involving `p` itself are excluded.
+        explain: |
+          Locks protect relationships too: `p->lock` makes "`p` is RUNNING" and "some
+          `c->proc` is `p`" change together. Other harts' `c->proc` values for other processes
+          can change freely, and they do not matter for `p`'s record.
+  - title: What does "consistent" mean for this snapshot?
+    q: |
+      Each record is read under its own `p->lock`, one slot after another, with `wait_lock`
+      held for the whole scan. Which of these can a correct snapshot contain: two RUNNING
+      records naming the same hart; more RUNNING records than there are harts; a record whose
+      `ppid` is missing from the snapshot; a USED record with no parent; a ZOMBIE? What would
+      it take to make the whole table consistent at one instant, and what would that cost?
+    hints:
+      - |
+        Sort the transitions by lock. Which ones need `wait_lock` (the parent link in
+        `kfork`, ZOMBIE in `kexit`, reaping in `kwait`), and which need only that process's
+        `p->lock` ([[yield]], [[sleep]], [[wakeup]], the scheduler's RUNNING)?
+      - |
+        A record is consistent as of the moment its `p->lock` was held. Between two slots the
+        other harts keep scheduling, and a hart that switches processes changes two slots.
+      - |
+        Per-record consistency, plus parent links frozen for the scan. A single instant would
+        need every `p->lock` at once.
+    answer: |
+      The snapshot has three layers of guarantees:
+
+      1. **Each record agrees with itself**, because it was read under its `p->lock`: `pid`
+         goes with `state`, and `cpu` is a hart exactly when `state` is RUNNING.
+      2. **Parent links are frozen for the whole scan**, because `wait_lock` is held: no
+         process becomes a ZOMBIE and none is reaped, so every non-zero `ppid` is in the
+         snapshot, provided the scan was not cut short by `max` (a child can sit in a lower
+         slot than its parent: a run with `procinfo(buf, 4)` returned a record
+         whose parent was in slot 5, outside the four records).
+      3. **Nothing else is frozen.** Scheduling needs only `p->lock`, so harts go on switching
+         processes while the scan moves from slot to slot.
+
+      So, for the five cases:
+
+      - **Two RUNNING records on one hart, or more RUNNING records than harts: possible.**
+        Slot 3 is read while hart 0 runs it; hart 0 then takes a timer interrupt, yields, and
+        picks the process in slot 9; the scan reaches slot 9 and reads it RUNNING on hart 0.
+        Both records were true when they were read. The recorded run after `usertests`
+        reported `most RUNNING at once 4` on a three-hart machine.
+      - **A missing parent: impossible** when the whole table fits (`max` = `NPROC`), by
+        layer 2. `procinfotest` checks it in every snapshot, asking for all 64 slots.
+      - **USED with no parent: common.** [[allocproc]] marks a slot USED without
+        `wait_lock`; [[kfork]] sets the parent later, under `wait_lock`, so it waits for the
+        scan. In the measured runs every USED record had `ppid` 0.
+      - **ZOMBIE: common.** A child that exited before the scan stays a zombie until its
+        parent's `kwait` gets `wait_lock`.
+
+      A single consistent instant would need all 64 `p->lock`s held at once (and `wait_lock`).
+      The counting allows it (`noff` is an `int`), but every scheduler on the other harts would
+      spin on the first slot it tries, and so would every [[wakeup]], including the timer's on
+      hart 0: the whole machine would stop for the scan. `ps` does not need that, so it does not
+      pay for it.
+    checks:
+      - id: lab03-09
+        level: 3
+        type: multi
+        q: |
+          `procinfo` is implemented as in the reference (`wait_lock` around the scan, each
+          record under its `p->lock`), called with `max` = `NPROC`. Which of these can appear
+          in one snapshot on three harts?
+        options:
+          - text: Four records with state RUNNING
+            correct: true
+            why: |
+              Records are taken at different moments; a hart can switch processes between two
+              slots. A recorded run reported `most RUNNING at once 4`.
+          - text: A USED record with ppid 0
+            correct: true
+            why: |
+              A child between [[allocproc]] and `kfork`'s parent assignment, which waits for
+              `wait_lock`. The measured runs saw one in about a quarter of all snapshots.
+          - text: A record with ppid 7 when no record has pid 7
+            why: |
+              You may have thought the parent could exit and be reaped during the scan. Both
+              `kexit`'s ZOMBIE and `kwait`'s reap need `wait_lock`, which the scan holds, and
+              parent links change only under it.
+          - text: A RUNNING record with cpu -1
+            why: |
+              You may have thought `c->proc` and `state` can disagree. Under `p->lock` they
+              cannot: the scheduler changes both while holding it. Clinic 3 shows this record
+              appearing only when the lock is dropped.
+          - text: A ZOMBIE record
+            correct: true
+            why: A child that exited before the scan began stays a zombie until its parent reaps it, which waits for `wait_lock`.
+        explain: |
+          The snapshot is per-record consistent, with parent links frozen for its duration. It
+          is not an instant of the whole table, and making it one would stop every hart.
+  - title: name and sz, and what procdump gets away with
+    q: |
+      [[procdump]] prints pid, state and name with no lock at all. Why is that acceptable
+      there? Your call returns records to a user program: you take `p->lock` for `state`,
+      `pid` and the hart, but what do you do about `name` and `sz`, which `p->lock` does not
+      protect?
+    hints:
+      - |
+        Read `procdump`'s comment ([[kernel/proc.c:675]]) and find who calls it: what is the
+        caller holding, in what context does it run, and what state might the machine be in
+        when someone uses it?
+      - |
+        If a hart is stuck forever holding some `p->lock`, what does `acquire` do to the
+        next hart that wants it? Now compare what goes wrong if a dump prints a garbled line
+        with what goes wrong if a program acts on a garbled record.
+      - |
+        Keep the lock for the fields it protects. For `name` and `sz`, copy without a lock but
+        safely: a fixed-size copy, a forced terminator, and a comment saying the values may be
+        stale. The alternative is changing the writers.
+    answer: |
+      **procdump** runs when you type Ctrl-P: [[consoleintr]] calls it from the UART interrupt
+      handler, holding `cons.lock`, on whichever hart took the interrupt. It is a debugging aid
+      for a machine that may be stuck, and a common reason a machine is stuck is that some hart
+      holds a lock and never lets go. If `procdump` took `p->lock`, the dump would hang on
+      exactly the slot you need to see ("No lock to avoid wedging a stuck machine further").
+      Its output is advisory text on the console; nothing acts on it. A garbled line is an
+      acceptable price.
+
+      **procinfo** is an ordinary system call on a healthy machine, so taking locks is
+      affordable (about 46 µs per call, measured), and its output goes to a program that may
+      act on it, for example by sending `kill` to a pid. So it takes `p->lock` for `state`,
+      `pid` and the hart, and gets records that agree with themselves. Clinic 3 shows what the
+      lock-free version produces.
+
+      For `name` and `sz`, no lock helps, because their owner writes them without one. The
+      reference accepts that and makes the read safe rather than exact:
+
+      - `sz` is an aligned 8-byte field read with one load, so it is never torn; at worst it
+        is the size from just before a `sbrk` or an `exec`.
+      - `name` is copied as a fixed 16 bytes and the last byte is forced to 0, so `ps` always
+        gets a terminated string. If [[kexec]] is writing the name at that moment, the copy
+        can be a mix of the old and the new name (reasoned; not seen in the recorded runs).
+
+      The alternative is to change the writers: have `kexec`, `growproc` and lazy `sbrk` ([[kernel/sysproc.c:62]]) take `p->lock`
+      while they update `name` and `sz`. That moves two fields into the `p->lock` section of
+      `proc.h`, and every future writer has to know. For a `ps`, the cost buys nothing.
+    checks:
+      - id: lab03-10
+        level: 2
+        type: choice
+        q: |
+          Why does [[procdump]] read the process table without taking any lock?
+        options:
+          - text: So that a dump still prints on a machine that is stuck with some lock held forever.
+            correct: true
+            why: |
+              It is the tool you reach for when the machine hangs; taking `p->lock` could make
+              the dump hang on the very slot that is stuck.
+          - text: Because it runs with interrupts off, so no other hart can change the table.
+            why: |
+              You may have thought interrupts off stops the other harts. It only stops
+              interrupts on the hart running `procdump`; the others keep scheduling.
+          - text: "Because `cons.lock`, which its caller holds, protects the process table."
+            why: |
+              You may have thought any held lock protects everything nearby. `cons.lock`
+              protects the console's input buffer; nothing in `proc.c` takes it.
+          - text: Because it only runs at boot, before any other process exists.
+            why: |
+              You may have confused it with `userinit`. It runs whenever Ctrl-P is typed,
+              from the console interrupt handler.
+        explain: |
+          Different jobs, different rules. A last-resort debugging aid must not depend on the
+          locks it may be trying to diagnose; an ordinary system call whose results programs
+          act on should take the locks that make its answers true. See
+          [[concept:locks#unlocked]].
+build: |
+  **Start from the frozen commit**, in your own clone of xv6 (not this site's `xv6/`):
+
+  ```sh
+  git checkout -b my-procinfo 06aad25
+  ```
+
+  Work in this order; each milestone can be tested before the next.
+
+  1. **The interface.** Write `kernel/pinfo.h`. Add `SYS_procinfo` (23) to
+     `kernel/syscall.h`, `entry("procinfo")` to `user/usys.pl`, and to `user/user.h` both
+     `struct pinfo;` (near `struct stat;`) and `int procinfo(struct pinfo *, int);`.
+     Without the forward declaration, `-Werror` stops the build with
+     `'struct pinfo' declared inside parameter list will not be visible outside of this
+     definition or declaration`.
+  2. **The handler and the scan.** `sys_procinfo` in `kernel/sysproc.c` (fetch the two
+     arguments, check and clamp `max`, `kalloc` a page, call the scan, one `copyout`, `kfree`)
+     and a `procinfo(struct pinfo *, int)` in `kernel/proc.c` that takes each slot's `p->lock`
+     in turn. Add the prototype to `kernel/defs.h` and the table entry in
+     `kernel/syscall.c`. Fill `ppid` with 0 and `cpu` with -1 for now. Write a ten-line test
+     program, or go straight to step 5 and use `ps`.
+  3. **The parent.** `wait_lock` around the scan; `ppid` from `p->parent`.
+  4. **The hart.** The `cpus[]` loop for RUNNING records.
+  5. **`ps`**, and `$U/_ps` in `UPROGS`. Try `ps`, then `ps &` (the background shell's
+     records are interesting).
+  6. **The test.** `procinfotest` (or your own), then `usertests -q`, then `procinfotest`
+     again: the second run has thousands of pids behind it.
+
+  **Debugging.** Run QEMU with three harts. If a run hangs, attach [[g:gdb]] (`make
+  qemu-gdb` in one terminal, `${TOOLPREFIX}gdb kernel/kernel` and `target remote` in
+  another), then `info threads` and `thread apply all bt`: every hart's backtrace, as in
+  clinic 2. `TOOLPREFIX` is your RISC-V toolchain's prefix, the same one xv6's Makefile
+  detects (`riscv64-unknown-elf-`, `riscv64-linux-gnu-` or `riscv64-elf-`); set it with
+  `export TOOLPREFIX=riscv64-unknown-elf-` or whichever you have. On Debian/Ubuntu/WSL,
+  `gdb-multiarch` also works as the debugger. To
+  see who holds a lock, print it: `p wait_lock` shows `cpu = 0x8000fa50 <cpus+128>`, and
+  each `struct cpu` is 128 bytes, so that is hart 1. To watch the scan, start QEMU halted
+  (`-S`) and set breakpoints before you continue, for example on the line after
+  `acquire(&p->lock)`, and print `p - proc`, `p->pid` and `cpus[$tp].noff` (`tp` holds the
+  hart number in the kernel). A test that passes once proves little here: clinic 3's bug passed on
+  four of six runs.
+clinic:
+  - bug: Copied each record out while holding the locks
+    change: |
+      No kernel buffer: `procinfo` gets the user address and copies each record as soon as it
+      is filled, inside both locks, releasing them on failure:
+
+      ```diff
+      -      n++;
+      -    }
+      -    release(&p->lock);
+      +      if (copyout(me->pagetable, me->sz, addr + n * sizeof(rec),
+      +                  (char *)&rec, sizeof(rec)) < 0) {
+      +        release(&p->lock);
+      +        release(&wait_lock);
+      +        return -1;
+      +      }
+      +      n++;
+      +    }
+      +    release(&p->lock);
+      ```
+
+      (`rec` is a single `struct pinfo` on the stack, `me` is `myproc()`; `sys_procinfo`
+      no longer allocates a page.)
+    symptom: |
+      $ procinfotest
+      procinfotest: own record: running on a hart, right name: OK
+      procinfotest: child: sleeping, then zombie, then gone after wait: OK
+      procinfotest: max=1 writes one record, max=0 none, max=-1 fails: OK
+      procinfotest: bad buffers return -1; a lazy buffer works: OK
+      procinfotest: 7581 snapshots, 0 bad, newest pid seen 1647, most RUNNING at once 3
+      procinfotest: snapshots during fork/exit churn: every one consistent: OK
+      procinfotest: 5 checks OK
+      $ usertests -q
+      usertests starting
+      [...]
+      ALL TESTS PASSED
+      $ procinfotest
+      [...]
+      procinfotest: 6849 snapshots, 0 bad, newest pid seen 9756, most RUNNING at once 3
+      procinfotest: snapshots during fork/exit churn: every one consistent: OK
+      procinfotest: 5 checks OK
+    why: |
+      Nothing breaks, and that is the honest result for this tree. The "lazy buffer" check
+      makes the very first `copyout` land on a page that was never touched, so [[vmfault]]
+      runs with `wait_lock` and init's `p->lock` held: it calls [[kalloc]], which takes
+      `kmem.lock` (a third spinlock, `noff` 3, the same depth [[kwait]] reaches through
+      `freeproc` → `kfree`), and returns. No path in [[copyout]] sleeps, and it never touches
+      the user virtual address, so there is no page fault either. The "bad buffers" check
+      makes `copyout` fail in the middle of the scan, and the error path releases both
+      locks, so that works too.
+
+      Timing how long `wait_lock` stays held per call, with a copy of each kernel that
+      reads the `time` CSR before and after the scan (10 million units per second in QEMU),
+      shows no clear effect. The difference was lost in the noise between runs: for 20,000 calls into an
+      already-mapped buffer, a mean of 346 and 535 units (34.6 and 53.5 µs) in two runs of the
+      reference against 338 and 285 for this version; for 300 calls into fresh lazy pages, 303
+      and 534 against 420 and 363 (Measure has the table, including a churn row that is a
+      fair comparison but not a typical scan: see the note there). Copying three or four
+      40-byte records is cheap next to 64 `acquire`/`release` pairs.
+
+      So in this kernel the mistake is a matter of design, not of correctness. The reasons to
+      avoid it are that the locked code now depends on what `copyout` does (a kernel where
+      the fault path can wait for a disk would panic with `sched locks` here), and that the
+      error path inside the scan is one more place to get the releases wrong. Clinic 6 shows
+      what a missed release does.
+  - bug: Took p->lock, then wait_lock
+    change: |
+      `wait_lock` is taken only around the parent read, inside the loop, after the slot's
+      `p->lock`:
+
+      ```diff
+      -  acquire(&wait_lock);
+         for (p = proc; p < &proc[NPROC] && n < max; p++) {
+           acquire(&p->lock);
+           if (p->state != UNUSED) {
+             ...
+      +      acquire(&wait_lock);
+             out[n].ppid = p->parent ? p->parent->pid : 0;
+      +      release(&wait_lock);
+             ...
+         }
+      -  release(&wait_lock);
+      ```
+
+      It looks tidier: `wait_lock` is held for one line instead of the whole scan.
+    symptom: |
+      $ procinfotest
+      procinfotest: own record: running on a hart, right name: OK
+      procinfotest: child: sleeping, then zombie, then gone after wait: OK
+      procinfotest: max=1 writes one record, max=0 none, max=-1 fails: OK
+      procinfotest: bad buffers return -1; a lazy buffer works: OK
+
+      (no further output; after 120 seconds, gdb attached:)
+      acquire (lk=lk@entry=0x80010370 <proc+1440>) at kernel/spinlock.c:37
+      warning: 37	kernel/spinlock.c: No such file or directory
+        Id   Target Id                    Frame
+      * 1    Thread 1.1 (CPU#0 [running]) acquire (lk=lk@entry=0x80010370 <proc+1440>) at kernel/spinlock.c:37
+        2    Thread 1.2 (CPU#1 [running]) acquire (lk=lk@entry=0x80010370 <proc+1440>) at kernel/spinlock.c:37
+        3    Thread 1.3 (CPU#2 [running]) acquire (lk=lk@entry=0x8000f9b8 <wait_lock>) at kernel/spinlock.c:37
+
+      Thread 3 (Thread 1.3 (CPU#2 [running])):
+      #0  acquire (lk=lk@entry=0x8000f9b8 <wait_lock>) at kernel/spinlock.c:37
+      #1  0x0000000080002490 in procinfo (out=out@entry=0x87f10000, max=64) at kernel/proc.c:727
+      #2  0x0000000080002c70 in sys_procinfo () at kernel/sysproc.c:139
+      #3  0x0000000080002a02 in syscall () at kernel/syscall.c:148
+      #4  0x0000000080002788 in usertrap () at kernel/trap.c:68
+      #5  0x0000003ffffff09c in ?? ()
+
+      Thread 2 (Thread 1.2 (CPU#1 [running])):
+      #0  acquire (lk=lk@entry=0x80010370 <proc+1440>) at kernel/spinlock.c:37
+      #1  0x0000000080002182 in killed (p=p@entry=0x80010370 <proc+1440>) at kernel/proc.c:638
+      #2  0x0000000080002270 in kwait (addr=0) at kernel/proc.c:409
+      #3  0x0000000080002a94 in sys_wait () at kernel/sysproc.c:37
+      #4  0x0000000080002a02 in syscall () at kernel/syscall.c:148
+      #5  0x0000000080002788 in usertrap () at kernel/trap.c:68
+      #6  0x0000003ffffff09c in ?? ()
+
+      Thread 1 (Thread 1.1 (CPU#0 [running])):
+      #0  acquire (lk=lk@entry=0x80010370 <proc+1440>) at kernel/spinlock.c:37
+      #1  0x0000000080001fbc in wakeup (chan=chan@entry=0x80007880 <ticks>) at kernel/proc.c:582
+      #2  0x000000008000265e in clockintr () at kernel/trap.c:172
+      #3  0x00000000800026de in devintr () at kernel/trap.c:215
+      #4  0x0000000080002720 in usertrap () at kernel/trap.c:69
+      #5  0x0000003ffffff09c in ?? ()
+      $1 = {locked = 1, name = 0x80007168 "wait_lock", cpu = 0x8000fa50 <cpus+128>}
+      cpus[0].proc = 0x80010208 <proc+1080> noff = 2
+      cpus[1].proc = 0x80010370 <proc+1440> noff = 2
+      cpus[2].proc = 0x800100a0 <proc+720> noff = 2
+      [...]
+      slot  2 pid     3 state RUNNING   name procinfotest  lock.locked 0 lock.cpu 0x0 parent 0x8000ff38 <proc+360>
+      slot  3 pid     5 state RUNNING   name procinfotest  lock.locked 0 lock.cpu 0x0 parent 0x800100a0 <proc+720>
+      slot  4 pid     6 state RUNNING   name procinfotest  lock.locked 1 lock.cpu 0x8000fad0 <cpus+256> parent 0x800100a0 <proc+720>
+      [...]
+    why: |
+      The test got through its first four checks, in which `procinfo` overlaps another
+      process's `exit` at most once (check 2's child), a window far too short to hit; the
+      stress phase overlaps thousands, and the test hung there. Each `struct proc` is
+      360 bytes and each `struct cpu` 128, so the addresses decode as follows (the line numbers
+      in the backtraces are those of this build, one more than the site's source for
+      `kwait`):
+
+      - **Hart 2** runs `procinfotest` (pid 3, slot 2: `cpus[2].proc` is `proc+720`). Its
+        `procinfo` holds slot 4's lock (`lock.cpu` is `cpus+256`, hart 2) and spins for
+        `wait_lock` at the line the change added.
+      - **Hart 1** runs pid 6, a churning child in slot 4 (`proc+1440`). Its [[kwait]] holds
+        `wait_lock` (`cpu = cpus+128`, hart 1) and calls [[killed]] on itself
+        ([[kernel/proc.c:408]]), which spins for slot 4's lock: its own, held by hart 2.
+      - **Hart 0** runs pid 5, the spinning child in slot 3. A timer interrupt arrived in user
+        mode; [[clockintr]] took `tickslock` and called [[wakeup]] on `ticks`, which takes
+        every `p->lock` in turn and now spins on slot 4's. Hart 0 is not part of the cycle,
+        but it is caught anyway, holding `tickslock`.
+
+      Hart 1 waits for hart 2 and hart 2 waits for hart 1: a two-lock cycle, made of the
+      `wait_lock` → `p->lock` order that `kwait` uses and the `p->lock` → `wait_lock` order the
+      change introduced. Every `noff` is 2: one lock held plus the `push_off` of the `acquire`
+      that spins. Interrupts are off on all three harts, so no timer can ever move anything
+      again, and since hart 0 holds `tickslock`, even `uptime` would hang now.
+
+      The partner varies from run to run. Another run of the same variant closed the
+      cycle with `kwait`'s scan of its children instead: hart 1 in `kwait` holding `wait_lock`
+      at `proc.c:385` (this build's numbering), acquiring a child's lock (slot 6) that hart 0's
+      `procinfo` held, with hart 2 in `kwait` at line 418 as a victim spinning on `wait_lock`
+      (`noff` 1). That is the first option of the check in question 3. Lock order is a
+      property of the whole kernel:
+      a new function must follow the order every existing path already uses.
+  - bug: No locks at all, like procdump
+    change: |
+      `procinfo` copies procdump's approach: no `wait_lock`, no `p->lock`, everything else
+      unchanged:
+
+      ```diff
+      -  acquire(&wait_lock);
+         for (p = proc; p < &proc[NPROC] && n < max; p++) {
+      -    acquire(&p->lock);
+           if (p->state != UNUSED) {
+             ...
+           }
+      -    release(&p->lock);
+         }
+      -  release(&wait_lock);
+      ```
+    symptom: |
+      $ procinfotest
+      procinfotest: own record: running on a hart, right name: OK
+      procinfotest: child: sleeping, then zombie, then gone after wait: OK
+      procinfotest: max=1 writes one record, max=0 none, max=-1 fails: OK
+      procinfotest: bad buffers return -1; a lazy buffer works: OK
+      procinfotest: first bad snapshot: running, but on no hart: pid 127 ppid 7 state 4 cpu -1
+      procinfotest: 44970 snapshots, 3 bad, newest pid seen 2675, most RUNNING at once 3
+      procinfotest: snapshots during fork/exit churn: every one consistent: FAIL
+      procinfotest: 1 FAILED
+      $ procinfotest
+      [...]
+      procinfotest: first bad snapshot: on a hart, but not running: pid 2681 ppid 2677 state 3 cpu 2
+      procinfotest: 37677 snapshots, 1 bad, newest pid seen 5101, most RUNNING at once 3
+      procinfotest: snapshots during fork/exit churn: every one consistent: FAIL
+      procinfotest: 1 FAILED
+      $ procinfotest
+      [...]
+      procinfotest: 34453 snapshots, 0 bad, newest pid seen 7202, most RUNNING at once 3
+      procinfotest: snapshots during fork/exit churn: every one consistent: OK
+      procinfotest: 5 checks OK
+    why: |
+      Torn records do show up, but rarely per snapshot: on one boot, six runs took 213,431
+      snapshots in all and only 4 were inconsistent (3 in the first run, 1 in the second, none
+      in the other four, which printed `5 checks OK`). Per run it is less rare: a second series
+      of six runs failed 4 of them. Each bad record mixes two moments:
+
+      - **`state 4 cpu -1`, "running, but on no hart".** The compiled loop loads `p->state`
+        three separate times (three `lw a5,24(s1)` in this build: the UNUSED test, the copy into
+        the record, and the RUNNING test before the `cpus[]` loop). The copy saw RUNNING, and
+        by the time the `cpus[]` loop ran, no hart's `c->proc` pointed at the process: it had
+        just yielded or slept, or the scheduler had set RUNNING ([[kernel/proc.c:451]]) but
+        not yet `c->proc` (line 452).
+      - **`state 3 cpu 2`, "on a hart, but not running".** The reverse: the copy saw RUNNABLE,
+        then the scheduler on hart 2 picked the process, and the third load saw RUNNING, so
+        the loop found it on hart 2.
+      - **`pid 8223 ppid 0 state 0`, "bad pid or state"** (seen in that second series).
+        The first load saw a live state, so the slot was recorded with its pid, but the copy
+        of `state` came after [[freeproc]] on another hart had set UNUSED: a record of a
+        process that, as far as the record says, does not exist.
+
+      With `p->lock` held, the scheduler cannot be between those lines, and all three loads see
+      the same value. Without it, the program receives a record that was never true at any
+      moment. Nothing crashed: this build loads `p->parent` once into a register, checks it for
+      0 and then dereferences that same register, so the parent pointer could not be read as
+      non-zero and then as zero. That is luck of code generation, not a guarantee.
+
+      A second variant kept `p->lock` but dropped `wait_lock`. Six runs (60,643 snapshots)
+      printed no bad snapshot at all: this workload's parents (the test and its two churning
+      children) never exit while their children live, so no parent link changes during a
+      scan. It still gives up layer 2 of question 6 (parent links may now change while the
+      scan runs); a measurement saw only milder effects (see Measure): some children caught
+      mid-fork already had a parent, and snapshots with two RUNNING records on one hart became
+      more common. Rare is not never: a race test that passes is weak evidence.
+  - bug: Ignored max
+    change: |
+      The scan stops only at the end of the table:
+
+      ```diff
+      -  for (p = proc; p < &proc[NPROC] && n < max; p++) {
+      +  for (p = proc; p < &proc[NPROC]; p++) {
+      ```
+
+      `sys_procinfo` still copies out `n` records.
+    symptom: |
+      $ procinfotest
+      procinfotest: own record: running on a hart, right name: OK
+      procinfotest: child: sleeping, then zombie, then gone after wait: OK
+      procinfotest: procinfo(buf, 1) returned 3 and changed 80 bytes after buf[0]; procinfo(buf, 0) returned 3
+      procinfotest: max=1 writes one record, max=0 none, max=-1 fails: FAIL
+      procinfotest: bad buffers return -1; a lazy buffer works: OK
+      procinfotest: 5977 snapshots, 0 bad, newest pid seen 1654, most RUNNING at once 3
+      procinfotest: snapshots during fork/exit churn: every one consistent: OK
+      procinfotest: 1 FAILED
+      $ ps
+      PID   PPID  STATE   CPU  SIZE    NAME
+      1     0     sleep   -    16384   init
+      2     1     sleep   -    20480   sh
+      1656  2     run     2    16384   ps
+    why: |
+      With `init`, `sh` and `procinfotest` in the table, `procinfo(buf, 1)` wrote three
+      records: the one the caller asked for and two more, the 80 bytes after `buf[0]` that the
+      test had filled with `0xab`. `procinfo(buf, 0)` wrote three records into a buffer the
+      caller said had no room at all. The kernel's own page is never overrun (the scan still
+      stops at `NPROC`, and the page holds 64 records); the overflow happens in **user
+      memory**, through a [[copyout]] that is perfectly legal: the bytes after the buffer belong
+      to the same process and are writable, so nothing checks them. In the test the extra
+      records fell inside its own oversized array; in a program with `struct pinfo b[2];` on
+      its stack they would overwrite whatever lies next to `b`.
+
+      `ps` looks fine, because it always passes `NPROC`: a bug that only shows up for callers
+      that pass a small `max`, which is why the test tries `max` values of 1 and 0.
+  - bug: Returned the count, not the number written
+    change: |
+      Records are written only while there is room, but the count keeps going, and that total
+      is returned:
+
+      ```diff
+      -  for (p = proc; p < &proc[NPROC] && n < max; p++) {
+      +  for (p = proc; p < &proc[NPROC]; p++) {
+           acquire(&p->lock);
+      -    if (p->state != UNUSED) {
+      +    if (p->state != UNUSED && n >= max) {
+      +      n++; // count it, but there is no room
+      +    } else if (p->state != UNUSED) {
+      ```
+
+      and `sys_procinfo` copies out `min(n, max)` records.
+    symptom: |
+      $ procinfotest
+      procinfotest: own record: running on a hart, right name: OK
+      procinfotest: child: sleeping, then zombie, then gone after wait: OK
+      procinfotest: procinfo(buf, 1) returned 3 and changed 0 bytes after buf[0]; procinfo(buf, 0) returned 3
+      procinfotest: max=1 writes one record, max=0 none, max=-1 fails: FAIL
+      procinfotest: bad buffers return -1; a lazy buffer works: OK
+      procinfotest: 11082 snapshots, 0 bad, newest pid seen 2820, most RUNNING at once 3
+      procinfotest: snapshots during fork/exit churn: every one consistent: OK
+      procinfotest: 1 FAILED
+    why: |
+      This time the kernel writes nothing past `max` ("changed 0 bytes"), so memory is safe,
+      but the call answers 3 where it wrote 1, and 3 where it wrote nothing. Every caller that
+      loops `for (i = 0; i < n; i++)` over its buffer now reads two records the kernel never
+      wrote: whatever was in the array before, here the test's `0xab` filler, elsewhere old
+      records from a previous call. Returning a total is a defensible API (question 2), but
+      only if the documentation and every caller agree that `min(n, max)` records are valid.
+      The test treats the return value as the reference contract defines it, so it catches the
+      mismatch.
+  - bug: procdump's loop, with a lock added
+    change: |
+      The loop is written like [[procdump]]'s, which skips unused slots with `continue`, and
+      the lock is added at the top:
+
+      ```diff
+           acquire(&p->lock);
+      -    if (p->state != UNUSED) {
+      +    if (p->state == UNUSED)
+      +      continue;
+      +    {
+      ```
+
+      The `continue` jumps past the `release(&p->lock)` at the bottom of the loop.
+    symptom: |
+      $ ps
+      Ppanic: acquire
+
+      (gdb attached:)
+      acquire (lk=lk@entry=0x80010208 <proc+1080>) at kernel/spinlock.c:37
+      warning: 37	kernel/spinlock.c: No such file or directory
+        Id   Target Id                    Frame
+      * 1    Thread 1.1 (CPU#0 [running]) acquire (lk=lk@entry=0x80010208 <proc+1080>) at kernel/spinlock.c:37
+        2    Thread 1.2 (CPU#1 [running]) acquire (lk=lk@entry=0x80010208 <proc+1080>) at kernel/spinlock.c:37
+        3    Thread 1.3 (CPU#2 [running]) panic (s=s@entry=0x80007048 "acquire") at kernel/printk.c:144
+
+      Thread 3 (Thread 1.3 (CPU#2 [running])):
+      #0  panic (s=s@entry=0x80007048 "acquire") at kernel/printk.c:144
+      #1  0x0000000080000c28 in acquire (lk=lk@entry=0x80010208 <proc+1080>) at kernel/spinlock.c:26
+      #2  0x0000000080001fbc in wakeup (chan=chan@entry=0x8000f950 <tx_lock>) at kernel/proc.c:582
+      #3  0x00000000800041cc in releasesleep (lk=lk@entry=0x8000f950 <tx_lock>) at kernel/sleeplock.c:42
+      #4  0x0000000080000964 in uartwrite (buf=buf@entry=0x3fffff9eb0 "P", n=n@entry=1) at kernel/uart.c:95
+      #5  0x000000008000012c in consolewrite (user_src=1, src=16015, n=1) at kernel/console.c:74
+      #6  0x000000008000456e in filewrite (f=0x8001fad0 <ftable+24>, addr=16015, n=1) at kernel/file.c:147
+      #7  0x0000000080004fb6 in sys_write () at kernel/sysfile.c:94
+      #8  0x00000000800029fc in syscall () at kernel/syscall.c:148
+      #9  0x0000000080002782 in usertrap () at kernel/trap.c:68
+      #10 0x0000003ffffff09c in ?? ()
+
+      Thread 2 (Thread 1.2 (CPU#1 [running])):
+      #0  acquire (lk=lk@entry=0x80010208 <proc+1080>) at kernel/spinlock.c:37
+      #1  0x0000000080001fbc in wakeup (chan=chan@entry=0x80007868 <tx_chan>) at kernel/proc.c:582
+      #2  0x0000000080000a18 in uartintr () at kernel/uart.c:145
+      #3  0x00000000800026b2 in devintr () at kernel/trap.c:199
+      #4  0x0000000080002812 in kerneltrap () at kernel/trap.c:149
+      #5  0x0000000080005778 in kernelvec () at kernel/kernelvec.S:38
+      Backtrace stopped: frame did not save the PC
+
+      Thread 1 (Thread 1.1 (CPU#0 [running])):
+      #0  acquire (lk=lk@entry=0x80010208 <proc+1080>) at kernel/spinlock.c:37
+      #1  0x0000000080001dd8 in scheduler () at kernel/proc.c:447
+      #2  0x0000000080000ea0 in main () at kernel/main.c:44
+      $1 = {locked = 0, name = 0x80007168 "wait_lock", cpu = 0x0}
+      cpus[0].proc = 0x0 noff = 1
+      cpus[1].proc = 0x0 noff = 1
+      cpus[2].proc = 0x800100a0 <proc+720> noff = 63
+      [...]
+      UNUSED slots whose p->lock is held: 61 (slots 3..63), lk->cpu of the first: 0x8000fad0 <cpus+256>
+    why: |
+      Slots 0 to 2 (`init`, `sh`, `ps`) were in use and released normally. Each of the other 61
+      slots was locked and then skipped by `continue`, so `ps`'s hart (hart 2, `cpus+256`)
+      left `procinfo` holding 61 `p->lock`s. `wait_lock` was released at the end, as the code
+      says, so `procinfo` returned, the `copyout` worked, and `ps` went back to user space with
+      61 spinlocks held. The way back to user space does not look at `noff`: [[prepare_return]]
+      sets `SPIE`, and `sret` copies it into `SIE`, so interrupts were on again.
+
+      Then `ps` printed its first character, `P`. That `write` ends in [[uartwrite]], which
+      releases `tx_lock` with [[releasesleep]], which calls [[wakeup]], which acquires every
+      `p->lock` in turn, and slot 3's is already held **by this hart**. [[acquire]] notices
+      ([[kernel/spinlock.c:25]]) and panics: `panic: acquire`, right after the `P`. `noff` 63 is
+      the 61 slot locks, plus `tx_lock`'s inner spinlock held by `releasesleep`, plus the
+      `push_off` of the failing `acquire`. Meanwhile hart 0's scheduler and hart 1's UART
+      interrupt handler (another `wakeup`) spin on slot 3 forever.
+
+      This is the one place where copying [[procdump]] is actively harmful. Its `continue`
+      is fine because it holds nothing; the moment a lock is added, every exit from the loop
+      body must pass through the `release`. Had the panic not caught it, the next scheduler to
+      reach slot 3 would have spun forever.
+reveal:
+  - title: A record both sides agree on
+    commit: 1
+    file: kernel/pinfo.h
+    lines: 1-10
+    diff: true
+    state:
+      hart: 1
+      mode: U
+      proc: ps (pid 3)
+      intr: "on"
+      satp: user
+      locks: []
+      stack: [main]
+      sp: {"on": user, detail: "ps's user stack"}
+    note: |
+      The story for this tour is a recorded run on three harts: at a fresh shell you type
+      `ps`. `ps` is pid 3, running on hart 1; `init` (pid 1) and the shell (pid 2) are asleep,
+      `init` in `wait` for the shell and the shell in `wait` for `ps`. The machine-state values
+      in the steps for `sys_procinfo` and `procinfo` come from that run, with QEMU started
+      halted and breakpoints set before it ran.
+
+      The first commit defines the record. It lives in its own header because two programs
+      compiled separately, the kernel and `ps`, must agree on it byte for byte: the kernel
+      fills it, `copyout` copies its bytes, and `ps` reads them through the same declaration.
+
+      The layout has no padding: four `int`s (16 bytes), then the 8-byte `sz` at offset 16,
+      already aligned, then 16 characters, 40 bytes in all. That matters for a structure the
+      kernel hands to user space: a padding hole would be a few bytes the kernel copies out
+      without ever writing, whatever happened to be in its buffer before.
+
+      `state` is the kernel's `enum procstate` number. User programs cannot include
+      `kernel/proc.h` (it needs the kernel's spinlock and page-table types), so `ps` keeps its
+      own table of names for 1 to 5.
+  - title: One forward declaration, one stub
+    commit: 1
+    file: user/user.h
+    lines: 1-30
+    focus: 3-4
+    diff: true
+    state:
+      hart: 1
+      mode: U
+      proc: ps (pid 3)
+      intr: "on"
+      satp: user
+      locks: []
+      stack: [main]
+      sp: user
+    note: |
+      The rest of the plumbing is what every system call needs ([[tour:5]]): number 23 in
+      [[kernel/syscall.h]], `entry("procinfo")` in [[user/usys.pl]] to generate the stub
+      (`li a7, SYS_procinfo`, `ecall`, `ret`), and the prototype on line 29.
+
+      Line 4 is the one new idea. `user.h` is included by every user program, and most of them
+      never include `pinfo.h`. A prototype that mentions `struct pinfo *` where no `struct
+      pinfo` has been declared makes the compiler declare a new structure type valid only
+      inside that parameter list, and it warns. Under `-Werror` the build stops:
+      `'struct pinfo' declared inside parameter list will not be visible outside of this
+      definition or declaration` (recorded by removing line 4). `struct pinfo;` declares the
+      tag without its contents, exactly as `struct stat;` on line 3 does for `fstat`. A
+      pointer to an incomplete structure is enough for a prototype.
+
+      At this commit the kernel has no handler yet: a call would reach [[syscall]], fail its
+      range check, print an "unknown sys call 23" message and return -1.
+  - title: sys_procinfo checks its arguments
+    commit: 2
+    file: kernel/sysproc.c
+    lines: 113-145
+    focus: 115-131
+    diff: true
+    state:
+      hart: 1
+      mode: S
+      proc: ps (pid 3)
+      intr: "on"
+      satp: kernel
+      locks: []
+      stack: [usertrap, syscall, sys_procinfo]
+      sp: {"on": kernel, detail: "ps's kernel stack; `sp` was 0x3fffff9f80 here in the recorded run"}
+      irq: 0
+    note: |
+      `ps` called `procinfo(buf, 64)`, its stub put 23 in `a7`, and [[usertrap]] sent the
+      trap to [[syscall]] with interrupts back on (in the recorded run `sstatus` was
+      `0x200000022` at line 126: SIE set). The handler fetches its two arguments from the
+      [[g:trapframe]]: the buffer address with [[argaddr]] (in the run `0x1010`, `ps`'s global
+      array) and `max` with [[argint]].
+
+      Neither is trusted. `argaddr` does not check the address at all; the `copyout` at the end
+      will, page by page, against `ps`'s own page table. `max` is checked here: negative is
+      refused, and anything above `NPROC` is clamped, since the table cannot hold more and the
+      kernel's buffer is sized for exactly `NPROC` records.
+
+      The stack is `ps`'s kernel stack, which was empty when the trap arrived: here it holds
+      just the frames of `usertrap`, `syscall` and `sys_procinfo`.
+  - title: A private page to gather into
+    commit: 2
+    file: kernel/sysproc.c
+    lines: 113-145
+    focus: 133-138
+    state:
+      hart: 1
+      mode: S
+      proc: ps (pid 3)
+      intr: "on"
+      satp: kernel
+      locks: []
+      stack: [usertrap, syscall, sys_procinfo]
+      sp: kernel
+      irq: 0
+    note: |
+      The records are gathered in a page from [[kalloc]] (`0x87f26000` in the recorded run),
+      not on the stack and not in a global array. The stack is a single page: in the recorded
+      run `procinfo` ran with `sp` at `0x3fffff9f20`, 224 bytes below the top, and a 2,560-byte
+      array would have taken more than half of what is left before the [[g:guard-page]]. A global
+      array would be shared by three harts calling `procinfo` at once. The page belongs to this
+      call alone.
+
+      Line 135 checks that 64 records fit in the page. Both sides of the comparison are
+      constants, so the compiler decides it at compile time; the built kernel contains no code
+      for it. It still documents the assumption and would fire at once (in the first call) if
+      someone grew `NPROC` or the record. `log.c` uses the same kind of check for its header.
+
+      [[kalloc]] fills the page with the byte 5, so nothing of a previous owner can leak out,
+      and the scan writes every field of every record it returns.
+  - title: The scan, one slot at a time, under p->lock
+    commit: 2
+    file: kernel/proc.c
+    lines: 706-737
+    focus: 717-723
+    diff: true
+    state:
+      hart: 1
+      mode: S
+      proc: ps (pid 3)
+      intr: "off"
+      satp: kernel
+      locks: ["init's p->lock (slot 0)"]
+      stack: [usertrap, syscall, sys_procinfo, procinfo]
+      sp: kernel
+      irq: {noff: 1, intena: 1}
+    note: |
+      `procinfo` walks all 64 slots and takes each slot's lock in turn, the same pattern as
+      [[scheduler]], [[wakeup]] and [[kkill]]. Here it is at slot 0, `init`. Holding `p->lock`
+      means interrupts are off on this hart and `noff` is 1; `intena` is 1 because interrupts
+      were on when the system call took its first lock. (At this commit there is no
+      `wait_lock` yet; the recorded run, on the final branch, showed `noff` 2 at this line, one
+      more for `wait_lock`.)
+
+      What the lock buys: `state` and `pid` are written only under it, so the UNUSED test,
+      the copy of `pid` and the copy of `state` all see one moment of this process's life. A
+      process that is being freed by [[freeproc]] on another hart is either fully there or
+      fully UNUSED; one being created by [[allocproc]] either has its pid and USED, or neither.
+
+      The loop condition also stops at `max` records. In the recorded run `max` was 64 and
+      three slots were in use, so all 64 slots were visited and three records filled.
+    others: |
+      Hart 0 and hart 2 are idle in their schedulers, which take every slot's `p->lock` in
+      turn too. When a scheduler reaches the slot `procinfo` holds, it spins in [[acquire]]
+      until `procinfo` releases it, then sees the state and moves on. Nobody waits for long: each slot is held only while one record is copied.
+  - title: name and sz, read the way procdump reads them
+    commit: 2
+    file: kernel/proc.c
+    lines: 706-737
+    focus: 724-732
+    state:
+      hart: 1
+      mode: S
+      proc: ps (pid 3)
+      intr: "off"
+      satp: kernel
+      locks: ["sh's p->lock (slot 1)"]
+      stack: [usertrap, syscall, sys_procinfo, procinfo]
+      sp: kernel
+      irq: {noff: 1, intena: 1}
+    note: |
+      `sz` and `name` are a different matter. The process writes them about itself with no
+      lock: [[growproc]] and lazy `sbrk` change `sz`, and [[kexec]] writes both. Holding
+      `p->lock` excludes none of those writes, so these two fields are read *without* any
+      protection, exactly as [[procdump]] reads them.
+
+      The code makes the read safe rather than exact. `sz` is one aligned 8-byte load: it can
+      be stale (from just before a `sbrk`), never half of one value and half of another.
+      `name` is copied as a fixed 16 bytes, and byte 15 is set to 0, so whatever [[kexec]]'s
+      `safestrcpy` is doing at that instant, `ps` receives a terminated string of at most 15
+      characters: perhaps an old name, perhaps a mixture (reasoned, not observed). In the
+      recorded run the three names were `init`, `sh` and `ps`.
+
+      Making these fields exact would mean changing their writers to take `p->lock`, and
+      moving them into the locked section of `struct proc` for every future writer too.
+    others: |
+      The shell, whose record is being copied, is asleep in [[kwait]] in this run, so its name
+      cannot change now. Had it been running `exec` on hart 0 at this moment, `kexec` would be
+      writing `p->name` with no lock while this hart copies it: nothing prevents the overlap.
+  - title: What procdump does, and why it may
+    commit: 2
+    file: kernel/proc.c
+    lines: 674-704
+    focus: 676-703
+    state:
+      hart: 0
+      mode: S
+      proc: none
+      intr: "off"
+      satp: kernel
+      locks: [cons.lock]
+      stack: [scheduler, kerneltrap, devintr, uartintr, consoleintr, procdump]
+      sp: {"on": scheduler, detail: "with a `kernelvec` frame on top"}
+      irq: {noff: 1, intena: 0}
+    note: |
+      For comparison, the kernel's own process listing. The state shown is an illustration,
+      not part of the recorded run: you typed Ctrl-P while hart 0 was idle in its scheduler,
+      the UART interrupt landed there, and [[consoleintr]] called `procdump` holding
+      `cons.lock`, with interrupts off and `intena` 0 because the interrupt handler started
+      with them off.
+
+      `procdump` takes no lock at all: no `p->lock` for `state` and `pid`, nothing for
+      `name`. The comment on line 676 gives the reason: it is meant for a machine that may
+      be stuck, and the usual cause of a stuck machine is a lock that is never released. A
+      dump that took `p->lock` would hang on exactly the slot you want to see. A torn line on
+      the console is the price, and nobody acts on that line.
+
+      `procinfo` runs as an ordinary system call on a working machine, and its records go to
+      a program that may act on them. So it takes the locks that make `state`, `pid` and the
+      hart true, and treats only `name` and `sz` the way `procdump` treats everything. Notice
+      also the `continue` on line 696: harmless here, because `procdump` holds nothing; with a
+      lock added at the top of the loop it would skip the `release` (clinic 6).
+  - title: Release everything, then one copyout
+    commit: 2
+    file: kernel/sysproc.c
+    lines: 113-145
+    focus: 140-144
+    state:
+      hart: 1
+      mode: S
+      proc: ps (pid 3)
+      intr: "on"
+      satp: kernel
+      locks: []
+      stack: [usertrap, syscall, sys_procinfo]
+      sp: {"on": kernel, detail: "`sp` 0x3fffff9f80 again in the recorded run"}
+      irq: 0
+    note: |
+      `procinfo` has returned with every lock released: in the recorded run, at line 140,
+      `noff` was 0, `sstatus` was `0x200000022` (interrupts on again), `n` was 3 and the page
+      held `{pid 1, ppid 0, sleeping, cpu -1, 16384, "init"}`, `{2, 1, sleeping, -1, 20480,
+      "sh"}` and `{3, 2, running, 1, 16384, "ps"}`.
+
+      Now one [[copyout]] moves `n * 40` bytes to `ps`'s buffer at `0x1010`, translating the
+      address through `ps`'s page table. If the buffer is bad (not mapped, not writable, or
+      above `sz`), it returns -1 and so does the call. Either way the page goes back with
+      [[kfree]].
+
+      The copy happens outside every lock. In this tree that is a choice, not a necessity:
+      the next step shows that `copyout` can neither sleep nor fault, and [[kwait]] calls it
+      under two spinlocks. Clinic 1 ran the version that copies under the locks and found no
+      failure and no measurable difference. What the choice buys is independence: the locked
+      code does not depend on what `copyout` might do, and a failure has no lock to unwind.
+  - title: What copyout can do while you wait for it
+    commit: 2
+    file: kernel/vm.c
+    lines: 340-380
+    focus: 350-370
+    state:
+      hart: 1
+      mode: S
+      proc: ps (pid 3)
+      intr: "on"
+      satp: kernel
+      locks: []
+      stack: [usertrap, syscall, sys_procinfo, copyout]
+      sp: kernel
+      irq: 0
+    note: |
+      To decide whether `copyout` may run under a spinlock, list what it can do. For each page
+      of the destination:
+
+      - [[walkaddr]] looks up the user address in the process's page table: a pure software
+        walk, no lock.
+      - If nothing is mapped there, [[vmfault]] is called (line 357). It refuses addresses at
+        or above `sz`; otherwise it calls [[kalloc]], which takes `kmem.lock` for a few
+        instructions, zeroes the new page, and maps it with [[mappages]], which may `kalloc`
+        page-table pages too. It never sleeps.
+      - The PTE must be writable, which rejects `ps`'s text.
+      - [[memmove]] copies to `pa0`, the *physical* address, through the kernel's
+        [[g:direct-map]]. The kernel never uses the user virtual address, so the hardware has
+        nothing to fault on.
+
+      So in this kernel `copyout` is safe under a spinlock: no sleep (which [[sched]] would
+      catch with `sched locks`), no fault, and only `kmem.lock` nested inside, which takes
+      nothing else. That is exactly why [[kwait]] can copy the exit status out while holding
+      `wait_lock` and the child's `p->lock`. The reference still keeps the copy outside, so that
+      a future `vmfault` that waits for a disk does not turn `procinfo` into a panic.
+  - title: wait_lock around the scan, for the parent
+    commit: 3
+    file: kernel/proc.c
+    lines: 709-744
+    focus: 720-728
+    diff: true
+    state:
+      hart: 1
+      mode: S
+      proc: ps (pid 3)
+      intr: "off"
+      satp: kernel
+      locks: [wait_lock, "sh's p->lock (slot 1)"]
+      stack: [usertrap, syscall, sys_procinfo, procinfo]
+      sp: {"on": kernel, detail: "`sp` 0x3fffff9f20 in the recorded run"}
+      irq: {noff: 2, intena: 1}
+    note: |
+      `parent` is protected by `wait_lock`, and the rule (comment at [[kernel/proc.c:26]]) is
+      that `wait_lock` comes before any `p->lock`. So `procinfo` takes it once, before the loop,
+      and holds it to the end. In the recorded run, at the first record `noff` was 1 at line
+      719 (only `wait_lock`, whose `cpu` field pointed at hart 1's `struct cpu`) and 2 at line
+      723; `intena` stayed 1.
+
+      For slot 1, the shell, `p->parent` was `0x8000fdd0 <proc>`: slot 0, `init`, so `ppid` is
+      1. For `init` itself the pointer is 0 and `ppid` is 0.
+
+      Reading the parent's `pid` without the parent's `p->lock` is safe here, and the comment
+      says why: `pid` changes only when a slot is allocated or freed, a process with children is
+      freed only by [[kwait]] under `wait_lock`, and its children are handed to `init` under
+      `wait_lock` before that. Holding `wait_lock` for the whole scan also freezes every parent
+      link, every exit and every reap until the scan ends, so a non-zero `ppid` names a
+      process that is in the same snapshot, as long as `max` did not cut the scan short.
+    others: |
+      While hart 1 holds `wait_lock`, every `fork` (at its parent assignment, [[kernel/proc.c:296]]),
+      every `exit` ([[kernel/proc.c:347]]) and every `wait` ([[kernel/proc.c:376]]) on harts 0 and
+      2 spins in [[acquire]] until the scan is over. That is the price of the frozen parent links.
+      In the recorded run nothing else was running, so nobody waited.
+  - title: The paths that fix the order
+    commit: 3
+    file: kernel/proc.c
+    lines: 371-420
+    focus: 384-388
+    state:
+      hart: 0
+      mode: S
+      proc: sh (pid 2)
+      intr: "off"
+      satp: kernel
+      locks: [wait_lock, "ps's p->lock (slot 2)"]
+      stack: [usertrap, syscall, sys_wait, kwait]
+      sp: kernel
+      irq: {noff: 2, intena: 1}
+    note: |
+      Why must `procinfo` take `wait_lock` first? Because this code, and [[kexit]], already
+      hold `wait_lock` while they take `p->lock`s. The state shown is an illustration (the hart
+      is a guess): after `ps` exits, the shell wakes in [[kwait]], holding `wait_lock`, and
+      takes `ps`'s lock at line 385 to look at its state. Then, still holding `wait_lock`, it may
+      call [[killed]] at line 409, which takes the shell's own `p->lock`. [[kexit]] does the
+      same with `wakeup(p->parent)`, which takes every `p->lock` in turn.
+
+      If `procinfo` held some `p->lock` and then asked for `wait_lock`, one of these paths
+      holding `wait_lock` and asking for that same `p->lock` closes a cycle:
+
+      | Time | Hart 1: `kwait` | Hart 2: `procinfo` with the order reversed |
+      |---|---|---|
+      | 1 | `acquire(&wait_lock)` | `acquire(&p->lock)`, slot 4 |
+      | 2 | `killed(p)` on slot 4: spins | `acquire(&wait_lock)`: spins |
+      | 3 | spins forever | spins forever |
+
+      Clinic 2 recorded this exact pair, with hart 0 trapped as well. Lock order is not a
+      local decision: a new function must follow the order every existing path already uses.
+    others: |
+      The scheduler on any hart also takes `p->lock`s, but it never holds `wait_lock`, so it
+      can never be one side of this cycle. It can be a victim, spinning behind a deadlocked
+      lock, which is how a two-hart deadlock ends up stopping a third hart.
+  - title: Which hart, from c->proc
+    commit: 4
+    file: kernel/proc.c
+    lines: 709-752
+    focus: 729-737
+    diff: true
+    state:
+      hart: 1
+      mode: S
+      proc: ps (pid 3)
+      intr: "off"
+      satp: kernel
+      locks: [wait_lock, "ps's own p->lock (slot 2)"]
+      stack: [usertrap, syscall, sys_procinfo, procinfo]
+      sp: kernel
+      irq: {noff: 2, intena: 1}
+    note: |
+      The scan has reached slot 2, `ps` itself: it holds its own `p->lock` now, which is
+      allowed, since a running process does not hold its own lock. The state is RUNNING, so
+      the loop looks for a hart whose `c->proc` points here. In the recorded run, at line 736,
+      `i` was 1, and `cpus[0].proc` and `cpus[2].proc` were 0 (both harts idle) while
+      `cpus[1].proc` was `0x800100a0 <proc+720>`, slot 2. So `ps`'s record says `cpu 1`, and
+      that is the line `ps` printed.
+
+      The answer is reliable because of the lock, not because of anything about the other
+      harts: `c->proc` changes to or from `p` only while `p->lock` is held (next step). And it
+      is reliable only until the `release` on line 748. A moment after the system call returns,
+      `ps` may take a timer interrupt, yield, and continue on hart 0.
+
+      `NCPU` is 8 and QEMU has three harts here; `cpus[3]` to `cpus[7]` never run a scheduler,
+      so their `proc` stays 0 and the loop simply finds nothing there.
+  - title: Why state and c->proc agree under p->lock
+    commit: 4
+    file: kernel/proc.c
+    lines: 429-471
+    focus: 447-454
+    state:
+      hart: 2
+      mode: S
+      proc: none
+      intr: "off"
+      satp: kernel
+      locks: ["p->lock of the slot being examined"]
+      stack: [scheduler]
+      sp: scheduler
+      irq: {noff: 1, intena: 0}
+    note: |
+      Here is the other side, on any hart's [[scheduler]] (shown on hart 2). With the slot's
+      `p->lock` held it sets `p->state = RUNNING` (line 452) and `c->proc = p` (453), and
+      switches to the process. When the process gives the CPU back, it has already taken its
+      own `p->lock` in [[yield]], [[sleep]] or [[kexit]] and changed its state, and the
+      scheduler clears `c->proc` (461) before releasing that lock (464). Both changes happen
+      inside the lock, so a reader holding `p->lock` can never see one without the other.
+      (`intena` is 0 because the scheduler took the lock after `intr_off()` on line 443.)
+
+      This also explains the results of question 6. Each record is true at the moment its
+      slot was locked, but the scheduler is free to run on other slots meanwhile. Suppose the
+      scan has passed slot 3, read RUNNING on hart 0, and hart 0 then yields that process
+      and picks the one in slot 9: the scan will find slot 9 RUNNING on hart 0 as well. The
+      recorded run after `usertests` reported `most RUNNING at once 4` on three harts, for
+      exactly this reason.
+    others: |
+      While this scheduler holds slot 9's lock between lines 447 and 464 (the process runs in
+      between and releases it, then takes it again to stop), `procinfo` on another hart that
+      reaches slot 9 waits in [[acquire]]. It will then see either a state other than RUNNING with no hart, or
+      RUNNING with this hart, never a mixture.
+  - title: ps prints the snapshot
+    commit: 5
+    file: user/ps.c
+    lines: 43-67
+    focus: 49-64
+    diff: true
+    state:
+      hart: 1
+      mode: U
+      proc: ps (pid 3)
+      intr: "on"
+      satp: user
+      locks: []
+      stack: [main]
+      sp: user
+    note: |
+      Back in user mode, `ps` holds a private copy of the snapshot in `buf`, its global
+      array (at `0x1010` in this build). It makes one call with room for `NPROC` records, so it
+      can never be truncated, and prints `n` lines. The user `printf` has no field widths, so
+      the small helpers above `main` (`col` and `itoa`) pad the columns; `itoa` prints `-` for
+      the -1 of a process that is not running.
+
+      Every line comes from one scan, but by the time they are printed the table has moved on:
+      the shell may have woken up, and `ps` itself, listed as `run 1`, may already be on
+      another hart. A `ps` can only ever report the past; what the kernel guarantees is that
+      each line was true together at one moment, and that the parent links all belong to one
+      moment too.
+
+      The recorded output:
+
+      ```text
+      PID   PPID  STATE   CPU  SIZE    NAME
+      1     0     sleep   -    16384   init
+      2     1     sleep   -    20480   sh
+      3     2     run     1    16384   ps
+      ```
+  - title: The test checks only what the design promises
+    commit: 6
+    file: user/procinfotest.c
+    lines: 134-165
+    focus: 144-162
+    diff: true
+    state:
+      hart: 1
+      mode: U
+      proc: procinfotest (pid 3)
+      intr: "on"
+      satp: user
+      locks: []
+      stack: [main, stresstest, inconsistent]
+      sp: user
+    note: |
+      The last part of `procinfotest` forks a child that spins and two that `fork` and
+      `wait` in a loop, then calls `procinfo` for 20 ticks and checks every snapshot with this
+      function. It checks exactly the promises of question 6: a valid pid and state in every
+      record; no pid twice; a hart in a record exactly when it is RUNNING (the per-record
+      guarantee of `p->lock`); and every non-zero `ppid` present in the same snapshot (the test asks for all 64 slots, so `max` never cuts the scan short; the
+      guarantee of `wait_lock`).
+
+      It deliberately does **not** check that no two RUNNING records name the same hart, and the
+      comment says why. A test that checked it would pass thousands of snapshots and then
+      fail in the run after `usertests`, which saw four RUNNING records at once on three
+      harts: a correct kernel, an over-strict test. A test must claim
+      no more than the design guarantees.
+
+      The other checks: the test's own record; a child seen sleeping in `read`, then as a
+      zombie, then gone after `wait`; `max` values of 1, 0 and -1 against a buffer filled with
+      `0xab`; and bad buffers (address 0, which is read-only text; an address above `sz`; the
+      trapframe page, which has no `PTE_U`) plus a lazily allocated one. Each prints `OK` or
+      `FAIL`, and on failure the max check and the stress check print what they saw.
+verify: |
+  On the branch, on three harts, `procinfotest` passes, `usertests -q` passes, and
+  `procinfotest` passes again on the same boot:
+
+  ```text
+  $ procinfotest
+  procinfotest: own record: running on a hart, right name: OK
+  procinfotest: child: sleeping, then zombie, then gone after wait: OK
+  procinfotest: max=1 writes one record, max=0 none, max=-1 fails: OK
+  procinfotest: bad buffers return -1; a lazy buffer works: OK
+  procinfotest: 8318 snapshots, 0 bad, newest pid seen 2222, most RUNNING at once 3
+  procinfotest: snapshots during fork/exit churn: every one consistent: OK
+  procinfotest: 5 checks OK
+  $ usertests -q
+  usertests starting
+  test copyin: OK
+  test copyout: OK
+  [...]
+  test partial_write: OK
+  test unlinkcwd: OK
+  ALL TESTS PASSED
+  $ procinfotest
+  procinfotest: own record: running on a hart, right name: OK
+  procinfotest: child: sleeping, then zombie, then gone after wait: OK
+  procinfotest: max=1 writes one record, max=0 none, max=-1 fails: OK
+  procinfotest: bad buffers return -1; a lazy buffer works: OK
+  procinfotest: 5757 snapshots, 0 bad, newest pid seen 10350, most RUNNING at once 4
+  procinfotest: snapshots during fork/exit churn: every one consistent: OK
+  procinfotest: 5 checks OK
+  $ ps
+  PID   PPID  STATE   CPU  SIZE    NAME
+  1     0     sleep   -    16384   init
+  2     1     sleep   -    20480   sh
+  10351 2     run     0    16384   ps
+  ```
+
+  What this shows: about fourteen thousand snapshots taken while thousands of processes were
+  created and destroyed around them (pids climbed to 2222 during the first run alone), each one keeping its promises (records consistent
+  with themselves, parents present). The second run's `most RUNNING at once 4` on three
+  harts is not a failure: it is the evidence that a snapshot read slot by slot is not an
+  instant of the whole table, which is why the test does not check for it. `usertests`
+  makes no `procinfo` calls, so it shows that nothing else changed. The snapshot count varies
+  between runs: timings on QEMU depend on what else the computer is doing.
+measure: |
+  All numbers come from runs on three harts under QEMU, using a scratch measurement program
+  (not part of the branch) on a copy of the branch's kernel. One tick is 0.1 s (the timer is
+  set 1,000,000 `time` units ahead, and QEMU's `time` runs at 10 MHz), so tick counts are
+  coarse.
+
+  **What a call costs.** 50,000 calls each, on an otherwise idle system, measured with
+  `uptime` (two runs, same results):
+
+  | Call | Ticks for 50,000 | Per call, roughly |
+  |---|---|---|
+  | `getpid()` | 5 | 10 µs |
+  | `procinfo(buf, 1)` | 11 and 10 | 21 µs |
+  | `procinfo(buf, 64)` | 23 | 46 µs |
+
+  A full snapshot costs about four `getpid`s. Even `max = 1`, which stops the scan at the
+  first in-use slot, costs twice a `getpid`: allocating and freeing the page and the
+  `copyout` are not free.
+
+  **How often a snapshot catches the table mid-change.** For 50 ticks, one child spun and
+  two forked and reaped children as fast as they could, while the program took snapshots and
+  counted (two runs on the reference kernel):
+
+  | | Run 1 | Run 2 |
+  |---|---|---|
+  | snapshots | 31,691 | 32,315 |
+  | records (about 7.7 per snapshot) | 244,204 | 247,093 |
+  | records RUNNING / RUNNABLE / SLEEPING | 90,198 / 36,593 / 85,945 | 89,999 / 39,283 / 86,834 |
+  | snapshots with a child caught mid-fork (USED) | 8,796 (28%) | 8,721 (27%) |
+  | ... of those USED records, with `ppid` 0 | 8,802 of 8,802 | 8,721 of 8,721 |
+  | snapshots with a ZOMBIE | 18,254 (58%) | 17,887 (55%) |
+  | snapshots with 3 RUNNING records | 27,032 | 26,637 |
+  | snapshots with two RUNNING records on one hart | 0 | 0 |
+  | snapshots with a parent missing | 0 | 0 |
+
+  A quarter of the snapshots show a process that does not fully exist yet, and more than
+  half show one that no longer runs: a `ps` on a busy machine sees processes in transition
+  all the time, and correctly so. Every child caught mid-fork had no parent yet, because
+  [[kfork]] sets the parent under `wait_lock`, which the scan holds. (That is what the runs
+  showed, not a guarantee: a child whose parent was set just before the scan began, but
+  which is not yet RUNNABLE, would show its parent.) Two RUNNING records on one hart did not
+  occur in these 64,006 snapshots, but did occur in the `procinfotest` run in Verify (four
+  RUNNING on three harts): rare, possible.
+
+  The same program on a kernel with `wait_lock` removed from `procinfo` (keeping every
+  `p->lock`): 29,802 and 29,507 snapshots; USED records with a parent already set, 7 of 8,208
+  and 4 of 8,179; snapshots with two RUNNING records on one hart, **16 and 10**; parent
+  missing, 0 and 0. A likely explanation (reasoned, not measured): holding `wait_lock` also
+  keeps the churning children from sleeping and waking in `wait` while the scan runs, so
+  harts switch processes mid-scan less often.
+
+  **Does copying out under the locks cost anything?** A copy of each kernel recorded the
+  `time` CSR after taking `wait_lock` and before releasing it (units of 0.1 µs), for the
+  reference and for clinic 1's version that copies each record out inside the locks:
+
+  | Workload (calls) | Reference: mean, max (run 1; run 2) | Copy under locks: mean, max (run 1; run 2) |
+  |---|---|---|
+  | mapped buffer (20,000) | 346, 2,191; 535, 36,129 | 338, 2,249; 285, 654 |
+  | a fresh lazy page each call (300) | 303, 421; 534, 910 | 420, 1,040; 363, 665 |
+  | mapped buffer during fork/exit churn (20,000) | 9,136, 110,339; 11,803, 128,434 | 9,312, 147,157; 6,209, 62,429 |
+
+  No consistent difference: run-to-run variation (timings on QEMU depend on what else the
+  computer is doing) is larger than any effect of
+  three or four 40-byte copies, even when the first one allocates a page.
+
+  **A caution about the churn row.** Its mean near 1 ms is an artefact of the measurement
+  program, not a typical scan. Its lazy-page phase ran first and grew it to about 300 pages,
+  so every `fork` in the churn copied about 1.2 MB in [[uvmcopy]] while holding the new
+  child's `p->lock` (which [[kfork]] holds from [[allocproc]] until line 294), and the scan
+  waited at that USED slot. An instrumented run that timed each `acquire` in the
+  scan confirmed it: with churners of 16 KB (`procinfotest`'s workload) the scan held
+  `wait_lock` for 50 to 80 µs on average (worst case under 0.5 ms), while after growing to
+  304 pages it averaged 573 µs, almost all of it spent waiting at USED slots. The row is still
+  a fair A/B comparison of the two kernels. The lesson is that the longest `p->lock` hold in
+  this kernel is `kfork`'s, not the schedulers', and that a scan pays for whatever the other
+  holders of the locks it visits are doing.
+further: |
+  - **A `top`.** Take two snapshots a second apart and show what changed. Pids are never
+    reused here (`nextpid` only grows), so matching records across snapshots is easy; with the
+    per-process CPU time of lab 4 you can sort by usage. Teaches why a snapshot is always
+    about the past.
+  - **Exact names.** Make [[kexec]] write `p->name` under `p->lock`, or give each process a
+    sequence counter that `kexec` bumps before and after the write, and have `procinfo` retry
+    while the counter is odd or changed. Teaches the seqlock pattern: consistent reads without
+    blocking the writer.
+  - **A consistent instant.** Take all 64 `p->lock`s in slot order (plus `wait_lock`), read
+    everything, release in reverse. Measure how long the other harts stall, and whether two
+    such scans on two harts can deadlock (they take the locks in the same order). Teaches
+    what global consistency costs.
+  - **One process.** `procinfo1(pid, struct pinfo *)` for a single process. With pids never
+    reused, a `kill`-style "find, then act" stays safe even when the process exits in between.
+    Teaches the difference between naming a process by pid and by slot.
+  - **Wedge-proof dump.** Change [[procdump]] to *try* each `p->lock` a bounded number of
+    times and mark slots it could not lock. Teaches why a debugging path must never block, and
+    what a try-lock looks like on RISC-V.

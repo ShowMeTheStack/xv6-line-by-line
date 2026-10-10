@@ -1,0 +1,122 @@
+summary: |
+  The four functions of the [[g:sleeplock]]. They show the [[g:sleep-wakeup]] pattern in its
+  simplest form: check a condition under a spinlock, and if it is not met, register on a
+  channel, release the spinlock and sleep; re-check after every wakeup.
+
+  Why have a second kind of lock? A [[g:spinlock]] is the wrong tool when the wait can be
+  long. Reading a disk block takes a long time by CPU standards, and a CPU spinning for it
+  would be wasted, with interrupts off. Worse, a process may not sleep while holding a
+  spinlock at all ([[sched]] panics). Holding a sleep lock does not by itself turn interrupts
+  off, and it may be held across [[sleep]], so the [[g:buffer-cache|buffer cache]] ([[bread]]) and the inode layer ([[ilock]]) hold one
+  during disk I/O.
+
+  The cost: only a process can use a sleep lock, since waiting means calling [[sleep]].
+  Interrupt handlers and the [[scheduler]] never do.
+
+  **Read before:** [[kernel/sleeplock.h]], [[kernel/spinlock.c]], and [[sleep_prepare]],
+  [[sleep]] and [[wakeup]] in [[kernel/proc.c]]. The concept page
+  [[concept:locks#sleep-locks]] puts these functions next to every other lock in the kernel.
+
+blocks:
+  - lines: 1-10
+    title: Headers
+    note: |
+      [[kernel/proc.h]] is needed for [[myproc]] and the process's PID; the rest is the
+      usual set plus [[kernel/sleeplock.h]] itself.
+
+  - lines: 12-19
+    title: "initsleeplock(): a free sleep lock"
+    note: |
+      Initializes the inner [[g:spinlock]] (every one is named `"sleep lock"`) and marks the
+      lock free. Called once per buffer by [[binit]], once per inode slot by [[iinit]], and
+      for the UART's `tx_lock` by [[uartinit]].
+
+  - lines: 21-34
+    title: "acquiresleep(): wait, sleeping, until the lock is free"
+    note: |
+      Line 24 takes the inner spinlock, so `locked` cannot change while this process looks
+      at it. If the lock is free, the loop is skipped, and lines 31–33 take it and release
+      the spinlock. The process now holds the sleep lock but no spinlock, so interrupts can
+      be back on.
+
+      If the lock is held, the process must wait, using the [[g:sleep-wakeup]] protocol:
+
+      1. [[sleep_prepare]] registers it on the channel `lk` (the sleep lock's address)
+         *while the spinlock is still held*. The holder's [[releasesleep]] needs the same
+         spinlock before it can call [[wakeup]], so it cannot slip in between the check on
+         line 25 and the registration.
+      2. Release the spinlock. It must not be held during [[sleep]]: the holder needs it to
+         release the lock, and a process may not switch away holding a spinlock other than
+         its own `p->lock`.
+      3. [[sleep]] gives up the CPU, unless the wakeup has already happened since step 1,
+         in which case it returns at once. Either way no wakeup is lost.
+      4. Retake the spinlock and test `locked` again. The `while` matters: [[wakeup]] wakes
+         *every* waiter on this channel, and another one may have taken the lock first.
+         [[kkill]] also makes a sleeping process runnable without anything having changed.
+
+      Lock order: the inner spinlock is taken before `p->lock` (inside [[sleep_prepare]]),
+      and [[releasesleep]] also holds it while [[wakeup]] takes each `p->lock`. The two
+      paths agree, so they cannot [[g:deadlock]].
+
+      There is no `killed` check here; a killed process keeps waiting for the lock. That is
+      acceptable because xv6 holds sleep locks only around operations that finish on their
+      own (disk I/O, file-system updates, sending bytes to the UART), so the wait ends.
+
+      This tree's protocol differs from the MIT book's `sleep(chan, lk)`: no lock is passed
+      to [[sleep]]. [[concept:locks#sleep-wakeup]] shows why no wakeup can be lost.
+
+  - lines: 36-44
+    title: "releasesleep(): free the lock and wake the waiters"
+    note: |
+      Under the inner spinlock, mark the lock free and wake every process sleeping on `lk`.
+      Calling [[wakeup]] while still holding the spinlock is what makes step 1 of
+      [[acquiresleep]] safe: a waiter is either already registered (and gets woken) or has
+      not yet checked `locked` (and will see 0).
+
+      Note that `releasesleep` does not check that the caller holds the lock. [[brelse]] and
+      [[iunlock]] check with [[holdingsleep]] first; [[iput]] and [[uartwrite]] release a lock
+      they acquired a few lines earlier.
+
+  - lines: 46-55
+    title: "holdingsleep(): does the current process hold it?"
+    note: |
+      Used for sanity checks such as "the caller must have locked this buffer" in
+      [[bwrite]] and [[brelse]]. The inner spinlock makes the two reads consistent with each
+      other. The result is about the *process*, not the CPU, which is the right question for
+      a lock that can be held across a sleep.
+
+lines:
+  15: |
+    The spinlock that guards `locked` and `pid`.
+  16: |
+    Debugging name, such as `"buffer"` or `"inode"`.
+  24: |
+    Take the guard spinlock: `locked` cannot change while we hold it. Interrupts are now off.
+  25: |
+    Held by someone else? Then wait. Re-checked after every wakeup.
+  26: |
+    Register on the channel `lk` while the guard is still held, so no [[releasesleep]] can
+    be missed. Sets `p->chan`.
+  27: |
+    Release the guard so the holder can release the sleep lock.
+  28: |
+    Give up the CPU until [[wakeup]]`(lk)`, or return immediately if that wakeup already
+    happened after line 26.
+  29: |
+    Retake the guard before looking at `locked` again.
+  31: |
+    Take the sleep lock.
+  32: |
+    Record the holder, for [[holdingsleep]]. [[myproc]] does its own [[push_off]] and
+    [[pop_off]], so for a moment `noff` is one deeper than the locks held: 2 here, or 3 when
+    [[iput]] calls this while holding `itable.lock` ([[concept:locks#nesting]]).
+  33: |
+    Release the guard. The sleep lock stays held, with interrupts back on (if they were on
+    before).
+  40: |
+    Free the lock.
+  42: |
+    Wake every process sleeping on this lock. They race to take it; the loser goes back to
+    sleep.
+  52: |
+    Held, and by this process.

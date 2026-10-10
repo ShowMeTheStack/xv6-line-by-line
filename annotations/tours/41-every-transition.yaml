@@ -1,0 +1,694 @@
+title: "Every transition: mode, stack and page table"
+group: The dance of privilege
+prerequisites: [2, 5, 13]
+summary: |
+  Freeze xv6 at any instruction, on any hart, and ask three questions. **Which privilege
+  mode?** User, supervisor or machine. **Which stack?** Whatever memory `sp` points into.
+  **Which page table?** Whatever `satp` names. If you can answer all three at every
+  instruction, you understand where the hart is. This is the master question of this group
+  of tours ([[concept:mode-stack-page-table]]).
+
+  The answers change only at a handful of places, and every change is one of **eight
+  transitions**:
+
+  | | Transition | Mode |
+  |---|---|---|
+  | T1 | system call (`ecall`) | U → S |
+  | T2 | exception in user code | U → S |
+  | T3 | device interrupt in user mode | U → S |
+  | T4 | timer interrupt in user mode | U → S |
+  | T5 | return to user (`sret`) | S → U |
+  | T6 | context switch (`swtch`) | S → S |
+  | T7 | trap taken in the kernel (`kernelvec`) | S → S |
+  | T8 | boot (`mret`) | M → S |
+
+  This tour visits the code where each one happens, at commit 06aad25, and ends with the full
+  table of mode/stack/page-table combinations that can exist. The later tours of the group
+  zoom in: [[tour:42]] on stacks, [[tour:43]] on a system call's CSRs, [[tour:44]] on
+  interrupts.
+cast: |
+  The story moves between three [[g:hart|harts]]:
+
+  | Hart | What it is doing |
+  |---|---|
+  | 0 | Booting (T8), then scheduling |
+  | 1 | Running `cat README` (pid 3): T6, T5, T1 and its relatives |
+  | 2 | Earlier: the shell (pid 2) printing its `$ ` prompt when a tick arrives, a trap taken inside the kernel (T7) |
+
+  The shell (pid 2) is waiting for `cat`.
+steps:
+  - title: "T8: the only way down is a return"
+    file: kernel/start.c
+    lines: 43-52
+    focus: 50-51
+    state:
+      hart: 0
+      mode: M
+      proc: none
+      intr: off
+      satp: bare
+      locks: []
+      stack: [start]
+      sp: {"on": boot, detail: "0x80008880"}
+    note: |
+      Every hart wakes up in **machine mode**, the most privileged. RISC-V has no "enter
+      supervisor mode" instruction. The only way to *lower* the mode is to return from a trap:
+      `mret` sets the mode from `mstatus.MPP` and jumps to `mepc`. So [[kernel:start]] fills in
+      both as if a trap had come from supervisor mode at [[kernel:main]], and returns from it
+      ([[tour:46]] tells this story).
+
+      | Question | Before `mret` | After |
+      |---|---|---|
+      | mode | M | **S** |
+      | stack | boot (`0x80008880`, measured) | boot, unchanged |
+      | page table | none: M-mode doesn't translate | none: `satp` = 0 |
+
+      That's the pattern of the whole tour: a mode change never moves `sp` or `satp`. Those
+      are separate instructions, and the code has to arrange them itself.
+
+      T8 happens once per hart, and machine mode is never re-entered afterwards. Nothing in this
+      tree writes `mtvec`, all traps are delegated to S-mode, and the timer is the supervisor
+      timer that Sstc provides ([[concept:mode-stack-page-table#t8]]).
+    figure: t41-itinerary
+    caption: |
+      One hart's itinerary through the transitions, drawn as three tracks: the mode, the stack
+      `sp` points into, and the page table in `satp`. A transition changes the top track; the
+      other two change at their own instructions, slightly before or after, which is where the
+      odd combinations come from.
+
+  - title: Boot's other change, paging on
+    file: kernel/vm.c
+    lines: 72-84
+    focus: 80-82
+    state:
+      hart: 0
+      mode: S
+      proc: none
+      intr: off
+      satp: kernel
+      locks: []
+      irq: 0
+      stack: [main, kvminithart]
+      sp: {"on": boot, detail: "inside main's frames on stack0"}
+    note: |
+      The page-table answer changes once during boot, outside all eight transitions: hart 0's
+      [[kvminithart]] writes the kernel page table into `satp` (`0x8000000000087fff` in our
+      run). Harts 1 and 2 do the same once hart 0 has built the table.
+
+      It's worth being exact about where `satp` is written, because there are only four
+      places in the whole tree:
+
+      | Where | Value | When |
+      |---|---|---|
+      | [[kernel/start.c:28]] | 0 (off) | boot, M-mode |
+      | [[kvminithart]] | kernel | boot, once per hart |
+      | [[kernel/trampoline.S:92]] | kernel | every trap from user mode (T1–T4) |
+      | [[kernel/trampoline.S:111]] | a user table | every return to user mode (T5) |
+
+      So the claim that "the page table changes only in the trampoline" is true once boot is
+      over, and not before.
+
+  - title: main becomes the scheduler, a role change only
+    file: kernel/main.c
+    lines: 31-45
+    focus: 44
+    state:
+      hart: 0
+      mode: S
+      proc: none
+      intr: off
+      satp: kernel
+      locks: []
+      irq: 0
+      stack: [main, scheduler]
+      sp: {"on": scheduler, detail: "0x80008870 at scheduler's entry, the same memory as the boot stack"}
+    note: |
+      `main` calls [[scheduler]], which never returns. Mode, page table and the memory under
+      `sp` are all unchanged: this is not a transition. But the *role* of the stack changes.
+      The boot stack becomes this hart's **scheduler stack**, the one place a hart can stand
+      when it is running no process ([[concept:stacks#scheduler]]).
+
+      From here on, every change on every hart is T1–T7.
+    others: |
+      All three harts end up here, each on its own slice: gdb read `0x80008870`, `0x80009870`
+      and `0x8000a870` at the three schedulers' entries. Each scheduler loop runs forever on
+      its own hart; they cooperate only through the `p->lock` of each process they look at
+      ([[tour:12]]).
+
+  - title: "T6: the scheduler chooses cat"
+    file: kernel/proc.c
+    lines: 435-454
+    focus: 446-453
+    state:
+      hart: 1
+      mode: S
+      proc: none
+      intr: off
+      satp: kernel
+      locks: ["cat's p->lock"]
+      irq: {noff: 1, intena: 0, note: "the scheduler acquired `cat`'s `p->lock` right after `intr_off()` on line 442, so intena is 0"}
+      stack: [scheduler]
+      sp: {"on": scheduler, detail: "0x80009810, the scheduler's frame"}
+    note: |
+      Hart 1's scheduler finds `cat` (pid 3) `RUNNABLE`. `cat` was preempted earlier, so its
+      kernel stack holds a frozen call chain ending in `swtch`. Holding `cat`'s `p->lock`, the
+      scheduler marks it `RUNNING` and calls [[swtch]].
+
+      **T6 is the one transition that changes no mode at all.** Before and after, the hart is
+      in S-mode with the kernel page table. Only the stack changes: from the scheduler stack
+      to `cat`'s kernel stack, or back. It is never directly from one process to another
+      ([[tour:13]]).
+    others: |
+      Hart 2's scheduler may reach `cat`'s slot at the same instant. It blocks in [[acquire]]
+      and, when it gets the lock, sees `RUNNING` and moves on. Without `p->lock`, two harts
+      could load `cat`'s saved `sp` and run on one kernel stack at once.
+
+  - title: "T6: one load moves sp"
+    file: kernel/swtch.S
+    lines: 8-41
+    focus: 26
+    state:
+      hart: 1
+      mode: S
+      proc: cat (pid 3)
+      intr: off
+      satp: kernel
+      locks: ["cat's p->lock"]
+      irq: {noff: 1, intena: 0, note: "noff stays 1 across `swtch`; `sched` will put back `cat`'s own saved intena, also 0, since `cat` yielded from a timer trap"}
+      stack: [usertrap, yield, sched]
+      sp: {"on": kernel, switched: "`ld sp, 8(a1)` in [[swtch]] ([[kernel/swtch.S:26]])", detail: "cat's kernel stack, where cat's sched left it"}
+    note: |
+      [[swtch]] stores 14 registers into the old context and loads 14 from the new one. One
+      of the loads, line 26, is `sp`. The instant it executes, hart 1 is on `cat`'s kernel
+      stack. `ret` then jumps into `cat`'s [[sched]], where `cat` called `swtch` when it was
+      preempted.
+
+      | Question | Before line 26 | After |
+      |---|---|---|
+      | mode | S | S |
+      | stack | scheduler | **`cat`'s kernel stack** |
+      | page table | kernel | kernel |
+
+      Notice what `swtch` does not touch: no CSR, no `sret`, no `satp`. It saves 14 registers,
+      not 32, because the C calling convention already preserved the rest on the stack.
+      `cat` continues in `sched` → [[yield]] (which releases `p->lock`) → [[usertrap]], and
+      heads for user mode.
+
+  - title: "T5, part 1: prepare_return arms the way out"
+    file: kernel/trap.c
+    lines: 97-132
+    focus: 108-131
+    state:
+      hart: 1
+      mode: S
+      proc: cat (pid 3)
+      intr: off
+      satp: kernel
+      locks: []
+      irq: {noff: 0, note: "every lock is released, so line 108's `intr_off()` runs at noff 0 and no later `pop_off` can turn interrupts back on"}
+      stack: [usertrap, prepare_return]
+      sp: {"on": kernel, detail: "cat's kernel stack"}
+    note: |
+      T5 is spread over three steps, because the mode, the page table and the stack each
+      change at a different instruction. First [[prepare_return]] sets up the CSRs that
+      `sret` and the next trap will read:
+
+      | Line | What | Why |
+      |---|---|---|
+      | 108 | `SIE` = 0 | the next line makes kernel traps unsafe |
+      | 112 | `stvec` = [[uservec]] | traps from user mode must go to the trampoline |
+      | 116–119 | trapframe: kernel `satp`, `sp`, [[usertrap]], hart | [[uservec]] will need them |
+      | 126–128 | `SPP` = 0, `SPIE` = 1 | `sret` will go to U-mode |
+      | 131 | `sepc` = saved user `pc` | `sret` will jump there |
+
+      All three answers are still S, kernel stack, kernel page table. Only the *next* trap's
+      destination has changed. [[tour:43]] shows each of these writes with measured values.
+
+  - title: "T5, part 2: the page table goes first"
+    file: kernel/trampoline.S
+    lines: 100-113
+    focus: 111-112
+    state:
+      hart: 1
+      mode: S
+      proc: cat (pid 3)
+      intr: off
+      satp: user
+      locks: []
+      irq: 0
+      stack: [userret]
+      sp: {"on": none, detail: "still cat's kernel stack address, unmapped in cat's page table"}
+    note: |
+      [[usertrap]] returns into [[userret]] in the trampoline. Line 111 installs `cat`'s page
+      table:
+
+      | Question | Answer now |
+      |---|---|
+      | mode | S |
+      | stack | **none**: `sp` still holds a kernel-stack address, which `cat`'s table doesn't map |
+      | page table | **user** |
+
+      This is the odd combination: supervisor mode on a user page table, with no usable stack.
+      It starts here and lasts until the `sret` on line 153, the second of the trampoline's two
+      stretches with no usable stack ([[concept:stacks#none]]). For its first five
+      instructions `sp` keeps the kernel-stack address; from line 118 it holds the user's
+      value, still unusable. It is safe because the trampoline pushes nothing. The code keeps
+      running only because the trampoline page sits at the same virtual address in both page
+      tables.
+
+  - title: "T5, part 3: sp, then the mode"
+    file: kernel/trampoline.S
+    lines: 114-153
+    focus: 118-153
+    state:
+      hart: 1
+      mode: S
+      proc: cat (pid 3)
+      intr: off
+      satp: user
+      locks: []
+      irq: 0
+      stack: [userret]
+      sp: {"on": none, switched: "`ld sp, 48(a0)` in [[userret]] ([[kernel/trampoline.S:118]]) loads the user's `sp`", detail: "`sp` holds cat's user stack pointer; supervisor code cannot use it"}
+    note: |
+      Line 118 loads `cat`'s user `sp` from the trapframe; the rest of the registers follow,
+      `a0` last. Then line 153, [[g:insn:sret|sret]]: mode ← `SPP` (U), `pc` ← `sepc`, `SIE` ← `SPIE`.
+
+      | Question | After line 118 | After `sret` |
+      |---|---|---|
+      | mode | S | **U** |
+      | stack | none: `sp` holds `cat`'s user value, which S-mode cannot use | **user** |
+      | page table | user | user |
+
+      So T5 changes the page table, then `sp`, then the mode, in that order, in
+      [[userret]], and the user stack becomes usable only with the mode change: supervisor
+      code cannot use user pages (`sstatus.SUM` is never set). It is the mirror of T1, where
+      the trap makes the user stack unusable before `sp` and `satp` change. Each order is forced: the page table must change while the code is still
+      privileged enough to write `satp`, and the user registers, `sp` included, can be loaded
+      only after it, because they come from the trapframe at `TRAPFRAME`, which only the user
+      page table maps.
+
+  - title: "T1: cat calls read, and ecall changes only the mode"
+    file: user/usys.S
+    lines: 22-28
+    focus: 24-26
+    state:
+      hart: 1
+      mode: U
+      proc: cat (pid 3)
+      intr: on
+      satp: user
+      locks: []
+      stack: [main, cat, read]
+      sp: {"on": user, switched: "`sret` ([[kernel/trampoline.S:153]]) returned to user mode, making the user stack usable", detail: "cat's user stack"}
+    note: |
+      `cat` reads `README` with `read(fd, buf, 512)`. The stub puts `SYS_read` (5) in `a7` and
+      executes [[g:insn:ecall|ecall]], at `0x3c6` in `cat`'s image.
+
+      The hardware does very little: mode ← S, `sepc` ← the `ecall`'s address, `scause` ← 8,
+      `stval` ← 0, `SPP` ← 0, `SPIE` ← `SIE`, `SIE` ← 0, `pc` ← `stvec`. It goes to S-mode and
+      not M-mode only because [[kernel:start]] delegated it ([[kernel/start.c:31]]).
+
+      | Question | After `ecall` |
+      |---|---|
+      | mode | **S** |
+      | stack | none: `sp` still holds `cat`'s user value |
+      | page table | **still `cat`'s**: the hardware never touches `satp` |
+
+      T2, T3 and T4 enter exactly the same way. Only `scause` differs.
+
+  - title: "T1–T4, entry: uservec in supervisor mode with user everything"
+    file: kernel/trampoline.S
+    lines: 16-74
+    focus: 32-73
+    state:
+      hart: 1
+      mode: S
+      proc: cat (pid 3)
+      intr: off
+      satp: user
+      locks: []
+      irq: 0
+      stack: [uservec]
+      sp: {"on": none, detail: "cat's user sp, which the kernel won't use"}
+    note: |
+      `stvec` sent the hart to [[uservec]], into the same odd combination: the first of the
+      trampoline's two stretches with no usable stack, which lasts until line 92. In its first
+      half `sp` is still the user's:
+
+      | Question | Answer |
+      |---|---|
+      | mode | S |
+      | stack | **none**: `sp` is the user's, and the kernel won't trust it |
+      | page table | **user** |
+
+      With no stack and no free register, [[uservec]] parks `a0` in `sscratch`, loads the
+      constant `TRAPFRAME`, and stores all 31 registers into `cat`'s trapframe through `cat`'s
+      own page table ([[tour:7]]).
+    others: |
+      If hart 0 or hart 2 traps from another process at the same moment, they run these same
+      instructions at the same virtual addresses. Each hart's `satp` maps `TRAPFRAME` to its
+      own process's page, so no lock is needed.
+
+  - title: "T1–T4, entry: a kernel sp before a kernel page table"
+    file: kernel/trampoline.S
+    lines: 75-91
+    focus: 76-91
+    state:
+      hart: 1
+      mode: S
+      proc: cat (pid 3)
+      intr: off
+      satp: user
+      locks: []
+      irq: 0
+      stack: [uservec]
+      sp: {"on": none, detail: "holds cat's kernel stack top, not yet mapped"}
+    note: |
+      Line 76 loads `sp` from `kernel_sp`: the top of `cat`'s kernel stack. But `satp` still
+      names `cat`'s page table, which doesn't map kernel stacks. So for the four instructions
+      up to line 92, `sp` holds the right value and still isn't usable. This is the second half
+      of the stretch, the mirror of T5 part 2:
+
+      | Question | Answer |
+      |---|---|
+      | mode | S |
+      | stack | **none** (a kernel address, unmapped) |
+      | page table | user |
+
+      `tp` (line 79) becomes the hart number, and `t0` and `t1` get [[usertrap]]'s address
+      and the kernel `satp`.
+
+  - title: "T1–T4, entry: csrw satp, and everything is kernel"
+    file: kernel/trampoline.S
+    lines: 86-98
+    focus: 92-98
+    state:
+      hart: 1
+      mode: S
+      proc: cat (pid 3)
+      intr: off
+      satp: kernel
+      locks: []
+      irq: 0
+      stack: [uservec]
+      sp: {"on": kernel, switched: "`csrw satp` makes the stack loaded on line 76 reachable", detail: "top of cat's kernel stack: empty"}
+    note: |
+      Line 92 installs the kernel page table, and in that instant the `sp` loaded on line 76
+      becomes a real stack. All three answers now agree: S-mode, `cat`'s kernel stack, kernel
+      page table. `jalr t0` calls [[usertrap]], with `ra` pointing at [[userret]].
+
+      Look back at the order. On the way in: stack value, then page table. On the way out
+      (T5): page table, then stack value. Both orders keep one rule: **the user's `sp` is
+      never paired with the kernel page table**, and C code never runs without a mapped stack.
+
+      `cat`'s kernel stack is **empty** at this point, as it is on every entry from user mode.
+      `kernel_sp` is always the top ([[kernel/trap.c:117]]).
+
+  - title: "usertrap: one entry, four transitions"
+    file: kernel/trap.c
+    lines: 37-80
+    focus: 54-62
+    state:
+      hart: 1
+      mode: S
+      proc: cat (pid 3)
+      intr: off
+      satp: kernel
+      locks: []
+      irq: 0
+      stack: [usertrap]
+      sp: {"on": kernel, detail: "cat's kernel stack: usertrap's frame"}
+    note: |
+      T1, T2, T3 and T4 share every instruction up to here. [[usertrap]] tells them apart
+      by `scause`:
+
+      | `scause` | Transition | Handled by |
+      |---|---|---|
+      | 8 | T1 system call | `epc += 4`, [[intr_on]], [[syscall]] |
+      | `0x8000000000000009` | T3 device interrupt | [[devintr]] → PLIC → driver |
+      | `0x8000000000000005` | T4 timer interrupt | [[devintr]] → [[clockintr]], then [[yield]] |
+      | 13 or 15 | T2 load/store page fault | [[vmfault]], if the page was allocated lazily |
+      | anything else | T2, fatal | `setkilled`; the process exits at line 82 |
+
+      The top bit of `scause` separates interrupts (asynchronous, `sepc` = the next
+      instruction to run) from exceptions (synchronous, `sepc` = the instruction that
+      trapped). For `cat`'s `read`, it's 8: [[syscall]] → [[sys_read]], with interrupts on.
+      From here on the hart may take T7 traps ([[tour:5]] follows the whole call).
+
+  - title: "T2: an exception, survived or fatal"
+    file: kernel/trap.c
+    lines: 69-83
+    focus: 71-79
+    state:
+      hart: 1
+      mode: S
+      proc: cat (pid 3)
+      intr: off
+      satp: kernel
+      locks: []
+      irq: 0
+      stack: [usertrap]
+      sp: {"on": kernel, detail: "cat's kernel stack"}
+    note: |
+      Suppose `cat` had a bug and *stored* through a null pointer. The hardware traps exactly
+      as for `ecall`, with `scause = 15` (store page fault), `stval = 0` (the bad address) and
+      `sepc` = the faulting store.
+
+      At this commit a page fault isn't automatically fatal. [[vmfault]] is asked first: if the
+      address lies inside the process's size but has no page yet (memory from `sbrklazy`), it
+      allocates one, and `usertrap` returns normally. `sepc` was *not* advanced, so the faulting
+      instruction runs again and succeeds. Address 0 is `cat`'s first text page, which *is* mapped:
+      readable and executable but not writable. So the fault isn't about a missing page,
+      [[vmfault]] refuses (it checks `ismapped`), line 78 marks `cat` killed, and line 82 makes
+      it exit.
+
+      Either way, T2 enters through T1's door and leaves through T5's (or never, via
+      [[kexit]]). Exceptions *in the kernel* are a different story: they arrive as T7, and
+      [[kerneltrap]] panics ([[tour:10]]).
+
+  - title: "T3 and T4: devintr reads the cause"
+    file: kernel/trap.c
+    lines: 182-220
+    focus: 190-216
+    state:
+      hart: 1
+      mode: S
+      proc: cat (pid 3)
+      intr: off
+      satp: kernel
+      locks: []
+      irq: 0
+      stack: [usertrap, devintr]
+      sp: {"on": kernel, detail: "cat's kernel stack"}
+    note: |
+      While `cat` runs in user mode, two other kinds of event can pull hart 1 into the kernel
+      the same way. Both are interrupts: the top bit of `scause` is 1, and `sepc` is the
+      instruction that *didn't* run yet.
+
+      - **T3**, code 9: a device, through the [[g:plic|PLIC]]. [[plic_claim]] names it (UART
+        10, disk 1), the driver runs, [[plic_complete]] re-opens it. `devintr` returns 1.
+      - **T4**, code 5: this hart's `time` passed its `stimecmp`. [[clockintr]] re-arms it.
+        `devintr` returns 2, and [[usertrap]] calls [[yield]].
+
+      Neither one touches `sepc` before returning, and neither needs to. T5 will resume `cat`
+      exactly at the instruction it was about to run.
+    others: |
+      The tick is per hart, but the counter isn't: only hart 0's [[clockintr]] increments
+      `ticks`, under `tickslock`. The PLIC is shared, but its claim register gives each
+      interrupt to exactly one hart ([[tour:9]]).
+
+  - title: "T4 leads to T6: yield and sched"
+    file: kernel/proc.c
+    lines: 479-509
+    focus: 501-507
+    state:
+      hart: 1
+      mode: S
+      proc: cat (pid 3)
+      intr: off
+      satp: kernel
+      locks: ["cat's p->lock"]
+      irq: {noff: 1, intena: 0, note: "`yield`'s `acquire` ran with SIE off (a timer trap from user mode), so intena is 0"}
+      stack: [usertrap, yield]
+      sp: {"on": kernel, detail: "cat's kernel stack"}
+    note: |
+      A timer tick is where most T6s come from. [[yield]] takes `cat`'s `p->lock`, marks it
+      `RUNNABLE`, and calls [[sched]], which switches to hart 1's scheduler stack. `cat` stays
+      behind, frozen on its kernel stack: `usertrap → yield → sched → swtch`. That's the frozen
+      chain step 5 resumed. T4 and T6 close the loop.
+
+      The second half of this T6 is the scheduler picking someone, maybe `cat` again, maybe on
+      a different hart. When `cat` continues, `yield` releases the lock and `usertrap` takes
+      T5 back to user mode.
+    others: |
+      `sched` insists on exactly one lock held (`noff == 1`) and interrupts off. A second lock
+      held across the switch could block every other hart that needs it, for as long as `cat`
+      waits to be scheduled again. It also saves the hart's `intena` (0 here) and puts it back
+      when `cat` resumes, because the flag belongs to the thread ([[concept:locks#sched-intena]]).
+
+  - title: "T7: a trap while already in the kernel"
+    file: kernel/kernelvec.S
+    lines: 1-38
+    focus: 12-14
+    state:
+      hart: 2
+      mode: S
+      proc: sh (pid 2)
+      intr: off
+      satp: kernel
+      locks: ["tx_lock (sleep-lock)"]
+      irq: {noff: 0, note: "the shell holds only a sleep-lock, which noff doesn't count: noff 0 with SIE on is why the tick could be taken"}
+      stack: [usertrap, syscall, sys_write, filewrite, consolewrite, uartwrite, kernelvec]
+      sp: {"on": kernel, detail: "sh's kernel stack: 0x3fffffbe70 → 0x3fffffbd70"}
+    note: |
+      The shell is printing its `$ ` prompt: `write` → … → [[uartwrite]], holding the UART's
+      sleep-lock, with interrupts on. A tick arrives. (We caught exactly this in our run:
+      `sepc = 0x8000094c`, just after a byte was stored into the UART, and `sp = 0x3fffffbe70`
+      on the shell's kernel stack, slot 1.) Because [[usertrap]] set `stvec` to [[kernelvec]]
+      (line 47), this trap doesn't go near the trampoline:
+
+      | Question | Before | After the trap |
+      |---|---|---|
+      | mode | S | S |
+      | stack | sh's kernel stack | **the same stack**, with a 256-byte frame pushed |
+      | page table | kernel | kernel |
+
+      No answer changes at all. `kernelvec` saves 17 registers (the 16 caller-saved ones and
+      `gp`) on the current stack and calls [[kerneltrap]]. The tick could be taken at all only
+      because the shell held no spinlock: a sleep-lock doesn't count in `noff`, and SIE is
+      never 1 while `noff > 0` ([[concept:locks#invariant]]). The current stack can also be a **scheduler** stack:
+      an interrupt taken in the scheduler's window (proc.c lines 441–442) lands there
+      ([[tour:44]]).
+    others: |
+      There is no separate interrupt stack. Each hart's interrupts use whatever stack that
+      hart is on, which is always one only that hart is using at that moment. So no lock is
+      needed for the frame.
+
+  - title: "T7, the way back: kerneltrap and sret to S-mode"
+    file: kernel/trap.c
+    lines: 134-165
+    focus: 156-163
+    state:
+      hart: 2
+      mode: S
+      proc: sh (pid 2)
+      intr: off
+      satp: kernel
+      locks: ["tx_lock (sleep-lock)"]
+      irq: {noff: 0, note: "back from `yield`: its `release` left SIE off, because `yield` acquired with intena 0"}
+      stack: [usertrap, syscall, sys_write, filewrite, consolewrite, uartwrite, kernelvec, kerneltrap]
+      sp: {"on": kernel, detail: "sh's kernel stack, 0x3fffffbd40, below the kernelvec frame"}
+    note: |
+      [[kerneltrap]] handles the device or tick. If it was a tick and a process is running,
+      it yields: T6 from *inside* a T7. The shell did, in our run, while still holding the
+      UART's sleep-lock (allowed: a sleep-lock may be held across a switch, a spinlock may not). That's how a long system call is preempted. `yield`'s `acquire` runs with SIE
+      already off, so it records `intena` 0, and its `release` leaves interrupts off until
+      `sret` restores them ([[concept:locks#intena]]). Then it
+      puts back the `sepc` and `sstatus` it saved, and `kernelvec`'s [[g:insn:sret|sret]]
+      returns to the interrupted kernel instruction. `SPP` is 1, so the mode stays S.
+
+      So `sret` serves two transitions: T5 (`SPP = 0`, down to user mode) and the end of T7
+      (`SPP = 1`, back to supervisor mode). The instruction is the same; the saved `SPP`
+      decides.
+
+      An exception in kernel code arrives here too, but [[devintr]] returns 0 for it and
+      `kerneltrap` panics. The kernel has no recovery for its own faults.
+
+  - title: Every combination that exists
+    file: kernel/trampoline.S
+    lines: 100-120
+    focus: 111-117
+    state:
+      hart: 1
+      mode: S
+      proc: cat (pid 3)
+      intr: off
+      satp: user
+      locks: []
+      irq: 0
+      stack: [userret]
+      sp: {"on": none, detail: "between line 111 and line 118"}
+    note: |
+      Put the eight transitions together and you get every combination of the three answers
+      that ever occurs at this commit:
+
+      | Mode | Stack | Page table | Where |
+      |---|---|---|---|
+      | M | none (`sp` = 0, then `stack0`'s base, not yet usable) | none | the boot ROM at `0x1000`, [[_entry]] before line 17 |
+      | M | boot | none | [[_entry]] from line 17, [[kernel:start]] |
+      | S | boot | none, then kernel | [[kernel:main]] |
+      | S | scheduler | kernel | the scheduler loop; T7 in its window |
+      | S | kernel | kernel | everything a process does in the kernel; T7 on it |
+      | S | none (user's `sp`) | user | [[uservec]] up to line 76; [[userret]] from line 118 to `sret` |
+      | S | none (kernel `sp`, unmapped) | user | [[uservec]] 76–91, [[userret]] 111–117 |
+      | U | user | user | the program |
+
+      Eight rows out of the many conceivable ones (3 modes × 5 stacks × 3 page tables); the
+      concept page lists nine rows because it splits one by `stvec`. The
+      trampoline accounts for two of them, both with interrupts off and both a few
+      instructions long. These lines are one of them. Some combinations **never** happen: U-mode on a kernel
+      stack, C code on a user page table, the user's `sp` with the kernel page table. Each
+      absence is a design decision ([[concept:mode-stack-page-table#table]]).
+
+  - title: Five myths, and is there a ninth transition?
+    file: kernel/swtch.S
+    lines: 1-24
+    focus: 1-11
+    state:
+      hart: 1
+      mode: S
+      proc: cat (pid 3)
+      intr: off
+      satp: kernel
+      locks: ["cat's p->lock"]
+      irq: {noff: 1, intena: 0}
+      stack: [usertrap, yield, sched, swtch]
+      sp: {"on": kernel, detail: "cat's kernel stack"}
+    note: |
+      Five beliefs this tour has shown to be false:
+
+      1. *"The hardware switches page tables on a trap."* It changes the mode, the `pc` and a
+         few CSR fields. `satp` and `sp` are software's job (steps 9–12).
+      2. *"`swtch` changes privilege."* It is called in S-mode and returns in S-mode, and
+         touches no CSR (step 5).
+      3. *"Each process has its own kernel page table."* There is one, shared by every hart
+         and process. Each process has its own *user* page table and its own kernel stack,
+         mapped in the shared table.
+      4. *"The trapframe is on the kernel stack."* It is a separate page, mapped at
+         `TRAPFRAME` in the user page table ([[concept:stacks#save-areas]]).
+      5. *"A context switch saves all 32 registers."* `swtch` saves 14. The user's 31 are in
+         the trapframe, and the kernel's caller-saved ones are on the kernel stack.
+
+      **A ninth transition?** If you count *mode* changes, no: every one at this commit is
+      T1–T5, T7's `sret`, or T8. But two things changed an answer without being one of
+      the eight: [[_entry]]'s `add sp, sp, a0` ([[kernel/entry.S:17]]), which gives the hart
+      its first stack, and [[kvminithart]]'s `satp` write in boot (step 2). And T5 has two entrances: [[usertrap]] returning into
+      [[userret]], and [[forkret]] calling it directly for a process's first trip. With those
+      footnotes, the eight cover everything.
+locks:
+  - lock: "p->lock (spinlock)"
+    where: "[[scheduler]], [[yield]], [[sched]] (T6); [[killed]] in [[usertrap]]"
+    protects: "Which hart runs on a process's kernel stack: held across every `swtch`, released by the other side"
+  - lock: "tickslock (spinlock)"
+    where: "[[clockintr]] on hart 0 (T4, T7)"
+    protects: "The global `ticks` counter"
+  - lock: "stvec, sepc, scause, sstatus, satp (no lock)"
+    where: "every transition"
+    protects: "All per hart. What protects them is ordering on the hart itself: interrupts off until `sepc` is saved, and interrupts off across the two windows where `stvec` doesn't match the mode"
+  - lock: "the trampoline and the kernel page table (no lock)"
+    where: "[[uservec]], [[userret]]"
+    protects: "Shared by all harts but never written after boot, so no lock is needed"
+quiz:
+  - q: "Process A is running in user mode when its timer tick fires. B was preempted earlier by a tick in user mode. The scheduler switches to B, which returns to user mode and immediately calls `read`, which sleeps. How many privilege-mode changes happened, and how many `swtch` calls?"
+    a: "Three mode changes: A's tick (T4, U→S), B's `sret` (T5, S→U), B's `ecall` (T1, U→S). B's sleep and the scheduler's moves are `swtch` calls, which change no mode: A→scheduler, scheduler→B, and B→scheduler when it sleeps. That's three swtches. If the tick were taken while A was in the kernel, it would be a T7, and there would be no mode change at all."
+  - q: "What happens if the trampoline is removed from the kernel page table but left in user page tables? We tried it."
+    a: "Boot completes, and the first process never runs. In our build the first fault was in [[forkret]]: it calls `userret` at `0x3ffffff09c` while still on the kernel page table, and the fetch faults (`scause = 12`, instruction page fault). The trap goes to `stvec`, which `prepare_return` had already pointed at `0x3ffffff000`, also unmapped. So the hart faulted at `stvec` over and over, about 565,000 times in 8 seconds, with no panic and no output."
+  - q: "Why doesn't `sched` switch directly from one process's kernel stack to the next process's?"
+    a: "Two reasons. Once the old process's `p->lock` is released, another hart may start running on its kernel stack, so the hart needs somewhere neutral to stand: the scheduler stack, which no other hart uses. And a direct A→B switch would hold A's lock while acquiring B's. Two harts doing A→B and B→A at once would deadlock."
+  - q: "A hart is in S-mode, `satp` holds a user page table, and `sp` holds a user address. Where is it, exactly, and could an interrupt arrive?"
+    a: "In [[userret]] between line 118 (`ld sp`) and `sret`, or at the very start of [[uservec]] before line 76 (where the `sp` is the user's own value). Interrupts are off in both places: after a trap, the hardware cleared `SIE`, and `prepare_return` cleared it before returning."
+  - q: "Both T5 and the end of T7 execute `sret`. What decides whether the hart ends up in user or supervisor mode, and who set it?"
+    a: "`sstatus.SPP`. For T5, `prepare_return` cleared it. For T7, the hardware set it to 1 when the trap was taken from S-mode, and `kerneltrap` wrote back its saved `sstatus` (with `SPP = 1`) before returning, in case a `yield` let another thread change it."
+  - q: "`swtch` changes `sp`, `ra` and `s0`–`s11`. Which of the three master-question answers can it change?"
+    a: "Only the stack: kernel ↔ scheduler. The mode stays S, because `swtch` executes no `sret` or `mret`. The page table stays the kernel's, because `swtch` doesn't touch `satp`. That's why a context switch is not a privilege transition at all."

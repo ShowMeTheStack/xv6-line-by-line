@@ -1,0 +1,697 @@
+title: Where a suspended process lives
+group: The dance of privilege
+prerequisites: [7, 13, 20, 21, 22, 45]
+summary: |
+  A process that is not running is not *anywhere* in the CPU. No hart holds its registers, no
+  `pc` points into its code. Yet some hart can pick it up at any moment and continue it as if
+  nothing had happened. So everything needed to continue it must be in memory. Where,
+  exactly?
+
+  The short answer is three places: the **trapframe** (the user registers), the **kernel
+  stack** (the kernel's call chain), and **`p->context`** (14 registers saved by `swtch`).
+  The short answer is often followed by a tidy claim: the three never overlap, and together
+  they hold every register exactly once. This tour checks that claim against real memory,
+  dumped with gdb from this build while `usertests preempt` ran on three harts. It turns out
+  to be half right, and the half that is wrong teaches the most: some register values are
+  stored **twice**, sometimes as the same number and sometimes as different
+  ones, and the design is correct anyway.
+
+  Then we follow the three places through a process's life: what `fork` gives a child, what
+  `exec` replaces, and what `exit` and `wait` free, and what they never free.
+cast: |
+  We stop the machine at three moments, from two runs. In the first two (`usertests preempt`),
+  hart 2's scheduler has just come back from a `swtch`. In the third (`usertests writebig`),
+  it is hart 1's. Either way, the process it left is fully suspended:
+
+  | Process | Slot | Why it stopped | Kernel stack used |
+  |---|---|---|---|
+  | pid 5, a spinning child | `proc[4]` | timer, in **user** mode | 112 bytes |
+  | pid 4, the test | `proc[3]` | asleep in `read` on a pipe | 336 bytes |
+  | pid 3, the shell's child | `proc[2]` | timer, **in the kernel**, during `exec` | 1920 bytes |
+
+  Meanwhile the other harts are running other processes, and the scheduler stacks are in use.
+  Each hart runs at most one process; the suspended ones are pure data.
+steps:
+  - title: Three places, filled by three mechanisms
+    file: kernel/proc.h
+    lines: 81-104
+    focus: 96-100
+    state:
+      hart: 2
+      mode: S
+      proc: "none (hart 2's scheduler, just back from pid 5)"
+      intr: off
+      satp: kernel
+      locks: ["pid 5's p->lock"]
+      irq: {noff: 1, intena: 0, note: "line 456 has just forced intena to 0 (the value pid 5's thread left in `cpus[2]` was 0 too)"}
+      stack: [main, scheduler]
+      sp: {"on": scheduler, detail: "0x8000a810"}
+    note: |
+      Three fields of `struct proc` point at the three places:
+
+      | Field | What it locates | Filled by |
+      |---|---|---|
+      | `trapframe` | a page holding the **user** registers | [[uservec]] on every trap from user mode |
+      | `kstack` | the **kernel stack**, `KSTACK(slot)` | ordinary C function calls (and [[kernelvec]]) |
+      | `context` | 14 registers of the **kernel thread** | [[swtch]] |
+
+      A fourth item is often forgotten: `pagetable`. The user's memory, including its user
+      stack, is reached only through it.
+
+      We are on hart 2 at [[kernel/proc.c:456]], just after pid 5's `swtch` returned into the
+      scheduler. Pid 5's `p->lock` is still held, so pid 5 cannot be resumed while we look:
+      this is exactly the moment the frozen process is complete. In this tour we dump all
+      three places for pid 5, and then compare.
+    figure: t47-three-places
+    caption: |
+      Pid 5, suspended by a timer interrupt in user mode, as gdb read it in our run. The user
+      `s4`–`s11` appear in both the trapframe and `p->context`. `s3` matches only by
+      coincidence. `s0`–`s3` also sit in prologue spills on the kernel stack.
+
+  - title: "Place 1: the trapframe, 31 registers and a pc"
+    file: kernel/proc.h
+    lines: 31-77
+    focus: 40-77
+    state:
+      hart: 2
+      mode: S
+      proc: "none (hart 2's scheduler)"
+      intr: off
+      satp: kernel
+      locks: ["pid 5's p->lock"]
+      irq: {noff: 1, intena: 0}
+      stack: [main, scheduler]
+      sp: {"on": scheduler}
+    note: |
+      The trapframe is one page from [[kalloc]], pointed to by `p->trapframe` and mapped at
+      `TRAPFRAME` (`0x3fffffe000`) in **pid 5's page table only**. It is not on any stack.
+      gdb read pid 5's:
+
+      | Field | Value | |
+      |---|---|---|
+      | `epc` | `0x3a7a` | the `j` the tick interrupted |
+      | `ra`, `sp` | `0x3a72`, `0x11e80` | user return address, user stack |
+      | `s0`–`s2` | `0x11ec0`, `0`, `0x8430` | |
+      | `s3`–`s11` | `0, 1, 0, 2, 0x9010, 0x81e8, 0x9460, 1, 0x8220` | |
+      | `a0`–`a7` | `0, 0x11def, 1, 0, 9, 0x81a1, 0x100000000000, 1` | `a7 = 1`: its last system call was `fork` |
+      | `gp`, `tp`, `t0`–`t6` | `0x0505050505050505` | never used by this program |
+      | `kernel_sp`, `kernel_hartid` | `0x3fffff6000`, 2 | for the *next* trap |
+
+      `0x0505050505050505` is [[kalloc]]'s junk fill ([[kernel/kalloc.c:80]]). `init`'s first
+      trapframe page started as junk, `userret` loaded it into the registers, and since
+      these programs never write `gp`, `tp` or `t0`, `t2`–`t6`, and write `t1` only in
+      `printf`'s `printint` (not yet called in this run), the junk has been copied through
+      every `fork` since. It is harmless, and it is a fine fingerprint.
+
+      That is the whole user state: 31 general registers (`x0` is always 0) plus the `pc`.
+      Nothing else from user mode needs saving; the user's memory stays put in its page table.
+
+  - title: Who wrote each trapframe field, and when
+    file: kernel/trampoline.S
+    lines: 32-98
+    focus: 40-73
+    state:
+      hart: 2
+      mode: S
+      proc: usertests child (pid 5)
+      intr: off
+      satp: user
+      locks: []
+      irq: 0
+      stack: [uservec]
+      sp: {"on": none, detail: "still the user's 0x11e80"}
+    note: |
+      Four writers, at four different moments:
+
+      | Fields | Written by | When |
+      |---|---|---|
+      | 31 registers | [[uservec]], lines 40–73 | every entry from user mode, before anything else runs |
+      | `epc` | [[usertrap]], [[kernel/trap.c:52]] | right after, from `sepc` |
+      | `a0` (and `epc += 4`) | [[syscall]], [[usertrap]] | system calls only: the return value, skip the `ecall` |
+      | `kernel_satp`, `kernel_sp`, `kernel_trap`, `kernel_hartid` | [[prepare_return]] | every exit to user mode, for the next entry |
+
+      The trapframe also has **readers** besides the trampoline: [[argraw]] reads system-call
+      arguments from it, [[kfork]] copies it, [[kexec]] rewrites `epc` and `sp`.
+
+      There is no lock on it. Apart from its birth (the parent's `kfork` fills a child's
+      trapframe while the child is still `USED` and invisible) and its death (the parent's
+      `freeproc`, after the child is a `ZOMBIE`), only the process's own kernel thread and the
+      trampoline running on its behalf touch it, and a process runs on one hart at a time. While pid 5 is
+      suspended, nobody touches it at all.
+
+  - title: "Place 2: the kernel stack, 112 bytes deep"
+    file: kernel/proc.c
+    lines: 499-508
+    focus: 506
+    state:
+      hart: 2
+      mode: S
+      proc: usertests child (pid 5)
+      intr: off
+      satp: kernel
+      locks: ["pid 5's p->lock"]
+      irq: {noff: 1, intena: 0, note: "`yield`'s `acquire` ran with SIE off (a timer trap from user mode): intena 0, which `sched` keeps in `s3`"}
+      stack: [usertrap, yield]
+      sp: {"on": kernel, detail: "KSTACK(4)"}
+    note: |
+      Pid 5's `KSTACK(4)` page, from `context.sp` up to the top, word by word as gdb read it
+      (gcc keeps frame pointers, so each frame's saved `s0` links to the next):
+
+      ```text
+      address      value            frame       meaning
+      0x3fffff5ff8 0x3ffffff09c     usertrap    ra: returns into userret (trampoline)
+      0x3fffff5ff0 0x11ec0          usertrap    saved s0  = the USER's s0
+      0x3fffff5fe8 0                usertrap    saved s1  = the USER's s1
+      0x3fffff5fe0 0x8430           usertrap    saved s2  = the USER's s2
+      0x3fffff5fd8 0x800026d0       yield       ra: back into usertrap (line 86)
+      0x3fffff5fd0 0x3fffff6000     yield       saved s0 (usertrap's frame)
+      0x3fffff5fc8 0x80010370       yield       saved s1 = &proc[4]
+      0x3fffff5fc0 2                yield       (slot not written)
+      0x3fffff5fb8 0x80001f02       sched       ra: back into yield
+      0x3fffff5fb0 0x3fffff5fe0     sched       saved s0 (yield's frame)
+      0x3fffff5fa8 0x80010370       sched       saved s1
+      0x3fffff5fa0 2                sched       saved s2 = which_dev, from usertrap
+      0x3fffff5f98 0                sched       saved s3  = the USER's s3
+      0x3fffff5f90 0x3fffff5fc0     sched       (slot not written)  ◄─ context.sp
+      ```
+
+      No register file was dumped here wholesale. What is on a kernel stack is what any C
+      call chain leaves: return addresses, frame links, locals, and **callee-saved registers
+      spilled by prologues**. `usertrap` uses `s0`, `s1` and `s2`, so its prologue saved the
+      values those registers held on entry, and on entry they held the *user's* values,
+      because [[uservec]] never touches `s` registers. `sched` uses `s3` (for `intena`, the
+      thread's own copy of the flag, [[concept:locks#sched-intena]]), so
+      its prologue saved the user's `s3`, which nothing between had touched. So four user
+      registers (`s0`–`s2` spilled by `usertrap`, `s3` by `sched`) are now stored twice: in the
+      trapframe and here.
+
+  - title: "Place 3: p->context, 14 registers"
+    file: kernel/swtch.S
+    lines: 8-41
+    focus: 10-23
+    state:
+      hart: 2
+      mode: S
+      proc: usertests child (pid 5)
+      intr: off
+      satp: kernel
+      locks: ["pid 5's p->lock"]
+      irq: {noff: 1, intena: 0, note: "the `s3 = 0` that `swtch` saves is this intena"}
+      stack: [usertrap, yield, sched, swtch]
+      sp: {"on": kernel, detail: "KSTACK(4), 0x3fffff5f90"}
+    note: |
+      Back on hart 2 a moment earlier, inside `swtch` on pid 5's stack: lines 10–23 store
+      `ra`, `sp` and `s0`–`s11` into `proc[4].context`. gdb read the result:
+
+      | | `p->context` | trapframe (user) |
+      |---|---|---|
+      | `ra` | `0x80001e9c` (in [[sched]]) | `0x3a72` |
+      | `sp` | `0x3fffff5f90` | `0x11e80` |
+      | `s0` | `0x3fffff5fc0` | `0x11ec0` |
+      | `s1` | `0x80010370` | `0` |
+      | `s2` | `0x8000f9a0` | `0x8430` |
+      | `s3` | `0`: `sched`'s `intena` | `0`: the same number, by coincidence |
+      | `s4`–`s11` | `1, 0, 2, 0x9010, 0x81e8, 0x9460, 1, 0x8220` | **the same eight values** |
+
+      Why only these 14? Because `swtch` is called like an ordinary function. The calling
+      convention already lets a callee destroy `a0`–`a7` and `t0`–`t6`, so `sched` cannot be
+      relying on them, and saving them would be wasted work. `ra` says where to continue,
+      `sp` where the stack is, and `s0`–`s11` are exactly the registers a callee promises to
+      give back. `gp` is unused by the kernel; `tp` holds the hart number and deliberately
+      stays with the hart.
+
+  - title: Overlap, checked register by register
+    file: kernel/proc.h
+    lines: 1-19
+    focus: 6-18
+    state:
+      hart: 2
+      mode: S
+      proc: "none (hart 2's scheduler)"
+      intr: off
+      satp: kernel
+      locks: ["pid 5's p->lock"]
+      irq: {noff: 1, intena: 0}
+      stack: [main, scheduler]
+      sp: {"on": scheduler}
+    note: |
+      Put the three dumps side by side for the callee-saved registers:
+
+      | Register | trapframe | kernel stack | `p->context` |
+      |---|---|---|---|
+      | `s0`, `s1`, `s2`, `s3` | user values | **user values again** (spilled by `usertrap`'s and `sched`'s prologues) | kernel values (`s3` is `sched`'s `intena`, 0 here by coincidence) |
+      | `s4`–`s11` | user values | absent | **user values again** |
+      | `ra`, `sp` | user values | absent | kernel values |
+
+      So "no overlap" is false: every user `s` register is stored at least twice. And "each
+      place holds different registers" is false too: the trapframe and `p->context` both have
+      `s0`–`s11`, `ra` and `sp`, holding the **user's** values in one and the **kernel
+      thread's** values in the other, which sometimes coincide. `s4`–`s11` coincide because
+      nothing on the path `usertrap → yield → sched` used them, so they still held what the
+      user left in them when `swtch` saved them. `s3` only looks the same: `sched` spilled the
+      user's `s3` onto the stack and reused the register for `intena`, which is also 0 here.
+
+      The design is still correct, because each copy has exactly one *reader*:
+
+      - `swtch` restores the kernel thread from `p->context`;
+      - each function's epilogue restores its own spills as the stack unwinds;
+      - [[userret]] restores the user from the trapframe.
+
+      A duplicate that only one reader ever uses can never disagree with anything. The
+      accurate claim is: the trapframe is the complete user state, `p->context` plus the
+      kernel stack are the complete kernel-thread state, and the two may share values.
+    others: |
+      Is anything missing? The hart's CSRs. `sepc` is copied to `trapframe->epc`; `satp` is
+      rebuilt from `p->pagetable`; `sstatus` and `stvec` are rebuilt by [[prepare_return]].
+      Kernel-side, [[sched]] keeps the thread's `intena` in a local variable, which lives on
+      this stack or in a saved `s` register. Nothing a process needs is left in a hart.
+
+  - title: A consequence of the calling convention
+    file: kernel/trampoline.S
+    lines: 100-153
+    focus: 124-142
+    state:
+      hart: 2
+      mode: S
+      proc: usertests child (pid 5)
+      intr: off
+      satp: user
+      locks: []
+      irq: 0
+      stack: [userret]
+      sp: {"on": none, switched: "`ld sp, 48(a0)` ([[kernel/trampoline.S:118]]) loads the user's `sp`", detail: "0x11e80, the user's stack pointer; supervisor code cannot use it until `sret`"}
+    note: |
+      Follow the user's `s` registers through a trap. [[uservec]] leaves them untouched.
+      [[usertrap]] is an ordinary C function called with `jalr`, so the calling convention
+      obliges it to return with `s0`–`s11` exactly as it found them, which were the user's
+      values. Everything it calls obeys the same rule, `swtch` included. So when `usertrap`
+      returns into [[userret]], the `s` registers **already hold the user's values**, and the
+      twelve `ld s0` … `ld s11` among lines 124–142 write the same numbers back.
+
+      Then why load them at all? Because one path breaks the chain: every new process's first
+      return, through [[forkret]]: each fork child, and `init`. [[forkret]] reaches `userret` through a function pointer, from a kernel thread that
+      never came in through `uservec`: its `s` registers hold kernel values (they started as
+      zeros in a forged context). For that thread, the trapframe copy, made from the parent's
+      by [[kfork]], is the only place the child's user `s` registers exist.
+
+      This is a fact about this build's paths, not a promise the code makes. A future kernel
+      that edits `trapframe->s0`, or reaches `userret` some other way, would need these loads,
+      and the trampoline does not try to be clever: it restores everything.
+
+  - title: "Asleep in read: 336 bytes and a syscall's arguments"
+    file: kernel/pipe.c
+    lines: 111-128
+    focus: 126
+    state:
+      hart: 2
+      mode: S
+      proc: usertests (pid 4)
+      intr: on
+      satp: kernel
+      locks: []
+      irq: {noff: 0, note: "`pi->lock` was released on line 125 with intena 1, so SIE is on; `sleep` will take `p->lock` with SIE on, and `sched`'s `s3` will be 1"}
+      stack: [usertrap, syscall, sys_read, fileread, piperead]
+      sp: {"on": kernel, detail: "KSTACK(3)"}
+    note: |
+      Pid 4 called `read(3, buf, 12288)` on an empty pipe and slept. Its kernel stack, from
+      gdb's frame-pointer walk:
+
+      ```text
+      KSTACK(3), top 0x3fffff8000
+        usertrap  0x3fffff7fe0  ra → userret; spills user s0, s1, s2 = 0x11ec0, 5, 0x8430
+        syscall   0x3fffff7fc0
+        sys_read  0x3fffff7f90
+        fileread  0x3fffff7f60
+        piperead  0x3fffff7f00  resumes at pipe.c:127, the line after sleep() (sleep's saved ra)
+        sleep     0x3fffff7ee0
+        sched     0x3fffff7eb0  ◄─ context.sp     (336 bytes in all)
+      ```
+
+      Its trapframe still holds the system call as the user made it: `a7 = 5` (`SYS_read`),
+      `a0 = 3` (the pipe's read end), `a1 = 0xccf8` (the user buffer), `a2 = 0x3000`, and
+      `epc = 0x5772`, already advanced past the `ecall`. `a0` will be overwritten with the
+      result when `read` finishes.
+
+      Its context: `s3 = 1` is `sched`'s copy of `intena` (interrupts were on when `sleep`
+      took `p->lock`; `piperead`'s own `s3`, the buffer address `0xccf8`, was spilled into
+      `sched`'s frame). `s4 = 0x80069218` (`&pi->nread`) and `s5 = 0x3000` (`n`) are
+      `piperead`'s variables. `s6`–`s11` again equal the user's. The kernel stack
+      is the *reason* the process stopped, written as a call chain: a stack that ends in
+      `piperead → sleep` means "waiting for a pipe".
+
+  - title: Preempted inside the kernel, with a kernelvec frame
+    file: kernel/kernelvec.S
+    lines: 12-38
+    focus: 14-35
+    state:
+      hart: 1
+      mode: S
+      proc: sh child becoming usertests (pid 3)
+      intr: off
+      satp: kernel
+      locks: ["root directory inode (sleep-lock)"]
+      irq: {noff: 0, note: "`pop_off` had just dropped noff to 0 and, with intena 1, turned SIE on: the pending tick was taken at once. The inode's sleep-lock is not counted"}
+      stack: [usertrap, syscall, sys_exec, kexec, namei, namex, dirlookup, readi, brelse, releasesleep, release, pop_off, kernelvec]
+      sp: {"on": kernel, detail: "KSTACK(2), a 256-byte kernelvec frame pushed"}
+    note: |
+      A third case, from a different moment (`usertests writebig`): the shell had forked
+      pid 3 to run `usertests`, and pid 3 was inside [[kexec]], looking up the path, when hart
+      1's timer fired **in the kernel**. The trap went through [[kernelvec]], which pushed 256
+      bytes onto whatever stack was current, pid 3's own, and [[kerneltrap]] called
+      [[yield]]. 1920 bytes of `KSTACK(2)` are in use:
+
+      ```text
+      usertrap → syscall → sys_exec → kexec → namei → namex → dirlookup
+        → readi → brelse → releasesleep → release → pop_off
+            (interrupted here, just after intr_on)
+        → [kernelvec frame, 256 bytes] → kerneltrap → yield → sched
+      ```
+
+      Part of the 256-byte frame, as gdb read it:
+
+      | Offset | Slot | Value |
+      |---|---|---|
+      | 0 | `ra` | `0x80000c34` (inside [[pop_off]]) |
+      | 8 | `sp` (not saved) | `0x0505050505050505` |
+      | 24 | `tp` (not saved) | `0x0505050505050505` |
+      | 72–128 | `a0`–`a7` | `0x8000fa50`, `0x800199b0`, `0x10`, ... |
+      | 56, 64, 136–208 | `s0`–`s11` (not saved) | leftovers |
+
+      Only `gp` and the 16 caller-saved registers (`ra`, `t0`–`t6`, `a0`–`a7`) are saved;
+      `s` registers are left to
+      `kerneltrap`'s own prologue, as for any C function. The unwritten slots still hold
+      junk: kernel stack pages come from [[kalloc]] at boot, filled with `0x05`, and nobody
+      clears them.
+
+  - title: Where the interrupted kernel pc is kept
+    file: kernel/trap.c
+    lines: 134-164
+    focus: 140-142
+    state:
+      hart: 1
+      mode: S
+      proc: sh child becoming usertests (pid 3)
+      intr: off
+      satp: kernel
+      locks: ["root directory inode (sleep-lock)"]
+      irq: {noff: 0, note: "the tick came in at noff 0; `yield` will acquire with SIE off, so intena 0"}
+      stack: [usertrap, syscall, sys_exec, kexec, namei, namex, dirlookup, readi, brelse, releasesleep, release, pop_off, kernelvec, kerneltrap]
+      sp: {"on": kernel, detail: "KSTACK(2), above the kernelvec frame"}
+    note: |
+      The kernelvec frame has no slot for `sepc`. Yet pid 3 must resume exactly where
+      `pop_off` was interrupted. Where is that address?
+
+      [[kerneltrap]] reads it into a local variable, and in this build gcc keeps the local in
+      `s2` (`sstatus` in `s1`, `scause` in `s3`). Those are callee-saved registers, so when
+      `kerneltrap` calls `yield`, and `yield` calls `sched`, each prologue that wants those
+      registers spills them. gdb found them in `sched`'s frame:
+
+      | Address | Value | |
+      |---|---|---|
+      | `0x3fffff9890` | `0x80000c50` | saved `s2`: **`sepc`**, [[pop_off]] just after `intr_on()` |
+      | `0x3fffff9888` | `0x8000000000000005` | saved `s3`: `scause`, the timer |
+      | `0x3fffff98b8` | `0x200000120` | saved `s1` in `yield`'s frame: `sstatus` with `SPP = 1`, `SPIE = 1` |
+
+      So the interrupted kernel `pc` is stored on the kernel stack by an ordinary function
+      prologue, in `sched`'s frame, three frames below the `kernelvec` frame (under
+      `kerneltrap`'s and `yield`'s). When pid 3 resumes (perhaps on another hart),
+      the epilogues put it back in `s2`, and [[kerneltrap]] writes it to *that* hart's `sepc`
+      ([[kernel/trap.c:162]]) just before `kernelvec`'s `sret`. That is why `kerneltrap` keeps
+      these values in locals instead of re-reading the CSRs: by the time `yield` returns, the
+      hart's `sepc` belongs to whatever ran in between ([[tour:44]]).
+
+      This pc, `0x80000c50`, also shows *why* the trap came here: the timer was already
+      pending, and fired the instant `pop_off` re-enabled interrupts. A tick can be taken
+      only where `noff` is 0, since SIE is on only then: `pop_off` turns it on only after
+      `noff` has dropped to 0, so the tick never lands inside a critical section
+      ([[concept:locks#invariant]]). Outside one it can land anywhere, even mid-work in
+      `memset` or [[uartwrite]] ([[tour:44]]); here it was simply already waiting. The root
+      inode's sleep-lock, still held, doesn't count in `noff`.
+
+  - title: "fork: a child with a forged context and an empty stack"
+    file: kernel/proc.c
+    lines: 124-150
+    focus: 143-147
+    state:
+      hart: any
+      mode: S
+      proc: usertests (pid 4)
+      intr: off
+      satp: kernel
+      locks: ["pid 5's p->lock"]
+      irq: {noff: 1, intena: 1, note: "`allocproc` took the child's lock inside `fork`, with SIE on: intena 1"}
+      stack: [usertrap, syscall, sys_fork, kfork, allocproc]
+      sp: {"on": kernel, detail: "KSTACK(3), the parent's"}
+    note: |
+      A new process gets its three places from two functions. [[allocproc]] makes the
+      context: all zeros, except `ra = forkret` and `sp = p->kstack + PGSIZE`. When hart 2's
+      scheduler first picked child pid 5 in our run, gdb showed exactly that:
+
+      ```text
+      proc[4].context: ra=0x8000193a (forkret)  sp=0x3fffff6000  s0..s11 = 0
+      kernel stack used: 0 bytes
+      ```
+
+      The kernel stack itself was not allocated here. `KSTACK(4)` was allocated and mapped at
+      boot by [[proc_mapstacks]] and belongs to the **slot**, so the child simply inherits an
+      empty page that previous occupants of `proc[4]` once used. Nothing of the parent's
+      kernel stack is copied: the child will never return through `sys_fork` or `syscall`.
+
+      The trapframe page *is* new: [[kalloc]] at [[kernel/proc.c:129]], full of `0x05` junk
+      until `kfork` fills it.
+    others: |
+      `allocproc` returns with the child's `p->lock` held, and the child stays `USED`, not
+      `RUNNABLE`, until [[kfork]] is completely done. No scheduler on another hart can pick a
+      half-built child: a forged context is visible to nobody until it is valid.
+
+  - title: "fork: the trapframe is copied, with one change"
+    file: kernel/proc.c
+    lines: 270-292
+    focus: 278-282
+    state:
+      hart: any
+      mode: S
+      proc: usertests (pid 4)
+      intr: off
+      satp: kernel
+      locks: ["child's p->lock (pid 5)"]
+      irq: {noff: 1, intena: 1}
+      stack: [usertrap, syscall, sys_fork, kfork]
+      sp: {"on": kernel, detail: "KSTACK(3)"}
+    note: |
+      [[kfork]] copies the parent's whole trapframe, then sets the child's `a0 = 0`. The
+      child's user stack was copied by [[uvmcopy]] just before, page by page, so the copied
+      `sp = 0x11e80` points at an identical stack in the child's own memory. gdb, at the
+      child's first scheduling:
+
+      | Child trapframe field | Value | |
+      |---|---|---|
+      | `epc` | `0x5752` | after `fork`'s `ecall`, same as the parent |
+      | `a0` | **0** | the only user register that differs |
+      | `sp`, `s0`–`s11` | the parent's | |
+      | `kernel_sp` | `0x3fffff8000` | **the parent's** kernel stack top! |
+      | `kernel_hartid` | 2 | where the parent last left user mode |
+
+      The kernel fields are stale, and that is fine: the child cannot trap before it has
+      returned to user mode once, and the only way there is [[forkret]] →
+      [[prepare_return]], which rewrites all four ([[kernel/trap.c:116-119]]). One line, at
+      the right moment, makes a whole copied structure correct.
+
+      Line 279 runs while `kfork` still holds the child's `p->lock` from [[allocproc]]
+      (released at line 294), and the child is still `USED`: no other hart can see it yet.
+
+  - title: "fork: the child's first run, top of an empty stack"
+    file: kernel/proc.c
+    lines: 510-543
+    focus: 538-542
+    state:
+      hart: 2
+      mode: S
+      proc: usertests child (pid 5)
+      intr: off
+      satp: kernel
+      locks: []
+      irq: {noff: 0, note: "`forkret`'s `release` of the scheduler's lock: intena was 0, so SIE stays off"}
+      stack: [forkret, prepare_return]
+      sp: {"on": kernel, switched: "`ld sp, 8(a1)` in [[swtch]] loaded the forged `sp`", detail: "KSTACK(4) from its top, 0x3fffff6000"}
+    note: |
+      `swtch` "returns" to [[forkret]] with `sp` at the very top of `KSTACK(4)`. `forkret`
+      releases the lock the scheduler took (with `intena` 0, recorded by the scheduler, so
+      interrupts stay off: [[concept:locks#handoff]]), calls [[prepare_return]], and jumps to [[userret]]
+      through a pointer. Its frame is never popped: once `sret` happens, the next trap starts
+      again from `kernel_sp`, the top, and writes over it.
+
+      Now count the child's three places at the moment it reaches user mode:
+
+      - trapframe: the parent's user registers, `a0 = 0`, fresh kernel fields;
+      - kernel stack: empty (as for any process in user mode);
+      - `p->context`: the forged values, never used again; the next `swtch` overwrites them.
+
+      The child's user `s` registers come only from the trapframe, through `userret`'s loads.
+      That is the path that makes those loads necessary.
+
+  - title: "exec: the user half is replaced, the kernel half is not"
+    file: kernel/exec.c
+    lines: 126-140
+    focus: 132-138
+    state:
+      hart: 1
+      mode: S
+      proc: sh child becoming usertests (pid 3)
+      intr: on
+      satp: kernel
+      locks: []
+      irq: 0
+      stack: [usertrap, syscall, sys_exec, kexec]
+      sp: {"on": kernel, detail: "KSTACK(2), kexec's frame alone is 544 bytes"}
+    note: |
+      [[kexec]] runs on the process's kernel stack (the 1920-byte dump above came from inside
+      it) and builds a **new page table** with a new user stack, while the old ones stay
+      intact for a possible failure ([[tour:22]]). At the commit point:
+
+      | Place | What `exec` does |
+      |---|---|
+      | user memory and user stack | replaced: new page table installed, old one freed at line 138 |
+      | trapframe | same page; `epc` = the ELF entry, `sp` = the new stack; `a1` = `argv` (line 124); the other 28 registers left as they were |
+      | kernel stack | the same page, still holding `kexec`'s own frames |
+      | `p->context` | untouched |
+
+      The return value, `argc`, reaches `a0` through [[syscall]] like any result. The new
+      program starts with whatever `s` and `t` registers the old one had, a reason `exec`'d
+      programs must not assume registers start at zero.
+
+  - title: "exit: a zombie keeps its stack and its context"
+    file: kernel/proc.c
+    lines: 347-365
+    focus: 362-363
+    state:
+      hart: 1
+      mode: S
+      proc: usertests child (pid 5)
+      intr: off
+      satp: kernel
+      locks: ["pid 5's p->lock"]
+      irq: {noff: 1, intena: 0, note: "`kexit` took `wait_lock` (noff 1, intena 0: it came from a timer trap), then its own `p->lock` (noff 2), and released `wait_lock` at line 360, leaving the 1 that `sched` demands"}
+      stack: [usertrap, kexit]
+      sp: {"on": kernel, detail: "KSTACK(4), 128 bytes used"}
+    note: |
+      Pid 5 was killed. At its next timer trap, [[usertrap]] saw `killed` and called
+      [[kexit]] directly, on pid 5's kernel stack. `kexit` marked it `ZOMBIE` and called
+      [[sched]], which never returns. gdb, afterwards:
+
+      ```text
+      proc[4] pid 5 ZOMBIE   context: ra=0x80001e9c sp=0x3fffff5f80 s4=0xffffffffffffffff
+      frames: usertrap → kexit → sched       (128 bytes)
+      ```
+
+      `s4 = -1` is `kexit`'s `status` argument, kept in a callee-saved register and saved by
+      `swtch` into a context that nobody will ever load. (Pid 4, which exited normally, left
+      `usertrap → syscall → sys_exit → kexit → sched`, 192 bytes.)
+
+      `kexit` holds two spinlocks for a moment, `wait_lock` and its own `p->lock`, and
+      releases `wait_lock` (line 360) before calling `sched`, which would panic with
+      "sched locks" at `noff` 2 ([[concept:locks#unusual]]).
+
+      The zombie cannot free its own kernel stack: it is standing on it until `swtch`
+      finishes, and it still holds `p->lock`. Its hart's scheduler releases that lock only
+      after `sp` has left this page. Its trapframe and user memory remain too, until the
+      parent collects it.
+
+  - title: "wait: the parent frees two places of three"
+    file: kernel/proc.c
+    lines: 152-171
+    focus: 158-170
+    state:
+      hart: any
+      mode: S
+      proc: usertests (pid 4)
+      intr: off
+      satp: kernel
+      locks: [wait_lock, "pid 5's p->lock"]
+      irq: {noff: 2, intena: 1, note: "`wait_lock` and the child's `p->lock`, taken inside `wait` with SIE on; `kfree` on line 159 adds `kmem.lock` for a moment: noff 3, the deepest nesting measured ([[concept:locks#nesting]])"}
+      stack: [usertrap, syscall, sys_wait, kwait, freeproc]
+      sp: {"on": kernel, detail: "the parent's KSTACK(3)"}
+    note: |
+      The parent's [[kwait]] finds the zombie under `wait_lock` and the child's `p->lock`, and
+      calls [[freeproc]]:
+
+      | Place | Fate |
+      |---|---|
+      | trapframe page | `kfree` (line 159) |
+      | user page table, user memory, user stack | [[proc_freepagetable]] (line 162) |
+      | kernel stack | **not freed**: it belongs to slot 4, mapped since boot |
+      | `p->context` | **not cleared**: still says `sp = 0x3fffff5f80`, until the next [[allocproc]] overwrites it |
+
+      Then `state = UNUSED`, and slot 4, with its kernel stack, is free for the next
+      process. When the next `fork` lands in `proc[4]`, its forged context will start at the
+      top of the same page, and the zombie's old frames will be overwritten as the new
+      process's call chains grow down over them.
+
+      This is why a design where each process owned a freshly allocated kernel stack would
+      need extra care: something other than the dying process would have to free it, after
+      the last `swtch` off it. xv6 avoids the question by tying stacks to slots.
+    others: |
+      Who could race the parent here? The zombie's own hart has finished with it (it released
+      `p->lock` only after `swtch`). Other schedulers skip `ZOMBIE` and `UNUSED`. Another
+      [[kwait]] in a sibling cannot see this child, because `p->parent` is read under
+      `wait_lock`. And [[allocproc]] on another hart cannot claim slot 4 until it sees
+      `UNUSED` under the same `p->lock` that `kwait` holds now.
+
+  - title: The ledger of a suspended process
+    file: kernel/proc.h
+    lines: 81-104
+    focus: 85-103
+    state:
+      hart: 2
+      mode: S
+      proc: "none (hart 2's scheduler)"
+      intr: off
+      satp: kernel
+      locks: []
+      irq: 0
+      stack: [main, scheduler]
+      sp: {"on": scheduler}
+    note: |
+      Everything that makes a process resumable, with its size in our dumps and its owner:
+
+      | Place | Holds | Size here | Allocated | Freed |
+      |---|---|---|---|---|
+      | trapframe | user `x1`–`x31`, `pc`, 4 kernel fields | 288 bytes in a 4 KiB page | [[allocproc]] | [[freeproc]] |
+      | kernel stack | the kernel's call chain, spills, at most one `kernelvec` frame per trap | 112 / 336 / 1920 bytes of 4 KiB | at boot, per slot | never |
+      | `p->context` | `ra`, `sp`, `s0`–`s11` of the kernel thread | 112 bytes | forged by [[allocproc]], saved by [[swtch]] | never cleared |
+      | page table | user memory, user stack | a few pages | `fork`, `exec` | [[freeproc]], `exec` |
+
+      And what is **not** in any of them, because it belongs to a hart: `tp`, the scheduler
+      stack, `struct cpu`, `stvec`, `stimecmp`. A process carries nothing hart-specific, which
+      is precisely what lets it resume on any hart.
+
+      The three places are not three disjoint thirds of one register file. They are the
+      saved state of **two** threads of control, the user program and its kernel thread, plus
+      the kernel thread's memory. Overlaps between them are harmless because each copy has a
+      single reader.
+locks:
+  - lock: "p->lock"
+    where: "[[yield]] / [[sleep]] → [[sched]] → released by the [[scheduler]]; [[kwait]]; [[allocproc]]"
+    protects: "The moment of suspension: no hart may load `p->context` until `swtch` has saved it and left the stack"
+  - lock: "wait_lock"
+    where: "[[kwait]], [[kexit]], [[kfork]]"
+    protects: "`p->parent`; who may free a zombie's trapframe and page table"
+  - lock: "(no lock) the trapframe"
+    where: "[[uservec]], [[usertrap]], [[prepare_return]], [[kfork]]"
+    protects: "Nothing needed: apart from its birth (the parent's `kfork`, while the child is `USED`) and its death (the parent's `freeproc`, after `ZOMBIE`), only the process's own thread touches it, and a process runs on one hart at a time"
+  - lock: "(no lock) the kernel stack"
+    where: "every kernel function"
+    protects: "Nothing needed: exactly one thread uses it, and `p->lock` covers the hand-over between harts"
+quiz:
+  - q: "A textbook table says: trapframe = user registers, kernel stack = caller-saved registers, context = callee-saved registers, \"no overlap\". Using pid 5's dump, give one register value stored in two of the places, and one register that has different values in two places."
+    a: "User `s7 = 0x9010` is in both the trapframe and `p->context` (also `s4`–`s11`; `s3` matches only by coincidence, since `sched` reuses it for `intena`). User `s2 = 0x8430` is in the trapframe and in `usertrap`'s frame on the kernel stack. `s2` itself has different values in the trapframe (`0x8430`, the user's) and the context (`0x8000f9a0`, the kernel thread's)."
+  - q: "Why is it safe that the same register has two different saved values?"
+    a: "Each copy has exactly one reader. `swtch` reads only `p->context` (the kernel thread's value), epilogues read only their own spills, and `userret` reads only the trapframe (the user's value). The two copies describe two different threads of control and are never compared."
+  - q: "Explain why `userret`'s loads of `s0`–`s11` usually write back values the registers already hold, and name the case where they are essential."
+    a: "`usertrap` is a C function reached from `uservec`, which never touches `s` registers, so by the calling convention it returns with the user's `s` values intact. The loads matter on one path: every new process's first return, through [[forkret]] (each fork child, and `init`). `forkret` reaches `userret` from a forged kernel thread whose `s` registers are not the user's; only the copied trapframe has them."
+  - q: "Where is the `pc` at which a process was interrupted kept, (a) if it was in user mode, (b) if it was in the kernel?"
+    a: "(a) In `trapframe->epc`, copied from `sepc` by `usertrap`. (b) In `kerneltrap`'s local variable `sepc`, which in this build lives in `s2` and is spilled onto the kernel stack by the prologue of a function it calls (`sched` in our dump); `kerneltrap` writes it back to the hart's `sepc` before `sret`."
+  - q: "A child's trapframe, copied from the parent, says `kernel_sp = 0x3fffff8000`, the parent's stack. What stops the child from trapping onto its parent's kernel stack?"
+    a: "The child can only enter user mode through [[forkret]], which calls [[prepare_return]] first, and that rewrites `kernel_sp` (and the other kernel fields) for the child. A trap can only happen from user mode, so the stale value is never used."
+  - q: "After `wait` frees a zombie, its `p->context` still holds a saved `sp`. Why is that harmless, and what would make it dangerous?"
+    a: "No scheduler loads a context unless the process is `RUNNABLE`, and an `UNUSED` slot becomes runnable only after [[allocproc]] forges a fresh context. It would be dangerous if some code could set an `UNUSED` or `USED` slot `RUNNABLE` without going through `allocproc`."

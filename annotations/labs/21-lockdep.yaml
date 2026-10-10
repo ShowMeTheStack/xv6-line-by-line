@@ -1,0 +1,1884 @@
+published: true
+title: "Lockdep-lite: a runtime lock-order checker"
+area: Concurrency
+stars: 4
+branch: ext/21-lockdep
+prerequisites: {tours: [13, 18, 51, 52], concepts: [locks]}
+summary: |
+  Two harts deadlock when each holds a lock the other wants. [[tour:52]] built one on
+  purpose: a copy of the kernel whose [[kfork]] takes `wait_lock` while it still holds the new
+  child's `p->lock`. The bug froze the machine, but only under a stress test, and when it froze
+  all three harts spun with interrupts off and printed nothing. In this lab you build a
+  checker that finds that bug **at boot, on the first run, before any deadlock**, and prints
+  the two code paths that disagree.
+
+  The idea is Linux's *lockdep*, cut down to fit xv6. Every time a lock is acquired, note
+  which locks are already held: an order "this before that", an edge in a graph. A deadlock
+  needs two paths that take the same two locks in opposite orders (or a longer ring of them),
+  so the first acquisition that would close a cycle in that graph is a warning, even if the
+  two paths have never run at the same time. The checker does not wait for the unlucky timing. It needs the paths only
+  to run once each, in any order.
+
+  Every design decision is a question about xv6's locks. What *is* a class, and what does a
+  class graph get wrong? Whose locks are "held": a hart's or a process's, when `p->lock` is
+  acquired by the scheduler and released by the process on the other side of [[swtch]], and a
+  sleep-lock's holder may wake up on another hart? How can the checker protect its own graph
+  when it runs *inside* [[acquire]]? What about interrupt handlers? And what do you do when
+  the checker, on its first real run, reports cycles in code that has never deadlocked and
+  never will? This tree has three of them, all of them known (the concept page measured them),
+  and the lab handles each one honestly: by writing down, in code the checker can use, the
+  rule that makes it safe, and checking that rule at run time where possible.
+
+  The reference solution is twelve commits. With it, boot and `usertests -q` run with no
+  report while the checker examines about 27 million acquisitions, at a cost of 16 to 38
+  percent in run time (measured while the computer was busy with other work; your times
+  will differ).
+learn:
+  - "Why a deadlock between two locks needs two code paths that take them in opposite orders, and why a graph of lock *classes* can report that from one run of each path, before the deadlock ever happens."
+  - "What a class graph over-approximates: why `iput`'s inode lock under `itable.lock`, a directory and a file in it, and a log block and its home block all look like cycles to a class graph, and what knowledge of the code makes each one safe."
+  - "How can knowledge that only the code has (which instance, which role) be written into the code so that a checker can use it, and how can such an annotation fail loudly when it is wrong?"
+  - "What must \"held\" mean when `p->lock` is acquired by one thread and released by another across `swtch`, and when a sleep-lock's holder wakes up on another hart?"
+  - "How can a checker that runs inside `acquire` protect its own data, and what must it still have in common with a spinlock?"
+  - "What is the interrupt rule for locks, and does xv6 need a checker for it?"
+  - "What run-time checking costs, and which part of it is worth optimising."
+spec: |
+  **The checker.** Add `kernel/lockdep.c`, a lock-order checker that runs from boot and is
+  called by every [[acquire]], [[release]], [[acquiresleep]] and [[releasesleep]].
+
+  - Locks that play the same part must be treated alike: the 64 `p->lock`s created by one
+    loop in [[procinit]], the 50 inodes, every pipe's lock.
+  - For every acquisition the checker learns what the acquirer already holds, and keeps the
+    order "held before new" in a graph.
+  - An acquisition whose order would close a cycle in that graph is reported, whether or not
+    a deadlock happens, with both orders: where each of the two (or more)
+    locks on each path was acquired, on which hart, by which process.
+  - It also checks the interrupt rule: a lock class used inside an interrupt handler must
+    never be held with interrupts on.
+  - It must handle what this tree really does: `p->lock` acquired by the [[scheduler]] and
+    released by a process on the same hart, sleep-locks held across [[sleep]] and released on
+    another hart, and locks taken inside interrupt handlers.
+  - After a report it panics (a kernel option may let it print the report and switch itself
+    off instead).
+
+  **What must not change.** No struct that embeds a lock changes size. Every existing lock
+  rule and check stays. **Boot and `usertests -q` must run on three harts with the checker on
+  and silent, and print `ALL TESTS PASSED`.** Where the checker reports a cycle that cannot
+  deadlock, the fix is an annotation in the code that explains why, not a switch that turns
+  the checker off.
+
+  **The test program**, `lockdeptest`, uses a new system call `lockdep(int cmd, struct ldstat
+  *st)`: `lockdep(0, &st)` copies out the checker's statistics, and `lockdep(n, 0)` runs
+  kernel self-test `n` (locks of its own, acquired in a right or a wrong order) and returns how
+  many reports it caused. The program checks each count, and that the kernel's own locks have
+  caused no report:
+
+  ```text
+  $ lockdeptest
+  lockdeptest: 18 classes, 39 orders, 101086 acquisitions checked, 39 of them slowly
+  lockdeptest: test 1: A then B; later B then A
+  lockdep: acquiring test A while holding test B may deadlock
+  [... the kernel's report ...]
+  lockdeptest: test 1: 1 report(s), as expected: OK
+  [... tests 2 to 6 ...]
+  lockdeptest: checker on, no report about the kernel's locks: OK
+  lockdeptest: 7 of 7 checks OK; read the reports above to see that each names both orders
+  ```
+
+  The program counts reports; it does not check what they say. The last line says so.
+think:
+  - title: What does the checker reason about, a lock or a kind of lock?
+    q: |
+      There are 64 `p->lock`s, 30 buffer locks, 50 inode locks, and a new lock for every pipe.
+      The checker will remember "B was acquired while A was held" and look for cycles. Should
+      A and B be individual locks, or groups of locks? If groups, how would you decide which
+      lock belongs to which group, using only what xv6 already has? What would each choice
+      catch, and what would it get wrong? Commit to an answer before the hints.
+    hints:
+      - |
+        Look at the deadlock in [[tour:52]], break 6. [[kfork]] held one particular child's
+        `p->lock`; [[kexit]]'s [[wakeup]] went for that same slot. Would the same deadlock
+        need the same slot next time? And look at what [[initlock]] is given besides the lock.
+      - |
+        A deadlock needs two paths with opposite orders. If they are judged only lock by lock,
+        both paths must have touched the *same* instances. How many instances are there of
+        `p->lock`, and how many runs would that take?
+      - |
+        Groups. What does every lock already carry, from the moment it is created, that is
+        the same for all `p->lock`s and different for `wait_lock`? Then check whether that
+        ever puts locks with different roles in one group.
+    answer: |
+      **Groups, called classes.** A class is the name given to [[initlock]] or
+      [[initsleeplock]]: `proc` for all 64 `p->lock`s (one call in [[procinit]]), `inode` for all
+      50 inode sleep-locks, `pipe` for every pipe ever created. The reference keeps the class
+      number in the lock itself, in the four bytes of padding after `locked`, so no struct
+      changes size.
+
+      Classes are what make the checker useful. The kfork bug is "some `p->lock`, then
+      `wait_lock`" against "`wait_lock`, then some `p->lock`". With classes, one fork and one
+      `wait` are enough to see both orders, whichever slots they used. Lock by lock, the checker
+      would need both paths to touch the same slot, and would also need a graph node for each of
+      156 spinlocks and 81 sleep-locks at boot, plus one for every pipe. Clinic 2 tried it: the
+      class table overflowed in [[procinit]].
+
+      The price is **over-approximation**. A class graph says "inode before inode" when
+      [[create]] locks a directory and then a file in it; it cannot see that the two are always
+      a parent and its child. It says "itable before inode" for [[iput]] and "inode before
+      itable" for [[namex]], and cannot see that `iput` only does this when no one else holds a
+      reference. Lock order is a property of instances; class graphs see less and report more.
+      Most of this lab is about what to do with those reports.
+
+      One more thing to notice: every sleep-lock's inner spinlock is created by the *same*
+      `initlock(&lk->lk, "sleep lock")` call inside `initsleeplock`, so buffers, inodes and the
+      UART's `tx_lock` share one inner class, `sleep lock`. Linux has the same issue with locks
+      initialised inside a helper, and fixes it by passing a class key in from the caller. In
+      this tree it causes no false report, so the reference leaves it.
+    checks:
+      - id: lab21-01
+        level: 1
+        type: choice
+        q: |
+          The reference checker groups locks by the name passed to [[initlock]]. Which pair of
+          acquisitions would it treat as the *same* edge "proc before wait_lock"?
+        options:
+          - text: "kfork holding proc[8].lock takes wait_lock; another kfork holding proc[3].lock takes wait_lock."
+            correct: true
+            why: |
+              Both `p->lock`s were created by the same `initlock(&p->lock, "proc")` call in
+              [[procinit]], so they are one class; one edge covers every slot.
+          - text: "None: each slot's lock is a separate node, so these are two different edges."
+            why: |
+              You may have pictured a graph of lock instances. That graph would need both
+              paths to collide on the same slot before it could see the cycle; classes do not.
+          - text: "Only if both forks ran on the same hart."
+            why: |
+              You may have mixed up classes with the per-hart list of held locks. Edges are
+              global: an order seen on hart 0 and its reverse seen on hart 2 still close a cycle.
+          - text: "Only if both forks were made by the same process."
+            why: |
+              You may have thought the graph is per process. It is one graph for the whole
+              kernel; that is how it can relate code that ran at different times.
+        explain: |
+          A class is the set of locks that play the same part in the code. Learning orders per
+          class turns "these two slots happened to collide" into "these two code paths disagree",
+          which one run can show. See [[concept:locks#order]].
+      - id: lab21-02
+        level: 2
+        type: tf
+        q: |
+          True or false: a graph of lock classes can report a cycle that can never deadlock.
+        answer: true
+        why_tf: |
+          You may have thought every class cycle is a real bug. The class graph forgets which
+          instance was locked, and some code is safe only because of which instance it locks.
+        reasons:
+          - text: "True: iput takes an inode lock under itable.lock only when no one else can hold that inode, but the graph sees only 'itable before inode'."
+            correct: true
+            why: That is the over-approximation this tree really has, and the one the concept page measured.
+          - text: "True: the graph is updated without a lock, so it can contain edges that never happened."
+            why: |
+              You may have thought the fast path is unsafe. Edges are added only under the
+              checker's lock; the lock-free part only *reads* bits that are never cleared.
+          - text: "False: a cycle among classes always contains a cycle among instances."
+            why: |
+              You may have reasoned that classes just merge nodes. Merging nodes merges edges from
+              different instances into one path, which can form a ring no instances ever form.
+          - text: "False: the checker only records orders that happened, so any cycle it finds has happened."
+            why: |
+              You may have thought a cycle means a deadlock occurred. Each edge happened, but at
+              different times and on different instances; the ring as a whole may be impossible.
+        explain: |
+          Class graphs over-approximate. A report is a question ("can these two paths really
+          meet?") that only the code can answer. See [[concept:locks#order]] and [[tour:51]].
+  - title: Whose locks are "held"?
+    q: |
+      When a lock is acquired, the checker must know what is already held, to record the
+      edges. Is that a property of a hart, of a process, or of a thread? Think about two cases
+      before you answer: the [[scheduler]] acquires a process's `p->lock` and switches to it,
+      and the process releases it; and a process holding a buffer's sleep-lock sleeps in
+      [[virtio_disk_rw]] and later wakes up on another hart. What must your bookkeeping do in
+      each case?
+    hints:
+      - |
+        Read [[concept:locks#handoff]] and [[holding]]: who does xv6 itself think holds a
+        spinlock? Then read [[holdingsleep]]: who holds a sleep-lock?
+      - |
+        A spinlock is never held across a switch except `p->lock`, and that one stays on the
+        same hart ([[sched]] checks noff 1). A sleep-lock is held across sleeps.
+      - |
+        Two lists: one kind per hart, one kind per process. Releasing must not assume that the
+        lock being released is the last one pushed.
+    answer: |
+      **Spinlocks per hart, sleep-locks per process**, exactly as xv6 itself counts them:
+      [[holding]] compares `lk->cpu` with this hart, [[holdingsleep]] compares the pid.
+
+      - A spinlock list per hart handles the handoff for free. The scheduler's acquire pushes
+        `p->lock` on the hart's list; after [[swtch]] the process, on the same hart, releases it
+        and the release finds it there. The release must **search** the list rather than pop
+        the top, because releases are not always in reverse order ([[kexit]] releases
+        `wait_lock` while it still holds its own `p->lock`).
+      - Sleep-locks are listed per process (per `proc[]` slot): a process sleeps holding a
+        buffer and may resume on another hart, and only that process ever changes its list.
+      - An acquisition is ordered after both: every spinlock on this hart's list and every
+        sleep-lock of the running process (if there is one).
+
+      A list per *thread* for spinlocks, which is what Linux keeps, breaks on the handoff: the
+      scheduler's acquire goes to one list and the process's release looks in another. Linux
+      handles its runqueue lock, which crosses the switch the same way, with explicit
+      annotations that hand the lock over. Clinic 3 shows what happens without them: a panic at
+      the very first [[forkret]].
+    checks:
+      - id: lab21-03
+        level: 2
+        type: state
+        q: |
+          The reference checker, at the moment [[forkret]] (its line 520) is about to release
+          `p->lock` for the first process. gdb recorded this on hart 2. Fill in that hart's
+          state.
+        state: {mode: S, stack: kernel, sie: "off", noff: "1", intena: "0"}
+        why:
+          mode: You may have thought forkret runs in user mode because it leads to user space. It is kernel code, entered by swtch.
+          stack: You may have thought the scheduler's stack is still in use. swtch loaded the process's context, so sp is on its kernel stack.
+          sie: You may have thought interrupts are on in a new process. The scheduler acquired p->lock with them off, and they stay off until this release's pop_off decides.
+          noff: You may have thought the lock does not count for the process. noff is per hart, and the scheduler's acquire is still counted until this release.
+          intena: You may have thought intena is 1 here. The scheduler acquired the lock with interrupts off (intena 0), so this release leaves them off.
+        why_wrong: |
+          The process is running on the lock the scheduler took for it: noff 1, intena 0, and
+          the hart's checker list holds one entry, pushed from inside [[scheduler]].
+        explain: |
+          gdb read `cpus[2].noff = 1`, `intena = 0`, and the hart's single list entry with its
+          first return address at `scheduler + 98`. The process releases a lock it never
+          acquired, and the per-hart list handles it. See [[concept:locks#handoff]].
+  - title: When does the checker run, and what must it cost?
+    q: |
+      [[acquire]] is called tens of millions of times in `usertests`. Where in `acquire` should
+      the checker look at the order: before the spin, or once the lock is held? And what must
+      the common case cost, given that almost every order it will ever see, it has seen before?
+    hints:
+      - |
+        The point of the checker is to speak before a deadlock. Where does a deadlocked hart
+        stop executing?
+      - |
+        The set of orders is small and only grows: it never forgets one. What is the cheapest
+        way to ask "have I seen A before B?" without taking any lock?
+      - |
+        Where does a deadlocked hart still execute code, and where does it never arrive? For
+        the cost: a "yes or no" that only ever changes from no to yes can be read without a
+        lock; how small can the table of such answers be, with at most 64 groups?
+    answer: |
+      **Before the spin.** A hart that deadlocks stops inside the spin loop, so a checker
+      called after it would never run. The reference calls `lockdep_acquire()` right after the
+      [[holding]] check, before the `amoswap` loop; [[acquiresleep]] calls the checker before it
+      can sleep. The lock is pushed on the held list at that point too, as Linux does.
+
+      **The common case is one load.** With at most 64 classes, the edges fit in one 64-bit
+      word per class: bit `b` of `after[a]` means "a before b". Bits are only ever set, so a
+      set bit read without any lock is still true, and the acquisition goes on. Only a clear
+      bit takes the checker's lock, checks again, looks for a cycle, and sets the bit. In our
+      `usertests -q` runs the checker examined 25.7 to 28.9 million acquisitions and took its
+      lock 46 times: once for each order it learned.
+
+      About three quarters of acquisitions happen with something already held (in a run of a
+      copy of the kernel with counters added, 21.5 million of 28.1 million, making 42 million calls to `order()`;
+      a copy that took the lock on every call took it 39.7 to 42.0 million times), and nearly
+      all of those calls find their bit set. What every acquisition also pays is the bookkeeping: a
+      return-address trace (five frames, found by following the frame pointers, as a
+      backtrace does) and a push on the held list. Measure shows how much that is.
+    checks:
+      - id: lab21-04
+        level: 2
+        type: choice
+        q: |
+          A learner calls the checker at the end of [[acquire]], after the spin loop and after
+          `lk->cpu = mycpu()`. Now inject the kfork bug from [[tour:52]] and run a stress test
+          until the two harts collide. What does the learner's checker print at that moment?
+        options:
+          - text: "Nothing: both harts are spinning in acquire and never reach the check."
+            correct: true
+            why: |
+              The deadlocked acquisitions never complete, so the code after the loop never runs.
+              (It may still have reported the cycle earlier, from acquisitions that did not
+              collide; but in the collision itself it is silent.)
+          - text: "A report with both chains, just before the freeze."
+            why: |
+              You may have thought the check runs on every call. It runs only when the loop
+              exits, and in a deadlock it does not.
+          - text: "panic: acquire, because the checker notices the lock is held."
+            why: |
+              You may have confused this with the holding() check, which only fires for a lock
+              the same hart already holds.
+          - text: "A report from the third hart, which is not deadlocked."
+            why: |
+              You may have hoped another hart would notice. The checker only examines the
+              acquisitions its own hart makes, and the third hart soon spins on the same locks.
+        explain: |
+          Check before waiting. Then the first time the two orders ever both appear, in any run,
+          the checker reports it, whether or not the timing was unlucky. The verify section shows
+          the reference catching this bug at boot.
+      - id: lab21-05
+        level: 2
+        type: number
+        q: |
+          In one of our runs of `usertests -q` with the reference checker, `lockdeptest` (run
+          right after it) reported `19 classes, 46 orders, 27161729 acquisitions checked, N of
+          them slowly`. What was N? (The slow path is the one that takes the checker's lock.)
+        answer: 46
+        wrong:
+          27161729: |
+            You may have thought every acquisition takes the checker's lock. Only an order not
+            yet known does; known orders are a set bit, read without a lock.
+          0: |
+            You may have thought the slow path is only for reports. Every new order takes it
+            once, to set its bit and to look for a cycle first.
+          19: |
+            You may have counted classes. The slow path runs once per new order (edge), not once
+            per class.
+        why_wrong: |
+          The slow path runs when an order is not yet known: once per edge learned, if no two
+          harts race for the same new edge.
+        explain: |
+          46 orders, 46 slow paths, in each of our nine runs. Everything else was a bit test or
+          nothing at all. See Measure for what the remaining bookkeeping costs.
+  - title: How does the checker protect its own graph?
+    q: |
+      The class table and the edge bitmaps are shared by all three harts, and pipes create
+      classes at any time. They need a lock. Can it be a `struct spinlock` taken with
+      [[acquire]]? If not, what exactly goes wrong, and what must the replacement still do
+      that `acquire` does?
+    hints:
+      - |
+        Follow a call: `acquire(&pid_lock)` while holding a `p->lock`. The checker needs its
+        lock to add the edge. Which function does it call to take that lock, and what does
+        that function call first?
+      - |
+        And the report: it calls [[printk]], which acquires `pr.lock`. Where is the checker at
+        that moment, and what does it hold?
+      - |
+        Something with the spinlock's atomic swap but without the call into the checker; and
+        ask which of the spinlock's other duties (interrupts, the owner check) it still needs.
+        Then ask how the report can print without recursing.
+    answer: |
+      **Not a spinlock.** `acquire(&lock)` calls the checker, which needs its lock, which calls
+      `acquire`, which calls the checker... The checker runs before the spin, so the inner
+      acquisition is never even attempted: the recursion goes on until the stack runs out.
+      Clinic 1 did exactly this. The first nested acquisition at boot (`pid_lock` under a
+      `p->lock` in [[userinit]]) recursed through 40 frames to the bottom of hart 0's boot stack,
+      went on past it, and the machine died without a message.
+
+      The reference uses `ldlock`, a word taken with `__atomic_exchange_n` and released with an
+      `__ATOMIC_RELEASE` store: the same two instructions as a spinlock, minus the checker,
+      [[push_off]] and [[holding]]. It must still be held with **interrupts off**: if an
+      interrupt arrived while this hart held it, and the handler acquired any lock, the
+      handler's checker would spin on `ldlock` forever, on the hart that holds it. Inside
+      `acquire` interrupts are already off; the sleep-lock hooks and the class registration call
+      [[push_off]] first (clinic 5 leaves that out of one hook).
+
+      The report has the same problem one level up: it calls [[printk]], which calls `acquire(&pr.lock)`,
+      while the checker holds `ldlock`. A per-hart `busy` flag makes the checker ignore every
+      acquisition on this hart while it prints. Linux's lockdep has the same guard
+      (`lockdep_recursion`). Clinic 4 removed it: the checker found its cycle and the machine
+      froze without printing a word.
+    checks:
+      - id: lab21-06
+        level: 2
+        type: choice
+        q: |
+          Why must `ldlock` be taken with interrupts off, even though it is not a `struct
+          spinlock`?
+        options:
+          - text: "An interrupt handler on this hart would call the checker for its own locks and spin on ldlock, which this hart holds."
+            correct: true
+            why: |
+              Every handler acquires locks (`tickslock`, `p->lock`s in [[wakeup]]), and every
+              acquisition can need `ldlock`. The same reason makes `acquire` turn them off.
+          - text: "Because amoswap only works with interrupts off."
+            why: |
+              You may have thought the atomic swap needs it. An AMO is atomic regardless of
+              interrupts; interrupts matter for who else can run on this hart.
+          - text: "To keep other harts out while the graph changes."
+            why: |
+              You may have mixed up the two jobs. The swap keeps other harts out; turning off
+              interrupts keeps this hart's own handlers out.
+          - text: "It need not be: the checker is only called with interrupts off anyway."
+            why: |
+              You may have thought only [[acquire]] calls it. [[acquiresleep]] runs with
+              interrupts on and calls the checker, so the hook turns them off itself.
+        explain: |
+          The rule "interrupts off while holding a lock that a handler may want" applies to
+          every lock, including the checker's own. See [[concept:locks#invariant]].
+  - title: What is a cycle, and when do you look for one?
+    q: |
+      A new edge `a -> b` has just appeared. How do you decide whether it closes a cycle, and
+      how much work may that take? And when the answer is yes, what should the report contain
+      so that a person can act on it? What about `a -> a`, a lock acquired while another lock
+      of the same class is held?
+    hints:
+      - |
+        A cycle through the new edge exists exactly when `b` can already reach `a`.
+      - |
+        The graph has at most 64 nodes, and new edges are rare (dozens per boot). Keep enough
+        about each edge to explain it later.
+      - |
+        A depth-first search from `b`, run only for a new edge, remembering how it reached each
+        class. `a -> a` is a cycle of length one.
+    answer: |
+      **Search only when an edge is new.** `a -> b` closes a cycle exactly when `b` already
+      reaches `a`. The reference runs a depth-first search from `b` over the bitmaps (at most 64
+      nodes), keeping in `prev[]` the class it came from, so that the path can be printed. It
+      runs once per new edge, under `ldlock`, so its cost does not matter.
+
+      **The report names both orders.** First the acquisition that would close the cycle:
+      hart, process, the class held and where it was acquired, the class wanted and where.
+      Then every edge of the existing path from `b` back to `a`, each with the hart, process
+      and return addresses saved when that edge was first seen. "Where" is five return
+      addresses found by walking the frame pointers up the stack, which you turn into function
+      names and lines with `${TOOLPREFIX}addr2line -f -i -e kernel/kernel`. The new edge is not added.
+      `TOOLPREFIX` is your RISC-V toolchain's prefix, the same one xv6's Makefile detects
+      (`riscv64-unknown-elf-`, `riscv64-linux-gnu-` or `riscv64-elf-`); set it with
+      `export TOOLPREFIX=riscv64-unknown-elf-` or whichever you have. On Debian/Ubuntu/WSL,
+      `gdb-multiarch` also works as the debugger.
+
+      **`a -> a` is a cycle of length one**: two locks of one class nested. Two harts doing
+      that to two inodes in opposite orders would deadlock, and the class graph cannot tell
+      which order is which, so it must report it. This is what the reference's first run with
+      sleep-locks reported, for a directory and a file in it ([[create]]).
+
+      **After a report**: Linux's lockdep prints and then turns itself off (once the graph has
+      a cycle, later reports are mostly echoes). The reference does that while xv6 still has
+      false reports, and panics once they are fixed (`LOCKDEP_PANIC` in `param.h`), so that a
+      new report stops the machine where gdb can look.
+    checks:
+      - id: lab21-07
+        level: 2
+        type: order
+        q: |
+          Put in order what the reference does in `order()` when a hart that holds `wait_lock`
+          acquires a `p->lock`, and the edge `wait_lock -> proc` is not known yet.
+        items:
+          - "load after[wait_lock] without a lock; the proc bit is clear"
+          - "take ldlock"
+          - "check the bit again under ldlock"
+          - "search from proc for a path back to wait_lock"
+          - "no path: record the edge with both traces and set the bit"
+          - "release ldlock"
+        why_wrong: |
+          You may have put the search before taking the lock, or recorded the edge before
+          searching. The bit is read twice (once cheaply, once under the lock), and the edge is
+          added only after the search found no cycle.
+        explain: |
+          Another hart may have added the same edge between the first load and taking the lock;
+          the second check covers that. Adding the edge before searching would make every new
+          edge look like part of a cycle with itself.
+  - title: What do interrupt handlers change?
+    q: |
+      A disk interrupt arrives on hart 0 while process 7 is in the kernel holding an inode's
+      sleep-lock. [[virtio_disk_intr]] takes `disk.vdisk_lock` and wakes a process (taking
+      `p->lock`s). Should the checker record "inode before virtio_disk"? And Linux's lockdep
+      checks a second rule: a lock taken in an interrupt handler must never be held with
+      interrupts on. Why is that rule needed, can xv6 break it, and where would you check it?
+    hints:
+      - |
+        Is the handler acting for process 7? Would process 7 ever wait for `vdisk_lock` because
+        of that inode? And when a handler runs on a hart, how many spinlocks does that hart
+        hold? Read [[concept:locks#invariant]].
+      - |
+        The second rule fails like this: code holds lock L with interrupts on; a handler on the
+        same hart wants L. Which instruction in [[acquire]] prevents that for every spinlock?
+      - |
+        Count handler depth per hart. Inside a handler, only the hart's spinlocks are held.
+        Record, per class, "used in a handler" and "held with interrupts on".
+    answer: |
+      **The process's sleep-locks are left out inside a handler.** The order "inode, then
+      `vdisk_lock`" is real in a sense: process 7 cannot let go of its inode until the handler
+      returns, and the handler may wait for `vdisk_lock`. But it can never be part of a cycle.
+      A handler only ever waits for spinlocks, and a spinlock holder can never wait for a
+      sleep-lock: it would have to sleep holding a spinlock, and [[sched]] panics `sched locks`
+      (noff above 1). So no chain of waits that starts in the handler can come back to process
+      7's sleep-locks; and a sleep-lock taken *in* a handler is caught by the interrupt rule
+      below. Recording such edges would add nothing (the same orders are learned from process
+      context anyway: Ctrl-P shows `inode -> ... virtio_disk`). The reference brackets every handler in [[devintr]] with
+      `lockdep_irq_enter()`/`lockdep_irq_exit()`, and inside a handler only the hart's own
+      spinlocks count. That list is empty when the handler starts: an interrupt is taken only at
+      noff 0 ([[concept:locks#invariant]]). gdb caught exactly this case: hart 0 interrupted
+      `init` while it held an inode's lock, and [[clockintr]] acquired
+      `tickslock` with `inirq[0] = 1` and an empty list.
+
+      **The interrupt rule.** If code held lock L with interrupts on and a handler on the same
+      hart wanted L, the handler would spin forever on a lock whose holder cannot run until
+      the handler returns. Linux allows spinlocks with interrupts on (`spin_lock` versus
+      `spin_lock_irqsave`), so its lockdep records, per class, "taken in a handler" and "held
+      with interrupts on", and reports a class that is both. In xv6 **[[acquire]] turns
+      interrupts off before anything else** ([[push_off]], [[kernel/spinlock.c:24]]), and
+      [[pop_off]] and [[sched]] panic if they find interrupts on while a lock is held, so no
+      spinlock is ever held with interrupts on. The rule is satisfied by construction.
+
+      The reference still records both uses, because one kind of lock *is* held with
+      interrupts on: a sleep-lock. Taking one in a handler would be the bug (and would try to
+      sleep in a handler). To see the check work on spinlocks, we called the checker *before*
+      `push_off` in a scratch copy: the first boot reported `proc is taken in interrupt
+      handlers and held with interrupts on`, from [[wakeup]] in [[clockintr]] and from
+      [[killed]] in [[usertrap]] (which runs after `intr_on`).
+    checks:
+      - id: lab21-08
+        level: 2
+        type: tf
+        q: |
+          True or false: in the reference kernel (unmodified), the interrupt-rule check can fire
+          for a spinlock class.
+        answer: false
+        why_tf: |
+          You may have thought some xv6 path holds a spinlock with interrupts on. None does:
+          acquire disables them first, and pop_off and sched panic if they come back on.
+        reasons:
+          - text: "False: acquire calls push_off, which clears SIE, before the checker runs, so the checker never sees a spinlock acquired with interrupts on."
+            correct: true
+            why: That is why the `intr_get()` test in `lockdep_acquire` is commented "never". It fired only in the copy that called the checker before push_off.
+          - text: "False: the checker skips interrupt handlers entirely."
+            why: |
+              You may have thought handlers are invisible to it. The checker sees every
+              acquisition in a handler and marks the class "used in a handler"; it only leaves
+              out the interrupted process's sleep-locks.
+          - text: "True: tickslock is taken both in clockintr and in sys_uptime, which runs with interrupts on."
+            why: |
+              You may have looked at where the caller runs. `sys_uptime` runs with interrupts
+              on, but its `acquire` turns them off before the lock is taken.
+          - text: "True: every p->lock is taken in wakeup from handlers and in system calls."
+            why: |
+              You may have thought "in system calls" means "with interrupts on". The lock is
+              always taken after push_off, so it is never held with interrupts on.
+        explain: |
+          The Linux rule exists because Linux lets a spinlock be held with interrupts on. xv6
+          does not, so for spinlocks the rule holds by construction; only sleep-locks remain to
+          check. See [[concept:locks#handlers]].
+  - title: The first real run reports cycles that are not bugs. Now what?
+    q: |
+      With sleep-locks tracked, the checker's first boot reports "inode while holding inode"
+      ([[create]] locks a directory, then the file it is creating). Fix that, and the next run
+      reports "buffer while holding buffer" ([[write_log]]). Fix that, and `rm` of any file
+      reports "inode while holding itable" ([[iput]]) against "itable while holding inode"
+      ([[namex]]). None of these has ever deadlocked. What do you change? (Deleting the check,
+      or ignoring a class, is not an answer.)
+    hints:
+      - |
+        For each report, find the rule that makes it safe. [[concept:locks#order]] states two of
+        them. For iput, read the comment on [[kernel/fs.c:361]] and ask: can that
+        `acquiresleep` ever wait?
+      - |
+        A lock acquisition that can never wait can never be one of the waits in a deadlock. And
+        "a directory before a file in it" is an order between two *roles* of one class.
+      - |
+        Give a nested acquisition a role that becomes a class of its own (Linux calls it a
+        subclass), and give acquisitions that cannot wait a trylock that records no order but
+        checks that it really did not have to wait.
+    answer: |
+      **Write the rule into the code, in a form the checker can use.**
+
+      - **Nesting within one class: subclasses.** `acquiresleep_nested(lk, sub)` and
+        `ilock_nested(ip, sub)` take a role; the checker gives each role a class of its own
+        (`inode/1`). [[create]] and [[sys_unlink]] lock the file as `SUB_CHILD`, so the graph learns
+        `inode -> inode/1`, an order it can check. Code that locked a file and then a directory
+        would close a cycle (`inode/1 -> inode`) or nest `inode` in `inode` again: both are
+        reported (verify). Buffers nest in fixed ways too (an indirect block, then a bitmap
+        block or a new block; a log block, then its home copy), so five reads become
+        `bread_nested(..., SUB_INNER)`. This is Linux's `mutex_lock_nested(&inode->i_mutex,
+        I_MUTEX_CHILD)`.
+      - **Acquisitions that cannot wait: trylocks.** [[iput]] takes the inode's lock only when
+        `ip->ref == 1`: nobody else references the inode, so nobody can hold its lock or be
+        inside `acquiresleep`/`releasesleep` on it. That acquisition never waits. A lock never
+        waited for cannot be part of a deadlock, so the checker records no order for a trylock
+        (Linux does the same) but still adds it to the held list, so what is taken *under* it is
+        checked. The reference adds `tryacquire()` and `tryacquiresleep()`, and `iput` panics if
+        the try ever fails. The original kernel already could not wait there silently (an
+        `acquiresleep` that slept with `itable.lock` held would panic `sched locks`); what the
+        trylock adds is that the *checker* can see this acquisition never waits, and a panic
+        that names the broken assumption.
+
+      Each annotation is a claim. A wrong one hides a real bug: had [[create]] been annotated
+      the other way round, the checker would learn a wrong order and stay silent. That is why
+      the reference keeps them few, puts the reason next to each, and makes the iput claim fail
+      loudly if it is ever wrong. With these three changes, boot and `usertests -q` run without a report.
+    checks:
+      - id: lab21-09
+        level: 3
+        type: choice
+        q: |
+          Why is a trylock that records no order a *correct* way to silence the [[iput]] report,
+          and not merely a convenient one?
+        options:
+          - text: "A deadlock is a ring of harts each waiting; an acquisition that never waits cannot be one of the waits, and iput's try panics if it would have to."
+            correct: true
+            why: |
+              The ring needs every member to be waiting for the next. Remove the possibility of
+              waiting at one edge and that edge cannot be in any ring. The panic names the
+              assumption if it is ever broken.
+          - text: "Because iput runs rarely, so a deadlock there is unlikely."
+            why: |
+              You may be thinking in probabilities. A checker exists precisely because rare
+              paths deadlock too; the argument must be that it cannot happen at all.
+          - text: "Because itable.lock is a spinlock and the inode lock is a sleep-lock, so they cannot deadlock."
+            why: |
+              You may have thought mixing kinds is safe. A spinlock holder waiting for a
+              sleep-lock can deadlock just as well (and would also panic in sched).
+          - text: "Because a trylock is faster."
+            why: |
+              You may be thinking of performance. Speed has nothing to do with whether the order
+              can close a cycle.
+        explain: |
+          Annotations are only as good as the reasoning behind them; this one fails loudly if
+          the reasoning is ever wrong. See [[concept:locks#unusual]].
+      - id: lab21-10
+        level: 2
+        type: match
+        q: |
+          Match each report from the reference's development runs with what made it safe.
+        pairs:
+          - left: "inode while holding inode (create)"
+            right: a directory is always locked before a file in it
+            why: |
+              You may have thought this needs a trylock. The second lock can wait (another
+              process may hold the file); what makes it safe is the fixed parent-then-child order.
+          - left: "buffer while holding buffer (write_log)"
+            right: a log block is always locked before the home copy of a block
+            why: |
+              You may have thought buffers are never nested. The log holds its own block while
+              reading the home copy; the roles are fixed, so no reverse order exists.
+          - left: "inode while holding itable (iput)"
+            right: the inode's last reference means its lock is free
+            why: |
+              You may have thought this is a parent-child nesting. It is a different class pair,
+              safe only because ref == 1 rules out every other holder.
+        explain: |
+          Two rules about roles and one about instances: subclasses express the first two, a
+          checked trylock the third. See [[concept:locks#order]].
+build: |
+  **Start from the frozen commit**, in your own clone of xv6:
+
+  ```text
+  git checkout -b my-lockdep 06aad25
+  ```
+
+  **Milestones**, each one booting:
+
+  1. **Classes.** A class table in a new `kernel/lockdep.c` (add `$K/lockdep.o` to `OBJS`),
+     a `cls` field in `struct spinlock` and `struct sleeplock` (in the padding after
+     `locked`: check with `sizeof` that nothing grew), set by [[initlock]] and
+     [[initsleeplock]]. Its lock is a bare word with an atomic swap, taken with interrupts
+     off.
+  2. **Held lists.** Hook [[acquire]] (after the `holding` check, before the spin) and
+     [[release]]. Per-hart lists; release searches. Run `usertests -q`: if the handoff is
+     wrong you will know at the first [[forkret]].
+  3. **Edges.** A bitmap per class; Ctrl-P prints them (from [[procdump]]). Compare what you
+     see after `ls` with [[tour:51]]'s graph.
+  4. **Cycles and reports.** Search on new edges only, print both orders, turn off after one
+     report. Run `echo hi > x` then `rm x`: you should get your first report (the iput one,
+     already visible with spinlocks alone).
+  5. **Sleep-locks**, per process, then **interrupt handlers**.
+  6. **Annotations**, one report at a time, until boot and `usertests -q` are silent.
+  7. **Panic on a report**, the system call, the self-tests and `lockdeptest`.
+
+  **Reading a report.** It prints return addresses. On the host, in your xv6 directory:
+
+  ```text
+  ${TOOLPREFIX}addr2line -f -i -e kernel/kernel 0x80003d66
+  ```
+
+  A return address points just after the call, so decoding it as is can print a line well
+  after the call (in one report, five lines later). Subtract 2 to land inside the call
+  instruction: `addr2line ... 0x80003d64`. `-i` also shows functions that were inlined there.
+
+  **Debugging** (QEMU with `-smp 3`, and gdb). Break on [[panic]] and look at the
+  checker's state: `p nheld`, `p held[$tp]`, `p cls[3]`, `p/x after`. `$tp` is the hart number
+  in the kernel. A conditional breakpoint on a hot function (`lockdep_acquire`) slows QEMU a
+  lot; put it on something rarer (`newedge`, `lockdep_irq_enter`, a line in [[forkret]]) and
+  set the hot one from there. Test your checker on wrong orders you write on purpose
+  (the self-tests), not only on xv6: a checker that never reports is easy to write.
+clinic:
+  - bug: The checker's lock is an ordinary spinlock
+    change: |
+      `ldlock` becomes a `struct spinlock` (never given a class) and the "lock without a
+      class" panic is deleted:
+
+      ```diff
+      -static uint ldlock;
+      +static struct spinlock ldlock;
+
+       static void
+       ldlk(void)
+       {
+      -  while (__atomic_exchange_n(&ldlock, 1, __ATOMIC_ACQUIRE) != 0)
+      -    ;
+      +  acquire(&ldlock);
+       }
+       [... ldunlk: release(&ldlock) ...]
+      -  if (lk->cls == 0)
+      -    panic("lockdep: lock without a class");
+      ```
+    symptom: |
+      xv6 kernel is booting
+
+      hart 2 starting
+      hart 1 starting
+
+      (nothing more; gdb attached 25 seconds after boot:)
+        Id   Target Id                    Frame
+      * 1    Thread 1.1 (CPU#0 [running]) kernelvec () at kernel/kernelvec.S:14
+        2    Thread 1.2 (CPU#1 [running]) 0x0000000000000000 in ?? ()
+        3    Thread 1.3 (CPU#2 [running]) 0x0000000000000000 in ?? ()
+      [...]
+      $1 = 0xfffffffe87c9dbb0
+      [...]
+      $2 = (char (*)[32768]) 0x80009bc0 <stack0>
+
+      (another boot, gdb from reset, breakpoint on lockdep_acquire if $sp < 0x80009d00:)
+      Thread 1 hit Breakpoint 1, lockdep_acquire (lk=lk@entry=0x80011cd0 <ldlock>, try=try@entry=0) at kernel/lockdep.c:384
+      [...]
+      $1 = 0x80009bd0
+      $2 = 1
+      #0  lockdep_acquire (lk=lk@entry=0x80011cd0 <ldlock>, try=try@entry=0) at kernel/lockdep.c:384
+      #1  0x0000000080000c18 in acquire (lk=lk@entry=0x80011cd0 <ldlock>) at kernel/spinlock.c:28
+      #2  0x0000000080000d90 in ldlk () at kernel/lockdep.c:53
+      #3  0x0000000080001020 in order (h=h@entry=0x80020260 <held>, c=c@entry=0, pc=pc@entry=0x80009da8 <stack0+488>) at kernel/lockdep.c:305
+      #4  0x0000000080001484 in orderall (c=0, pc=pc@entry=0x80009da8 <stack0+488>) at kernel/lockdep.c:335
+      #5  0x0000000080001794 in lockdep_acquire (lk=lk@entry=0x80011cd0 <ldlock>, try=try@entry=0) at kernel/lockdep.c:397
+      #6  0x0000000080000c18 in acquire (lk=lk@entry=0x80011cd0 <ldlock>) at kernel/spinlock.c:28
+      #7  0x0000000080000d90 in ldlk () at kernel/lockdep.c:53
+      #8  0x0000000080001020 in order (h=h@entry=0x80020260 <held>, c=c@entry=0, pc=pc@entry=0x80009fd8 <stack0+1048>) at kernel/lockdep.c:305
+      [...]
+      #33 0x0000000080001020 in order (h=h@entry=0x80020260 <held>, c=c@entry=6, pc=pc@entry=0x8000aac8 <stack0+3848>) at kernel/lockdep.c:305
+      #34 0x0000000080001484 in orderall (c=6, pc=pc@entry=0x8000aac8 <stack0+3848>) at kernel/lockdep.c:335
+      #35 0x0000000080001794 in lockdep_acquire (lk=lk@entry=0x80023460 <pid_lock>, try=try@entry=0) at kernel/lockdep.c:397
+      #36 0x0000000080000c18 in acquire (lk=lk@entry=0x80023460 <pid_lock>) at kernel/spinlock.c:28
+      #37 0x0000000080003062 in allocpid () at kernel/proc.c:97
+      #38 0x00000000800031dc in allocproc () at kernel/proc.c:125
+      #39 0x0000000080003254 in userinit () at kernel/proc.c:223
+      #40 0x000000008000257c in main () at kernel/main.c:31
+    why: |
+      Two boots stopped silently after `hart 1 starting` (the second with gdb attached
+      later); a third, with gdb from reset and the breakpoint above, shows why. The first acquisition with something already held is [[userinit]] →
+      [[allocproc]] → [[allocpid]], which takes `pid_lock` while holding the new process's
+      `p->lock` (frames 35 to 40). The edge `proc -> nextpid` is new, so `order()` takes the
+      checker's lock: `ldlk()` → `acquire(&ldlock)` → the checker again (frames 5 to 7). The
+      checker runs *before* the spin, so `ldlock` is never actually taken and `holding()` never
+      objects; this hart still holds the `p->lock`, so `order()` needs `ldlock` again (now for
+      `proc -> class 0`), and so on. Each round costs 560 bytes of stack (`stack0+1048` to
+      `stack0+488`). The breakpoint caught hart 0 at `sp = 0x80009bd0`, 16 bytes above the
+      bottom of `stack0`.
+
+      Hart 0 boots on its 4 KB slice of `stack0`, which has no guard page below it, so the
+      recursion went on writing below `stack0` into whatever the linker put there. In the first
+      session, 25 seconds later, hart 0 was in [[kernelvec]] with a nonsense stack pointer and
+      harts 1 and 2 had jumped to address 0 right after `main.c:39`. We did not track down which
+      overwritten word did that; the point is that nothing ever printed.
+
+      On a process's kernel stack the guard page would have turned the same recursion into a
+      page fault and `panic: kerneltrap`. Either way, the fix is a lock that the checker does not
+      check: Linux uses a raw `arch_spinlock_t` for the same reason.
+  - bug: One class per lock instead of one per name
+    change: |
+      `lockdep_class()` makes a new class on every call instead of looking the name up:
+
+      ```diff
+      -  for (c = 1; c < nclass; c++)
+      -    if (cls[c].sleep == sleep && strncmp(cls[c].name, name, 32) == 0)
+      -      break;
+      +  c = nclass; // every lock its own class
+         if (c == nclass) {
+      ```
+    symptom: |
+      xv6 kernel is booting
+
+      panic: lockdep: too many classes
+
+      (gdb from reset, at the panic:)
+      #0  panic (s=s@entry=0x800091f0 "lockdep: too many classes") at kernel/printk.c:139
+      #1  0x0000000080001606 in lockdep_class (name=name@entry=0x80009470 "proc", sleep=sleep@entry=0) at kernel/lockdep.c:75
+      #2  0x0000000080000b86 in initlock (lk=lk@entry=0x80028758 <proc+20160>, name=name@entry=0x80009470 "proc") at kernel/spinlock.c:17
+      #3  0x0000000080002ece in procinit () at kernel/proc.c:55
+      #4  0x000000008000250c in main () at kernel/main.c:22
+      $1 = 64
+    why: |
+      Two boots, the same panic, before the other harts printed anything. The class table has
+      64 entries (one bit each in a `uint64` row of the edge matrix), and [[procinit]] alone asks
+      for 64 `p->lock`s. The classes before them and the first `p->lock`s filled all 63 usable
+      entries (`nclass` = 64), and the call for the `p->lock` at `proc+20160` found the table
+      full.
+
+      A bigger table would not save the idea. It would need a node for each of the 156
+      spinlocks and 81 sleep-locks that exist at boot, plus one for every pipe ever created. And
+      it would find less: the kfork bug of the verify section is "some `p->lock` then
+      `wait_lock`" against "`wait_lock` then some `p->lock`". Per instance, both orders must
+      happen on the same slot before the cycle is visible. With classes, init's first `fork`
+      and first `wait` are enough, whatever slots they use. (This part is reasoned from the
+      code; the copy never got that far.)
+  - bug: Spinlocks listed per process instead of per hart
+    change: |
+      A per-thread list, as Linux keeps: the running process's list if there is one,
+      otherwise (scheduler, boot) the hart's:
+
+      ```diff
+      +static struct ldheld pheld[NPROC][MAXHELD]; // per process
+      +static int npheld[NPROC];
+      +
+      +static struct ldheld *
+      +mylist(int **n)
+      +{
+      +  struct proc *p = mycpu()->proc;
+      +
+      +  if (p) {
+      +    *n = &npheld[p - proc];
+      +    return pheld[p - proc];
+      +  }
+      +  *n = &nheld[cpuid()];
+      +  return held[cpuid()];
+      +}
+      [... lockdep_acquire, lockdep_release and orderall use mylist() ...]
+      -    panic("lockdep: release of a lock this hart does not hold");
+      +    panic("lockdep: release of a lock this thread does not hold");
+      ```
+    symptom: |
+      xv6 kernel is booting
+
+      hart 2 starting
+      hart 1 starting
+      panic: lockdep: release of a lock this thread does not hold
+
+      (gdb from reset, at the panic:)
+      Thread 2 hit Breakpoint 1, panic (s=s@entry=0x80009250 "lockdep: release of a lock this thread does not hold") at kernel/printk.c:139
+      [...]
+      #0  panic (s=s@entry=0x80009250 "lockdep: release of a lock this thread does not hold") at kernel/printk.c:139
+      #1  0x0000000080001882 in lockdep_release (lk=lk@entry=0x8002a998 <proc>) at kernel/lockdep.c:445
+      #2  0x0000000080000cf6 in release (lk=lk@entry=0x8002a998 <proc>) at kernel/spinlock.c:69
+      #3  0x0000000080002ffc in forkret () at kernel/proc.c:520
+      #4  0x0000000080002fe8 in myproc () at kernel/proc.c:90
+      Backtrace stopped: frame did not save the PC
+      [...]
+      $4 = {1, 1, 1, 0, 0, 0, 0, 0}
+    why: |
+      Two boots, the same panic, before `init` printed anything. The first process (pid 1,
+      `proc[0]`) runs for the first time. Hart 1's [[scheduler]] acquired `proc[0].lock` with
+      no process running, so the checker put it on **hart 1's** list (`nheld` shows one entry
+      on each hart's list: every scheduler holds the lock of the slot it is looking at).
+      [[swtch]] then switched to the process, whose first act in [[forkret]] is to release that
+      lock. Now a process is running, so the checker looked in **the process's** list, which
+      is empty, and panicked. (Frame 4 is not a real caller: forkret was entered by `swtch`,
+      not called.)
+
+      The kernel itself had no problem: [[holding]] checks the hart, and the hart does hold
+      it. A per-thread list needs to be told about the handoff: Linux does that for its
+      runqueue lock with explicit "release here, acquire there" annotations around the context
+      switch. A per-hart list matches what xv6 already means by "held", and needs nothing.
+      Without the panic (if the release simply did nothing when the lock is missing), the
+      scheduler's list would keep the stale entry and the next acquisition on that hart would
+      record a false `proc -> ...` edge (reasoned from the code, not run).
+  - bug: The report forgets that printk takes a lock
+    change: |
+      The `busy` flag is not set while the report prints. To have something to report, the
+      copy also contains the kfork bug of the verify section (`kfork` takes `wait_lock` while
+      holding the child's `p->lock`):
+
+      ```diff
+           if (reach(c, h->cls)) {
+      -      busy[id] = 1; // printk() acquires pr.lock: don't check it
+             report(h, c, pc);
+      ```
+    symptom: |
+      xv6 kernel is booting
+
+      hart 2 starting
+      hart 1 starting
+      init: starting sh
+      $
+
+      (nothing more, and `ls` typed at the prompt never ran; a second boot, gdb attached after
+      20 seconds:)
+        Id   Target Id                    Frame
+      * 1    Thread 1.1 (CPU#0 [running]) 0x0000000080000dd4 in ldlk () at kernel/lockdep.c:53
+        2    Thread 1.2 (CPU#1 [halted ]) s_sstatus (x=2) at kernel/riscv.h:67
+        3    Thread 1.3 (CPU#2 [running]) 0x0000000080000dd4 in ldlk () at kernel/lockdep.c:53
+
+      Thread 3 (Thread 1.3 (CPU#2 [running])):
+      #0  0x0000000080000dd4 in ldlk () at kernel/lockdep.c:53
+      #1  0x0000000080000ffa in order (h=h@entry=0x800205e8 <held+896>, c=c@entry=8, pc=pc@entry=0x3fffffbe68) at kernel/lockdep.c:306
+      [...]
+      #5  0x0000000080003800 in killed (p=0x80023a00 <proc+360>) at kernel/proc.c:634
+      #6  0x00000000800001c8 in consoleread (user_dst=1, dst=20255, n=1) at kernel/console.c:100
+      [...]
+
+      Thread 1 (Thread 1.1 (CPU#0 [running])):
+      #0  0x0000000080000dd4 in ldlk () at kernel/lockdep.c:53
+      #1  0x0000000080000ffa in order (h=h@entry=0x80020268 <held>, c=c@entry=4, pc=pc@entry=0x3fffffdbf8) at kernel/lockdep.c:306
+      #2  0x000000008000144c in orderall (c=4, pc=pc@entry=0x3fffffdbf8) at kernel/lockdep.c:335
+      #3  0x00000000800017a0 in lockdep_acquire (lk=lk@entry=0x80011c88 <pr>, try=try@entry=0) at kernel/lockdep.c:399
+      #4  0x0000000080000c18 in acquire (lk=lk@entry=0x80011c88 <pr>) at kernel/spinlock.c:28
+      #5  0x000000008000057a in printk (fmt=fmt@entry=0x80009148 "lockdep: acquiring %s while holding %s may deadlock\n") at kernel/printk.c:71
+      #6  0x000000008000112a in report (h=0x80020268 <held>, c=8, pc=0x3fffffded8) at kernel/lockdep.c:261
+      #7  order (h=h@entry=0x80020268 <held>, c=c@entry=8, pc=pc@entry=0x3fffffded8) at kernel/lockdep.c:310
+      [...]
+      #11 0x00000000800038d6 in kwait (addr=0) at kernel/proc.c:381
+      $1 = 1
+      $2 = 1
+    why: |
+      Two boots, the same freeze, with not one character of the report printed. Hart 0 is
+      `init` in [[kwait]]: the checker found the cycle (frame 7, holding `ldlock`) and called
+      `report()`, whose first [[printk]] acquires `pr.lock`. That acquisition goes through the
+      checker too; hart 0 holds `wait_lock`, the order `wait_lock -> pr` is new, and the slow
+      path wants `ldlock`, which hart 0 itself holds (`$1 = 1`). `ldlock` has no owner check,
+      so instead of `panic: acquire` the hart spins on itself, with interrupts off, forever.
+      Hart 2 (the shell, in [[consoleread]] → [[killed]]) then needed `ldlock` for a new order
+      of its own and joined it; hart 1 was idle in its scheduler.
+
+      The checker had found exactly the bug it was built for, and the machine froze silently,
+      as the bug itself would have. Anything the checker does while holding its lock must not
+      come back into the checker: the reference marks the hart `busy` while it prints, and
+      Linux's lockdep does the same with its recursion counter.
+  - bug: The sleep-lock hook does not turn interrupts off
+    change: |
+      `lockdep_acquiresleep` without its `push_off`/`pop_off`. Its callers run with
+      interrupts on (a sleep-lock is taken in a system call), so the hook now uses the hart's
+      lists and may take `ldlock` with interrupts on:
+
+      ```diff
+      -  push_off(); // stay on this hart while using its list
+         p = mycpu()->proc;
+         if (lockdep_on && !busy[cpuid()]) {
+      [...]
+             push(&sheld[s][nsheld[s]++], lk, c, pc);
+         }
+      -  pop_off();
+       }
+      ```
+    symptom: |
+      $ echo hi > x
+      $ rm x
+      $ usertests -q
+      usertests starting
+      [...]
+      ALL TESTS PASSED
+
+      (a second boot, `usertests -q` twice: both ALL TESTS PASSED, no report, no panic)
+    why: |
+      Two boots, three runs of `usertests -q`, nothing. The bug is real; it just needs timing
+      that these runs never produced. Reasoned from the code:
+
+      - **`ldlock` with interrupts on.** The slow path of the sleep-lock hook (a new order,
+        or a class's first use) takes `ldlock`. A timer or device interrupt arriving then, on
+        this hart, runs a handler whose `acquire` also calls the checker. If that acquisition
+        needs `ldlock` too (a new order in the handler, or the first use of a class in a
+        handler), the handler spins on a lock held by the code it interrupted: the same-hart
+        deadlock that `acquire`'s own [[push_off]] prevents for every spinlock.
+      - **The hart can change under it.** With interrupts on, a timer interrupt can make the
+        process [[yield]] in the middle of the hook and resume on another hart. Then
+        `cpuid()`, `busy[]` and `nchecks[]` refer to a hart the code is no longer on.
+
+      Why it stayed hidden: the checker's slow path ran 46 times in a whole `usertests -q`
+      run, mostly early, and by then the handlers' own orders are long known, so a handler hardly ever needs
+      `ldlock`. The window is real and narrow. This is the clinic of tour 52's break 7 in
+      another form: a test that passes says nothing about a race the test cannot hit, and the
+      rule ("whoever holds this lock has interrupts off") has to come from reasoning.
+  - bug: "Not a bug: the iput cycle, reported as one"
+    change: |
+      The reference with [[iput]] taking the lock with [[acquiresleep]] again, as in the
+      original tree:
+
+      ```diff
+      -    if (!tryacquiresleep(&ip->lock))
+      -      panic("iput: inode locked");
+      +    acquiresleep(&ip->lock);
+      ```
+    symptom: |
+      $ echo hi > x
+      $ rm x
+      lockdep: acquiring inode while holding itable may deadlock
+      hart 0, pid 4 (rm):
+        holds itable at 0x80004aba 0x80004b8a 0x80006812 0x80003f9c 0x80003d22
+        wants inode at 0x80005722 0x80004b00 0x80004b8a 0x80006812 0x80003f9c
+      but this order has been seen before:
+      hart 0, pid 1:
+        holds inode at 0x80004924 0x800049c6 0x8000507a 0x800051be 0x80005f94
+        wants itable at 0x80004478 0x80004f9a 0x8000509c 0x800051be 0x80005f94
+      panic: lockdep
+
+      (the addresses, each decoded at address - 2 with ${TOOLPREFIX}addr2line -f -i:)
+      holds itable:  iput fs.c:363, iunlockput fs.c:400, sys_unlink sysfile.c:246, syscall, usertrap
+      wants inode:   acquiresleep sleeplock.c:25, iput fs.c:377, iunlockput, sys_unlink, syscall
+      holds inode:   ilock_nested fs.c:314, ilock fs.c:300, namex fs.c:717, namei fs.c:749, kexec exec.c:42
+      wants itable:  iget fs.c:256, dirlookup fs.c:625, namex fs.c:731, namei, kexec
+    why: |
+      The first `rm` of a file panics. `rm x` drops the last reference to an unlinked inode,
+      so [[iput]] takes the inode's sleep-lock while holding `itable.lock` (line 377 here):
+      `itable -> inode`. The other order was learned at boot, by pid 1 running
+      [[kexec]]`("/init")`: [[namex]] holds the root directory's lock and [[dirlookup]] calls
+      [[iget]], which takes `itable.lock`: `inode -> itable`.
+
+      Both orders are real, but they cannot meet. `iput` takes the lock only when `ip->ref ==
+      1`, and the reference it holds is the only one, so no process holds that inode's lock or
+      waits for it, and the `acquiresleep` never waits. The `inode` held by namex is always one
+      somebody references (namex does), so it is never the inode `iput` is freeing. The
+      checker cannot know that `ref == 1` makes the second order happen only on unreferenced
+      inodes: it sees classes.
+
+      The temptation is to exempt `itable` from checking, or to delete the edge. Both would also
+      hide a real bug that someday takes a referenced inode under `itable.lock`. The
+      reference's answer is to say what is true in code: the acquisition is a try, a try
+      records no order, and `iput` panics if the try ever fails, so the claim is checked on
+      every call. With the trylock this kernel passed `usertests -q` with no report, and the
+      panic never fired.
+reveal:
+  - title: A class number in the lock's padding
+    commit: 1
+    file: kernel/spinlock.h
+    lines: 1-9
+    diff: true
+    state:
+      hart: 0
+      mode: S
+      proc: none (boot)
+      intr: "off"
+      satp: bare
+      locks: []
+      stack: [main, consoleinit, initlock, lockdep_class]
+      sp: boot
+      irq: 0
+    note: |
+      The checker reasons about classes, so every lock carries its class number. `locked` is
+      a 4-byte `uint` followed by 4 bytes of padding before the 8-byte `name` pointer; `cls`
+      fills the padding. `struct spinlock` stays 24 bytes, `struct sleeplock` (the same change)
+      stays 48, and nothing that embeds a lock (`struct proc`, `struct pipe`, every buffer and
+      inode) moves.
+
+      [[initlock]] now ends with `lk->cls = lockdep_class(name, 0)`, and [[initsleeplock]] with
+      `lockdep_class(name, 1)`. gdb, stopped at the first call on the finished branch: hart 0,
+      in [[main]] → [[consoleinit]] → `initlock(&cons.lock, "cons")`, with no lock held and
+      `sstatus = 0x200000000` (SIE clear). So `cons` is class 1.
+    others: |
+      Harts 1 and 2 are spinning in [[main]] waiting for `started`; they create no locks. Later,
+      any hart can create a class: every [[pipealloc]] calls `initlock(&pi->lock, "pipe")`.
+  - title: The class table and a lock the checker can use
+    commit: 1
+    file: kernel/lockdep.c
+    lines: 19-71
+    focus: 29-47
+    diff: true
+    state:
+      hart: 0
+      mode: S
+      proc: none (boot)
+      intr: "off"
+      satp: bare
+      locks: []
+      stack: [main, consoleinit, initlock, lockdep_class]
+      sp: boot
+      irq: {noff: 1, intena: 0, note: "lockdep_class's own push_off (line 56); SIE was already off at boot. ldlock is not a spinlock and is not counted"}
+    note: |
+      The table maps a class number to its name; class 0 means "none", so a lock never passed
+      to `initlock` is noticed. Lookup compares the strings, so every `initlock(&p->lock,
+      "proc")` in [[procinit]] gets the same class.
+
+      The table needs a lock: pipes create classes at any time, on any hart. It cannot be a
+      `struct spinlock`. The next commit makes [[acquire]] call the checker, and a checker that
+      called `acquire` would recurse (clinic 1 recorded the result). `ldlock` is a bare word:
+      `ldlk()` is the swap loop that `acquire` uses, `ldunlk()` the release store, with nothing
+      else.
+
+      What it keeps from a spinlock is the rule about interrupts: whoever holds `ldlock` must
+      have them off, or a handler on the same hart could need it and spin forever. Here
+      `lockdep_class` calls [[push_off]] itself (line 56), because [[pipealloc]] calls
+      `initlock` with interrupts on.
+  - title: The hook goes before the spin
+    commit: 2
+    file: kernel/spinlock.c
+    lines: 20-55
+    focus: 25-28
+    diff: true
+    state:
+      hart: 0
+      mode: S
+      proc: none (boot)
+      intr: "off"
+      satp: bare
+      locks: ["p->lock (proc[0], being built)"]
+      stack: [main, userinit, allocproc, allocpid, acquire, lockdep_acquire]
+      sp: boot
+      irq: {noff: 2, intena: 0, note: "proc[0].lock plus this acquire's push_off; recorded by gdb at the same call on the finished branch"}
+    note: |
+      [[acquire]] calls `lockdep_acquire(lk)` after [[push_off]] and the [[holding]] check,
+      and **before** the swap loop. A deadlocked hart never leaves that loop, so a check placed
+      after it would never speak about the one acquisition that matters. [[release]] calls
+      `lockdep_release(lk)` after its own `holding` check.
+
+      The state is the first nested acquisition of the boot, which gdb stopped at on the
+      finished branch: [[userinit]] → [[allocproc]] holds the new process's `p->lock` (taken at
+      [[kernel/proc.c:115]]) and [[allocpid]] acquires `pid_lock`. `cpus[0].noff = 2`, intena 0,
+      no process yet. At this commit the checker only lists the lock; the next one turns
+      "`proc` held while `nextpid` is acquired" into an edge.
+    others: |
+      Harts 1 and 2 are still waiting for `started` in [[main]]. Once the scheduler runs, every
+      hart calls the checker tens of thousands of times a second; it runs with interrupts off,
+      on the hart's own list, so the harts do not disturb each other here.
+  - title: Where was it acquired? Walking the frame pointers
+    commit: 2
+    file: kernel/lockdep.c
+    lines: 88-126
+    focus: 90-107
+    diff: true
+    state:
+      hart: 0
+      mode: S
+      proc: none (boot)
+      intr: "off"
+      satp: bare
+      locks: ["p->lock (proc[0], being built)"]
+      stack: [main, userinit, allocproc, allocpid, acquire, lockdep_acquire]
+      sp: boot
+      irq: {noff: 2, intena: 0}
+    note: |
+      A report is useless without "where". xv6 is compiled with `-fno-omit-frame-pointer`, so
+      every function keeps `s0` pointing at the top of its frame, with its return address at
+      `s0-8` and the caller's `s0` at `s0-16`. `trace()` starts from the checker's own frame,
+      skips `acquire`'s, and copies up to five return addresses (`NTRACE`): the function that
+      called `acquire`, its caller, and so on. It stops at the edge of the current stack page.
+      For a process's kernel stack (one page) that is the stack's edge; the boot stacks in
+      `stack0` are not page-aligned (`stack0` is at `0x80009be0` in this build), so there a
+      walk may read a few words of a neighbouring slice, which is harmless. (Lab 2, the kernel backtrace, builds the
+      same walk.)
+
+      gdb printed the entry for `proc[0].lock` on hart 0's list: `pc0 0x800031e2 pc1
+      0x80003274`, which `addr2line` turns into [[allocproc]] ([[kernel/proc.c:115]]) and
+      [[userinit]]. Each entry is the lock, its class and five addresses: 56 bytes, up to eight
+      per hart (`MAXHELD`; the deepest real nesting is three).
+  - title: Release searches, because p->lock changes threads
+    commit: 2
+    file: kernel/lockdep.c
+    lines: 109-146
+    focus: 128-145
+    state:
+      hart: 2
+      mode: S
+      proc: init (pid 1)
+      intr: "off"
+      satp: kernel
+      locks: ["p->lock (pid 1, acquired by the scheduler)"]
+      stack: [forkret, release, lockdep_release]
+      sp: {"on": kernel, switched: "`ld sp, 8(a1)` in [[swtch]], from hart 2's scheduler"}
+      irq: {noff: 1, intena: 0, note: "the scheduler's acquire of this p->lock; recorded by gdb at forkret line 520"}
+    note: |
+      gdb stopped hart 2 at [[forkret]]'s `release(&p->lock)` ([[kernel/proc.c:520]]), pid 1's
+      first moment as a process, on the finished branch:
+
+      ```text
+      hart 2 noff 1 intena 0 sstatus 0x200000020
+      proc pid 1 name
+      nheld[2] = 1
+        held[0]: lk 0x80023898 cls 8 (proc) pc0 0x80003474 pc1 0x8000253c
+      (gdb) info symbol held[$tp][0].pc[0]
+      scheduler + 98 in section .text
+      ```
+
+      The process is about to release a lock that the [[scheduler]] acquired, a different
+      thread on the same hart ([[concept:locks#handoff]]). The entry is on **hart 2's** list,
+      and `lockdep_release` searches that list for the lock, finds it and removes it. The
+      search matters for a second reason: locks are not always released in reverse order
+      ([[kexit]] releases `wait_lock` before its own `p->lock`).
+
+      This is why the list is per hart. A list per thread would have the scheduler's acquire on
+      one list and this release on another (clinic 3).
+    others: |
+      Harts 0 and 1 run their own schedulers, each holding the `p->lock` of the slot it is
+      looking at, each on its own list. When pid 1 later gives up hart 2, it acquires its own
+      `p->lock` in [[yield]] or [[sleep]] (pushed on hart 2's list) and the scheduler releases
+      it: the same handoff the other way round.
+  - title: Edges, and a fast path of one load
+    commit: 3
+    file: kernel/lockdep.c
+    lines: 110-180
+    focus: 119-154
+    diff: true
+    state:
+      hart: 0
+      mode: S
+      proc: none (boot)
+      intr: "off"
+      satp: bare
+      locks: ["p->lock (proc[0], being built)"]
+      stack: [main, userinit, allocproc, allocpid, acquire, lockdep_acquire, order, newedge]
+      sp: boot
+      irq: {noff: 2, intena: 0, note: "recorded by gdb in newedge on the finished branch: cpus[0].noff = 2, intena = 0"}
+    note: |
+      `lockdep_acquire` now calls `order(h, c)` for every lock `h` the hart holds. An edge "a
+      before b" is bit `b` of `after[a]`. **Fast path:** load `after[h->cls]` without any lock;
+      if the bit is set, this order is known, and that is all. Bits are only ever set, so a set
+      bit read without the lock is still true. **Slow path:** take `ldlock`, test again (another
+      hart may have just added it), and add the edge: the bit, plus a record in `edges[]` with
+      the hart, the pid, and the traces of both acquisitions, for the report later.
+
+      gdb stopped the first `newedge` of the boot, the acquisition of the previous steps:
+      `h->cls = 8` (`proc`), `c = 6` (`nextpid`), with 15 classes registered so far. Ctrl-P
+      now prints the graph from [[procdump]]; after `usertests -q` it had 46 edges, close to
+      [[tour:51]]'s measured graph.
+
+      How fast is fast? In our runs of `usertests -q` the checker examined about 27 million
+      acquisitions and took the slow path 46 times. About three quarters of those acquisitions
+      had something else held, so they made about 42 million `order()` calls; all but 46 ended
+      at the bit test.
+  - title: A cycle is a path back
+    commit: 4
+    file: kernel/lockdep.c
+    lines: 145-172
+    focus: 151-172
+    diff: true
+    state:
+      hart: 0
+      mode: S
+      proc: rm (pid 4)
+      intr: "off"
+      satp: kernel
+      locks: [itable.lock]
+      stack: [usertrap, syscall, sys_unlink, iunlockput, iput, acquiresleep, acquire, lockdep_acquire, order, reach]
+      sp: kernel
+      irq: {noff: 2, intena: 1, note: "itable.lock plus the acquire's push_off for the sleep-lock's inner lock; reasoned from the code for the report below"}
+    note: |
+      A new edge `a -> b` closes a cycle exactly when `b` already reaches `a`. `reach()` is a
+      depth-first search over the bitmaps, from `b`, recording in `prev[]` where it came from.
+      At most 64 classes, run only for a new edge, under `ldlock`: its cost does not matter. If
+      `a == b` it answers yes at once: two locks of one class, nested.
+
+      The state is the first report this commit produced (next step): `rm` (pid 4) in [[iput]],
+      holding `itable.lock`, acquiring the inner spinlock of the inode's sleep-lock. At this
+      commit sleep-locks are not tracked yet, but their inner spinlocks are: every one of them
+      is class `sleep lock`.
+  - title: The first report, with spinlocks alone
+    commit: 4
+    file: kernel/lockdep.c
+    lines: 194-249
+    focus: 203-222
+    state:
+      hart: 0
+      mode: S
+      proc: rm (pid 4)
+      intr: "off"
+      satp: kernel
+      locks: [itable.lock]
+      stack: [usertrap, syscall, sys_unlink, iunlockput, iput, acquiresleep, acquire, lockdep_acquire, order, report]
+      sp: kernel
+      irq: {noff: 2, intena: 1}
+    note: |
+      `report()` walks `prev[]` back into a path and prints the acquisition that would close
+      the cycle, then each edge of the path with what was recorded when it was learned. Then
+      the checker switches itself off (`lockdep_on = 0`), as Linux's does. `busy[id]` makes the
+      checker ignore this hart while it prints: [[printk]] acquires `pr.lock`, and the checker
+      holds `ldlock`.
+
+      This commit's kernel, at the first `rm` of a file:
+
+      ```text
+      $ rm x
+      lockdep: acquiring sleep lock while holding itable may deadlock
+      hart 0, pid 4 (rm):
+        holds itable at 0x80003d66 0x80003e36 0x80005a3e 0x8000328c 0x80003012
+        wants sleep lock at 0x80004974 0x80003dac 0x80003e36 0x80005a3e 0x8000328c
+      but this order has been seen before:
+      hart 2, pid 1:
+        holds sleep lock at 0x800049c8 0x8000365c 0x80003f38 0x80002304 0x800022d8
+        wants proc at 0x8000295a 0x800049d6 0x8000365c 0x80003f38 0x80002304
+      hart 0, no process:
+        holds proc at 0x800024e4 0x80002576 0x8000189e 0x800000c2 0x8000001a
+        wants itable at 0x8000397a 0x800042b0 0x8000446a 0x8000258c 0x8000189e
+      lockdep: turning off the checker
+      ```
+
+      Decoded with `addr2line`: [[iput]] holds `itable.lock` (fs.c:352 in this commit) and its
+      `acquiresleep` takes the inode's inner lock (fs.c:362). The path back: pid 1, in
+      [[fsinit]] from [[forkret]], released a buffer: [[releasesleep]] holds the buffer's inner
+      lock and calls [[wakeup]], which takes `p->lock`s; and at boot, [[userinit]] held the new
+      process's `p->lock` while [[namei]]`("/")` called [[iget]] (`itable`). This is exactly
+      the class cycle that [[concept:locks#order]] measured: `p->lock -> itable -> lk->lk ->
+      p->lock`. It cannot deadlock: commit 9 explains why (iput only does this for an inode
+      nobody else references) and writes it into the code.
+  - title: Sleep-locks belong to the process
+    commit: 5
+    file: kernel/sleeplock.c
+    lines: 20-48
+    focus: 22-47
+    diff: true
+    state:
+      hart: 1
+      mode: S
+      proc: "pid 1 (forkret, before exec)"
+      intr: "off"
+      satp: kernel
+      locks: ["root directory inode (sleep-lock)"]
+      stack: [forkret, kexec, namei, namex, ilock, bread, bget, acquiresleep, lockdep_acquiresleep]
+      sp: kernel
+      irq: {noff: 0, note: "gdb stopped on entry to the hook, before its own push_off (cpus[1].noff = 0); forkret runs with SIE off"}
+    note: |
+      [[acquiresleep]] calls `lockdep_acquiresleep()` before it can sleep, and
+      [[releasesleep]] calls `lockdep_releasesleep()` first, so the sleep-lock leaves the list
+      before its own inner lock is taken. The lists are per process, by `proc[]` slot
+      (`sheld[NPROC][8]`): a process may sleep holding a buffer and resume on another hart, and
+      only the process itself changes its list. Ordering now looks at both lists: the hart's
+      spinlocks and the running process's sleep-locks.
+
+      gdb on the finished branch, the first time a process acquired a sleep-lock while holding
+      one: pid 1, in [[forkret]]'s `kexec("/init")`, holds the root directory's inode lock
+      (taken in [[ilock]]) and asks for block 33's buffer:
+
+      ```text
+      lockdep_acquiresleep (lk=lk@entry=0x80029b88 <bcache+2264>, sub=sub@entry=0, try=try@entry=0)
+      #2  bget (dev=1, blockno=33, sub=0) at kernel/bio.c:69
+      [...]
+      #5  ilock_nested (ip=ip@entry=0x800319a8 <itable+24>, sub=sub@entry=0) at kernel/fs.c:317
+      $6 = 0x800096b0 "buffer"
+      $8 = 1
+      $9 = 0x80009740 "inode"
+      ```
+
+      One entry on pid 1's list, class `inode`, so the edge `inode -> buffer`. The hart's own
+      list is empty (`nheld[1] = 0`): no spinlock is held.
+  - title: "The next report: two inodes"
+    commit: 5
+    file: kernel/lockdep.c
+    lines: 259-302
+    focus: 259-274
+    diff: true
+    state:
+      hart: 2
+      mode: S
+      proc: init (pid 1)
+      intr: "off"
+      satp: kernel
+      locks: ["/ (directory inode, sleep-lock)"]
+      stack: [usertrap, syscall, sys_mknod, create, ilock, acquiresleep, lockdep_acquiresleep, orderall]
+      sp: kernel
+      irq: {noff: 1, intena: 1, note: "lockdep_acquiresleep's push_off, in a system call; reasoned from the code"}
+    note: |
+      `orderall()` orders the new class after the hart's spinlocks and the process's
+      sleep-locks. With sleep-locks tracked, this commit's kernel reported at boot, when `init`
+      creates `/console` with `mknod`:
+
+      ```text
+      lockdep: acquiring inode while holding inode may deadlock
+      hart 2, pid 1 (init):
+        holds inode at 0x80003f30 0x80005904 0x8000601e 0x800035d6 0x8000335c
+        wants inode at 0x80003f30 0x8000598e 0x8000601e 0x800035d6 0x8000335c
+      both locks are of class inode
+      lockdep: turning off the checker
+      ```
+
+      Decoded: both from [[ilock]], called by [[create]] at sysfile.c:267 (the directory) and
+      sysfile.c:294 (the new file), under [[sys_mknod]]. Two locks of one class, nested: a
+      cycle of length one. It is safe because of a rule the class graph cannot see: a
+      directory is always locked before a file in it. Commit 7 writes that rule down.
+
+      The iput report of the previous commit is still there, but the checker turns off after
+      the first report, and this one comes earlier.
+  - title: Interrupt handlers act for no process
+    commit: 6
+    file: kernel/trap.c
+    lines: 186-224
+    focus: 196-220
+    diff: true
+    state:
+      hart: 0
+      mode: S
+      proc: init (pid 1), interrupted
+      intr: "off"
+      satp: kernel
+      locks: ["an inode (sleep-lock, init's)"]
+      stack: [kernelvec, kerneltrap, devintr, clockintr, acquire, lockdep_acquire]
+      sp: {"on": kernel, detail: "init's kernel stack, a kernelvec frame on top"}
+      irq: {noff: 1, intena: 0, note: "the handler's acquire of tickslock (not held yet); recorded by gdb: cpus[0].noff = 1, intena = 0"}
+    note: |
+      [[devintr]] brackets each handler with `lockdep_irq_enter()` and `lockdep_irq_exit()`,
+      which count per hart. While the count is non-zero, `orderall` leaves out the process's
+      sleep-locks: the handler runs on that process's stack, but no cycle can pass through
+      them (below).
+
+      gdb on the finished branch: hart 0 took a timer interrupt while `init` (pid 1) was in the
+      kernel holding an inode's sleep-lock; in [[clockintr]], `acquire(&tickslock)` reached the
+      checker with `inirq[0] = 1`, `nheld[0] = 0` and `nsheld` for pid 1 equal to 1. So no edge
+      `inode -> time` is learned. Recording it would be true but useless: whoever holds
+      `tickslock` holds a spinlock, and a spinlock holder can never wait for a sleep-lock
+      ([[sched]] would panic `sched locks`). So no cycle can run through the interrupted
+      process's sleep-locks; leaving them out loses nothing and keeps the graph to orders that
+      can close.
+
+      The hart's own list is empty, as it always is when a handler starts: an interrupt is
+      taken only at noff 0 ([[concept:locks#invariant]]).
+  - title: The interrupt rule, and why xv6 keeps it for free
+    commit: 6
+    file: kernel/lockdep.c
+    lines: 284-343
+    focus: 284-311
+    diff: true
+    state:
+      hart: 0
+      mode: S
+      proc: init (pid 1), interrupted
+      intr: "off"
+      satp: kernel
+      locks: []
+      stack: [kernelvec, kerneltrap, devintr, clockintr, acquire, lockdep_acquire, use]
+      sp: {"on": kernel, detail: "init's kernel stack, a kernelvec frame on top"}
+      irq: {noff: 1, intena: 0}
+    note: |
+      `use()` records per class "taken in an interrupt handler" (`USE_IRQ`) and "held with
+      interrupts on" (`USE_IRQON`), with where each was first seen, and reports a class that
+      has both. Such a lock could be held by code that a handler interrupts on its own hart,
+      and the handler would spin forever.
+
+      For spinlocks the test on line 335 can never be true: [[acquire]] calls [[push_off]]
+      before the checker, so SIE is always clear here. Linux needs the check because Linux lets
+      a spinlock be held with interrupts on; xv6 does not. For sleep-locks (this commit adds the
+      same call to the previous commit's hook) `USE_IRQON` is recorded on every acquisition, because a sleep-lock's holder runs
+      with interrupts on; a sleep-lock taken in a handler would be reported.
+
+      We checked that the test works by breaking the order in a scratch copy: `acquire` calling
+      the checker *before* `push_off`. Both boots stopped at once:
+
+      ```text
+      lockdep: proc is taken in interrupt handlers and held with interrupts on
+        in a handler: proc at 0x80003656 0x80003be4 0x80003c72 0x80003db0 0x80006d78
+        interrupts on: proc at 0x8000381c 0x80003d26 0x3ffffff09c
+      panic: lockdep
+      ```
+
+      Decoded: [[wakeup]] from [[clockintr]], and [[killed]] from [[usertrap]] line 81, which
+      runs after `intr_on()`. (The last address, `0x3ffffff09c`, is in the trampoline page:
+      [[uservec]] called `usertrap`.)
+  - title: Roles inside one class
+    commit: 7
+    file: kernel/lockdep.c
+    lines: 85-114
+    focus: 88-114
+    diff: true
+    state:
+      hart: 2
+      mode: S
+      proc: init (pid 1)
+      intr: "off"
+      satp: kernel
+      locks: ["/ (directory inode, sleep-lock)"]
+      stack: [usertrap, syscall, sys_mknod, create, ilock_nested, acquiresleep_nested, lockdep_acquiresleep, subclass]
+      sp: kernel
+      irq: {noff: 1, intena: 1, note: "lockdep_acquiresleep's push_off; reasoned from the code"}
+    note: |
+      `acquiresleep_nested(lk, sub)` and `ilock_nested(ip, sub)` take a role. `subclass(c,
+      sub)` turns role 1 of class `inode` into a class of its own, named `inode/1`, created the
+      first time it is used; role 0 is the class itself. The graph then learns `inode ->
+      inode/1` (a directory, then a file in it): an order between two classes, checked like
+      any other. A path that locked a file and then a directory would close a cycle with it, or
+      nest `inode` in `inode` again.
+
+      Linux has the same mechanism (`mutex_lock_nested(&inode->i_mutex, I_MUTEX_CHILD)`).
+      `acquiresleep(lk)` is now `acquiresleep_nested(lk, 0)`.
+  - title: create and unlink lock the file as a child
+    commit: 7
+    file: kernel/sysfile.c
+    lines: 276-300
+    focus: 289-294
+    diff: true
+    state:
+      hart: 2
+      mode: S
+      proc: init (pid 1)
+      intr: "on"
+      satp: kernel
+      locks: ["/ (directory inode, sleep-lock)"]
+      stack: [usertrap, syscall, sys_mknod, create]
+      sp: kernel
+      irq: 0
+    note: |
+      [[create]] locks the new inode with `ilock_nested(ip, SUB_CHILD)` while it holds the
+      directory, and [[sys_unlink]] does the same for the file it removes (line 226). Note line 282:
+      when the file already exists, `create` releases the directory before locking the file,
+      so that `ilock` needs no role.
+
+      The next boot of this commit's kernel got past `mknod` and reported in the first log
+      commit:
+
+      ```text
+      lockdep: acquiring buffer while holding buffer may deadlock
+      hart 0, pid 1 (init):
+        holds buffer at 0x8000507c 0x80003c8c 0x80004e42 0x800063b2 0x80003930
+        wants buffer at 0x8000507c 0x80003c3a 0x80004e50 0x800063b2 0x80003930
+      both locks are of class buffer
+      lockdep: turning off the checker
+      ```
+
+      Decoded: [[write_log]] (log.c:193 and log.c:194, inlined into `commit` and [[end_op]])
+      holds a log block and reads the home copy of a block. Another nesting with fixed roles.
+    others: |
+      Holding a sleep-lock does not turn interrupts off: between the two `ilock`s, `init` runs
+      with interrupts on and can be interrupted or preempted. Another process that wanted `/`
+      would sleep in [[acquiresleep]] until `create` unlocks it.
+  - title: Buffers nest by role too
+    commit: 8
+    file: kernel/log.c
+    lines: 186-202
+    focus: 193-196
+    diff: true
+    state:
+      hart: 0
+      mode: S
+      proc: init (pid 1)
+      intr: "on"
+      satp: kernel
+      locks: ["a log block (buffer sleep-lock)"]
+      stack: [usertrap, syscall, sys_mknod, end_op, commit, write_log]
+      sp: kernel
+      irq: 0
+    note: |
+      [[bread]] becomes `bread_nested(dev, blockno, 0)`, and five reads that happen while
+      another buffer is held use `SUB_INNER`: the home copy in [[write_log]] and
+      [[install_trans]] (under a log block), the bitmap block in [[balloc]] and [[bfree]] (under
+      an indirect block, from [[bmap]] or [[itrunc]]), and the new block in [[bzero]] (under an
+      indirect block, from `bmap`). In each case the outer buffer is a different kind of block,
+      and no code takes them the other way round.
+
+      With this commit the boot was silent. The first `rm` reported:
+
+      ```text
+      lockdep: acquiring inode while holding itable may deadlock
+      hart 0, pid 4 (rm):
+        holds itable at 0x8000444e 0x8000451e 0x80006152 0x80003930 0x800036b6
+        wants inode at 0x800050b4 0x80004494 0x8000451e 0x80006152 0x80003930
+      but this order has been seen before:
+      hart 0, pid 1:
+        holds inode at 0x800042b8 0x8000435a 0x80004a0e 0x80004b52 0x800058d4
+        wants itable at 0x80003e0c 0x8000492e 0x80004a30 0x80004b52 0x800058d4
+      lockdep: turning off the checker
+      ```
+
+      [[iput]] takes an inode's lock under `itable.lock`; [[namex]], in pid 1's
+      `kexec("/init")`, called [[iget]] under the root directory's lock. The second class cycle
+      of [[concept:locks#order]].
+  - title: A trylock records no order
+    commit: 9
+    file: kernel/spinlock.c
+    lines: 46-61
+    diff: true
+    state:
+      hart: 1
+      mode: S
+      proc: rm (pid 4)
+      intr: "off"
+      satp: kernel
+      locks: [itable.lock]
+      stack: [usertrap, syscall, sys_unlink, iunlockput, iput, tryacquiresleep, tryacquire]
+      sp: kernel
+      irq: {noff: 2, intena: 1, note: "itable.lock plus tryacquire's push_off; reasoned from the gdb state of the next step"}
+    note: |
+      `tryacquire()` makes one attempt and never spins. If it gets the lock it tells the checker
+      with `try = 1`: the lock goes on the held list (so what is taken under it is still
+      checked) but no order is recorded *for* it. A lock that is never waited for cannot be one
+      of the waits in a deadlock. `tryacquiresleep()` does the same for a sleep-lock: a try on
+      the inner lock, give up if the sleep-lock is taken, and never sleep.
+  - title: iput's acquisition, a checked claim
+    commit: 9
+    file: kernel/fs.c
+    lines: 360-394
+    focus: 371-379
+    diff: true
+    state:
+      hart: 1
+      mode: S
+      proc: rm (pid 4)
+      intr: "off"
+      satp: kernel
+      locks: [itable.lock]
+      stack: [usertrap, syscall, sys_unlink, iunlockput, iput, tryacquiresleep]
+      sp: kernel
+      irq: {noff: 1, intena: 1, note: "recorded by gdb: cpus[1].noff = 1, intena = 1"}
+    note: |
+      [[iput]] takes the inode's lock only for the last reference to an unlinked inode
+      (`last`). `ip->ref == 1` means nobody else references it, so nobody holds its lock or is
+      inside [[acquiresleep]] or [[releasesleep]] on it: the lock is free. That is exactly a
+      trylock, and if it ever fails the kernel panics. (The original would not have waited
+      silently either: sleeping with `itable.lock` held panics `sched locks`. The trylock's
+      gain is that the checker now knows this acquisition never waits, and the panic names
+      the assumption.)
+
+      gdb on the finished branch, `rm x`: hart 1, pid 4, at `tryacquiresleep` called from
+      fs.c:377, with `ip->ref = 1`, `ip->nlink = 0`, inode 25, `itable.lock` on hart 1's list
+      (`pc0` in `iput`), no sleep-lock on pid 4's list.
+
+      Both class cycles of [[concept:locks#order]] went through this one acquisition, so both
+      are gone. `usertests -q` on this commit's kernel: `ALL TESTS PASSED`, no report.
+  - title: Panic at a report
+    commit: 10
+    file: kernel/lockdep.c
+    lines: 271-310
+    focus: 276-286
+    diff: true
+    state:
+      hart: 1
+      mode: S
+      proc: init (pid 1)
+      intr: "off"
+      satp: kernel
+      locks: [wait_lock]
+      stack: [usertrap, syscall, sys_wait, kwait, acquire, lockdep_acquire, orderall, order, stop]
+      sp: kernel
+      irq: {noff: 2, intena: 1, note: "wait_lock plus the acquire's push_off; gdb read cpus[1].noff = 2 in the kfork demonstration (verify)"}
+    note: |
+      With xv6 clean, a report now means somebody just introduced a new order. `stop()` panics
+      (`LOCKDEP_PANIC 1` in `param.h`) after printing, and releases `ldlock` first, so the other
+      harts are not left spinning on it; with 0 it prints and turns the checker off, as before.
+
+      The state is the panic of the verify section's demonstration, in which [[kfork]] takes
+      `wait_lock` while still holding the child's `p->lock`: `init`'s first `wait()` ([[kwait]])
+      acquires a `p->lock` while holding `wait_lock`, and the checker stops the machine there,
+      at boot.
+  - title: Self-tests, on locks of their own
+    commit: 11
+    file: kernel/lockdep.c
+    lines: 564-617
+    focus: 584-612
+    diff: true
+    state:
+      hart: 0
+      mode: S
+      proc: lockdeptest (pid 3)
+      intr: "off"
+      satp: kernel
+      locks: ["test B"]
+      stack: [usertrap, syscall, sys_lockdep, selftest, nest, acquire, lockdep_acquire]
+      sp: kernel
+      irq: {noff: 2, intena: 1, note: "test B plus the acquire's push_off for test A; reasoned from the code"}
+    note: |
+      A checker that never reports is easy to write, so the kernel can test it on demand.
+      `lockdep(n, 0)` runs self-test `n` on locks named `test A`, `test B`, and so on, whose
+      classes are marked as test classes: a report about them is printed and counted, but does
+      not panic or stop the checker, and `forget()` clears their edges before each test. The
+      six tests are a two-lock cycle, a three-lock cycle, two locks of one class nested, the
+      same with the inner one as `SUB_CHILD` in both directions (no report), a role inversion,
+      and a trylock against the order (no report).
+
+      Test 4 shows the price of a role. Its two `nestsleep`s are a real AB-BA between two
+      instances: two processes running them at the same time would deadlock, and the checker
+      says nothing, because it trusts the roles. Only the directory tree makes the inode roles
+      safe (no directory is its own ancestor, and `unlink` refuses `.` and `..`).
+
+      In test 1 the second `nest()` acquires `test A` while holding `test B`. The report comes
+      before the acquisition, and the acquisition then goes ahead: one thread cannot deadlock
+      with itself on two free locks. The checker spoke about a deadlock that did not, and
+      here could not, happen.
+
+      `lockdep(0, &st)` copies out the statistics: whether the checker is on, classes, orders,
+      reports about real locks, acquisitions checked, and slow paths.
+  - title: lockdeptest
+    commit: 12
+    file: user/lockdeptest.c
+    lines: 1-58
+    focus: 27-57
+    diff: true
+    state:
+      hart: 0
+      mode: U
+      proc: lockdeptest (pid 3)
+      intr: "on"
+      satp: user
+      locks: []
+      stack: [main]
+      sp: user
+    note: |
+      The program prints the statistics, runs the six self-tests, compares each count of
+      reports with the expected one, then checks that the checker is still on and has made no
+      report about the kernel's own locks. One `OK` or `FAIL` per check, seven in all.
+
+      What it does not check is what each report *says*: those lines come from the kernel. The
+      last line says so. Read the reports for tests 1, 2, 3 and 5: each must name the
+      acquisition that closes the cycle and every edge of the path back.
+verify: |
+  On the branch (`ext/21-lockdep`, 12 commits), built with the project toolchain and run on
+  three harts (`-smp 3 -m 128M`), in one boot (reports trimmed):
+
+  ```text
+  $ lockdeptest
+  lockdeptest: 18 classes, 39 orders, 101086 acquisitions checked, 39 of them slowly
+  lockdeptest: test 1: A then B; later B then A
+  lockdep: acquiring test A while holding test B may deadlock
+  hart 0, pid 3 (lockdeptest):
+    holds test B at 0x80001534 0x80002218 0x80003f9c 0x80003d22 0x3ffffff09c
+    wants test A at 0x8000153a 0x80002218 0x80003f9c 0x80003d22 0x3ffffff09c
+  but this order has been seen before:
+  hart 0, pid 3 (lockdeptest):
+    holds test A at 0x80001534 0x80002204 0x80003f9c 0x80003d22 0x3ffffff09c
+    wants test B at 0x8000153a 0x80002204 0x80003f9c 0x80003d22 0x3ffffff09c
+  lockdeptest: test 1: 1 report(s), as expected: OK
+  [... tests 2 and 3 ...]
+  lockdeptest: test 4: two sleep-locks of one class, the inner one SUB_CHILD, both ways round
+  lockdeptest: test 4: 0 report(s), as expected: OK
+  lockdeptest: test 5: role 0 then SUB_CHILD; later SUB_CHILD then role 0
+  lockdep: acquiring test T while holding test T/1 may deadlock
+  [...]
+  lockdeptest: test 5: 1 report(s), as expected: OK
+  lockdeptest: test 6: A then B; later B then a trylock of A
+  lockdeptest: test 6: 0 report(s), as expected: OK
+  lockdeptest: checker on, no report about the kernel's locks: OK
+  lockdeptest: 7 of 7 checks OK; read the reports above to see that each names both orders
+  $ usertests -q
+  usertests starting
+  [...]
+  test unlinkcwd: OK
+  ALL TESTS PASSED
+  $ lockdeptest
+  lockdeptest: 19 classes, 46 orders, 28158293 acquisitions checked, 63 of them slowly
+  [... the same seven checks, all OK ...]
+  lockdeptest: 7 of 7 checks OK; read the reports above to see that each names both orders
+  ```
+
+  `usertests -q` passed with the checker on and silent: about 28 million
+  acquisitions checked, 46 orders learned, no report. "Slowly" counts the self-tests' own slow
+  paths too: 39 before the first `lockdeptest` (the program prints its statistics before
+  it runs the self-tests), 63 after `usertests` and one round of self-tests (the first
+  `lockdeptest`'s 17). In nine other runs with `lockdeptest` only after `usertests`, it was 46: one
+  slow path per order. Every commit builds, and every commit's kernel passed `usertests -q`
+  on three harts (commits 4 to 8 print one report first and then run with the checker off).
+
+  **The kfork bug from [[tour:52]], caught at boot.** A copy of the branch with the two lines
+  removed that make [[kfork]] release the child's `p->lock` before taking `wait_lock`. Two
+  boots, the same report before the shell's first prompt:
+
+  ```text
+  init: starting sh
+  lockdep: acquiring proc while holding wait_lock may deadlock
+  hart 1, pid 1 (init):
+    holds wait_lock at 0x80003854 0x80004022 0x80003f90 0x80003d16 0x3ffffff09c
+    wants proc at 0x800038e8 0x80004022 0x80003f90 0x80003d16 0x3ffffff09c
+  but this order has been seen before:
+  hart 1, pid 1 (init):
+    holds proc at 0x800031e2 0x8000331a 0x80004000 0x80003f90 0x80003d16
+    wants wait_lock at 0x800033d2 0x80004000 0x80003f90 0x80003d16 0x3ffffff09c
+  panic: lockdep
+  ```
+
+  Decoded (this copy's line numbers): [[kwait]] holds `wait_lock` (proc.c:373) and acquires a
+  child's `p->lock` (proc.c:381); earlier, `init`'s `fork()` held the child's `p->lock` from
+  [[allocproc]] (proc.c:115, via kfork proc.c:266) and acquired `wait_lock` (proc.c:294).
+  gdb at the panic found hart 1 in `lockdep_acquire` ← `acquire` ← `kwait` ← `sys_wait` with
+  `cpus[1].noff = 2`, and the other harts busy elsewhere (hart 2 looking up `sh` in a directory
+  for `exec`, hart 0 in [[uartintr]]). One process, one fork, one wait: no concurrency was needed. The same
+  change on the original kernel booted, ran `ls`, `echo hi` and `forktest`, and then froze in
+  `usertests`' `forkfork` test. A second boot running only `usertests forkfork` froze the
+  same way; gdb, attached after 90 seconds, found the cycle of tour 52:
+
+  ```text
+  Thread 3 (Thread 1.3 (CPU#2 [running])):
+  #0  acquire (lk=lk@entry=0x8000f9b8 <wait_lock>) at kernel/spinlock.c:37
+  #1  0x000000008000227c in kwait (addr=0) at kernel/proc.c:414
+  [...]
+
+  Thread 2 (Thread 1.2 (CPU#1 [running])):
+  #0  acquire (lk=lk@entry=0x80010640 <proc+2160>) at kernel/spinlock.c:37
+  #1  0x0000000080001fb0 in wakeup (chan=0x800104d8 <proc+1800>) at kernel/proc.c:578
+  #2  0x00000000800020a8 in kexit (status=0) at kernel/proc.c:350
+  [...]
+
+  Thread 1 (Thread 1.1 (CPU#0 [running])):
+  #0  acquire (lk=lk@entry=0x8000f9b8 <wait_lock>) at kernel/spinlock.c:37
+  #1  0x0000000080001d36 in kfork () at kernel/proc.c:294
+  [...]
+  $1 = {locked = 1, name = 0x80007168 "wait_lock", cpu = 0x8000fa50 <cpus+128>}
+  $2 = 9
+  ```
+
+  `wait_lock` held by hart 1 (in [[kexit]], waiting for a `p->lock` in [[wakeup]]), hart 0 in
+  `kfork` waiting for `wait_lock` (it holds the new child's lock, by the code: we did not
+  print `proc+2160`'s owner), and `ticks` at 9, which cannot advance while every hart spins
+  with interrupts off.
+
+  **A rename-style inode inversion.** A copy of the branch whose [[sys_link]] keeps the file
+  locked while it looks up and locks the target directory (the original releases the file
+  first, line 153). That is the inversion `rename` must avoid: one path holds a file and
+  wants its directory, [[sys_unlink]] holds the directory and wants the file. At the first `ln`:
+
+  ```text
+  $ ln f g
+  lockdep: acquiring inode while holding inode may deadlock
+  hart 1, pid 4 (ln):
+    holds inode at 0x80004924 0x800049c6 0x80006676 0x80003f9c 0x80003d22
+    wants inode at 0x80004924 0x800049c6 0x80005092 0x800051ee 0x800066a6
+  both locks are of class inode
+  panic: lockdep
+  ```
+
+  (`sys_link` holds `f`, and [[namex]] under [[nameiparent]] locks `/`.) If the programmer
+  annotates honestly and locks the file as a child (`ilock_nested(ip, SUB_CHILD)`), the
+  report names the two orders, against [[create]] at boot:
+
+  ```text
+  lockdep: acquiring inode while holding inode/1 may deadlock
+  hart 0, pid 4 (ln):
+    holds inode/1 at 0x80004924 0x80006678 0x80003f9c 0x80003d22 0x3ffffff09c
+    wants inode at 0x80004924 0x800049c6 0x80005092 0x800051ee 0x800066a8
+  but this order has been seen before:
+  hart 1, pid 1 (init):
+    holds inode at 0x80004924 0x800049c6 0x8000639a 0x80006aae 0x80003f9c
+    wants inode/1 at 0x80004924 0x80006426 0x80006aae 0x80003f9c 0x80003d22
+  panic: lockdep
+  ```
+
+  On the original kernel with the same change, a short program (in the scratch copy only)
+  with one process looping `link("d/x", "d/y")` and another `unlink("d/y")` stopped after
+  `u0 l0 l100 u100 u200 l200 u300`: gdb found both processes `SLEEPING`, pid 3 (the
+  `unlink` loop) holding directory `d` (inode 25) and asleep on file `x`'s lock, pid 4 (the
+  `link` loop) holding `x` (inode 26) and asleep on `d`'s, while all three harts sat idle and `ticks` kept counting (6,146). A
+  deadlock of sleep-locks: nothing spins, two processes are gone.
+measure: |
+  **Run time.** `usertests -q` on three harts, wall-clock time measured by the script that
+  drives QEMU (measured while the computer was busy with other work; your times will
+  differ, since timings on QEMU depend on what else the computer is doing). To make the
+  comparison fair, the kernels of each round started at the same moment, so they shared
+  whatever else the computer was doing:
+
+  | round | original kernel | branch head | head / original |
+  |---|---|---|---|
+  | 1 | 80.3 s | 93.2 s | 1.16 |
+  | 2 | 60.1 s | 81.7 s | 1.36 |
+  | 3 | 54.3 s | 65.4 s | 1.20 |
+  | 4 | 55.2 s | 72.3 s | 1.31 |
+  | 5 | 49.4 s | 68.4 s | 1.38 |
+  | 6 | 54.6 s | 66.3 s | 1.21 |
+  | 7 | 50.6 s | 62.6 s | 1.24 |
+  | 8 | 50.9 s | 59.7 s | 1.17 |
+  | 9 | 60.6 s | 71.5 s | 1.18 |
+
+  With the checker, `usertests -q` took 16 to 38 percent longer (median 21 percent). How much
+  of the spread is noise? In rounds 1 to 6 a second copy of the *same* head kernel ran
+  alongside; the two copies differed by 0 to 4.3 percent (97.2 against 93.2 s in round 1).
+
+  **What the time goes on.** The checker examined 25.7 to 28.9 million acquisitions per run
+  and took its own lock 46 times. So the cost is the per-acquisition bookkeeping, not the
+  graph: a call, the five-frame trace, the push on a held list, and the search on release.
+  To see what the lock-free fast path is worth, a scratch copy took `ldlock` on every call to
+  `order()` (rounds 7 to 9 ran it alongside the other two): it took the lock 39.7 to 42.0
+  million times per run (more than the acquisitions: an acquisition with two locks held makes
+  two calls) and was 7 to 11 percent slower than the head (69.1, 64.1 and 79.6 s against
+  62.6, 59.7 and 71.5 s). Worth having, but most of the checker's cost is elsewhere.
+
+  **What it learned.** After boot, `ls` and `usertests -q`: 19 classes (including the
+  subclasses `inode/1` and `buffer/1`) and 46 orders, close to [[tour:51]]'s measured graph.
+  Ctrl-P prints them; for example `lockdep: proc -> kmem nextpid itable ftable` and `lockdep:
+  inode -> sleep lock kmem proc bcache buffer itable ftable virtio_disk log inode/1 buffer/1`.
+
+  **What QEMU hides.** The times are QEMU's, on a busy computer; they say "about a
+  fifth slower", not a cycle count. On real hardware the shared `after[]` words would be read
+  by every hart and almost never written, which caches handle well. The per-hart arrays are
+  another matter: `nheld`, `nchecks`, `inirq` and `busy` are small arrays indexed by hart,
+  written on every acquisition, so neighbouring harts' entries share cache lines.
+further: |
+  - **The log as a lock.** [[begin_op]] can make a process wait for a commit, and the
+    committing process holds buffers: it behaves like a lock the checker cannot see
+    ([[tour:51]] makes the same point). Give it a class of its own (Linux does this for its
+    journal with a `lockdep_map`) and see which orders appear.
+  - **Check the buffer roles.** `SUB_INNER` is a claim. Add a check that a `SUB_INNER` read
+    really happens while a buffer is held, or make the roles per block type (log, bitmap,
+    indirect, data) and let the checker learn their order.
+  - **Irq-safe before irq-unsafe.** Linux also reports an edge from a class used in a handler
+    to a class held with interrupts on, through any path. In xv6 only sleep-locks can be the
+    second; add the check and explain why it never fires.
+  - **Hold times.** Record how long each class is held (the `time` CSR at acquire and
+    release) and print the longest, per class. Which spinlock is held longest, and is it
+    one a handler waits for?
+  - **Sleeping holding a spinlock, by name.** [[sched]] panics `sched locks` without saying
+    which lock. Make it print the hart's held list first.

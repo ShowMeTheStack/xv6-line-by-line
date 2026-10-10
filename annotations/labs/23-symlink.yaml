@@ -1,0 +1,1859 @@
+published: true
+title: Symbolic links
+area: File system
+stars: 3
+branch: ext/23-symlink
+prerequisites: {tours: [31, 33, 34, 35, 36], concepts: [locks]}
+summary: |
+  In this tree a name in a directory is a hard link: a `struct dirent` holding an inode
+  number. Two names can share one inode, but only inside one file system, never for a
+  directory, and the inode stays alive while any name points at it. A *symbolic* link is a
+  different idea: a small file whose content is a path name, which `open` replaces by the
+  thing that path names. It may point at a directory, at a name that does not exist yet, or
+  at another link.
+
+  You add a fourth inode type, a `symlink(target, path)` system call, and following in
+  `open`. The code is short. The questions are not. Which system calls should follow a
+  link, and what happens to the ones that do not? Where in the inode does the target go,
+  and inside which transaction? A link can name itself, or its own directory: what may the
+  kernel hold while it looks a target up, given the order in which [[namex]] takes inode
+  locks? What stops a cycle of links, and what does the machine look like if nothing does?
+  A relative target like `f`: relative to what?
+
+  The reference solution is seven small commits. With it, `ln -s f d/l` makes a link whose
+  creation logs a handful of disk blocks, and opening a file through one link costs about twice
+  as much as opening it directly, because following is a second path lookup.
+learn:
+  - "How the inode types of this tree (`T_DIR`, `T_FILE`, `T_DEVICE`) are used by `open`, `create`, `namex` and `unlink`, and how a fourth type fits in without changing the on-disk format."
+  - "Where a file system can keep a small piece of variable-length data such as a link's target, and what has to happen inside one log transaction when it is written."
+  - "How many blocks one file-system operation may write ([[g:transaction|MAXOPBLOCKS]]), and how to count them for a new operation."
+  - "Which inode sleep-locks [[namex]] takes, in which order, and what that means for code that looks up a path while it holds an inode lock. What a self-deadlock on a sleep-lock looks like in this tree, and how one stuck process can stop every file-system write."
+  - "Why a loop in the kernel needs a bound, what a process that never leaves the kernel does to `kill` and to the log, and what a kernel stack overflow looks like through the guard page."
+  - "What `unlink`, `link` and the link count mean for a symbolic link."
+spec: |
+  **Behaviour.**
+
+  - `int symlink(char *target, char *path)` creates a new inode of type `T_SYMLINK` (4, in
+    `kernel/stat.h`) at `path`, whose content is the bytes of `target` (without the final
+    NUL; the inode's size is the target's length). `target` is not looked up: it may name
+    nothing yet. It returns 0, or -1 if `path` already exists, its directory does not exist,
+    or `target` is empty. If the disk is full, it returns -1 and leaves nothing behind:
+    the name does not exist afterwards, and a retry with free space succeeds.
+  - `open(path, flags)` **follows** links: while the inode it found is a `T_SYMLINK`, it
+    replaces it by the inode that the link's target names, at most `MAXSYMLINK` (10) times.
+    More links than that (a cycle, or a chain of 11) make `open` fail with -1. A target that
+    does not exist makes `open` fail.
+  - A **relative target** is taken from the link's own directory: a link `d/l` with target
+    `f` means `d/f`, whatever the current directory of the process that opens it.
+  - With `O_NOFOLLOW` (0x800, in `kernel/fcntl.h`), `open` returns the link itself, for
+    reading only: `read` returns the target's bytes and `fstat` reports `T_SYMLINK`.
+  - `open` with `O_CREATE` of an existing link follows it (so `echo hi > link` writes the
+    target); if the target does not exist, `open` fails. It does not create the target.
+  - A link that leads to a directory can be opened read-only, like the directory itself.
+
+  **Only `open` follows, and only the last name of a path.** This is the design decision of
+  the lab, worked out in the think section. [[namex]] is unchanged, so a link in the middle
+  of a path is not a directory to it: `open("dl/f")` fails when `dl` is a link to a
+  directory. [[sys_chdir]] and [[kexec]] look their path up with [[namei]] and do not
+  follow either: `cd dl` fails, and running a program through a link fails. `ls dl` opens `dl`
+  and reads the directory's entries, but then cannot stat any of them (`dl/f` has `dl` as a
+  middle component): it prints one `ls: cannot stat dl/<name>` line per entry. `unlink` and `link` act on the link itself, never on its target.
+
+  **What must not change.** Every existing behaviour of `open`, `mkdir`, `mknod`, `link`,
+  `unlink` and `chdir` on paths without links; the on-disk format (a link is an ordinary
+  inode with one data block); **`usertests -q` must print `ALL TESTS PASSED` on 3 harts.**
+
+  **The test program**, `symlinktest`, checks everything above itself and prints one line
+  per check (the counts in the worker lines, and their order, vary from run to run):
+
+  ```text
+  $ symlinktest
+  symlinktest: basic: OK
+  symlinktest: relative: OK
+  symlinktest: dangling: OK
+  symlinktest: nofollow: OK
+  symlinktest: chain: OK
+  symlinktest: cycle: OK
+  symlinktest: directory: OK
+  symlinktest: not followed in the middle of a path or by chdir: OK
+  symlinktest: create through a link: OK
+  symlinktest: unlink: OK
+  symlinktest: hard link to a symlink: OK
+  symlinktest: unlinked symlink's inode freed: OK
+  symlinktest: errors: OK
+  symlinktest: worker 1: 256 links made, 256 removed, 115 opened through links, 250 links read
+  symlinktest: worker 2: 241 links made, 244 removed, 121 opened through links, 253 links read
+  symlinktest: worker 0: 263 links made, 258 removed, 83 opened through links, 238 links read
+  symlinktest: concurrent: OK
+  symlinktest: ALL OK
+  ```
+
+  - **basic**: `/stt/l1` → `/stt/a`; reading through the link gives the file's data,
+    `fstat` gives the file's inode number, and a write through the link changes the file.
+  - **relative**: `/stt/rl` → `a` opens `/stt/a`, from `/` (where there is no `a`) and as
+    `../rl` from `/stt/sub`.
+  - **dangling**: a link to a name that does not exist cannot be opened, until the name is
+    created.
+  - **nofollow**: `O_NOFOLLOW` gives the link: type `T_SYMLINK`, size 6, link count 1, data
+    `/stt/a`; it cannot be opened for writing. The target's link count is still 1.
+  - **chain**: `c1` → `c2` → … → `c10` → `/stt/a` opens (10 links); `c0` → `c1` does not
+    (11). A link to a link opens too.
+  - **cycle**: `x` → `y` → `x`, and `s` → `s`, fail (also with `O_CREATE`) and do not hang.
+  - **directory**: `/stt/dlink` → `d` opens read-only as a directory whose entries include
+    `f`; opening it for writing fails. Then the honest part: `/stt/dlink/f` and
+    `chdir("/stt/dlink")` fail.
+  - **create through a link**: `O_CREATE` through a dangling link fails and creates nothing;
+    through a live one it truncates and writes the target.
+  - **unlink**, **hard link**, **inode freed**: `unlink` removes the link, not the target; a
+    hard link to a link raises the *link's* count to 2; an unlinked link's inode is freed
+    (the next new file gets its inode number).
+  - **errors**: empty target, existing name, missing directory.
+  - **concurrent**: three processes on three harts create, remove and open four links
+    `/stt/c/l0` … `l3` 2,000 times each, with targets that are a file `t` or another of the
+    links, so chains and cycles form and break all the time. Every open through links must
+    reach `t` or fail, every link read must hold a whole target, and each worker must have
+    succeeded at least once at both (otherwise the check proves nothing). The worker lines
+    show how often.
+think:
+  - title: What is a symbolic link, on disk?
+    q: |
+      A link must remember a path name of up to `MAXPATH` - 1 = 127 bytes. Before writing any
+      code, decide where those bytes live. In the directory entry? In some field of the
+      target? Somewhere in a new kind of inode? And what does the rest of the system (mkfs,
+      `ls`, [[stati]], `fstat`) need to know about your decision?
+    hints:
+      - "Look at `struct dirent` in [[kernel/fs.h:58]], `struct dinode` in [[kernel/fs.h:32]], and the three `T_` types in [[kernel/stat.h:1]]. Who reads `type`?"
+      - "A directory entry has 2 bytes of inode number and 14 of name, nothing else. The target may not exist, and many links may name it. An inode already has a size and data blocks that [[readi]] and [[writei]] know how to use."
+      - "A new inode type, value 4. The link's data is the target's bytes, its size their length. Nothing on disk changes shape."
+    answer: |
+      The target goes **into the link's own inode, as its file data**. The reference adds
+      `T_SYMLINK` (4) to `kernel/stat.h` and writes the target with [[writei]] at offset 0,
+      without a NUL: the inode's `size` is the target's length. Reading it back is
+      [[readi]] of `size` bytes.
+
+      The alternatives fail on a basic fact each. A `struct dirent` is 16 bytes: an inode
+      number and a 14-byte name ([[kernel/fs.h:58]]); there is no room, and a directory
+      entry must stay fixed-size for [[dirlookup]]. A field in the *target* cannot work:
+      the target may not exist (a dangling link), may be on the other side of many links,
+      and a link to it records a *name*, not an inode. A new inode type keeps the on-disk
+      format unchanged: `struct dinode` already has `type`, `size` and `addrs[]`.
+
+      The cost: every link uses one inode and one 1024-byte data block, even for a target
+      of one byte. (Storing short targets in `addrs[]` itself, 52 bytes, is a "further"
+      item.)
+
+      Who must learn about type 4? `stat.h` is shared by the kernel, `mkfs` and user
+      programs. `mkfs` never creates links, so it needs nothing. [[stati]] copies `type`
+      as it is, so `fstat` reports 4. Everything that tests for `T_DIR` or `T_FILE`
+      explicitly simply does not match a link; you will meet the places where that matters.
+    checks:
+      - id: lab23-01
+        level: 1
+        type: choice
+        q: |
+          `ln -s /stt/a /stt/l1` has run on the reference branch. Where are the six bytes
+          `/stt/a` stored?
+        options:
+          - text: "In the first data block of the link's own inode (inode type T_SYMLINK, size 6)."
+            correct: true
+            why: |
+              Right. [[writei]] put them at offset 0 of a fresh data block; the inode's
+              `size` says how many bytes are meaningful.
+          - text: "In the name field of l1's directory entry in /stt."
+            why: |
+              You may have thought a link is "a name pointing at a name". A `struct dirent`
+              holds an inode number and a 14-byte name, nothing else, and the name field is
+              l1's own name.
+          - text: "In a new field of /stt/a's inode, which counts and lists the links to it."
+            why: |
+              You may be thinking of hard links, which do live in the target (its
+              `nlink`). A symbolic link records a path; the target may not even exist, and
+              nothing in the target changes when you make one.
+          - text: "In the inode's addrs[] array, where the block numbers normally go."
+            why: |
+              That is a real design (Linux's ext2 stores targets shorter than 60 bytes
+              there), but not this one: the reference always uses a data block, even for
+              six bytes.
+        explain: |
+          A symbolic link is an ordinary inode whose data is a path. The type field
+          (`T_SYMLINK` = 4) tells `open` to treat the data as a name to look up instead of
+          as file contents. See [[g:inode]] and [[tour:33]].
+      - id: lab23-02
+        level: 2
+        type: number
+        q: |
+          A program opens `/stt/l1` (target `/stt/a`) with `O_RDONLY | O_NOFOLLOW` and calls
+          `fstat`. What is `st.size`?
+        answer: 6
+        wrong:
+          7: |
+            You may have counted the NUL that ends the string in C. The reference does not
+            store it: [[argstr]] returned the length 6 and `sys_symlink` writes exactly that
+            many bytes.
+          1024: |
+            You may have confused the inode's size with the size of its data block. The
+            block holds 1024 bytes, but `size` records how many of them are data.
+          128: |
+            You may have thought the kernel stores a whole `MAXPATH` buffer. It writes only
+            the target's bytes.
+        why_wrong: "`size` is the number of bytes written with writei: the target's length, without a NUL."
+        explain: |
+          `size` = `strlen("/stt/a")` = 6. Because the NUL is not stored, the reader must
+          add it: the reference reads exactly `size` bytes into a buffer and writes a 0
+          after them. Clinic 4 shows what happens when a reader forgets.
+  - title: Making one, inside one transaction
+    q: |
+      `symlink(target, path)` must make a new name in a directory, a new inode, and write the
+      target into it. Existing code already makes "new name, new inode": in what state does
+      it leave things, and in what order does it do them? If you reuse it as it is and then
+      write the target, can another process, on another hart, find the link before the
+      target is in it? What is left behind if the disk fills up halfway? Where must
+      `begin_op` and `end_op` go, and how many disk blocks can this one operation dirty: is
+      that within the limit every operation must respect?
+    hints:
+      - "Read how [[sys_mkdir]] and [[sys_mknod]] make a new name, and the comment above [[log_write]]. Look at what [[begin_op]] reserves ([[kernel/log.c:138]])."
+      - "Every [[log_write]] must happen between `begin_op` and `end_op`, and one operation may dirty at most `MAXOPBLOCKS` = 10 distinct blocks; a buffer written twice in one transaction counts once (absorption). The moment the directory entry is written, the name exists for everybody (the log does not hide it), and a failure after that point leaves the name in place."
+      - "Take the steps of the existing helper, but put the write of the target between \"allocate and lock the new inode\" and \"add the directory entry\". On failure, give the inode a link count of 0 and let [[iput]] free it. Keep the order of the two inode locks the helper uses."
+    answer: |
+      [[create]] does "new name, new inode": it locks the parent directory, checks the name
+      is free, calls [[ialloc]], locks the new inode, sets `nlink` to 1, adds the directory
+      entry with [[dirlink]], unlocks the directory and returns the new inode, locked.
+      Calling it and then [[writei]] would almost work: the name would be visible before the
+      target is written, but anyone who found it would sleep in [[ilock]] until the
+      target was there. The real trouble is failure. If [[writei]] finds the disk full, the
+      name is already in the directory. A `sys_symlink` that does exactly that, run on a
+      full disk, shows the result: `symlink` returned -1 but left a
+      link of size 0 at the name, so even a retry after freeing space failed until someone
+      ran `rm`.
+
+      So the reference does [[create]]'s steps itself, in a different order: lock the
+      directory, check the name, [[ialloc]] and lock the new inode, **write the target**,
+      and only then [[dirlink]] the name. The name appears only when the link is complete.
+      If either write fails, it sets the inode's `nlink` to 0, and [[iunlockput]]'s [[iput]]
+      frees the inode and any block it got; the directory never changed. Recorded on a full
+      disk: `symfull: symlink returned -1`, `/lk does not exist`, and after freeing space
+      `symlink again returned 0`. The two inode locks are taken in [[create]]'s order,
+      directory before new inode, parent before child, as everywhere in this file system.
+
+      Everything sits between one `begin_op` and one `end_op`, so a crash leaves either the
+      whole link (inode, target and name) or nothing. Forget them and the first
+      [[log_write]] panics (clinic 3). (The log gives atomicity across crashes, not
+      isolation: other processes see cached blocks at once. What keeps them out of a
+      half-made link here is the order of the writes and the two locks.)
+
+      **How many blocks?** Recorded with gdb, and with an instrumented kernel that printed
+      the log just before `end_op`: `ln -s f d/l` logged 4 blocks (the inode block holding
+      both the new link and `d`, the bitmap block, the link's new data block and `d`'s
+      data block); a link whose inode falls in a different inode block from its
+      directory's logged 5; and a link whose directory needed a new data block also logged
+      5. Each [[iupdate]] of an inode in a block already logged is absorbed. The worst case,
+      reasoned from [[bmap]] rather than measured, adds the directory's indirect block the
+      first time a directory grows past 12 blocks: 6, under the `MAXOPBLOCKS` of 10 that
+      [[begin_op]] reserves.
+
+      An empty target is refused: `namei("")` returns the current directory in this tree,
+      which no one would mean.
+    checks:
+      - id: lab23-03
+        level: 2
+        type: order
+        q: |
+          Put the steps of `ln -s f d/l` on the reference branch in the order they happen
+          (`d` is inode 25; the new link becomes inode 27).
+        items:
+          - text: "begin_op reserves room in the log for this operation"
+            why: "Nothing may be written to a buffer for the log before the operation has joined a transaction."
+          - text: "sys_symlink locks directory d and checks that the name l is free"
+            why: "Parent first: nameiparent, then ilock on d, then dirlookup, as in create."
+          - text: "ialloc gives inode 27, which is locked and gets nlink 1"
+            why: "The new inode is allocated and locked while d is still locked: parent before child."
+          - text: "writei stores the byte f in a new data block of inode 27"
+            why: "The target is written before any name points at the inode, so nobody can ever find an empty link."
+          - text: "dirlink writes the entry (l, 27) into d"
+            why: "The name comes last: only now is the link complete, and only now does it become reachable."
+          - text: "iunlockput releases inode 27 and then d, and end_op commits the transaction"
+            why: "end_op is last, after every log_write."
+        why_wrong: "Follow sys_symlink: begin_op, lock the parent and check the name, new inode, target, name, release both, end_op."
+        explain: |
+          gdb recorded this order in the run used by the reveal: after [[ialloc]] both inode
+          25 and inode 27 were locked by `ln` (pid 5) and the log held 1 block; at
+          [[dirlink]] it held 3 (inode block, bitmap, the link's data); at the end, 4.
+      - id: lab23-04
+        level: 2
+        type: tf
+        q: |
+          True or false: on the reference branch, a process on another hart can find the
+          name `d/l` while its target is not yet written.
+        answer: false
+        why_tf: |
+          You may have thought the name appears as soon as the inode exists. The reference
+          writes the directory entry last.
+        reasons:
+          - text: "The entry (l, 27) is written by dirlink only after writei has stored the target."
+            correct: true
+            why: |
+              Right. Until [[dirlink]] runs, no directory names inode 27. (And while
+              `sys_symlink` works, `d` is locked, so a lookup in `d` would wait anyway.)
+          - text: "The log transaction makes the new entry invisible until end_op commits it."
+            why: |
+              You may have confused crash atomicity with isolation. A block written into the
+              cache is seen by every process at once; the log only decides what survives a
+              crash.
+          - text: "It can find it, but open follows the empty target and fails, which is harmless."
+            why: |
+              That describes a design that links the name first. In the reference no empty
+              link ever exists, and the follow loop's `n <= 0` test is only a defence.
+        explain: |
+          Order of writes, not the log, decides what other processes can see. Writing the
+          name last makes the link appear complete or not at all, both for other processes
+          now and for a full disk, where the half-made inode is simply freed. See
+          [[concept:locks#lock-inode]].
+      - id: lab23-05
+        level: 3
+        type: number
+        q: |
+          In the recorded run, the new link (inode 27) and its directory `d` (inode 25) lie in
+          the same inode block (16 inodes per block), `d` has room in its existing data block,
+          and the link's target needs one new data block. How many distinct blocks are in the
+          log when `sys_symlink` calls `end_op`?
+        answer: 4
+        wrong:
+          5: |
+            You may have counted `d`'s inode block separately from the link's. Both inodes
+            are in the same block, and the log keeps one entry per block number (absorption).
+          8: |
+            You may have counted every `log_write` call: there are 8. But several write the
+            same block: the inode block is written by [[ialloc]], by the [[iupdate]] that
+            sets `nlink`, and by the [[iupdate]] at the end of each of the two [[writei]]
+            calls (the target, then the directory entry), and the link's data block twice
+            (zeroed by [[balloc]], then written).
+          10: |
+            You may have given `MAXOPBLOCKS`, the reservation [[begin_op]] makes for every
+            operation. That is the most an operation may write, not what this one writes.
+        why_wrong: "Count distinct block numbers: inode block, bitmap block, new data block, directory data block."
+        explain: |
+          The recorded log: blocks 34 (inodes 16–31, with 25 and 27), 46 (the free-block
+          bitmap), 1073 (the link's data) and 1071 (d's entries). An operation's cost in the
+          log is its number of *distinct* blocks, which is why [[log_write]] searches for the
+          block number first. See [[tour:31]].
+  - title: Which calls follow a link?
+    q: |
+      Every path in this tree is looked up by [[namex]], through [[namei]] or
+      [[nameiparent]]. You could follow links inside [[namex]], for every component of every
+      path, or only in some system calls, only for the last component. The spec fixes the
+      choice for this lab; before you accept it, argue it yourself. For `open`, `chdir`,
+      `exec`, `unlink`, `link`, `mkdir` and the middle of a path: what would following cost,
+      and what would not following cost? Which of them must *not* follow a link even in
+      Unix?
+    hints:
+      - "List the callers of [[namei]] and [[nameiparent]]: [[sys_open]], [[sys_chdir]], [[kexec]], [[sys_link]], [[sys_unlink]], [[create]]. Then read [[namex]]: where would a link in the middle of a path have to be handled?"
+      - "`unlink(link)` must remove the link, and `link(link, new)` and creating a name must see the link itself. Following inside [[namex]] means, at a middle component, building a new path (target + rest) and restarting the walk from the link's directory or the root, with one depth counter for the whole lookup."
+      - "Follow in `sys_open` only, after the inode is found and locked and before any check of its type; leave [[namex]] alone. Write down honestly what then does not follow."
+    answer: |
+      **Only `open` follows, and only at the end of the path.** That is the classic choice
+      for this exercise, and the reference makes it deliberately:
+
+      - It touches one system call. [[namex]], which every path goes through, stays exactly
+        as it is, with its careful parent-then-child locking. `unlink`, `link`, `mkdir`,
+        `mknod` and the parent part of `create` keep seeing the link itself, which is what
+        they must see even in Unix (`unlink` removes a link, not its target).
+      - `open` is where a program reads or writes a file, so it is where following is most
+        useful: `cat link`, `echo hi > link`, `ls link` (which opens and `fstat`s).
+
+      **What it costs**, and the spec says so: [[sys_chdir]] and [[kexec]] call [[namei]]
+      and do not follow, so `cd dl` fails and running a program through a link fails
+      (recorded: `exec e failed`). A link in the middle of a path is not a directory to
+      [[namex]] ([[kernel/fs.c:703]]), so `open("dl/f")` fails, and `ls dl` reads the
+      directory but prints only one `cannot stat dl/<name>` line per entry.
+
+      **The Linux way** follows at every component: when [[namex]] meets a link in the
+      middle of a path, it splices the target in front of the rest of the path and goes on
+      from the link's directory (or the root), counting links across the whole lookup.
+      That is the right design for a real system and a "further" item here; it changes the
+      function every file-system call depends on, and every system call must then choose
+      between following the last component or not (Linux has `O_NOFOLLOW`, `lstat`,
+      `AT_SYMLINK_NOFOLLOW` for exactly that).
+    checks:
+      - id: lab23-06
+        level: 2
+        type: multi
+        q: |
+          On the reference branch, `dl` is a link to the directory `d`, which contains the
+          file `f`. Which of these succeed?
+        options:
+          - text: "open(\"dl\", O_RDONLY)"
+            correct: true
+            why: "open follows the last component: the result is d, opened read-only like any directory."
+          - text: "unlink(\"dl\")"
+            correct: true
+            why: "unlink looks dl up with nameiparent and dirlookup, never following: it removes the link, and d is untouched."
+          - text: "open(\"dl/f\", O_RDONLY)"
+            why: |
+              You may have expected the kernel to follow dl because it is "on the way". Only
+              the last component is followed; [[namex]] finds `dl` is not `T_DIR` and fails.
+          - text: "chdir(\"dl\")"
+            why: |
+              You may have thought every lookup follows. [[sys_chdir]] uses [[namei]], which
+              returns the link itself, and then refuses it because it is not a directory.
+          - text: "exec(\"dl/prog\", argv) for a program prog in d"
+            why: |
+              Two reasons, either sufficient: `dl` is a middle component, and [[kexec]] does
+              not follow links even at the end of the path.
+        explain: |
+          The rule is one sentence: `open` follows the last name, nothing else does. The
+          test program checks both sides of it ("directory" and "not followed in the middle
+          of a path or by chdir").
+  - title: What may you hold while you look up the target?
+    q: |
+      `open` has found the link and holds its inode's sleep-lock (it called [[ilock]] to
+      read the type). It reads the target. Now it must look the target up. In which order do
+      you do "release the link" and "look up the target", and why does it matter? Think of
+      a link whose target leads *through the link itself*, like `s` → `s/x`, and of a link
+      to its own directory, `d/up` → `.`, while another process removes `d/up`.
+    hints:
+      - "Read [[namex]] ([[kernel/fs.c:692]]): which inodes does it lock, and in which order? Then read [[acquiresleep]] ([[kernel/sleeplock.c:22]]): what does it do if the lock is already held, and by whom?"
+      - "[[namex]] locks every component except the last, one at a time, parent before child. [[acquiresleep]] has no owner check: a process that asks for a sleep-lock it already holds sleeps, waiting for itself. And [[sys_unlink]] holds the directory while it locks the entry's inode ([[kernel/sysfile.c:218]], [[kernel/sysfile.c:226]])."
+      - "Ask what the process may hold at the moment the lookup starts, for *any* target. Arrange the three operations (read the target, release the link, look the target up) so that the answer is: no inode lock at all, only its place in the log transaction."
+    answer: |
+      **Release first, then look up.** While [[namei]] runs, the process must hold no inode
+      lock. Two things go wrong otherwise, and both were reproduced on a kernel that called
+      [[namei]] first and [[iunlockput]] after (clinic 1):
+
+      - **Self-deadlock.** `s` → `s/x`: [[namex]] walks `s/x`, finds `s` as a middle
+        component and calls [[ilock]] on it, that is [[acquiresleep]] on a lock this very
+        process holds. There is no check for that (unlike [[acquire]]'s `panic("acquire")`
+        for a spinlock): the process sleeps on its own lock, forever, with no message.
+      - **ABBA deadlock.** `d/up` → `.`: the opener holds `up` and [[namex]] needs `d` (a
+        middle component of `d/.`); meanwhile [[sys_unlink]] of `d/up` holds `d` and waits
+        for `up`. Each holds what the other wants. This is the general rule broken: inode
+        locks are taken parent before child, and a link is a *child* of its directory.
+
+      Releasing the link is safe because nothing more is needed from it: the target is in
+      a local buffer. The link may even be unlinked by someone else a moment later; this
+      `open` simply goes on with the name it read. [[iunlockput]] rather than [[iunlock]]
+      drops the reference too, and if the link was unlinked meanwhile, that [[iput]] frees
+      it, which is allowed because `open` is inside a transaction.
+
+      Notice what does *not* deadlock even with the bug: a link to itself, `self` → `self`.
+      [[namex]] never locks the last component of a path, so looking up `self` takes no lock
+      on it; the depth limit ends the loop. A test with only that case passes, and hides
+      the bug.
+    checks:
+      - id: lab23-07
+        level: 3
+        type: choice
+        q: |
+          A buggy `follow` calls `namei(target)` while it still holds the link's lock, and
+          releases the link only afterwards. You type `ln -s s/x s` and then `cat s &`. What
+          happens?
+        options:
+          - text: "cat sleeps forever in acquiresleep, waiting for the lock of inode s, which cat itself holds; nothing is printed."
+            correct: true
+            why: |
+              Right: recorded. `^P` showed `7 sleep  cat`, and gdb showed it sleeping on the
+              lock of inode 27 (the link), which was `locked 1 by pid 7`.
+          - text: "The kernel panics with acquire, because a lock was taken twice."
+            why: |
+              You may be thinking of spinlocks: [[acquire]] calls [[holding]] and panics.
+              [[acquiresleep]] has no such check; it just waits for the holder, here itself.
+          - text: "open returns -1 after MAXSYMLINK follows."
+            why: |
+              That is what happens to a cycle like `self` → `self`, whose lookup never locks
+              the link. `s/x` makes [[namex]] lock `s` as a directory on the way.
+          - text: "cat prints \"cannot open s\" because s/x does not exist."
+            why: |
+              The lookup never gets as far as asking whether `x` exists: it blocks at the
+              [[ilock]] of `s`, one component earlier.
+        explain: |
+          A sleep-lock records its holder (`lk->pid`) but [[acquiresleep]] never compares it
+          with the caller. Waiting for yourself looks exactly like waiting for anyone else:
+          SLEEPING, forever. See [[concept:locks#sleep-locks]] and [[tour:34]].
+      - id: lab23-08
+        level: 3
+        type: multi
+        q: |
+          With the same buggy `follow` (lookup while holding the link), which of these
+          situations can hang?
+        options:
+          - text: "open of s, where s → s/x"
+            correct: true
+            why: "namex locks s as a middle component: self-deadlock."
+          - text: "open of d/up, where d/up → ., while another process unlinks d/up"
+            correct: true
+            why: "Opener holds up and wants d; unlink holds d and wants up. Recorded with two processes: both asleep."
+          - text: "open of self, where self → self"
+            why: |
+              You may have expected every self-reference to deadlock. [[namex]] does not lock
+              the last component, so the lookup of `self` returns it unlocked; the loop then
+              stops at `MAXSYMLINK`. Recorded: `cat: cannot open self`.
+          - text: "open of x, where x → y and y → x"
+            why: |
+              Each lookup's last component is the other link, which [[namex]] returns
+              without locking; the depth limit ends the loop with -1.
+        explain: |
+          The bug bites exactly when the lookup must lock an inode that the caller holds,
+          or when another process takes the same two locks in the opposite order. Holding no
+          inode lock across [[namei]] rules out both, for every possible target.
+  - title: What stops a cycle?
+    q: |
+      `x` → `y` and `y` → `x` is legal to create: `symlink` does not look its target up. So
+      `open` must stop somehow. Choose a mechanism. Then predict what the machine looks like
+      if you forget it: the follow loop never ends. Does the system hang? Can you `kill` the
+      process? What happens to other processes' file operations? And if you had written
+      `follow` as a recursive function instead of a loop?
+    hints:
+      - "What does `open` hold while it follows: which lock, and which part of [[begin_op]]'s accounting? Where does this tree check `killed`? ([[kernel/trap.c:57]], [[kernel/trap.c:81]])"
+      - "A loop in a system call runs with interrupts on, so timer interrupts still let other processes run, but the process itself never returns to [[usertrap]], where `killed` is checked. Its `begin_op` is never matched by an `end_op`, so `log.outstanding` never reaches 0 and nothing is committed. A recursive version uses a new stack frame per link, on a 4096-byte kernel stack with a guard page below."
+      - "Count follows and give up after `MAXSYMLINK` (10). Detecting cycles exactly (remembering inode numbers) is possible but buys nothing: a chain of 11 distinct links is as suspicious as a cycle."
+    answer: |
+      The reference counts: after `MAXSYMLINK` = 10 follows, if the inode is still a link,
+      `open` fails with -1. A counter is enough, bounded and cheap. Remembering the inodes
+      visited would detect cycles exactly, but the limit has to exist anyway (a long chain
+      of distinct links is legal to build), and Linux, too, simply gives up after a fixed
+      number of links.
+
+      Without the limit, the loop never ends, and what the machine does is instructive
+      (clinic 2, recorded):
+
+      - **One hart is busy forever.** `cat x` runs inside `open` with interrupts on, so
+        timer interrupts still preempt it and the shell and other programs keep working.
+        `^P` shows `cat` as `run`.
+      - **`kill` does nothing.** [[kkill]] sets `killed`, and gdb confirmed `killed 1`, but
+        the flag is acted on only in [[usertrap]], on the way back to user space
+        ([[kernel/trap.c:81]]), and in a few sleep loops (pipes, `wait`, console reads,
+        `pause`). This loop never returns and never sleeps.
+      - **The file system stops, a little later.** `cat` called [[begin_op]] and will never
+        call `end_op`, so `log.outstanding` never returns to 0 and nothing is ever
+        committed. Other operations still start and finish, but their blocks pile up in the
+        log: after five small file creations it held 10 blocks in one recorded run (9 in
+        another). The sixth
+        `echo f > f6` still created `f6`, and then its `write` (gdb: `a7` = 16, `SYS_write`,
+        in another run) found 11 + (1 + 1) × 10 > 30 in [[begin_op]]
+        ([[kernel/log.c:138]]) and slept for ever. From then on every
+        process that starts a file-system operation (`open`, `exec`, `mkdir`, a write to a
+        file …) hangs.
+      - **A recursive `follow`** (one call per link) instead overflows the kernel stack:
+        gdb counted 19 nested calls, then a store into the guard page, and the kernel
+        panicked in [[kerneltrap]].
+    checks:
+      - id: lab23-09
+        level: 1
+        type: number
+        q: |
+          `MAXSYMLINK` is 10. A chain of links ends in a regular file: `c1` → `c2` → … →
+          `cN` → `file`. What is the largest `N` for which `open("c1")` still succeeds on the
+          reference branch?
+        answer: 10
+        wrong:
+          9: |
+            You may have thought the depth check runs before the last follow too. The loop
+            checks `depth >= MAXSYMLINK` only while the inode is still a link: after the
+            tenth follow it holds `file`, and the loop ends.
+          11: |
+            You may have counted `file` as one of the links, or allowed one follow too many.
+            With 11 links, the inode after 10 follows is `c11`, still a link: -1.
+        why_wrong: "Count follows: from c1, N links need N follows, and the loop allows 10."
+        explain: |
+          `symlinktest chain` checks both sides: 10 links (`c1` … `c10`) open, and 11 (`c0`
+          … `c10`) do not.
+      - id: lab23-10
+        level: 2
+        type: choice
+        q: |
+          A kernel without the depth limit (the loop version). You type `cat x &` with `x` →
+          `y` → `x`, then `kill` the cat process. What do you observe?
+        options:
+          - text: "The shell keeps working, ^P keeps showing cat as run even after kill, and after a few more file creations, file operations start to hang."
+            correct: true
+            why: |
+              Right, all three recorded: `cat` was still `run` 10 seconds after the kill with
+              `killed 1`, and the sixth `echo > file` hung in [[begin_op]].
+          - text: "The kernel panics with a stack overflow."
+            why: |
+              That is the *recursive* version. A loop uses one frame however long it runs.
+          - text: "The whole machine freezes at once; nothing answers."
+            why: |
+              You may have thought a kernel loop blocks everything. Interrupts are on during
+              a system call, so the timer preempts `cat` and the other harts and processes
+              run. Only `cat`'s own transaction is stuck.
+          - text: "kill stops it: the loop ends at the next timer interrupt."
+            why: |
+              A timer interrupt in the kernel goes through [[kerneltrap]], which may yield
+              but never checks `killed`. [[usertrap]] does, on the way to user space, and so
+              do a few sleep loops (pipes, `wait`); this loop neither returns nor sleeps.
+        explain: |
+          In this tree `killed` is a request that the victim acts on at a few checkpoints:
+          leaving the kernel, or waking in certain sleep loops. A system call that never
+          ends and never sleeps reaches none of them, so it is unkillable, and one that holds a log transaction slowly
+          stops the whole file system. Bounding kernel loops is not only about CPU time.
+  - title: Relative to what?
+    q: |
+      `ln -s f d/l` stores the target `f`. A process whose current directory is `/` opens
+      `d/l`. The spec says that means `d/f`. What would `namei("f")` give instead, and why is
+      the spec's meaning the only useful one? Then: how can `open` compute `d/f` with the
+      information it has? What if the target is `../e/f`? What if it is a chain of relative
+      links in different directories?
+    hints:
+      - "Look at the first lines of [[namex]] ([[kernel/fs.c:696]]): where does a path that does not start with `/` begin?"
+      - "A link is meant to mean the same thing whoever opens it, from wherever. The only directory it is tied to is the one that contains it. `open` knows the path it was given; the link's directory is that path minus its last component."
+      - "Keep the path being resolved in a `MAXPATH` buffer. For a relative target, cut the last component off the path and append the target; for an absolute one, replace the whole path. Check the length. Each later link in a chain is then relative to its own directory."
+    answer: |
+      In Unix a relative target is relative to **the directory that contains the link**:
+      `d/l` → `f` means `d/f`, whether you open it from `/`, from `d`, or as `../d/l` from
+      somewhere else. [[namei]] alone would take `f` from the *current* directory (the
+      process's `cwd`, [[kernel/fs.c:699]]), which gives a different file for every caller.
+
+      Commit 3 of the reference does exactly that wrong thing on purpose, so you can see it.
+      With `symlinktest` built on it, `relative`, `chain`, `directory` and `hard link to a
+      symlink` fail, because their links have relative targets, and `concurrent` fails
+      because the workers' relative links never reached `t` (`0 opened through links` in
+      every worker line). (`create through a link` fails too, for the reason commit 5
+      fixes.) Commit 4 adds `resolve`: it keeps the path `open` was given, strips trailing
+      slashes and the link's own name, and appends the target (an absolute target replaces
+      everything). For `d/l` → `f` that
+      builds `d/f` (gdb recorded `path` = `"d/l"`, `target` = `"f"`); for `/a/b/l` →
+      `../c/f` it builds `/a/b/../c/f`, and [[namex]] handles the `..`. Because the new path
+      is written back into the same buffer, the next link in a chain is resolved against
+      *its* directory. A result of `MAXPATH` bytes or more fails.
+
+      This works only because links in the middle of a path are not followed: the
+      directory part of the path is a real chain of directories, so cutting off the last
+      component really gives the link's directory.
+    checks:
+      - id: lab23-11
+        level: 2
+        type: choice
+        q: |
+          A process whose current directory is `/home` opens `/a/b/l`, a link with target
+          `../c/f`. Which path does the reference look up next?
+        options:
+          - text: "/a/b/../c/f"
+            correct: true
+            why: "The link's directory is /a/b; resolve appends the target to it, and namex handles the `..`."
+          - text: "/home/../c/f"
+            why: |
+              You may have resolved the target against the current directory, which is what
+              [[namei]] alone does. A link means the same thing whoever opens it.
+          - text: "../c/f, looked up from /home"
+            why: |
+              That is the same mistake: a relative path given to [[namei]] starts at `cwd`.
+          - text: "/a/b/l/../c/f"
+            why: |
+              You may have kept the link's own name. The target replaces the last
+              component; `l` is not a directory, and [[namex]] would fail on it.
+        explain: |
+          "Relative" always means relative to the directory the name was found in. For a
+          path you type, that is `cwd`; for a link's target, it is the link's directory.
+  - title: What else changes, and what does not?
+    q: |
+      Go through `sys_open` line by line with links in mind, then the other calls. Which
+      existing checks can a link now slip past? What should `O_CREATE` do with an existing
+      link, and `O_NOFOLLOW` with a request to write? What does `unlink` do to a link, and to
+      its target? Does a symbolic link change anybody's link count?
+    hints:
+      - "In [[sys_open]], where is the check that a directory is opened read-only ([[kernel/sysfile.c:355]]), and in which branch? In [[create]], what happens to an existing name that is not a file or a device ([[kernel/sysfile.c:283]])?"
+      - "A link can lead to a directory, so any check of the type must come after following. The shell opens `>` redirections with `O_CREATE`. [[sys_unlink]] and [[sys_link]] never call `open`; `nlink` counts directory entries naming an inode."
+      - "A test of an inode's type belongs where the final inode is known. An existing link is one more kind of existing name for the `O_CREATE` path to decide about. For `unlink` and `link`, trace what they look up and whether `open` is involved at all."
+    answer: |
+      **Checks that must move.** In the base tree, the "a directory may only be opened
+      read-only" test sits inside the `else` branch, right after [[namei]]
+      ([[kernel/sysfile.c:355]]). A link to a directory passes it (the link is not a
+      directory), and only then does `follow` turn it into the directory. So the check moves
+      below the loop, and becomes "a directory, or a link opened with `O_NOFOLLOW`, is
+      read-only". Leave it where it was and a link lets you open a directory for writing;
+      `echo xx > dl` then overwrites the directory's first entry and a later `ls` panics
+      (clinic 6).
+
+      **`O_NOFOLLOW` means "the link itself"**, and only for reading: `read` gives the
+      target's bytes, `fstat` gives `T_SYMLINK` and the link's own `nlink`. Writing to a link
+      in place would let a process change its target piece by piece; the reference refuses.
+      The test compares the mode with `~O_NOFOLLOW` masked off, so `O_RDONLY | O_NOFOLLOW`
+      still counts as read-only.
+
+      **`O_CREATE` on an existing link.** [[create]] refused any existing name that was not
+      a file or a device ([[kernel/sysfile.c:283]]), so `echo hi > link` failed. Commit 5
+      lets it return an existing link for `T_FILE`, and `open` follows it like any other.
+      If the target does not exist, `open` fails; Linux would create the target, which is a
+      "further" item.
+
+      **No change at all:** [[sys_unlink]] finds the name with [[nameiparent]] and
+      [[dirlookup]], never following, so it removes the *link*: its `nlink` drops to 0 and
+      the last [[iput]] runs [[itrunc]] (freeing the data block) and frees the inode.
+      [[sys_link]] makes a hard link to the link inode itself (the `T_DIR` test does not
+      apply), raising the *link's* `nlink`. A symbolic link never touches its target's
+      `nlink`: the target does not know it exists, which is exactly why a link can dangle.
+    checks:
+      - id: lab23-12
+        level: 1
+        type: tf
+        q: |
+          True or false: `symlink("/stt/a", "/stt/l1")` increases the link count (`nlink`)
+          of `/stt/a`.
+        answer: false
+        why_tf: |
+          You may have mixed up the two kinds of link. `nlink` counts directory entries that
+          name the inode: hard links.
+        reasons:
+          - text: "The symlink stores a path in its own inode; /stt/a's inode is never read or written."
+            correct: true
+            why: "Right: `symlinktest nofollow` checks that /stt/a's nlink is still 1."
+          - text: "nlink only counts open file descriptors."
+            why: |
+              That is `ip->ref` (in-memory references) and the file table's `ref`. `nlink`
+              is on disk and counts names.
+          - text: "Symbolic links are counted, but only after the first open through them."
+            why: |
+              Opening through a link reads the target's inode but never changes its `nlink`.
+        explain: |
+          This is why unlinking a target leaves its symbolic links dangling, while a hard
+          link keeps the inode alive. See [[g:link-count]] and [[g:hard-link]].
+      - id: lab23-13
+        level: 2
+        type: choice
+        q: |
+          A version of `sys_open` follows links but keeps the old "directories are read-only"
+          check where it was, before `follow`. `dl` → `d`, a directory. You type `echo xx >
+          dl` and then `ls d`. What happens?
+        options:
+          - text: "echo writes into directory d itself, overwriting its first entry, and ls d panics with ilock: no type."
+            correct: true
+            why: |
+              Recorded. The entry for `.` got inode number `0x7878` ("xx") = 30840; `ls`
+              looked it up, and [[ilock]] found type 0 in block 1960, far past the 200
+              inodes this disk has.
+          - text: "echo fails, because d is a directory."
+            why: |
+              That is the reference's behaviour, because its check comes after following.
+              Before following, the inode is a link, and the check does not apply.
+          - text: "echo creates a new file named dl inside d."
+            why: |
+              You may have expected `O_CREATE` to create something. The name `dl` exists, so
+              [[create]] returns the link, and following it gives `d` itself.
+          - text: "echo replaces the link dl by a file containing xx."
+            why: |
+              `open` does not remove names. The data goes wherever the opened inode is,
+              here the directory.
+        explain: |
+          Any check of an inode's type must look at the inode `open` will finally return.
+          A link is a way to reach another inode without passing the checks that the other
+          inode's own name would face.
+build: |
+  **Start.**
+
+  ```text
+  git checkout -b my-symlink 06aad25
+  ```
+
+  Write the test program first: copy the spec's list of checks into `user/symlinktest.c`.
+  It cannot compile until `T_SYMLINK`, `O_NOFOLLOW` and the `symlink` stub exist, so add
+  `$U/_symlinktest\` to `UPROGS` in the `Makefile` at milestone 2.
+
+  **Milestones, in an order that keeps the system bootable after each one.**
+
+  1. **Definitions.** `T_SYMLINK` 4 in `kernel/stat.h`, `O_NOFOLLOW` 0x800 in
+     `kernel/fcntl.h` (pick a bit no other flag uses), `MAXSYMLINK` 10 in `kernel/param.h`.
+     Test: `make` rebuilds everything, `usertests -q` still passes.
+  2. **The system call.** The four places every new system call needs (`syscall.h`,
+     the table in `syscall.c`, `usys.pl`, `user.h`), then `sys_symlink` in `sysfile.c`.
+     Test: `symlinktest` runs; `not followed in the middle of a path or by chdir`, `errors`
+     and `unlinked symlink's inode freed` already pass, the other 11 checks fail. (Even
+     `nofollow` fails: nothing refuses to open a link for writing yet.)
+  3. **Following in `open`.** The loop, the depth limit, `O_NOFOLLOW`, and the moved type
+     check. Test: `basic`, `dangling`, `cycle` pass; checks with relative targets still
+     fail. Then `usertests -q`.
+  4. **Relative targets.** Test: `relative`, `chain`, `directory` pass.
+  5. **`O_CREATE` through a link.** Test: `create through a link`, then the whole of
+     `symlinktest`, then `usertests -q`, then `symlinktest` again.
+  6. **`ln -s`.** Try it by hand: `ln -s README r`, `wc r`, `echo hi > r2`, `ln -s r2 r3`,
+     `echo bye > r3`, `cat r2`.
+
+  **Debugging advice.** Start QEMU halted with `make qemu-gdb` (it picks its own gdb port
+  and writes it into `.gdbinit`) when you need breakpoints from boot.
+
+  - In this build `follow` and `resolve` are `static`, called once, and inlined into
+    `sys_open`. Breakpoints by line number (`break sysfile.c:371`) still work, and `bt`
+    shows them as inline frames, but some locals print as `<optimized out>`.
+  - A hang inside the file system is almost always a sleep-lock or the log. Type `^P` to
+    see who is `sleep`ing, then attach gdb and print every inode in `itable` whose `ref`
+    is above 0, with `lock.locked` and `lock.pid`, and every process's `chan`. A process
+    whose `chan` equals `&itable.inode[i].lock` is waiting for that inode; if it is also
+    that lock's `pid`, it is waiting for itself. `chan` equal to `&log` means it waits in
+    [[begin_op]]: print `log.outstanding` and `log.lh.n`.
+  - `panic: log_write outside of trans`: a write to a buffer with no `begin_op` around it.
+    Break on `panic` and `bt`.
+  - If a link "sometimes" works, print the target buffer with `x/24xb` right after
+    [[readi]]: look at the bytes after the target.
+clinic:
+  - bug: Looking up the target while holding the link's lock
+    change: |
+      The natural order "read the target, look it up, then let go of the link":
+
+      ```diff
+           target[n] = 0;
+      -    // release the link before looking up its target: namei locks
+      -    // directories, and the target may lead through this very link.
+      -    iunlockput(ip);
+      -    if (resolve(path, target) < 0 || (ip = namei(path)) == 0)
+      -      return 0;
+      +    if (resolve(path, target) < 0 || (next = namei(path)) == 0)
+      +      goto bad;
+      +    iunlockput(ip);
+      +    ip = next;
+           ilock(ip);
+      ```
+
+      Two runs on this kernel, 3 harts: links typed at the shell followed by seven small
+      file creations, then (a fresh boot) a helper program `clinic23` (not on the branch): one process loops `symlink(".", "/dd/up")` + `unlink("/dd/up")` 2,000
+      times while its parent opens `/dd/up` 2,000 times. After each hang, `^P`, and gdb
+      attached to print the process table, the inodes in use and the log.
+    symptom: |
+      $ ln -s self self
+      $ cat self
+      cat: cannot open self
+      $ ln -s s/x s
+      $ cat s &
+      $
+      1 sleep  init
+      2 sleep  sh
+      7 sleep  cat
+      echo a > f1
+      $ echo b > f2
+      $ echo c > f3
+      $ echo d > f4
+      $ echo e > f5
+      $ echo f > f6
+      echo g > f7
+
+      1 sleep  init
+      2 sleep  sh
+      13 sleep  echo
+      7 sleep  cat
+      [...]
+      pid 13 echo state 2 chan 0x8001f970
+      pid 7 cat state 2 chan 0x8001e000
+      [...]
+      inode 27 type 4 ref 2 nlink 1 locked 1 by pid 7, &lock = 0x8001e000
+      inode 33 type 2 ref 1 nlink 1 locked 0 by pid 0, &lock = 0x8001e088
+      [...]
+      $1 = 1
+      $2 = 0
+      $3 = 11
+      $4 = (struct log *) 0x8001f970 <log>
+
+      (another boot)
+      $ clinic23 2000
+
+      1 sleep  init
+      2 sleep  sh
+      3 sleep  clinic23
+      4 sleep  clinic23
+      [...]
+      pid 3 clinic23 state 2 chan 0x8001e000
+      pid 4 clinic23 state 2 chan 0x8001e088
+      [...]
+      inode 26 type 1 ref 2 nlink 1 locked 1 by pid 4, &lock = 0x8001e000
+      inode 27 type 4 ref 2 nlink 1 locked 1 by pid 3, &lock = 0x8001e088
+    why: |
+      **`self` → `self` works.** The lookup of `self` never locks `self`: [[namex]] locks
+      only the directories it searches ([[kernel/fs.c:702]]) and returns the last component
+      unlocked ([[kernel/fs.c:727]]). So the buggy loop gets a second reference to the same inode, releases the
+      first, locks it again, and after 10 rounds gives up: `cannot open`. A test with only
+      this case would pass.
+
+      **`s` → `s/x` hangs, alone.** `cat` (pid 7) holds `s`, inode 27, and calls
+      `namei("s/x")`. [[namex]] reaches `s` as a middle component and calls [[ilock]] on it
+      ([[kernel/fs.c:702]]), that is [[acquiresleep]] on a sleep-lock that pid 7 holds.
+      [[acquiresleep]] does not check who holds the lock ([[kernel/sleeplock.c:25]]): it
+      sleeps until the holder releases it, and the holder is itself. gdb shows it: pid 7
+      sleeps on channel `0x8001e000`, which is the address of inode 27's lock, `locked 1 by
+      pid 7`. Nothing panics, nothing is printed.
+
+      **Then the file system stops.** `cat` is stuck *inside a transaction*: its
+      [[begin_op]] raised `log.outstanding` to 1 and its `end_op` will never run. Other
+      operations still start and finish, but with `outstanding` never reaching 0 nothing is
+      committed, and their blocks stay in the log: after `f1` … `f5` it held 10 blocks (gdb,
+      in an earlier run of this clinic that stopped there). The sixth `echo f > f6` still
+      created `f6` (gdb found its inode, 33, open), and that pushed the log to 11 blocks; its next file-system call, a `write`,
+      found 11 + (1 + 1) × 10 > 30 in [[begin_op]] ([[kernel/log.c:138]]) and slept on the
+      channel `&log` (`0x8001f970`), for ever. (Which `echo` is the first to hang depends on
+      how many blocks each creation adds: another run, with a slightly different disk
+      image, got through the sixth.) The shell waits for it, so the typed `echo g >
+      f7` is never run. One process holding one inode lock has stopped every file-system
+      write on all three harts. (In that earlier run, a later `ls` printed the root directory
+      up to `console 3 25 0`, then `ls: cannot stat ./self` (a cycle, refused as it should
+      be), and then nothing more. The next entry is `s`; that `ls` hung stat-ing it, on the
+      lock `cat` holds, is reasoned, not observed with gdb.)
+
+      **`d/up` → `.`: two processes, opposite orders.** `clinic23` never finished. pid 3,
+      the opener, holds the link `up` (inode 27, type 4) and sleeps on `0x8001e000`, the
+      lock of inode 26 (type 1, the directory `/dd`): it was looking up `/dd/.`, and [[namex]]
+      locks `/dd` as a middle component. pid 4 holds `/dd` and sleeps on `0x8001e088`, the
+      lock of `up`: that is [[sys_unlink]], which locks the directory and then the entry
+      ([[kernel/sysfile.c:218]], [[kernel/sysfile.c:226]]). The rule everybody else follows
+      is "parent before child"; the buggy `follow` takes a child (the link) and then its
+      parent. `log.outstanding` was 2: both are inside transactions, so the rest of the
+      file system follows them down as above.
+
+      The fix is not a smarter order but holding nothing: copy the target out, release the
+      link, then look up.
+  - bug: No limit on the number of links followed
+    change: |
+      The depth check is left out:
+
+      ```diff
+         for (depth = 0; ip->type == T_SYMLINK; depth++) {
+      -    if (depth >= MAXSYMLINK) // probably a cycle
+      -      goto bad;
+           n = ip->size;
+      ```
+
+      A second variant writes `follow` recursively, also without a limit: after looking up
+      the target and locking it, it returns `follow(ip, path)`. (In this build, with `-O`,
+      GCC keeps that as a real call, not a jump: `jal 80004d3e <follow>` inside `follow`;
+      its frame is 176 bytes.)
+    symptom: |
+      $ ln -s y x
+      $ ln -s x y
+      $ cat x &
+      $
+      1 sleep  init
+      2 sleep  sh
+      6 run    cat
+      kill 6
+      $
+      1 sleep  init
+      2 sleep  sh
+      6 run    cat
+      [...]
+      pid 6 cat state 4 chan (nil) killed 1
+      [...]
+      * 1    Thread 1.1 (CPU#0 [running]) intr_get () at kernel/riscv.h:327
+        2    Thread 1.2 (CPU#1 [halted ]) s_sstatus (x=2) at kernel/riscv.h:67
+        3    Thread 1.3 (CPU#2 [halted ]) s_sstatus (x=2) at kernel/riscv.h:67
+
+      (another boot: the same three commands, `echo hi`, a `kill` of a wrong pid, then five small files)
+      $ echo e > f5
+      $ echo f > f6
+      echo g > f7
+
+      1 sleep  init
+      2 sleep  sh
+      14 sleep  echo
+      6 run    cat
+      [...]
+      pid 14 echo state 2 chan 0x8001f970
+      [...]
+      $3 = 11
+
+      (the recursive version, another boot)
+      $ ln -s y x
+      $ ln -s x y
+      $ cat x
+      scause=0xf sepc=0x80005786 stval=0x3fffff8000
+      panic: kerneltrap
+
+      # gdb, the same run:
+      === first follow in cat: sp 0x3fffff9f00 pid 5 kstack 0x3fffff9000
+      follow call 18: sp 0x3fffff9350
+      follow call 19: sp 0x3fffff92a0
+      === kernelvec entry 1 after 19 follow calls in cat: sepc 0x80000bb0 stval 0x3fffff8ff8 sp 0x3fffff8fe0 pid 5 kstack 0x3fffff9000
+      push_off + 2 in section .text
+      === kernelvec entry 2 after 19 follow calls in cat: sepc 0x80005782 stval 0x3fffff8ee0 sp 0x3fffff8ee0 pid 5 kstack 0x3fffff9000
+      [...]
+      === kernelvec entry 16 after 19 follow calls in cat: sepc 0x80005782 stval 0x3fffff80e0 sp 0x3fffff80e0 pid 5 kstack 0x3fffff9000
+      === kernelvec entry 17 after 19 follow calls in cat: sepc 0x80005786 stval 0x3fffff8000 sp 0x3fffff7fe0 pid 5 kstack 0x3fffff9000
+    why: |
+      **The loop version: busy, unkillable, and slowly fatal.** `cat` follows `x`, `y`, `x`
+      … forever inside `sys_open`. It holds no spinlock between iterations and interrupts
+      are on (it is a system call), so the timer still preempts it: the shell answered,
+      `kill 6` ran, and `^P` worked. gdb showed `cat` RUNNING (state 4) on hart 0 while the
+      other two harts were halted in `wfi`, idle.
+
+      [[kkill]] set `killed` (gdb: `killed 1`), but `cat` was still `run` ten seconds
+      later. A process acts on `killed` in [[usertrap]] ([[kernel/trap.c:81]]), on its way
+      back to user space, and in a few sleep loops; this one never leaves the kernel and
+      never sleeps. Interrupts taken while it runs go through [[kerneltrap]], which may
+      yield but never checks `killed`.
+
+      And it is inside a transaction that will never end, exactly as in clinic 1: five file
+      creations went through, the sixth `echo` created its file and then slept in
+      [[begin_op]] (channel `0x8001f970` is `&log`; the log held 11 blocks). A cycle of two links, opened once, ends every
+      file-system write until reboot.
+
+      **The recursive version: a kernel stack overflow, caught by the guard page.** Each
+      call puts a 176-byte frame (with the 128-byte `target` buffer) on `cat`'s kernel stack,
+      the page `0x3fffff9000`–`0x3fffffa000`. The first call had `sp` = `0x3fffff9f00`; the
+      19th was at `0x3fffff92a0`. Inside the next lookup, [[push_off]]'s first store went to
+      `0x3fffff8ff8`, below the stack page, into the unmapped guard page: a store page fault
+      (`scause` 15) in supervisor mode, so the trap goes to `kernelvec`. But `kernelvec`
+      saves registers *on the current stack*, which is the overflowing one: its first store
+      faults again, and again, each nested trap moving `sp` down 256 bytes through the guard
+      page (16 times). The 16th entry's `addi` takes `sp` to `0x3fffff7fe0`, *below* the
+      guard page, into the kernel stack page of the next slot, which is mapped: two stores
+      succeed, and the store at `sp + 32` = `0x3fffff8000` touches the guard page once more.
+      That is entry 17, whose 256-byte frame (from `0x3fffff7ee0`) is entirely mapped, so
+      [[kerneltrap]] finally runs and panics with entry 17's values. The message reports
+      that last fault, in `kernelvec`, not in `follow`: when a kernel stack overflows, the panic's
+      `sepc` points at the trap code, and `stval` near a page boundary below `kstack` is the
+      clue.
+
+      With a limit of 10, the loop and the recursion are both harmless; the recursion would
+      use about 1.8 KiB of the 4 KiB stack, which is one more reason the reference uses a
+      loop.
+  - bug: No begin_op and end_op around symlink
+    change: |
+      `sys_symlink` does all its work without a transaction:
+
+      ```diff
+      -  begin_op();
+         if ((dp = nameiparent(path, name)) == 0) {
+      -    end_op();
+           return -1;
+         }
+      ```
+
+      (and the two `end_op` calls further down removed as well).
+    symptom: |
+      $ ln -s README l
+      panic: log_write outside of trans
+    why: |
+      The first block that `symlink` changes is the new inode's: [[ialloc]] marks the on-disk
+      inode allocated and calls [[log_write]] ([[nameiparent]] and [[dirlookup]] before it
+      only read). [[log_write]] checks
+      that some operation is open (`log.outstanding < 1`, [[kernel/log.c:231]]) and panics
+      when none is.
+
+      The panic is the lucky case. It only fires because nothing else was running. Had
+      another process been inside a transaction at that moment, `outstanding` would have
+      been 1 and the check would have passed (this is reasoned from the code, not run): the
+      link's blocks would have joined *that* operation's transaction, which may commit while
+      the link is half made (inode allocated and target written, no directory entry yet), so
+      that a crash leaves
+      an allocated inode that no directory names, and the log space reserved by
+      [[begin_op]] would no longer cover what is written. `begin_op`/`end_op` are not a
+      formality: they are how an operation reserves its room in the log and tells the log
+      when its blocks form a consistent state.
+  - bug: Reading the target without its length
+    change: |
+      The writer stores the target without a NUL, as the reference does. The reader asks
+      [[readi]] for a whole `MAXPATH` and forgets to terminate:
+
+      ```diff
+      -    n = ip->size;
+      -    if (n <= 0 || n >= MAXPATH || readi(ip, 0, (uint64)target, 0, n) != n)
+      -      goto bad;
+      -    target[n] = 0;
+      +    if ((n = readi(ip, 0, (uint64)target, 0, MAXPATH)) <= 0)
+      +      goto bad;
+      ```
+    symptom: |
+      $ symlinktest
+      symlinktest: basic: OK
+      symlinktest: relative: FAIL
+      symlinktest: dangling: FAIL
+      symlinktest: nofollow: OK
+      symlinktest: chain: FAIL
+      symlinktest: cycle: OK
+      symlinktest: directory: FAIL
+      symlinktest: not followed in the middle of a path or by chdir: OK
+      symlinktest: create through a link: FAIL
+      symlinktest: unlink: OK
+      symlinktest: hard link to a symlink: FAIL
+      symlinktest: unlinked symlink's inode freed: OK
+      symlinktest: errors: OK
+      symlinktest: worker 0: 256 links made, 254 removed, 0 opened through links, 234 links read
+      symlinktest: worker 1: 244 links made, 248 removed, 0 opened through links, 259 links read
+      symlinktest: worker 2: 253 links made, 249 removed, 0 opened through links, 251 links read
+      symlinktest: concurrent: FAIL
+      symlinktest: SOME TESTS FAILED
+
+      # gdb (another boot, a build of this bug whose sys_symlink adds the name before
+      # writing the target; follow is the same), right after readi, in symlinktest:
+      === hit 4: follow in symlinktest, after readi (370)
+      $16 = 3
+      $17 = 0x3fffff9e78 "a"
+      0x3fffff9e78:	0x61	0x00	0x00	0x00	0x00	0x00	0x00	0x00
+      [...]
+      === hit 5: follow in symlinktest, after readi (370)
+      $21 = 3
+      $22 = 0x3fffff9e78 "a\f"
+      0x3fffff9e78:	0x61	0x0c	0x00	0x80	0x00	0x00	0x00	0x00
+      [...]
+      === hit 6: follow in symlinktest, after readi (370)
+      $26 = 3
+      $27 = 0x3fffff9e78 "/stt/later\001\200"
+    why: |
+      [[readi]] clamps the request to the inode's size ([[kernel/fs.c:517]]), so it copies
+      exactly the target's bytes and returns their number. The bytes after them in `target`
+      are whatever an earlier system call of the same process left on its kernel stack;
+      nothing writes a 0 there. (In the gdb lines, `$16`, `$21` and `$26` are the pid of
+      `symlinktest`, 3, not a length.) gdb shows both outcomes in one process: on hit 4 the byte
+      after `a` happened to be 0 and the lookup worked; on hit 5, the next `open` of the
+      same link (as `../rl`), the byte after `a` was `0x0c`: the buffer held a leftover kernel
+      address, and `a` had overwritten only its lowest byte (the four bytes read as the
+      little-endian word `0x80000c61`). The path became `"a\f"` and the lookup failed. Hit 6 is
+      `/stt/later` with two junk bytes after it.
+
+      So whether a link works depends on what the process did before. Typed at the shell,
+      `ln -s README l` then `cat l` worked (a fresh `cat` process had zeros there), which is
+      why this bug survives hand testing. In `symlinktest` every check that opens a link
+      after other system calls is a lottery (`basic` happened to win; `nofollow` never
+      follows), and `concurrent` failed only because no worker ever reached `t` (`0 opened
+      through links`). The check that each worker succeeded at least once is what turned
+      that into a FAIL: a `symlinktest` without it reports `concurrent: OK` on this same
+      kernel.
+
+      The rule: data on disk has a length, and a C string needs a 0. Whoever reads must
+      use the length *and* add the 0.
+  - bug: O_NOFOLLOW is ignored
+    change: |
+      `open` always follows:
+
+      ```diff
+      -  if (!(omode & O_NOFOLLOW) && (ip = follow(ip, path)) == 0) {
+      +  if ((ip = follow(ip, path)) == 0) {
+      ```
+    symptom: |
+      $ symlinktest
+      symlinktest: basic: OK
+      symlinktest: relative: OK
+      symlinktest: dangling: OK
+      symlinktest: nofollow: FAIL
+      symlinktest: chain: OK
+      symlinktest: cycle: OK
+      symlinktest: directory: OK
+      symlinktest: not followed in the middle of a path or by chdir: OK
+      symlinktest: create through a link: OK
+      symlinktest: unlink: OK
+      symlinktest: hard link to a symlink: FAIL
+      symlinktest: unlinked symlink's inode freed: FAIL
+      symlinktest: errors: OK
+      worker 0: bad link /stt/c/l3: 'target'
+      worker 2: bad link /stt/c/l3: 'target'
+      worker 1: bad link /stt/c/l3: 'target'
+      symlinktest: concurrent: FAIL
+      symlinktest: SOME TESTS FAILED
+      $ usertests -q
+      usertests starting
+      [...]
+      ALL TESTS PASSED
+    why: |
+      Every check that asks for the link *itself* fails, and nothing else does. `nofollow`
+      expected type `T_SYMLINK` and the data `/stt/a` and got the file. `hard link to a
+      symlink` uses `O_NOFOLLOW` to see that the link's `nlink` is 2. `unlinked symlink's
+      inode freed` uses it to learn the link's inode number. The workers that read links
+      with `O_NOFOLLOW` read `target`, the content of the file at the end of the chain.
+
+      `usertests -q` passes: no existing program knows `O_NOFOLLOW`. A flag nobody uses yet
+      is only tested by the program you write for it, which is the argument for writing the
+      test first.
+  - bug: The directory check stays where it was
+    change: |
+      Following is added below the `else` branch, but the old "directories are read-only"
+      test stays inside it, before the follow, and checks only `T_DIR`:
+
+      ```diff
+           ilock(ip);
+      +    if (ip->type == T_DIR && omode != O_RDONLY) {
+      +      iunlockput(ip);
+      +      end_op();
+      +      return -1;
+      +    }
+         }
+      [...]
+      -  // a directory, or a link opened with O_NOFOLLOW, is read-only.
+      -  if ((ip->type == T_DIR || ip->type == T_SYMLINK) &&
+      -      (omode & ~O_NOFOLLOW) != O_RDONLY) {
+      +  // a link opened with O_NOFOLLOW is read-only.
+      +  if (ip->type == T_SYMLINK && (omode & ~O_NOFOLLOW) != O_RDONLY) {
+      ```
+    symptom: |
+      $ symlinktest
+      [...]
+      symlinktest: directory: FAIL
+      [...]
+      symlinktest: SOME TESTS FAILED
+
+      (another boot)
+      $ mkdir d
+      $ echo hi > d/f
+      $ ln -s d dl
+      $ ls d
+      .              1 25 48
+      ..             1 1 1024
+      f              2 26 3
+      $ echo xx > dl
+      $ ls d
+      panic: ilock: no type
+
+      # gdb, breakpoint on panic:
+      #1  0x00000000800032d8 in ilock (ip=ip@entry=0x8001e078 <itable+432>) at kernel/fs.c:317
+      #2  0x000000008000524a in sys_open () at kernel/sysfile.c:409
+      [...]
+      $17 = 30840
+      $18 = 1
+      $19 = 1960
+      $20 = 200
+    why: |
+      The check looks at the inode `open` found *by name*, which is the link; the inode
+      `open` returns is the one at the end of the link. `symlinktest directory` notices
+      only that `open("/stt/dlink", O_RDWR)` now succeeds.
+
+      The shell shows what that means. `echo xx > dl` opens `dl` with `O_WRONLY | O_CREATE |
+      O_TRUNC`; [[create]] returns the existing link, `follow` turns it into the directory
+      `d` (inode 25), and nothing refuses a writable directory any more (`O_TRUNC` applies
+      only to `T_FILE`). gdb saw `echo`'s two `write` calls with `ofile[1]` pointing at
+      inode 25, type 1. They wrote `xx` and `\n` over the first 3 bytes of `d`'s data: the
+      entry for `.`. Its 2-byte inode number became `0x7878` = 30840 and its name `\n`.
+
+      `ls d` reads that entry and stats `d/\n`: [[dirlookup]] finds it and calls [[iget]]
+      for inode 30840, which nothing checks (gdb: `sb.ninodes` = 200). [[ilock]] reads the
+      inode from block 30840 / 16 + 33 = 1960 (gdb `$19`), a data block that holds zeros
+      there, finds type 0, and panics ([[kernel/fs.c:317]]). One misplaced check, and a
+      user program corrupted a directory with an ordinary shell redirection.
+reveal:
+  - title: A fourth kind of inode
+    commit: 1
+    file: kernel/stat.h
+    lines: 1-12
+    focus: 1-4
+    diff: true
+    state:
+      hart: any
+      proc: "(definitions shared by the kernel, mkfs and user programs)"
+      locks: []
+    note: |
+      The story of this tour was recorded in one boot of the finished branch, on three
+      harts, with gdb attached from boot. You type `mkdir d` (it becomes inode 25), `echo hi > d/f` (inode
+      26), `ln -s f d/l` (`ln` is pid 5; the link becomes inode 27) and `cat d/l` (pid 6),
+      which prints `hi`. Later steps follow pid 5 through `symlink` and pid 6 through
+      `open`.
+
+      Commit 1 only defines things. `T_SYMLINK` is the value 4 in the `type` field that every
+      inode already has, on disk (`struct dinode`) and in memory (`struct inode`). Nothing
+      about the shape of an inode changes: a link is an inode with a size and data blocks,
+      like a file, whose data happens to be a path. That is why `mkfs` and the on-disk format
+      need no change, only a rebuild, since this header is shared.
+
+      Every piece of code that tests `type` now has a value it has never seen. Code that asks
+      "is it a directory?" (like [[namex]] at [[kernel/fs.c:703]]) treats a link as "not a
+      directory", which is exactly the behaviour the spec promises for links in the middle of
+      a path.
+  - title: A flag for the link itself, and a bound
+    commit: 1
+    file: kernel/fcntl.h
+    lines: 1-6
+    focus: 6
+    diff: true
+    state:
+      hart: any
+      proc: "(definitions)"
+      locks: []
+    note: |
+      `O_NOFOLLOW` is a new bit for `open`'s mode, 0x800, next to `O_CREATE` (0x200) and
+      `O_TRUNC` (0x400). The low two bits are not separate flags but an access mode
+      (`O_RDONLY` 0, `O_WRONLY` 1, `O_RDWR` 2), so a new flag must take a bit above them. The
+      other lines only change their padding so the values line up.
+
+      The same commit adds `MAXSYMLINK` (10) to `kernel/param.h`: the most links one `open`
+      will follow. It is a constant of the kernel, like `MAXPATH`, and user programs may
+      include `param.h` to see it (the test does, to build a chain of exactly 10 and one of
+      11).
+  - title: The plumbing of a new system call
+    commit: 2
+    file: kernel/syscall.c
+    lines: 102-136
+    focus: 134
+    diff: true
+    state:
+      hart: any
+      proc: "(the system-call table)"
+      locks: []
+    note: |
+      A new system call needs four small pieces outside its own code: a number
+      (`SYS_symlink` 23 in `syscall.h`), a user-side stub (`entry("symlink")` in `usys.pl`,
+      which generates `li a7, SYS_symlink`, `ecall`, `ret`), a prototype in `user.h`, and this table entry
+      (line 134) with its `extern` (line 106). [[syscall]] indexes the table with `a7` from the trapframe; the
+      arguments stay in `a0` and `a1` until `sys_symlink` fetches them. See [[tour:5]] for the
+      whole path.
+
+      The table is `static` and never written, so three harts read it without a lock.
+  - title: "sys_symlink: arguments, then one transaction"
+    commit: 2
+    file: kernel/sysfile.c
+    lines: 397-452
+    focus: 402-415
+    diff: true
+    state:
+      hart: 1
+      mode: S
+      proc: ln (pid 5)
+      intr: "on"
+      satp: kernel
+      locks: []
+      irq: 0
+      stack: [usertrap, syscall, sys_symlink]
+      sp: {"on": kernel, detail: "pid 5's kernel stack, base `0x3fffff9000`"}
+    note: |
+      Both strings are copied into the kernel first, with [[argstr]], into two `MAXPATH`
+      buffers on the kernel stack: 256 of this function's 288-byte frame. [[argstr]]
+      returns the length, which `sys_symlink` keeps in `n`: it is how many bytes the target
+      is, and soon the size of the new inode. An empty target is refused.
+
+      Then [[begin_op]] joins (or opens) a log transaction, reserving room for
+      `MAXOPBLOCKS` = 10 blocks, and [[nameiparent]] finds the directory `d` and puts the
+      last name, `l`, in `name`. Everything up to `end_op` is one operation in the log, so
+      a crash leaves either the whole link or nothing.
+
+      No lock is held at the focus lines (noff 0), and interrupts are on, as in any system
+      call after [[usertrap]]'s `intr_on`. The inode sleep-locks taken next do not change
+      that: sleep-locks are not counted in `noff`, and gdb saw noff 0 and `sstatus` =
+      `0x200000022` (SIE set) at every stop in this function.
+  - title: Parent, then a new inode, both locked
+    commit: 2
+    file: kernel/sysfile.c
+    lines: 397-452
+    focus: 416-429
+    state:
+      hart: 1
+      mode: S
+      proc: ln (pid 5)
+      intr: "on"
+      satp: kernel
+      locks: ["inode 25 (d) lock (sleep-lock)", "inode 27 (the new link) lock (sleep-lock)"]
+      irq: 0
+      stack: [usertrap, syscall, sys_symlink]
+      sp: {"on": kernel, detail: "`sp` = `0x3fffff9e80`"}
+    note: |
+      These are [[create]]'s first steps, written out: lock the parent, refuse a removed
+      directory (`nlink` 0) or an existing name, take a fresh inode from [[ialloc]] with type
+      4, lock it, set `nlink` to 1 and write it back. Why not call [[create]]? Because it
+      adds the directory entry before returning, and the reference wants the name to appear
+      last (next step).
+
+      gdb stopped right after [[ialloc]]: `d` (inode 25) locked by pid 5, the new inode 27,
+      `name` = `"l"`, on hart 1, and the log holding 1 block: 34, the inode block for inodes
+      16 to 31, which [[ialloc]] marked allocated (the [[iupdate]] that follows writes the
+      same block, absorbed).
+
+      Two inode sleep-locks are held at once, in the order parent, then child: the order
+      [[namex]], [[create]] and [[sys_unlink]] use. Nobody else can know inode 27 yet, and
+      nobody can search `d` while it is locked.
+  - title: The target first, the name last
+    commit: 2
+    file: kernel/sysfile.c
+    lines: 427-452
+    focus: 431-446
+    state:
+      hart: 2
+      mode: S
+      proc: ln (pid 5)
+      intr: "on"
+      satp: kernel
+      locks: ["inode 25 (d) lock (sleep-lock)", "inode 27 (the new link) lock (sleep-lock)"]
+      irq: 0
+      stack: [usertrap, syscall, sys_symlink]
+      sp: {"on": kernel, detail: "`sp` = `0x3fffff9e80`"}
+    note: |
+      [[writei]] at offset 0, `n` bytes from a kernel address (`user_src` = 0): the bytes of
+      the target, without the NUL. gdb at the call (hart 1): inode 27, type 4, `nlink` 1,
+      `size` 0, `n` = 1 (the target is `f`), 1 block in the log. At the [[dirlink]] that
+      follows, `ln` was on **hart 2**: inside [[writei]] it had given up the CPU (to wait for a
+      sleep-lock or the disk, or at a timer interrupt; gdb did not show which) and was
+      rescheduled on another hart, holding both inode sleep-locks, which
+      is allowed for sleep-locks. The log then held 3 blocks: 34, 46 (the free-block
+      bitmap, where [[balloc]] marked the new block used) and 1073 (the link's data, zeroed
+      by [[balloc]] and then written). After [[dirlink]] wrote the entry `(l, 27)` into
+      `d`'s block 1071: 4 blocks, `size` 1, `addrs[0]` = 1073.
+
+      Only now does the name exist, and the link it names is complete. If [[writei]] or
+      [[dirlink]] finds the disk full, no entry was written; `nlink` goes back to 0 and
+      [[iunlockput]]'s [[iput]] frees the inode with [[itrunc]] and [[ifree]], inside this
+      transaction. A test that fills the disk confirmed it on this branch: `symlink
+      returned -1`, `/lk does not exist`, and after freeing space `symlink again returned
+      0`.
+
+      Then both locks go, child first (the order of release does not matter for
+      deadlock), and `end_op`, the last operation outstanding, commits: the 4 blocks go to
+      the log on disk, the header is written, then the blocks are installed at their homes
+      ([[tour:31]]).
+    others: |
+      Suppose `cat d/l` starts on hart 0 right now. Its [[namex]] needs to search `d`, so it
+      sleeps in [[ilock]] on `d`'s lock until `ln` releases it, after the entry is written.
+      Even without that lock, the entry would not exist before the target does. The log
+      plays no part in this: it orders writes for crashes, it does not hide blocks from
+      other processes.
+  - title: "follow: a loop, with a bound"
+    commit: 3
+    file: kernel/sysfile.c
+    lines: 328-357
+    focus: 338-344
+    diff: true
+    state:
+      hart: 2
+      mode: S
+      proc: cat (pid 6)
+      intr: "on"
+      satp: kernel
+      locks: ["inode 27 (the link d/l) lock (sleep-lock)"]
+      irq: 0
+      stack: [usertrap, syscall, sys_open, follow]
+      sp: {"on": kernel, detail: "pid 6's kernel stack: `sp` = `0x3fffff9e60`, base `0x3fffff9000`"}
+    note: |
+      Now `cat d/l`. `sys_open` found inode 27 with [[namei]] and locked it with [[ilock]],
+      as it always did. `follow` takes over a *locked* inode and returns a locked inode that
+      is not a link (or 0).
+
+      gdb stopped at this line (341 here, 365 on the finished branch, whose loop is the
+      same): inode 27, type
+      4, `size` 1, locked by pid 6; `depth` 0; `log.outstanding` 1 (this `open` is a
+      transaction too, though it will write nothing). In this build `follow` is inlined into
+      `sys_open`; gdb still shows it as a frame.
+
+      Line 339 is the cycle breaker: the 11th time round, if the inode is still a link, give
+      up. Lines 341-344 read the target: exactly `size` bytes, then a 0, because the writer
+      stored no NUL. The test `n <= 0` refuses an empty link, which `symlink` never makes
+      (it writes the name last) but which a damaged disk could hold; `n >= MAXPATH` cannot happen for a link made by `symlink`, but
+      `target` has only `MAXPATH` bytes, and a check here costs nothing.
+  - title: Let go of the link, then look up its target
+    commit: 3
+    file: kernel/sysfile.c
+    lines: 328-357
+    focus: 345-350
+    state:
+      hart: 2
+      mode: S
+      proc: cat (pid 6)
+      intr: "on"
+      satp: kernel
+      locks: []
+      irq: 0
+      stack: [usertrap, syscall, sys_open, follow]
+      sp: {"on": kernel}
+    note: |
+      The most important two lines of the lab are in this order: [[iunlockput]] first,
+      [[namei]] second. Between them this process holds **no inode lock at all**; gdb right
+      after it (line 372 on the finished branch, 348 here): inode 27 `lock.locked` 0, `ref` 0, and the target
+      `"f"` safe in the local buffer.
+
+      Why it matters: [[namei]] runs [[namex]], which locks each directory on the path, one
+      at a time, parent before child, and the target can name *anything*, including a path
+      through this very link (`s` → `s/x`) or the link's own directory (`d/up` → `.`). Look
+      up with the link still locked and the first makes [[acquiresleep]] wait for a lock its
+      own caller holds, the second takes child-then-parent against [[sys_unlink]]'s
+      parent-then-child. Clinic 1 has both, recorded: processes asleep for ever, and soon the
+      whole log.
+
+      What is still held is the transaction: `log.outstanding` stays 1 across the lookup.
+      That is required, since [[namex]] may call [[iput]], which may free an inode.
+
+      At this commit, line 348 looks up the target as it is: `f` from `cat`'s current
+      directory `/`. There is no `/f`, so `open` fails here. Commit 4 fixes that.
+    others: |
+      With the link released, another process may unlink it right now, on another hart.
+      Nothing breaks: this `open` already has the target's bytes and goes on with them, as
+      if it had started a moment earlier. If that unlink was the last name, our
+      [[iunlockput]] above may have been the last reference, and [[iput]] frees the link's
+      inode and block, inside our transaction, as it must be.
+  - title: Type checks move below the follow
+    commit: 3
+    file: kernel/sysfile.c
+    lines: 359-400
+    focus: 386-399
+    diff: true
+    state:
+      hart: 2
+      mode: S
+      proc: cat (pid 6)
+      intr: "on"
+      satp: kernel
+      locks: ["inode 26 (d/f) lock (sleep-lock)"]
+      irq: 0
+      stack: [usertrap, syscall, sys_open]
+      sp: {"on": kernel}
+    note: |
+      Following happens after the inode is found and locked, by either branch, and only
+      without `O_NOFOLLOW`. With `O_NOFOLLOW` the link itself goes on through `sys_open`,
+      and `read` on the descriptor reads its data, the target.
+
+      The old check "a directory may only be opened read-only" sat in the `else` branch,
+      before any following ([[kernel/sysfile.c:355]]). It must now look at the inode `open`
+      will return, so it moves here, and covers links opened with `O_NOFOLLOW` too.
+      `(omode & ~O_NOFOLLOW) != O_RDONLY` keeps the old meaning exactly: any write bit, or
+      `O_CREATE`, or `O_TRUNC`, refuses a directory, but `O_NOFOLLOW` alone does not count as
+      a write. Clinic 6 leaves the check where it was: a link to a directory then opens it
+      for writing, and the shell corrupts it.
+
+      gdb at line 394 (418 on the finished branch): inode 26 (`d/f`), type 2, locked by pid 6,
+      `omode` 0. The rest of `sys_open` is unchanged: it never knows a link was involved.
+  - title: "resolve: a relative target, from the link's directory"
+    commit: 4
+    file: kernel/sysfile.c
+    lines: 328-346
+    focus: 334-345
+    diff: true
+    state:
+      hart: 2
+      mode: S
+      proc: cat (pid 6)
+      intr: "on"
+      satp: kernel
+      locks: []
+      irq: 0
+      stack: [usertrap, syscall, sys_open, follow, resolve]
+      sp: {"on": kernel}
+    note: |
+      `path` is `sys_open`'s own `MAXPATH` buffer, still holding the name `open` was called
+      with. `resolve` rewrites it in place to name the target: strip trailing slashes,
+      then the link's own name, keeping the directory part including its final `/`; an
+      absolute target throws even that away. gdb stopped here with `path` = `"d/l"` and
+      `target` = `"f"`: `dirlen` ends at 2, and [[safestrcpy]] writes `f` after `d/`, giving
+      `d/f`.
+
+      The test at line 342 refuses a result that would not fit. [[safestrcpy]] would
+      truncate silently, and a truncated path names the wrong file.
+
+      Why is the directory part right? Because only the last component of a path is ever
+      followed: everything before the last `/` was walked by [[namex]] as real directories.
+      In a design that follows links in the middle of a path, the link's directory is not a
+      prefix of the string any more, and this trick would not work.
+    others: |
+      The prefix is walked *again*, as text, with no lock held between the two walks. If
+      another process removes the link, then its emptied directory, and makes a new
+      directory with the same name, all between the two walks, the target is looked up in
+      the new directory. xv6 has no `rename`, so that is the only way the prefix can change
+      meaning, and the result is still a correct lookup of a name as it exists *now*; the
+      same is true of any path a program looks up twice.
+  - title: follow keeps the path up to date
+    commit: 4
+    file: kernel/sysfile.c
+    lines: 348-378
+    focus: 366-372
+    diff: true
+    state:
+      hart: 2
+      mode: S
+      proc: cat (pid 6)
+      intr: "on"
+      satp: kernel
+      locks: []
+      irq: 0
+      stack: [usertrap, syscall, sys_open, follow]
+      sp: {"on": kernel}
+    note: |
+      The only change in `follow` is what it looks up: `path`, freshly rewritten by
+      `resolve`, instead of `target`. Since each round rewrites `path`, the next link in a
+      chain is resolved against *its own* directory. `/stt/c1` → `c2` → … in the test, or a
+      link in `d` pointing at `../e/l2` whose target is relative to `e`, all come out right.
+
+      gdb at line 371 (374 on the finished branch; the [[ilock]] of the new inode): [[namei]] returned inode 26, not yet
+      locked; still no lock held. After the [[ilock]], the loop tests the type again: a
+      file, so the loop ends and `follow` returns inode 26 locked.
+
+      An instrumented copy of the kernel, printing `path` at the end of `sys_open`, showed
+      this rewriting from outside: for an `open` of `/m/1` (a link to `f`) it printed
+      `/m/f`. `sys_open`'s copy of the name has been replaced, which is harmless: nothing
+      after the follow uses it.
+  - title: O_CREATE on an existing link
+    commit: 5
+    file: kernel/sysfile.c
+    lines: 264-292
+    focus: 280-290
+    diff: true
+    state:
+      hart: any
+      mode: S
+      proc: "sh's child, opening the file of `echo hi > link`"
+      intr: "on"
+      satp: kernel
+      locks: ["the existing inode's lock (sleep-lock)"]
+      irq: 0
+      stack: [usertrap, syscall, sys_open, create]
+      sp: {"on": kernel}
+    note: |
+      The shell opens the file of `>` with `O_WRONLY | O_CREATE | O_TRUNC`, so that path
+      goes through [[create]], not [[namei]]. For an existing name, [[create]] used to accept
+      only a file or a device and refuse anything else: `echo hi > link` failed. Now an
+      existing link is handed back too (still locked), and `sys_open` follows it like any
+      other.
+
+      Only for `T_FILE` requests, that is, only for `open`. `mkdir` and `mknod` of an
+      existing name still fail, link or not (and `symlink` does its own check, without
+      [[create]]): a name is never silently reused.
+
+      If the target does not exist, `follow` fails and `open` returns -1; it does not create
+      the target, unlike Linux. Recorded by hand on the finished branch: `echo bye > d/l`
+      wrote `bye` into `d/f`.
+
+      (The state here is reasoned from the code: no gdb breakpoint was set in this branch.)
+  - title: "ln -s"
+    commit: 6
+    file: user/ln.c
+    lines: 1-20
+    focus: 8-12
+    diff: true
+    state:
+      hart: 2
+      mode: U
+      proc: ln (pid 5)
+      intr: "on"
+      satp: user
+      locks: []
+      stack: [main]
+      sp: {"on": user}
+    note: |
+      The user side of the story's first command: `ln -s f d/l` is `argv` = `{"ln", "-s",
+      "f", "d/l"}`, four arguments, and `symlink("f", "d/l")` is the system call of the
+      previous steps (pid 5 entered the kernel on hart 2 and gdb found it there).
+
+      The target is passed on exactly as typed: `ln` does not make it absolute, and the
+      kernel does not look it up. So `ln -s f d/l` means "`f`, next to the link", that is
+      `d/f`. Recorded on the finished branch:
+
+      ```text
+      $ ln -s f d/l
+      $ cat d/l
+      hi
+      $ ln -s d dl
+      $ ls dl
+      ls: cannot stat dl/.
+      ls: cannot stat dl/..
+      ls: cannot stat dl/f
+      ls: cannot stat dl/l
+      $ cat dl/f
+      cat: cannot open dl/f
+      $ cd dl
+      cannot cd dl
+      ```
+
+      `ls dl` opens `dl` (followed: the directory `d`) and reads its entries, then stats
+      `dl/.`, `dl/f`, …, where `dl` is a middle component, which is not followed. That is
+      the spec's honest corner, visible from the shell.
+  - title: Testing the limits exactly
+    commit: 7
+    file: user/symlinktest.c
+    lines: 150-188
+    focus: 156-173
+    diff: true
+    state:
+      hart: any
+      mode: U
+      proc: symlinktest
+      intr: "on"
+      satp: user
+      locks: []
+      stack: [main, chain]
+      sp: {"on": user}
+    note: |
+      A limit is only tested if both sides of it are: `c1` is a chain of exactly
+      `MAXSYMLINK` links and must open; `c0` is one more and must not. The relative targets
+      (`c2`, `c3` …) make the chain a test of `resolve` too: the test runs from `/`, where
+      no `c2` exists.
+
+      `cycle` (below) checks that two links naming each other, and a link naming itself, make
+      `open` fail rather than hang, with `O_CREATE` as well as without.
+
+      The rest of the program checks every line of the spec, including the parts that are
+      deliberately not followed, so the reference cannot drift into following them without
+      a test failing.
+  - title: Three harts, four links, chains and cycles
+    commit: 7
+    file: user/symlinktest.c
+    lines: 268-332
+    focus: 279-323
+    state:
+      hart: any
+      mode: U
+      proc: symlinktest (one of three worker children)
+      intr: "on"
+      satp: user
+      locks: []
+      stack: [main, concurrent, worker]
+      sp: {"on": user}
+    note: |
+      Three children, one per hart if the scheduler spreads them, each 2,000 rounds of a
+      random choice among: make a link `l0`…`l3` (target `t`, or another of the links),
+      remove one, open one following, open one with `O_NOFOLLOW`. Links appear, disappear
+      and point at each other while the other workers follow them.
+
+      What may never happen: an `open` through links that returns something other than the
+      file `t` (a half-made link, a recycled inode), or an `O_NOFOLLOW` read that returns
+      anything but a whole target. What may happen, and does: an `open` that fails because a
+      link in its chain vanished, or because the links currently form a cycle.
+
+      The last lines matter as much as the checks: a run in which no worker ever got through
+      proves nothing. On commit 3 (relative targets taken from `/`), every follow failed,
+      and a version of this test without that requirement still printed `concurrent: OK`;
+      now each worker
+      must succeed at least once, and the counts are printed. On the finished branch:
+      83 to 121 successful opens through links per worker, 238 to 253 links read.
+  - title: unlink needs no change at all
+    commit: 7
+    file: kernel/sysfile.c
+    lines: 201-256
+    focus: 212-248
+    state:
+      hart: any
+      mode: S
+      proc: rm d/l
+      intr: "on"
+      satp: kernel
+      locks: ["inode 25 (d) lock (sleep-lock)", "inode 27 (the link) lock (sleep-lock)"]
+      irq: 0
+      stack: [usertrap, syscall, sys_unlink]
+      sp: {"on": kernel}
+    note: |
+      [[sys_unlink]] is untouched by the branch, and it does the right thing. It finds the
+      *parent* with [[nameiparent]] and the entry with [[dirlookup]]; neither follows a
+      link, so `rm d/l` removes the link, never `d/f`. It clears the entry, drops the
+      link's `nlink` to 0, and the final [[iput]] (inside [[iunlockput]]) sees `ref` 1 and
+      `nlink` 0: it runs [[itrunc]], which frees the data block holding the target, and
+      [[ifree]] marks the inode free. `symlinktest` checks that last part from user space:
+      the next file created gets the unlinked link's inode number.
+
+      The target's `nlink` is never involved: a symbolic link is not counted anywhere in its
+      target, which is what lets a link dangle and lets a target be removed while links to
+      it exist. A *hard* link to a link (`link("rl", "rl2")`) is counted, in the link's own
+      `nlink`, which the test sees as 2.
+
+      Recorded on the finished branch: `rm d/l`, then `cat d/f` still printed `bye`.
+
+      (The state shows the moment both inodes are locked, parent then child, at
+      [[kernel/sysfile.c:226]]; it is reasoned from the code. This is the lock order that the
+      buggy `follow` of clinic 1 collided with.)
+verify: |
+  On the branch (`ext/23-symlink`, 7 commits; every commit builds with `make kernel/kernel
+  fs.img`), run on 3 harts (`-smp 3 -m 128M`), one boot (the disk image also held the
+  `symfull` test program described below):
+
+  ```text
+  $ symlinktest
+  symlinktest: basic: OK
+  symlinktest: relative: OK
+  symlinktest: dangling: OK
+  symlinktest: nofollow: OK
+  symlinktest: chain: OK
+  symlinktest: cycle: OK
+  symlinktest: directory: OK
+  symlinktest: not followed in the middle of a path or by chdir: OK
+  symlinktest: create through a link: OK
+  symlinktest: unlink: OK
+  symlinktest: hard link to a symlink: OK
+  symlinktest: unlinked symlink's inode freed: OK
+  symlinktest: errors: OK
+  symlinktest: worker 1: 256 links made, 256 removed, 115 opened through links, 250 links read
+  symlinktest: worker 2: 241 links made, 244 removed, 121 opened through links, 253 links read
+  symlinktest: worker 0: 263 links made, 258 removed, 83 opened through links, 238 links read
+  symlinktest: concurrent: OK
+  symlinktest: ALL OK
+  $ usertests -q
+  usertests starting
+  test copyin: OK
+  test copyout: OK
+  [...]
+  test unlinkcwd: OK
+  ALL TESTS PASSED
+  $ symlinktest
+  [...]
+  symlinktest: worker 1: 248 links made, 257 removed, 122 opened through links, 256 links read
+  symlinktest: worker 0: 262 links made, 262 removed, 96 opened through links, 240 links read
+  symlinktest: worker 2: 248 links made, 237 removed, 125 opened through links, 235 links read
+  symlinktest: concurrent: OK
+  symlinktest: ALL OK
+  ```
+
+  Every line is a check the program made itself. `usertests -q` passing shows that every
+  path without links behaves as before: `open`'s moved directory check still refuses
+  writable directories, [[create]] still refuses to reuse names for `mkdir` and `mknod`,
+  and nothing leaked (`usertests` counts free pages). The second `symlinktest`, after
+  `usertests`, shows the file system left in a state where everything still works.
+
+  **A full disk.** A test program `symfull` (not on the branch)
+  fills the disk with files, calls `symlink`, looks for the name, frees one file and tries
+  again. On the branch, another boot:
+
+  ```text
+  $ symfull
+  balloc: out of blocks
+  symfull: disk full after 886 data blocks
+  balloc: out of blocks
+  symfull: symlink returned -1
+  symfull: /lk does not exist
+  symfull: open /lk following: -1
+  symfull: after freeing space, symlink again returned 0
+  $ ls lk
+  lk             2 2 2441
+  ```
+
+  The failed `symlink` left nothing behind, and the retry worked (`ls lk` follows the
+  link to `README`, inode 2). With a `sys_symlink` that calls [[create]] first, the same
+  program printed `/lk exists: type 4 size 0 nlink 1` and the retry returned -1.
+
+  By hand, on the same branch:
+
+  ```text
+  $ ln -s /echo e
+  $ e hi
+  exec e failed
+  $ ls e
+  e              2 4 36960
+  $ ln -s /README r
+  $ wc r
+  48 336 2441 r
+  ```
+
+  `exec` does not follow (as the spec says), `ls` and `wc`, which `open`, do.
+
+  The intermediate commits behave as the reveal says. With `symlinktest` built on commit 2
+  (no following): 11 checks fail, `not followed …`, `unlinked symlink's inode freed` and
+  `errors` pass. On commit 3: `relative`, `chain`, `directory`, `create through a link`,
+  `hard link to a symlink` and `concurrent` fail. On commit 4: only `create through a link`
+  fails.
+measure: |
+  **What a link costs on disk, and in the log.** An instrumented copy of the kernel printed
+  the log just before `sys_symlink`'s `end_op` (instrumentation not on the branch):
+
+  | link | blocks logged |
+  |---|---|
+  | `d/l`, link and `d` in the same inode block (the reveal's run) | 4: inode block, `d`'s entries, bitmap, link data |
+  | `/m/1` … `/m/3` (same inode block as `/m`) | 4 |
+  | `/m/4` … `/m/a` (a new inode block) | 5 |
+  | `/g/l`, in a directory whose first block was full | 5: inode block, bitmap (once, for two new blocks), the new directory block, `/g`'s inode block, link data |
+  | `l1` in `/` | 5 |
+
+  Every link uses one inode and one whole 1024-byte block, whatever the length of its
+  target. A transaction never came near the `MAXOPBLOCKS` of 10 that [[begin_op]] reserves.
+
+  **What following costs.** The same instrumented kernel counted calls to [[bread]] during
+  one `open` (all were cache hits: 0 disk reads), and the plain branch timed 10,000
+  `open`+`close` pairs with `uptime` (one tick is about 0.1 s; measured while the computer
+  was busy with other work, so your times will differ and only the ratios mean much):
+
+  | `open` of | `bread` calls | 10,000 opens |
+  |---|---|---|
+  | `/m/f` (the file) | 33 | 113 ticks |
+  | `/m/1` → `f` (1 link) | 68 | 233 ticks |
+  | `/m/a` → `9` → … → `1` → `f` (10 links) | 428 | 1,485 ticks |
+
+  A link roughly doubles the cost of an `open`, because following is a second full path
+  lookup. After the first lookup and one [[bread]] for the link's own block, the resolved
+  path is looked up again from the start: [[dirlookup]] reads the entries of `/` up to `m`,
+  then those of `/m`, once more, one [[bread]] per 16-byte entry. Ten links cost about
+  thirteen lookups. That is the price of the simple design (look up the whole resolved
+  path again from the start), and one reason real kernels cache name lookups.
+further: |
+  - **Follow links in the middle of a path.** Move following into [[namex]]: when a
+    middle component is a link, splice its target in front of the rest of the path and go
+    on, with one depth count for the whole lookup. Then `cd dl`, `cat dl/f` and running
+    programs through links work. You will have to decide, for each caller of [[namei]] and
+    [[nameiparent]], whether its *last* component is followed, and redo this lab's locking
+    argument inside [[namex]], where a directory is locked.
+  - **lstat and readlink.** `O_NOFOLLOW` + `fstat` + `read` is a workable `lstat` and
+    `readlink`; add them as system calls and teach `ls` to show links (type 4) with their
+    targets instead of following them.
+  - **Fast symlinks.** Store targets shorter than 52 bytes in `addrs[]` itself instead of a
+    data block, as ext2 does: no block, one fewer bitmap update, and a lookup that reads no
+    data block. Count the blocks saved with the measurement above.
+  - **O_CREATE through a dangling link.** Make `open(link, O_CREATE)` create the missing
+    target, as Linux does. Work out which directory it must be created in, and what must be
+    locked while you do.

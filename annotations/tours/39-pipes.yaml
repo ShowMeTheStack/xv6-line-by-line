@@ -1,0 +1,764 @@
+title: Pipes
+group: Devices and putting it all together
+prerequisites: [5, 16, 20]
+summary: |
+  `ls | wc` prints `24 96 608`: `ls` produced 608 bytes and `wc` counted them, yet `ls`
+  never knew `wc` existed, and neither program ever touched a file. Between them sat a
+  [[g:pipe]]: 512 bytes of kernel memory, two counters, one spinlock, and two wait
+  channels.
+
+  This tour follows those 608 bytes. You will see the pipe built (two `struct file`s and
+  one page from [[kernel:kalloc]]), wired into two processes by `fork`, `close` and `dup`,
+  then used at the same time from two harts: `ls` writing one byte per system call on hart
+  1, `wc` reading whatever has piled up, from one byte to a few hundred at a time, on
+  hart 2. When the pipe is empty the reader sleeps;
+  when it is full the writer sleeps; and when the last write end is closed the reader gets
+  0, end of file, which is the only way `wc` ever learns that `ls` is done.
+
+  That last point hides the classic pipe bug. Forget to close the write end in `wc`'s own
+  process, or in the shell that waits for it, and `wc` waits forever. By the end you will
+  see exactly why.
+cast: |
+  The machine has three [[g:hart|harts]]. You typed `ls | wc` at a freshly booted shell
+  (pid 2), which forked pid 3 to parse and run the command and is now asleep in
+  [[kernel:kwait]]. When the tour starts:
+
+  | Hart | What it is doing |
+  |---|---|
+  | 0 | Running pid 3 (a copy of `sh`), about to create the pipe |
+  | 1 | Idle in its [[kernel:scheduler]]; it will run `ls` (pid 4) |
+  | 2 | Idle in its [[kernel:scheduler]]; it will run `wc` (pid 5) |
+
+  The harts are this tour's choice; in our traced runs the processes moved between harts
+  from run to run. The byte counts are real.
+steps:
+  - title: The shell asks for a pipe
+    file: user/sh.c
+    lines: 101-123
+    focus: 102-104
+    state:
+      hart: 0
+      mode: U
+      proc: sh (pid 3)
+      intr: on
+      satp: user
+      locks: []
+      stack: [main, runcmd]
+      sp: user
+    note: |
+      pid 3 parsed `ls | wc` into a `PIPE` node and is running [[user:runcmd]]. Before it
+      creates either program it calls `pipe(p)`. On return, `p[0]` is a descriptor for the
+      **read end** and `p[1]` for the **write end**. This is the first command since boot,
+      so pid 3 has descriptors 0, 1 and 2 (the console) and nothing else: the pipe will get
+      3 and 4.
+
+      Everything after this line is plumbing: making `ls`'s descriptor 1 and `wc`'s
+      descriptor 0 refer to the two ends. The programs themselves only ever use
+      `write(1, …)` and `read(0, …)`, exactly as they would with the console. That is the
+      point of a pipe: it is a file that connects two programs, and neither program needs to
+      know.
+
+  - title: sys_pipe builds both ends at once
+    file: kernel/sysfile.c
+    lines: 501-530
+    focus: 509-511
+    state:
+      hart: 0
+      mode: S
+      proc: sh (pid 3)
+      intr: on
+      satp: kernel
+      locks: []
+      irq: 0
+      stack: [usertrap, syscall, sys_pipe]
+      sp: {"on": kernel, switched: "`ld sp, 8(a0)` in `uservec` ([[kernel/trampoline.S:76]]) when pid 3 executed `ecall`", detail: "pid 3's kernel stack"}
+    note: |
+      [[sys_pipe]] reads one argument, the user address of the `int[2]` array, and asks
+      [[pipealloc]] for two [[g:open-file|open files]]: `rf` (read end) and `wf` (write
+      end). Then it installs them as descriptors and copies the two numbers out.
+
+      A pipe is one kernel object with two faces. Reading and writing are different
+      permissions on different `struct file`s, so a process can hold only one end, and the
+      kernel can tell when all holders of one end are gone. That is how end of file will
+      work.
+
+      From the `ecall` on, hart 0 runs on pid 3's **kernel stack** ([[concept:stacks#kernel]]),
+      empty until `uservec` loaded its top ([[kernel/trampoline.S:76]]). The array `p` that
+      will receive the two numbers is not here: it is a local of `runcmd`, on pid 3's *user*
+      stack, which is why `sys_pipe` must `copyout` to it.
+
+  - title: Two struct files from the global table
+    file: kernel/file.c
+    lines: 28-44
+    focus: 35-37
+    state:
+      hart: 0
+      mode: S
+      proc: sh (pid 3)
+      intr: off
+      satp: kernel
+      locks: [ftable.lock]
+      irq: {noff: 1, intena: 1}
+      stack: [usertrap, syscall, sys_pipe, pipealloc, filealloc]
+      sp: kernel
+    note: |
+      [[pipealloc]] calls [[filealloc]] twice. Each call scans the global file table
+      `ftable` (100 entries, [[NFILE]]) for one with `ref == 0`, sets `ref = 1`, and returns
+      it.
+
+      `ftable.lock` is held for the scan and the claim, so hart 0 has interrupts off for
+      these lines. The check `ref == 0` and the store `ref = 1` must be one atomic step.
+    others: |
+      Any hart opening a file, duplicating a descriptor or forking is in this table too:
+
+      | Time | Hart 0 (pid 3, `pipe`) | Hart 2 (another process, `open`) |
+      |---|---|---|
+      | t1 | sees `file[7].ref == 0` | sees `file[7].ref == 0` |
+      | t2 | sets `ref = 1`, returns it | sets `ref = 1`, returns it |
+      | t3 | pipe read end | an inode file: the same `struct file` |
+
+      That is the bug without the lock: two owners of one structure, each overwriting the
+      other's `type` and pointers. With `ftable.lock`, the second scanner waits and then
+      skips the claimed slot.
+
+  - title: One page for the pipe itself
+    file: kernel/pipe.c
+    lines: 22-46
+    focus: 31-45
+    state:
+      hart: 0
+      mode: S
+      proc: sh (pid 3)
+      intr: on
+      satp: kernel
+      locks: []
+      irq: 0
+      stack: [usertrap, syscall, sys_pipe, pipealloc]
+      sp: kernel
+    note: |
+      The pipe's state lives in a whole 4096-byte page from [[kalloc]]. A `struct pipe` is
+      exactly 552 bytes (a 24-byte spinlock, 512 bytes of data, four 4-byte integers; the
+      offsets in `kernel.asm`'s `pipeclose`, such as `sw zero,548(s1)` for `readopen = 0`,
+      confirm it), so 3,544 bytes of the page, about 3.5 KiB, are unused. xv6 has no
+      allocator for small kernel objects, and that waste is the price of the simplicity.
+
+      Both ends start open, both counters at 0, and the two files are typed `FD_PIPE`,
+      pointing at the same `pi`: `rf` readable only, `wf` writable only.
+
+      If anything fails, the `bad:` path gives back whatever was claimed: [[fileclose]] on
+      the `struct file`s (the `kfree` of the page is only a safeguard; nothing after
+      [[kalloc]] can fail). Nothing leaks.
+    others: |
+      [[kalloc]] takes `kmem.lock` while it pops a page off the free list shared by all
+      harts ([[tour:27]]). So creating a pipe takes two spinlocks in turn, `ftable.lock`
+      and `kmem.lock`, never both at once.
+
+  - title: A ring of 512 bytes and two counters that never wrap back
+    file: kernel/pipe.c
+    lines: 11-20
+    focus: 13-20
+    state:
+      hart: 0
+      mode: S
+      proc: sh (pid 3)
+      intr: on
+      satp: kernel
+      locks: []
+      irq: 0
+      stack: [usertrap, syscall, sys_pipe, pipealloc]
+      sp: kernel
+    note: |
+      `data` is a circular buffer. `nwrite` counts every byte ever written and `nread`
+      every byte ever read. They only increase; `% PIPESIZE` turns a count into a position:
+
+      | State | Test |
+      |---|---|
+      | empty | `nread == nwrite` |
+      | full | `nwrite == nread + 512` |
+      | bytes waiting | `nwrite - nread` |
+      | next byte to read | `data[nread % 512]` |
+
+      With separate "read" and "write" indices that wrap at 512, *full* and *empty* would
+      both look like "indices equal". Free-running counters keep them apart, with no
+      wasted slot and no extra flag.
+
+      They are 32-bit `uint`s, so after 4 GiB through one pipe they overflow to 0. That is
+      harmless: unsigned arithmetic is modulo 2³², and 512 divides 2³², so
+      `nwrite - nread` and `% 512` give the same answers across the overflow.
+
+      `readopen` and `writeopen` record whether any file for each end is still open.
+    others: |
+      The other five fields (`data`, `nread`, `nwrite`, `readopen`, `writeopen`) are
+      protected by `pi->lock`. Readers and writers will run on different
+      harts, and every check-then-act on these counters (is it empty? is it full?) must
+      happen inside one critical section.
+
+  - title: The descriptors, and the two numbers handed back
+    file: kernel/sysfile.c
+    lines: 501-530
+    focus: 513-529
+    state:
+      hart: 0
+      mode: S
+      proc: sh (pid 3)
+      intr: on
+      satp: kernel
+      locks: []
+      irq: 0
+      stack: [usertrap, syscall, sys_pipe]
+      sp: kernel
+    note: |
+      [[fdalloc]] picks the lowest free slot in pid 3's `ofile[]` table: 3 for the read end,
+      4 for the write end. Then two [[copyout]]s store `3` and `4` into the user's `p[0]` and
+      `p[1]` ([[tour:28]]).
+
+      No lock protects `ofile[]`. Only pid 3 itself changes its own descriptor table, and
+      an xv6 process has a single thread, so while pid 3 is in this system call nothing else
+      can touch the table.
+
+      If the copyout fails (a bad `p` pointer), the descriptors are removed and both files
+      closed, which also frees the pipe. A failed `pipe` leaves no trace.
+
+  - title: Fork twice, then rewire descriptors 0 and 1
+    file: user/sh.c
+    lines: 101-123
+    focus: 119-122
+    state:
+      hart: 0
+      mode: U
+      proc: sh (pid 3)
+      intr: on
+      satp: user
+      locks: []
+      stack: [main, runcmd]
+      sp: {"on": user, switched: "`ld sp, 48(a0)` in `userret` ([[kernel/trampoline.S:118]]) and `sret` ([[kernel/trampoline.S:153]]), as the second `fork` returned"}
+    note: |
+      pid 3 forks twice ([[tour:20]]). Each [[kfork]] calls [[filedup]] on every open
+      descriptor, so the children start with the pipe's two ends too.
+
+      - The left child, pid 4, will become `ls`: `close(1)` frees descriptor 1, so
+        `dup(p[1])` lands in the lowest free slot, **1**. Then it closes both originals.
+      - The right child, pid 5, will become `wc`: `close(0)`, `dup(p[0])` lands in **0**,
+        and it closes both originals.
+      - pid 3 closes both ends and waits for both children.
+
+      When the dust settles, regardless of which hart ran which line first:
+
+      | Process | fd 0 | fd 1 | fd 2 | fd 3, 4 |
+      |---|---|---|---|---|
+      | pid 3 (`sh`) | console | console | console | closed |
+      | pid 4 (`ls`) | console | **pipe write end** | console | closed |
+      | pid 5 (`wc`) | **pipe read end** | console | console | closed |
+
+      Each end's `struct file` ends with `ref == 1`: the write end is held only by `ls`, the
+      read end only by `wc`. Every `close` on these lines matters, and step 18 shows what one
+      missing `close` does.
+    others: |
+      These closes run on three harts in no fixed order, so the reference counts rise and
+      fall in different sequences from run to run (the write end's can reach 4: pid 3, both
+      children, and `ls`'s `dup`, if every fork and dup happens before any close). The counts are only changed under
+      `ftable.lock` ([[filedup]], [[fileclose]]), so every interleaving ends at the same
+      totals.
+
+      What each `fork` does to the stacks: the child's **user** stack is a copy of pid 3's, made
+      by [[uvmcopy]] with the rest of its memory, so the child finds `p` = `{3, 4}` in its own
+      copy of `runcmd`'s frame, at the same virtual address. Its **kernel** stack is not copied
+      at all: it is the empty page of its own slot, prepared so that the first `swtch` to it
+      lands at the top with `ra` = [[forkret]] ([[kernel/proc.c:147]]).
+
+  - title: wc reads first, and the pipe is empty
+    file: kernel/pipe.c
+    lines: 111-128
+    focus: 119-124
+    state:
+      hart: 2
+      mode: S
+      proc: wc (pid 5)
+      intr: off
+      satp: kernel
+      locks: [pi->lock]
+      irq: {noff: 1, intena: 1, note: "`pi->lock`, taken with SIE on in a system call; [[killed]] and [[sleep_prepare]] add `p->lock` for a moment (2)"}
+      stack: [usertrap, syscall, sys_read, fileread, piperead]
+      sp: {"on": kernel, switched: "`ld sp, 8(a0)` in `uservec` ([[kernel/trampoline.S:76]]) when `wc` executed `ecall`", detail: "wc's kernel stack"}
+    note: |
+      `wc` has exec'd ([[tour:22]]) and called `read(0, buf, 512)` ([[user/wc.c:16]]).
+      [[fileread]] sees `FD_PIPE` and calls [[piperead]]. Sooner or later `wc` drains
+      everything `ls` has written so far and finds the pipe empty. In our traced runs that
+      first happened after `ls` had written 72–299 bytes, but take the simplest case: `wc`
+      gets here before `ls` has written anything.
+
+      [[piperead]] takes `pi->lock` (interrupts off on hart 2) and finds `nread == nwrite`:
+      empty. The write end is still open, so data may yet come; `wc` must wait:
+
+      1. Killed? Then return -1 rather than wait.
+      2. [[sleep_prepare]]`(&pi->nread)`, still holding `pi->lock`.
+      3. Release `pi->lock` (line 125), then [[sleep]] (line 126).
+
+      The reader sleeps on `&pi->nread`, the writer will sleep on `&pi->nwrite`. Two
+      channels, so a wakeup meant for readers never disturbs a writer and vice versa.
+
+      Follow `noff` on the irq strip: 1 under `pi->lock` (with `intena` 1, since `SIE` was
+      on in the system call); 2 for a moment inside [[killed]] and [[sleep_prepare]], which
+      take `wc`'s `p->lock`; 0 after the release on line 125, which turns interrupts back
+      on. Then [[sleep]] takes `p->lock` again, so [[sched]] sees exactly what it demands:
+      `noff` 1, and that one lock is `p->lock` ([[concept:locks#sleep-wakeup]]).
+
+      When `wc` sleeps, its whole call chain stays on its kernel stack, and `swtch` moves hart 2
+      to its scheduler stack ([[kernel/swtch.S:26]]):
+
+      ```text
+      wc's kernel stack                     hart 2
+        top ─► usertrap                       sp ─► its scheduler stack (stack0, slice 2):
+               syscall                              start, main, scheduler, then wfi
+               sys_read
+               fileread
+               piperead    holds nothing now: pi->lock released at line 125
+               sleep
+               sched       ◄─ saved in wc's p->context.sp
+      ```
+
+      A sleeping process costs one kernel stack page (its slot's, allocated at boot) and no hart.
+    others: |
+      This is where the lost-wakeup problem would bite. `ls` on hart 1 may write its first
+      byte at any instant:
+
+      | Time | Hart 2 (wc) | Hart 1 (ls) |
+      |---|---|---|
+      | t1 | holds `pi->lock`, sees empty | `pipewrite`: `acquire(&pi->lock)` spins |
+      | t2 | `sleep_prepare`: `p->chan = &pi->nread` | spinning |
+      | t3 | releases `pi->lock` | stores `.`, `nwrite = 1`, `wakeup(&pi->nread)`: clears wc's `p->chan` |
+      | t4 | `sleep()`: `chan == 0`, returns at once, loops | |
+
+      Because the check and the registration are in one `pi->lock` critical section, the
+      byte cannot be stored between them, and a byte stored after them finds `wc`
+      registered ([[tour:16]]).
+
+  - title: ls writes one byte
+    file: kernel/file.c
+    lines: 132-148
+    focus: 139-143
+    state:
+      hart: 1
+      mode: S
+      proc: ls (pid 4)
+      intr: on
+      satp: kernel
+      locks: []
+      irq: 0
+      stack: [usertrap, syscall, sys_write, filewrite]
+      sp: {"on": kernel, switched: "`ld sp, 8(a0)` in `uservec` ([[kernel/trampoline.S:76]]) when `ls` executed `ecall`", detail: "ls's kernel stack"}
+    note: |
+      `ls` prints its first line, `.              1 1 1024`, with [[user:printf]], and user
+      `printf` calls `write(1, &c, 1)` once per character ([[tour:38]]). So `ls` will make
+      **608** one-byte `write` calls into this pipe, one per byte of its output.
+
+      Descriptor 1 is the pipe's write end. [[filewrite]] checks `writable` (the read end
+      would fail here) and sees `FD_PIPE`, so it calls [[pipewrite]] with the user address
+      and `n = 1`.
+
+      `ls` has no idea this is not the console. The same `filewrite` call reached
+      [[consolewrite]] for `echo` in [[tour:5]]; the `type` field is all that differs.
+
+  - title: pipewrite stores the byte under pi->lock
+    file: kernel/pipe.c
+    lines: 76-109
+    focus: 94-103
+    state:
+      hart: 1
+      mode: S
+      proc: ls (pid 4)
+      intr: off
+      satp: kernel
+      locks: [pi->lock]
+      irq: {noff: 1, intena: 1}
+      stack: [usertrap, syscall, sys_write, filewrite, pipewrite]
+      sp: kernel
+    note: |
+      [[pipewrite]] takes `pi->lock` and loops over the bytes (one, here):
+
+      - If the read end is closed (`readopen == 0`) or `ls` was killed, return -1: writing
+        to a pipe nobody can read is an error, not a wait.
+      - If the pipe is full, sleep (step 13).
+      - Otherwise [[copyin]] one byte from `ls`'s memory and store it at
+        `data[nwrite % 512]`, then `nwrite++`.
+
+      The copy from user memory happens **with a spinlock held**, interrupts off. That is
+      allowed because [[copyin]] never sleeps: it walks the page table in software, and at
+      worst allocates a page with [[kalloc]] ([[tour:28]]). A bad address simply ends the
+      write early.
+
+      Copying one byte per iteration costs a page-table walk per byte. It keeps the loop
+      simple, and lets it stop exactly where the pipe fills.
+
+      Each byte makes a one-byte stop on `ls`'s kernel stack on the way: [[copyin]] copies it
+      into `pipewrite`'s local `ch` ([[kernel/pipe.c:95]]), and only then into `data`.
+      [[piperead]] does the mirror image on `wc`'s kernel stack, `data` → its own `ch` → user
+      memory.
+    others: |
+      `wc` on hart 2 is asleep, so nobody competes for `pi->lock` right now. Later both
+      run at once: `ls` storing on hart 1 while `wc` is taking bytes on hart 2. They never
+      touch `data`, `nread` or `nwrite` at the same time, because each holds `pi->lock`
+      for its whole check-and-update. One spins briefly while the other finishes.
+
+  - title: Every write wakes the reader
+    file: kernel/proc.c
+    lines: 574-595
+    focus: 580-594
+    state:
+      hart: 1
+      mode: S
+      proc: ls (pid 4)
+      intr: off
+      satp: kernel
+      locks: [pi->lock, each p->lock in turn]
+      irq: {noff: 2, intena: 1}
+      stack: [usertrap, syscall, sys_write, filewrite, pipewrite, wakeup]
+      sp: kernel
+    note: |
+      After the loop, [[pipewrite]] calls `wakeup(&pi->nread)` ([[kernel/pipe.c:105]]),
+      still holding `pi->lock`. [[wakeup]] walks all 64 process slots, taking each
+      `p->lock` in turn, and finds `wc` asleep on `&pi->nread`: it clears `wc`'s `chan` and
+      makes it `RUNNABLE`.
+
+      `pipewrite` does this at the end of **every** call, whether or not anyone is
+      waiting. `ls` makes 608 calls, so that is 608 walks of the process table, about
+      39,000 `p->lock` acquisitions, to move 608 bytes. Simplicity over speed, again.
+
+      Then `pi->lock` is released and `write` returns 1 to `ls`, which goes on to its next
+      character.
+    others: |
+      Lock order: `pi->lock` → `p->lock`. The reader's [[sleep_prepare]] also takes its
+      `p->lock` while holding `pi->lock`, so the order is the same on both sides, and no
+      deadlock is possible ([[tour:18]], [[concept:locks#order]]).
+
+  - title: wc wakes on hart 2 and takes what is there
+    file: kernel/pipe.c
+    lines: 111-143
+    focus: 129-140
+    state:
+      hart: 2
+      mode: S
+      proc: wc (pid 5)
+      intr: off
+      satp: kernel
+      locks: [pi->lock]
+      irq: {noff: 1, intena: 1, note: "after `swtch` back, [[sched]] restored wc's intena 1, `sleep`'s release turned SIE on, and line 127 recorded 1 again ([[concept:locks#sched-intena]])"}
+      stack: [usertrap, syscall, sys_read, fileread, piperead]
+      sp: {"on": kernel, switched: "`ld sp, 8(a1)` in [[swtch]] ([[kernel/swtch.S:26]]), in hart 2's scheduler", detail: "wc's kernel stack, the frames from step 8 intact"}
+    note: |
+      Hart 2's scheduler picks `wc` up. It returns from [[sleep]], retakes `pi->lock`,
+      re-checks (not empty now), and copies: up to `n = 512` bytes, stopping as soon as
+      `nread == nwrite`. Each byte goes out with [[copyout]] into `wc`'s `buf`, and
+      `nread++` follows only a successful copy.
+
+      A pipe read returns **whatever is there**, not necessarily 512 bytes. By the time
+      `wc` ran, `ls` had written more. In our traced runs `wc` needed between 5 and 17
+      reads, for example 244, 238, 2, 80, 22, 22, then 0; another run included a stretch of
+      1-byte reads, `wc` and `ls` alternating byte by byte. The split depends on timing; the
+      total is always 608.
+
+      Then `wakeup(&pi->nwrite)`: space was freed, so a writer waiting for room may go on.
+
+      The wakeup itself moved nothing: it only set `wc` `RUNNABLE`. Hart 2's scheduler then
+      `swtch`ed onto `wc`'s kernel stack ([[kernel/swtch.S:26]]), at the `sched` frame saved
+      in step 8, and the chain unwound from there: `sched` returned to `sleep`, `sleep` to
+      `piperead`, which retakes `pi->lock` (line 127) and then re-checks its loop condition.
+    others: |
+      `ls` on hart 1 keeps writing while `wc` is in this loop. Each of its
+      [[pipewrite]] calls spins on `pi->lock` until `wc` releases it. Because every access
+      to `data`, `nread` and `nwrite` is made under `pi->lock`, `wc` can never see `nwrite`
+      advanced before the byte it counts has been stored, nor `ls` see space that `wc` has
+      not finished freeing.
+
+  - title: When ls outruns wc, the pipe fills
+    file: kernel/pipe.c
+    lines: 76-109
+    focus: 88-90
+    state:
+      hart: 1
+      mode: S
+      proc: ls (pid 4)
+      intr: off
+      satp: kernel
+      locks: [pi->lock]
+      irq: {noff: 1, intena: 1}
+      stack: [usertrap, syscall, sys_write, filewrite, pipewrite]
+      sp: kernel
+    note: |
+      In our runs `wc` kept up, but nothing guarantees it. Suppose hart 2 were busy and
+      `wc` had not read yet: `ls`'s output is 608 bytes and the pipe holds 512, so on byte
+      513 `nwrite == nread + 512`. The pipe is full.
+
+      `pipewrite` then:
+
+      1. `wakeup(&pi->nread)`: make sure the reader knows there is data.
+      2. [[sleep_prepare]]`(&pi->nwrite)`, holding `pi->lock`.
+      3. Release `pi->lock`, [[sleep]], and retake the lock when woken.
+
+      It is the mirror image of the reader. The writer sleeps on `&pi->nwrite`, and
+      [[piperead]]'s `wakeup(&pi->nwrite)` releases it once there is room. The loop then
+      re-checks `readopen` and `killed`, so a writer whose reader died is not stuck
+      forever.
+
+      This is **flow control**: a fast producer is slowed to the speed of its consumer,
+      and memory use stays at one page per pipe no matter how much data flows.
+
+      The writer's sleep looks just like the reader's in step 8, one level over: `ls`'s frames
+      wait on `ls`'s kernel stack while hart 1 goes to its scheduler stack.
+
+      ```text
+      ls's kernel stack (asleep on &pi->nwrite)
+        top ─► usertrap
+               syscall
+               sys_write
+               filewrite
+               pipewrite   i = 0: byte 513 not yet stored
+               sleep
+               sched       ◄─ saved in ls's p->context.sp
+      ```
+
+      Where `pipewrite` was in its loop (`i` and the user address, kept in callee-saved
+      registers) survives the sleep: `sleep` and `sched` save those registers in their frames,
+      and `swtch` saves the rest in `p->context`, which is how it continues with the right byte
+      when it wakes.
+    others: |
+      | Time | Hart 1 (ls) | Hart 2 (wc) |
+      |---|---|---|
+      | t1 | full: `wakeup(&pi->nread)`, registers on `&pi->nwrite`, releases | |
+      | t2 | `sleep()`: `SLEEPING` | takes `pi->lock`, copies 512 bytes, `nread += 512` |
+      | t3 | | `wakeup(&pi->nwrite)`: `ls` `RUNNABLE` |
+      | t4 | woken (on any hart), retakes `pi->lock`, writes byte 513 | releases, counts |
+
+  - title: ls exits and closes its descriptors
+    file: kernel/proc.c
+    lines: 325-345
+    focus: 333-340
+    state:
+      hart: 1
+      mode: S
+      proc: ls (pid 4)
+      intr: on
+      satp: kernel
+      locks: []
+      irq: 0
+      stack: [usertrap, syscall, sys_exit, kexit]
+      sp: {"on": kernel, switched: "`ld sp, 8(a0)` in `uservec` ([[kernel/trampoline.S:76]]) when `ls` called `exit`", detail: "ls's kernel stack"}
+    note: |
+      `ls` has printed all 24 lines and calls `exit(0)`. [[kexit]] first closes every open
+      descriptor. `ls` never called `close(1)` itself, and did not need to: exit closes
+      everything, and that is how most pipes get closed in practice.
+
+      Descriptor 0 is the console (its reference count drops by one). Descriptor 1 is the
+      pipe's write end, with `ref == 1`: `ls` was its last holder. [[fileclose]] is about to
+      discover that.
+    others: |
+      `wc` on hart 2 may be in [[piperead]] right now, or asleep on `&pi->nread` because
+      it has already taken all 608 bytes. Either way it will find out about the close
+      through `pi->lock` and a wakeup, two steps from now.
+
+  - title: fileclose drops the last reference
+    file: kernel/file.c
+    lines: 58-83
+    focus: 65-73
+    state:
+      hart: 1
+      mode: S
+      proc: ls (pid 4)
+      intr: off
+      satp: kernel
+      locks: [ftable.lock]
+      irq: {noff: 1, intena: 1}
+      stack: [usertrap, syscall, sys_exit, kexit, fileclose]
+      sp: kernel
+    note: |
+      [[fileclose]] takes `ftable.lock` and decrements `ref`. If others still hold the file,
+      that is all. Here `ref` becomes 0, so it copies the structure into the local `ff`,
+      marks the slot free (`ref = 0`, `FD_NONE`), and releases `ftable.lock`. Only *then*
+      does it call [[pipeclose]] with `ff.writable = 1`.
+
+      Why copy and release first? The slot may be reused by another hart's [[filealloc]]
+      the moment the lock is released, so the fields must be saved. And the cleanup must run
+      outside `ftable.lock`: for inode files it calls [[begin_op]] and [[iput]], which can
+      sleep, and no one may sleep holding a spinlock. Pipes use the same path.
+    others: |
+      `ftable.lock` makes the decrement-and-test atomic. Without it, two processes closing
+      the same shared file on two harts could both read `ref == 2`, both store 1, and the
+      file would never be closed. A [[filedup]] racing a `fileclose` could likewise lose its
+      increment, and the file would be freed while a descriptor still points to it.
+
+  - title: pipeclose marks the write end closed and wakes the reader
+    file: kernel/pipe.c
+    lines: 58-74
+    focus: 62-69
+    state:
+      hart: 1
+      mode: S
+      proc: ls (pid 4)
+      intr: off
+      satp: kernel
+      locks: [pi->lock]
+      irq: {noff: 1, intena: 1, note: "`pi->lock`; each [[wakeup]] adds `p->lock` in turn (2)"}
+      stack: [usertrap, syscall, sys_exit, kexit, fileclose, pipeclose]
+      sp: kernel
+    note: |
+      [[pipeclose]] takes `pi->lock`, sets `writeopen = 0`, and calls
+      `wakeup(&pi->nread)`: a reader asleep on an empty pipe must re-check, because "empty"
+      now means "finished", not "wait".
+
+      `readopen` is still 1 (`wc` holds the read end), so the pipe survives, with any
+      unread bytes still in `data`. `pi->lock` is released and `ls` continues its exit:
+      it closes descriptor 2, wakes its parent pid 3, and becomes a [[g:zombie]]
+      ([[tour:21]]).
+
+      Note that `writeopen` is a single flag, not a count. It goes to 0 only when the
+      write end's single `struct file` is finally closed, because [[fileclose]] only calls
+      `pipeclose` when that file's `ref` reaches 0. Counting the descriptors happens one
+      level up, in `ftable`.
+
+  - title: wc sees end of file
+    file: kernel/pipe.c
+    lines: 111-143
+    focus: 129-131
+    state:
+      hart: 2
+      mode: S
+      proc: wc (pid 5)
+      intr: off
+      satp: kernel
+      locks: [pi->lock]
+      irq: {noff: 1, intena: 1}
+      stack: [usertrap, syscall, sys_read, fileread, piperead]
+      sp: {"on": kernel, switched: "`ld sp, 8(a0)` in `uservec` ([[kernel/trampoline.S:76]]), for `wc`'s next `read`"}
+    note: |
+      `wc` reads again. If bytes remain, it gets them first: the loop condition on line 119
+      only waits while the pipe is empty **and** the write end is open. If `ls` exits
+      before `wc` has taken everything, the leftover bytes still come out first.
+
+      On the next `read`, `nread == nwrite` and `writeopen == 0`: the `while` is skipped,
+      the copy loop breaks at once with `i = 0`, and `piperead` returns **0**. To `wc`,
+      that is end of file, the same answer a disk file gives at its end, and its loop
+      `while ((n = read(fd, buf, sizeof(buf))) > 0)` ends ([[user/wc.c:16]]).
+
+      `wc` prints `24 96 608 ` (with a trailing space: its name argument is `""`) and
+      exits. Its exit closes the read end, the last reference to the pipe.
+    others: |
+      If `wc` were asleep on `&pi->nread` when `ls` closed, the wakeup in [[pipeclose]]
+      would make it `RUNNABLE`; it would retake `pi->lock` on whichever hart ran it, see
+      `writeopen == 0`, and return 0. Because `writeopen` is only changed under `pi->lock`,
+      there is no window in which `wc` could check "empty and open", then miss the close,
+      then sleep.
+
+  - title: "The classic bug: one forgotten close"
+    file: user/sh.c
+    lines: 101-123
+    focus: 112-117
+    state:
+      hart: 2
+      mode: U
+      proc: sh (pid 5)
+      intr: on
+      satp: user
+      locks: []
+      stack: [main, runcmd]
+      sp: {"on": user, switched: "`ld sp, 48(a0)` in `userret` ([[kernel/trampoline.S:118]]) and `sret` ([[kernel/trampoline.S:153]]), on pid 5's first return, via [[forkret]]"}
+    note: |
+      Delete line 116, `close(p[1])`, in the right child. What happens?
+
+      `wc` (pid 5) now holds the pipe's write end itself, at descriptor 4, through `exec`.
+      When `ls` exits, the write end's `ref` drops from 2 to 1, not to 0. `pipeclose` is
+      never called, `writeopen` stays 1, and when `wc` has read all 608 bytes, [[piperead]]
+      sees "empty, but the write end is open" and sleeps, waiting for a writer that is
+      itself. Nothing will ever wake it. pid 3 waits forever for `wc`, and the shell (pid 2)
+      waits forever for pid 3. Your terminal shows no prompt.
+
+      The same hang follows if pid 3 forgets line 120, `close(p[1])`: then pid 3 holds a
+      write end while it waits for `wc`, and `wc` waits for pid 3 to close it. A deadlock
+      spread across two processes, with no lock involved.
+
+      Forgetting to close a *read* end does no harm in `ls | wc`, because `wc` reads to the
+      end. It bites only when the reader quits early: if `ls` kept its copy (line 108) and
+      `wc` exited early, `ls`'s writes would not fail with -1 (`readopen` would still be 1), and
+      `ls` could sleep forever on a full pipe that only it can read.
+    others: |
+      The kernel cannot detect this. From its point of view the pipe has a live writer:
+      some `struct file` with `writable = 1` has `ref > 0`. Which process holds it, and
+      whether that process will ever write, it cannot know. End of file on a pipe is a
+      promise all writers make by closing, and every copy made by `fork` counts as a writer.
+
+  - title: The last close frees the page
+    file: kernel/pipe.c
+    lines: 58-74
+    focus: 71
+    state:
+      hart: 2
+      mode: S
+      proc: wc (pid 5)
+      intr: on
+      satp: kernel
+      locks: []
+      irq: 0
+      stack: [usertrap, syscall, sys_exit, kexit, fileclose, pipeclose]
+      sp: {"on": kernel, switched: "`ld sp, 8(a0)` in `uservec` ([[kernel/trampoline.S:76]]) when `wc` called `exit`", detail: "wc's kernel stack, its last: kexit never returns to user mode"}
+    note: |
+      `wc` exits. [[fileclose]] drops the read end's `ref` to 0 and calls [[pipeclose]] with
+      `writable = 0`: `readopen = 0`, `wakeup(&pi->nwrite)` (no writer left to hear it). Now
+      both flags are 0, so after releasing `pi->lock` it frees the page with [[kfree]].
+      The lock lived inside the page, so it must be released before the page is freed;
+      no other hart can be waiting for it, because no `struct file` points to this pipe any
+      more.
+
+      What did `ls | wc` cost in pipe machinery? One page, two `struct file`s, 608
+      `write` calls each taking `pi->lock` and walking the process table to wake the
+      reader, a few to a couple of dozen `read` calls (6 to 18 in our runs), and at least one sleep. The ideas that carried it:
+
+      - **Counters, not indices**: `nwrite - nread` says everything, even across overflow.
+      - **One lock, two channels**: `pi->lock` for every check-and-act, `&pi->nread` and
+        `&pi->nwrite` so readers and writers wake only each other.
+      - **Register before releasing**: [[sleep_prepare]] inside `pi->lock`, so no lost
+        wakeups between harts.
+      - **End of file is a reference count reaching zero**, which is why every `close`
+        matters.
+
+      [[kexit]] runs to the end on `wc`'s own kernel stack and leaves it for good in its final
+      [[sched]]. It does not free that stack, and could not: it is standing on it. It never
+      needs to, because kernel stacks belong to process *slots*, allocated once at boot. What
+      [[freeproc]] frees later, in pid 3's [[kwait]], is the trapframe and the user page table,
+      and with it `wc`'s user stack.
+locks:
+  - lock: pi->lock (spinlock)
+    where: "[[pipewrite]], [[piperead]], [[pipeclose]]"
+    protects: "The ring `data`, `nread`, `nwrite`, `readopen`, `writeopen` of one pipe"
+  - lock: ftable.lock (spinlock)
+    where: "[[filealloc]], [[filedup]], [[fileclose]]"
+    protects: "Every `struct file`'s `ref`, and claiming free slots in the global file table"
+  - lock: kmem.lock (spinlock)
+    where: "[[kalloc]] in [[pipealloc]], [[kfree]] in [[pipeclose]]"
+    protects: "The free-page list shared by all harts"
+  - lock: p->lock (spinlock)
+    where: "[[sleep_prepare]], [[sleep]], [[wakeup]], [[killed]]"
+    protects: "`p->chan` and `p->state` of a sleeping reader or writer. Whenever both are held, `pi->lock` comes first ([[sleep_prepare]], [[wakeup]], [[killed]] called from the pipe code); [[sleep]] takes `p->lock` only after `pi->lock` is released"
+  - lock: wait_lock (spinlock)
+    where: "[[kexit]] (`ls` and `wc` exiting), [[kwait]] (pid 3 reaping them)"
+    protects: "Parent-child links and the exit/wait handshake ([[tour:20]], [[tour:21]])"
+  - lock: pid_lock (spinlock)
+    where: "[[allocpid]], in [[kfork]]"
+    protects: "`nextpid`, for the two children's pids"
+  - lock: "ofile[] (no lock)"
+    where: "[[fdalloc]], [[sys_close]], [[sys_dup]]"
+    protects: "A process's descriptor table is changed only by that single-threaded process"
+  - lock: "sleep without pi->lock"
+    where: "[[pipewrite]], [[piperead]]"
+    protects: "Both release `pi->lock` before [[sleep]]: a sleeper holding it would block the very process that must wake it"
+quiz:
+  - q: "Why does a pipe use two ever-growing counters instead of two indices that wrap at 512?"
+    a: "With wrapping indices, a full pipe and an empty pipe both have equal indices, so you would need an extra flag or a wasted slot. With free-running counters, empty is `nread == nwrite` and full is `nwrite == nread + 512`; since 512 divides 2³², overflow does not break either test."
+  - q: "`piperead` calls `sleep_prepare(&pi->nread)` before releasing `pi->lock`. Describe the lost wakeup that could happen if it released the lock first and then registered."
+    a: "`wc` sees the pipe empty and releases the lock. Before it registers, `ls` on another hart stores a byte and calls `wakeup(&pi->nread)`, which finds nobody registered. `wc` then registers and sleeps, although data is waiting; if `ls` was writing its last byte, nothing ever wakes `wc`."
+  - q: "Why must `pipewrite` release `pi->lock` before calling `sleep()` when the pipe is full?"
+    a: "The only thing that can make room is `piperead` in the reader, and it needs `pi->lock`. A writer asleep holding the lock would block the reader forever. (`sched` also refuses to switch with any spinlock other than `p->lock` held.)"
+  - q: "In the right child, `close(p[1])` is deleted. Trace why `ls | wc` now never prints a result, even though `ls` exits normally."
+    a: "`wc` holds a write-end descriptor itself, so when `ls` exits the write end's `ref` drops to 1, not 0, and `pipeclose` never sets `writeopen = 0`. After the 608 bytes, `piperead` sees an empty pipe with an open write end and sleeps forever; pid 3 and the shell wait forever behind it."
+  - q: "`ls` writes 608 bytes but the pipe holds 512. Must `ls` sleep at some point? What decides it?"
+    a: "Only if `ls` ever gets 512 bytes ahead: when it is about to write byte k (513 ≤ k ≤ 608), `wc` has taken only k − 513 bytes. That needs `wc` to have taken at most 95 bytes while `ls` writes its last 96, so it depends on scheduling. In our traced runs `wc` always kept up and `ls` never slept."
+  - q: "`fileclose` copies the `struct file` into `ff` and releases `ftable.lock` before calling `pipeclose`. Why not call `pipeclose` with the lock held?"
+    a: "For inode files the same path calls `begin_op` and `iput`, which may sleep, and sleeping with a spinlock held is forbidden. Releasing first requires the copy, because the slot can be reallocated by another hart as soon as the lock is released."

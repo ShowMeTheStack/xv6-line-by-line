@@ -1,0 +1,633 @@
+title: Crossing the user/kernel boundary in memory
+group: Memory
+prerequisites: [5, 6, 25, 26]
+summary: |
+  You type `ls README`. To print one line, `ls` makes two system calls that carry pointers
+  across the user/kernel boundary in opposite directions: `open("README", …)` hands the
+  kernel the address of a string in `ls`'s memory, and `fstat(fd, &st)` hands it the
+  address of a `struct stat` that the kernel must fill in.
+
+  Those addresses are just numbers. They mean something only in `ls`'s page table, and the
+  kernel runs with a *different* page table, in which they point at nothing at all. So
+  every byte that crosses the boundary goes through a handful of functions that walk the
+  user page table by hand: [[copyinstr]], [[copyin]], [[copyout]], and the
+  [[either_copyin]]/[[either_copyout]] pair that lets one driver serve both user and kernel
+  callers. They check every page on the way: is it mapped, is it a *user* page, is it
+  writable, is it below [[MAXVA]], and if it is missing, was it lazily allocated?
+
+  Real addresses in this tour come from a run of this build under QEMU and gdb: `ls` is
+  pid 3, its whole address space is `0x4000` bytes, the string `"README"` is at `0x3fe0`
+  and `st` is at `0x3d38`, both on its single stack page, which lived at physical page
+  `0x87f1c000` in that run.
+cast: |
+  | Hart | What it is doing |
+  |---|---|
+  | 0 | Idle in its [[kernel:scheduler]], or running something else |
+  | 1 | Running `ls` (pid 3) in user mode, about to call `open`: the process this tour follows |
+  | 2 | Running whatever else is runnable, or idle in its scheduler. `sh` (pid 2) is on no hart: it is asleep in `wait`, waiting for `ls` |
+
+  `ls` was started by the shell with `argv = {"ls", "README", 0}`. [[kexec]] copied both
+  strings to the top of its stack page.
+steps:
+  - title: ls passes two pointers to the kernel
+    file: user/ls.c
+    lines: 27-46
+    focus: 35-40
+    state:
+      hart: 1
+      mode: U
+      proc: ls (pid 3)
+      intr: on
+      satp: user
+      locks: []
+      stack: [main, ls]
+      sp:
+        "on": user
+        detail: "`ls`'s stack page `0x3000`; `sp` = `0x3d30` at the `ecall` in our run"
+    note: |
+      `ls("README")` makes two system calls that matter to us:
+
+      - `open(path, O_RDONLY)`: `path` is `0x3fe0`, where [[kexec]] placed the string
+        `"README"` when it built the stack ([[kernel/exec.c:101]]). The kernel must copy the
+        string **in**.
+      - `fstat(fd, &st)`: `st` is a local variable at `0x3d38`, in `ls`'s stack frame. The
+        kernel must copy 24 bytes of metadata **out** into it.
+
+      `ls`'s address space in this build is four pages, `0x0` to `0x4000` (`p->sz` =
+      `0x4000`):
+
+      | Virtual page | Contents | PTE bits |
+      |---|---|---|
+      | `0x0000`, `0x1000` | code and data of `ls` | `U`, plus `R X` or `R W` |
+      | `0x2000` | [[g:guard-page]] | `V` but **not** `U` |
+      | `0x3000` | the stack: `st`, `"README"`, `argv` | `R W U` |
+
+      Both pointers land on the stack page. ([[tour:25]] builds this layout.)
+
+  - title: Why the kernel cannot just dereference the pointer
+    file: kernel/syscall.c
+    lines: 63-81
+    focus: 64-70
+    state:
+      hart: 1
+      mode: S
+      proc: ls (pid 3)
+      intr: on
+      satp: kernel
+      locks: []
+      irq: 0
+      stack: [usertrap, syscall, sys_open, argstr, argaddr]
+      sp:
+        "on": kernel
+        switched: "`ld sp, 8(a0)` in [[uservec]] ([[kernel/trampoline.S:76]]), after the `ecall`"
+        detail: "`ls`'s kernel stack, `KSTACK(2)` = `0x3fffff9000` in our run (pid 3, slot 2)"
+    note: |
+      `open` traps into the kernel ([[tour:5]]), and [[sys_open]] asks for its first
+      argument with [[argstr]], which reads the raw number `0x3fe0` from the saved `a0`
+      with [[argaddr]].
+
+      Why not treat it as a `char *` and read it? Because the hart is now using the
+      **kernel** page table. The kernel table maps devices, the kernel image, the
+      [[g:direct-map]] of RAM from `0x80000000`, the trampoline and kernel stacks, and
+      nothing at `0x3fe0`. A load from there would raise a page fault in supervisor mode,
+      and [[kerneltrap]] treats any unexpected kernel exception as fatal: `panic`. (Even
+      if the kernel were running on `ls`'s page table, RISC-V makes S-mode loads and stores
+      to `U` pages fault while the `sstatus.SUM` bit is 0. xv6 never sets SUM, and it is 0
+      under QEMU, so it stays 0.)
+
+      Notice that both of `ls`'s pointers point into its **user stack**, and the hart is no
+      longer using that stack. [[uservec]] saved `ls`'s `sp` (`0x3d30` in our run) in the
+      trapframe and switched `sp` to `ls`'s **kernel** stack ([[kernel/trampoline.S:76]]),
+      which held nothing until `usertrap` started pushing frames ([[concept:stacks]]). From here on the user stack is just data in `ls`'s
+      memory, reachable only through `ls`'s page table.
+
+      The comment says it plainly: `argaddr` does not check the pointer. It could not do
+      the job anyway: it does not know how many bytes will be copied, and the copy
+      functions must translate every page to find its physical address, so they check
+      permissions (and allocate lazy pages) at that moment.
+
+  - title: fetchstr hands the job to copyinstr
+    file: kernel/syscall.c
+    lines: 23-32
+    focus: 26-31
+    state:
+      hart: 1
+      mode: S
+      proc: ls (pid 3)
+      intr: on
+      satp: kernel
+      locks: []
+      irq: 0
+      stack: [usertrap, syscall, sys_open, argstr, fetchstr]
+      sp: kernel
+    note: |
+      [[fetchstr]] copies the string into `path`, a 128-byte ([[MAXPATH]]) array on
+      `ls`'s [[g:kernel-stack]] ([[kernel/sysfile.c:331]]). Once the string is in kernel
+      memory, the rest of `open` can use it freely: `ls` can no longer change it underneath
+      the kernel.
+
+      It passes `p->sz` (`0x4000`) along with the page table. The copy functions use the
+      size for one thing only: to decide whether a missing page might be a lazily allocated
+      one (see [[vmfault]] below). The fixed limit `max` matters too: a user string with no
+      NUL within 128 bytes makes `copyinstr` fail, instead of letting the kernel read on
+      forever.
+
+  - title: copyinstr walks page by page
+    file: kernel/vm.c
+    lines: 407-452
+    focus: 418-445
+    state:
+      hart: 1
+      mode: S
+      proc: ls (pid 3)
+      intr: on
+      satp: kernel
+      locks: []
+      irq: 0
+      stack: [usertrap, syscall, sys_open, argstr, fetchstr, copyinstr]
+      sp:
+        "on": kernel
+        detail: "`sp` = `0x3fffff9e50` (432 bytes in use); the destination `path` is on this stack at `0x3fffff9f10`"
+    note: |
+      [[copyinstr]] works in page-sized pieces, because consecutive *virtual* pages need
+      not be consecutive in physical memory:
+
+      1. `va0 = PGROUNDDOWN(0x3fe0)` = `0x3000`, the start of the page.
+      2. [[walkaddr]] translates `0x3000` through `ls`'s page table: `pa0 = 0x87f1c000` in
+         our run.
+      3. `n` = bytes left on this page = `0x1000 - 0xfe0` = 32, capped by `max` (128).
+      4. Copy byte by byte from `pa0 + 0xfe0`, which the kernel *can* read, thanks to the
+         direct map, until a `'\0'`.
+
+      `R`, `E`, `A`, `D`, `M`, `E`, then the NUL: `got_null` is set after 7 bytes and the
+      function returns 0. Had the string run past the end of the page, the loop would have
+      gone round again with `srcva = 0x4000` and translated that page separately. In `ls`
+      there is no such page: `0x4000` is `p->sz`, so `walkaddr` and `vmfault` both refuse
+      it, `copyinstr` returns -1, and `open` fails. In a larger process the next page would
+      be checked and the copy would continue.
+
+      The `\0` check is done byte by byte as it copies, rather than with `strlen` first,
+      because the kernel must never read beyond the bytes it has validated.
+
+      So the copy runs from one stack to the other, and the two are reached in different
+      ways (addresses from our gdb run):
+
+      ```text
+      ls's user stack page (virtual 0x3000, only in ls's page table)
+        0x3fe0  "README\0"     ── read via walkaddr + the direct map, at pa0 + 0xfe0
+        0x3d38  st             (filled later, by fstat)
+        0x3d30  ◄─ ls's sp, saved in the trapframe; nothing moves while ls is in the kernel
+
+      ls's kernel stack (KSTACK(2), 0x3fffff9000–0x3fffffa000, only in the kernel table)
+        top ─► usertrap · syscall · sys_open
+               path[128] at 0x3fffff9f10   ◄── the 7 bytes land here
+               argstr · fetchstr · copyinstr
+               0x3fffff9e50  ◄─ sp right now (copyinstr's 96-byte frame starts at 0x3fffff9eb0)
+      ```
+
+      The hart *runs* on the kernel stack, through the MMU and the kernel page table. It
+      only *reads* the user stack, as data, by translating `ls`'s addresses in software.
+
+  - title: walkaddr refuses anything that is not a user page
+    file: kernel/vm.c
+    lines: 118-139
+    focus: 127-138
+    state:
+      hart: 1
+      mode: S
+      proc: ls (pid 3)
+      intr: on
+      satp: kernel
+      locks: []
+      irq: 0
+      stack: [usertrap, syscall, sys_open, argstr, fetchstr, copyinstr, walkaddr]
+      sp: kernel
+    note: |
+      [[walkaddr]] is the gatekeeper. It returns a physical address only if all of these
+      hold:
+
+      - `va < MAXVA` (`1 << 38`, 256 GiB). Larger addresses cannot be translated by
+        [[g:sv39]] as xv6 uses it, and [[walk]] would `panic` on them, so they are rejected
+        before the walk.
+      - Every level of the walk finds a valid entry (`walk` returns non-zero).
+      - The leaf [[g:pte]] has `PTE_V` (the page exists).
+      - The leaf has **`PTE_U`** (the page is meant for user code).
+
+      The last check is the important one for security. `ls`'s page table also maps pages
+      that `ls` itself must never touch: the [[g:trampoline]] and its [[g:trapframe]] at
+      the top of the address space, and the guard page at `0x2000`, all without `PTE_U`.
+      The hardware stops `ls` from reading them directly. Without this check, `ls` could
+      simply *ask the kernel* to do it: `write(fd, TRAPFRAME, 512)` would copy out the saved
+      registers, and `read` into `TRAPFRAME` would let it overwrite the kernel-stack
+      pointer stored there. The kernel would become a tool for bypassing the hardware's
+      protection.
+
+      For `0x3000` all checks pass: `R W U V`.
+
+  - title: The walk itself, in software
+    file: kernel/vm.c
+    lines: 98-116
+    focus: 104-115
+    state:
+      hart: 1
+      mode: S
+      proc: ls (pid 3)
+      intr: on
+      satp: kernel
+      locks: []
+      irq: 0
+      stack: [usertrap, syscall, sys_open, argstr, fetchstr, copyinstr, walkaddr, walk]
+      sp: kernel
+    note: |
+      [[walk]] does in C what the MMU does in hardware: three levels of 512-entry tables,
+      indexed by 9 bits of the address each ([[PX]]). For `0x3000`, the level-2 and level-1
+      indices are 0, and the level-0 index is 3.
+
+      With `alloc = 0`, `walk` never creates anything: a missing intermediate table means
+      "not mapped" and returns 0. Every table page it reads is a physical page, which the
+      kernel reads through the direct map: `PTE2PA(*pte)` is directly usable as a pointer.
+
+      This is the hidden price of xv6's design, where the kernel and user programs use
+      separate page tables: every user pointer costs a software walk per page. Kernels that
+      map user memory into the kernel's own address space let the MMU do this work, and
+      they pay for it differently (in xv6's case it would need `sstatus.SUM` and much more
+      care about faults inside the kernel).
+    others: |
+      Is anyone changing these table pages while hart 1 reads them? See the last steps of
+      the tour: only `ls` itself modifies `ls`'s page table, and `ls` is busy right here.
+      No lock is needed for the walk.
+
+  - title: "When walkaddr says no: the lazy-page fallback"
+    file: kernel/vm.c
+    lines: 454-491
+    focus: 458-478
+    state:
+      hart: 1
+      mode: S
+      proc: ls (pid 3)
+      intr: on
+      satp: kernel
+      locks: []
+      irq: 0
+      stack: [usertrap, syscall, sys_open, argstr, fetchstr, copyinstr, vmfault]
+      sp: kernel
+    note: |
+      Our path did not come here, but every copy function has the same fallback: if
+      [[walkaddr]] returns 0, call [[vmfault]] before giving up.
+
+      The reason is `sbrk`'s lazy mode ([[tour:26]]): [[sys_sbrk]] can raise `p->sz`
+      without allocating anything. A user program that passes a pointer into such memory
+      (say, `read(fd, lazybuf, 512)` into a buffer it has never touched) would otherwise
+      get -1. In user mode, touching that memory causes a page fault that [[usertrap]]
+      fixes with `vmfault`. In the kernel there is no fault, because the kernel never
+      touches user memory through the MMU, so the copy functions call `vmfault` by hand.
+
+      `vmfault` allocates only when it is legitimate:
+
+      - `va >= psz` (beyond the process's size): return 0. This also rejects every address
+        at or above `MAXVA`, since `p->sz` never exceeds `TRAPFRAME`.
+      - [[ismapped]]: if a PTE is **valid** but `walkaddr` refused it, the page is not
+        lazy, it is forbidden. The guard page at `0x2000` is exactly this case: `V` set,
+        `U` cleared. Return 0.
+      - Otherwise [[kalloc]] a page, zero it, map it `R W U`, and return its physical
+        address, so the copy can continue as if it had always been there.
+    others: |
+      [[kalloc]] takes `kmem.lock` ([[tour:27]]): the free list is shared by all harts.
+      [[mappages]] then writes into `ls`'s own page table, which no other hart touches.
+
+  - title: fstat and filestat prepare a kernel copy
+    file: kernel/file.c
+    lines: 85-102
+    focus: 97
+    state:
+      hart: 1
+      mode: S
+      proc: ls (pid 3)
+      intr: on
+      satp: kernel
+      locks: []
+      irq: 0
+      stack: [usertrap, syscall, sys_fstat, filestat]
+      sp: kernel
+    note: |
+      `open` succeeds with descriptor 3. Now `fstat(3, 0x3d38)`. [[sys_fstat]] fetches the
+      user address with [[argaddr]], and [[filestat]] does the work:
+
+      1. [[ilock]] README's inode (a [[g:sleeplock]]), [[stati]] copies the metadata into
+         `st`, a `struct stat` on the **kernel** stack, then [[iunlock]].
+      2. [[copyout]] copies those 24 bytes to `0x3d38` in `ls`'s memory.
+
+      In our run, `st` held `ino = 2`, `type = 2` (`T_FILE`), `size = 2441`, and
+      `sizeof(st)` = 24: `dev`, `ino`, `type`, `nlink` (4 + 4 + 2 + 2 = 12 bytes), 4 bytes of
+      padding so that the 8-byte `size` starts at an 8-byte-aligned offset (16), and `size`
+      (8 bytes) ([[kernel/stat.h]]).
+
+      Notice the order: the snapshot is taken under the inode lock, and the copy to user
+      space happens *after* the lock is released. The inode lock protects the inode, not
+      `ls`'s stack, so there is no reason to hold it during the copy.
+    others: |
+      A moment earlier, while `ls` held README's inode lock (lines 94–96), a process on hart 2 that wanted the same inode
+      (say, `cat README`) would sleep in [[ilock]] until `iunlock`. Because `st` is a
+      private copy, that window is just a few field copies long.
+
+  - title: copyout checks one more thing
+    file: kernel/vm.c
+    lines: 341-377
+    focus: 350-374
+    state:
+      hart: 1
+      mode: S
+      proc: ls (pid 3)
+      intr: on
+      satp: kernel
+      locks: []
+      irq: 0
+      stack: [usertrap, syscall, sys_fstat, filestat, copyout]
+      sp:
+        "on": kernel
+        detail: "the source `st` is on this stack (`0x3fffff9f58`); the destination is on `ls`'s user stack"
+    note: |
+      [[copyout]] is `copyin` in reverse, with two extra checks:
+
+      - **Line 352**: an explicit `va0 >= MAXVA` test. `walkaddr` and `vmfault` would also
+        refuse such an address, so this is a second line of defense before line 362 calls
+        [[walk]], which panics on out-of-range addresses.
+      - **Line 364**: the page must have **`PTE_W`**. `walkaddr` only checked `PTE_U`. Without
+        this, `fstat(fd, (struct stat *)main)` would let the kernel write 24 bytes over
+        `ls`'s own read-only code, which the hardware forbids `ls` itself to do.
+
+      For our call: `va0 = 0x3000`, `pa0 = 0x87f1c000`, the offset is `0xd38`, `n` = 24
+      bytes (the struct fits on one page), and `memmove` writes to physical `0x87f1cd38`.
+      One loop iteration, and `ls`'s `st` is filled.
+
+      This is the copy of step 4 in reverse, stack to stack: the source is the kernel's
+      `st` in [[filestat]]'s frame on `ls`'s kernel stack (`0x3fffff9f58` in our run, 8
+      bytes above `filestat`'s `sp` (`0x3fffff9f50`); `copyout`'s own 112-byte frame lies
+      below that), and the destination is `ls`'s `st` in `ls`'s frame on its user stack.
+      The kernel writes into a user stack frame without ever running on that stack.
+
+      If `st` had straddled a page boundary, say at `0x2ff8`, the first iteration would
+      copy 8 bytes into one page and the second 16 bytes into the next, each separately
+      translated and checked. (That particular address would fail: `0x2000` is the guard
+      page.)
+
+  - title: A bad pointer is an error, not a crash
+    file: kernel/vm.c
+    lines: 341-377
+    focus: 350-365
+    state:
+      hart: 1
+      mode: S
+      proc: ls (pid 3)
+      intr: on
+      satp: kernel
+      locks: []
+      irq: 0
+      stack: [usertrap, syscall, sys_fstat, filestat, copyout]
+      sp: kernel
+    note: |
+      Suppose `ls` were buggy and passed `0x2f00`, inside the guard page, to `fstat`. Follow
+      it through:
+
+      | Check | Result |
+      |---|---|
+      | `va0 = 0x2000 < MAXVA` | passes |
+      | [[walkaddr]]: `PTE_V` set, `PTE_U` clear | returns 0 |
+      | [[vmfault]]: `0x2000 < p->sz`, but [[ismapped]] is true | returns 0 |
+      | `copyout` | returns -1 |
+
+      [[filestat]] returns -1, `fstat` returns -1 to `ls`, and `ls` prints "cannot stat".
+      The same holds for `0x10000000` (beyond `p->sz`), `0xffffffffffffffff` (beyond
+      `MAXVA`) or `TRAPFRAME` (no `PTE_U`).
+
+      [[copyin]] ([[kernel/vm.c:383]]) has the same shape. It has no explicit `MAXVA` test because it
+      never calls `walk` directly: [[walkaddr]] rejects such addresses and `vmfault`
+      refuses them because they lie beyond `p->sz`.
+
+      The rule: anything a user program can pass is checked page by page at the moment of
+      the copy, and every failure is a return value. A user program can make its own system
+      call fail; it cannot make the kernel fault.
+
+  - title: either_copyout serves two kinds of caller
+    file: kernel/proc.c
+    lines: 643-671
+    focus: 647-656
+    state:
+      hart: 1
+      mode: S
+      proc: cat (any process reading a file)
+      intr: on
+      satp: kernel
+      locks: ["file's ip->lock (sleep-lock)", "buf's lock (sleep-lock)"]
+      irq: 0
+      stack: [usertrap, syscall, sys_read, fileread, readi, either_copyout]
+      sp: kernel
+    note: |
+      Some kernel code moves data to *either* user or kernel memory, depending on who
+      called it. [[readi]] is the main example: `read()` wants file data copied to a user
+      buffer, but [[kexec]] reads ELF headers into kernel variables, and directory lookup
+      reads directory entries into a kernel `struct dirent`. Rather than two versions of
+      `readi`, xv6 passes a flag, `user_dst`, and the leaf call is [[either_copyout]]:
+
+      - `user_dst = 1`: [[copyout]] with the *current* process's page table and size.
+      - `user_dst = 0`: the address is a kernel pointer; plain `memmove`.
+
+      [[either_copyin]] is the mirror image, used by [[writei]] and [[consolewrite]].
+
+      `ls README` itself never reads the file, but when `cat README` does, this is the
+      function that finally puts the bytes into `cat`'s memory, while [[fileread]] holds the
+      inode's sleep-lock and `readi` holds the buffer's ([[tour:29]]). It always uses
+      [[myproc]]: user addresses only make sense relative to the process that issued the
+      system call, which is the process running on this hart right now.
+
+  - title: The console copies out while holding a spinlock
+    file: kernel/console.c
+    lines: 87-138
+    focus: 121-124
+    state:
+      hart: 1
+      mode: S
+      proc: sh (pid 2)
+      intr: off
+      satp: kernel
+      locks: [cons.lock]
+      irq: {noff: 1, intena: 1}
+      stack: [usertrap, syscall, sys_read, fileread, consoleread, either_copyout]
+      sp: kernel
+    note: |
+      Step back in time to how `ls README` got started: the shell, `sh` (pid 2), was
+      reading your typing through `gets`, which calls `read(0, &c, 1)` once per character.
+      Each call goes to [[consoleread]] through the device table, with `user_dst = 1`.
+
+      `consoleread` holds `cons.lock`, a [[g:spinlock]], while it takes characters out of
+      the console's input buffer, and it copies each one to the shell with
+      `either_copyout(user_dst, dst, &cbuf, 1)`: one byte at a time, **with the spinlock
+      held and interrupts off**.
+
+      Is that allowed? A spinlock holder must not sleep. `copyout` never sleeps: the page
+      walk is pure computation, and its worst case, [[vmfault]] → [[kalloc]], takes only
+      another spinlock, `kmem.lock`. The lock order is always `cons.lock` → `kmem.lock`,
+      never the reverse. So the copy is safe inside the critical section. (It would not be
+      safe if a copy could wait for a disk read, as in some kernels that page user memory
+      out.)
+    others: |
+      The UART's interrupt handler, [[consoleintr]], puts typed characters into the same
+      buffer under the same `cons.lock`, and can run on any hart. While `sh` copies a byte
+      out on hart 1, a keystroke interrupt on hart 2 spins on `cons.lock` for a few
+      instructions and then appends its byte. Without the lock, the read index `cons.r` and
+      the write index `cons.w` could be updated in an inconsistent order.
+
+      On hart 1 itself the keystroke cannot interrupt: noff is 1, so SIE is off, and the
+      interrupt waits (or another hart claims it). If it could arrive here, `consoleintr`
+      would spin forever on a lock its own hart holds ([[concept:locks#handlers]]).
+
+  - title: Pipes copy one byte at a time under pi->lock
+    file: kernel/pipe.c
+    lines: 112-143
+    focus: 129-139
+    state:
+      hart: 2
+      mode: S
+      proc: wc (reader of a pipe)
+      intr: off
+      satp: kernel
+      locks: [pi->lock]
+      irq: {noff: 1, intena: 1}
+      stack: [usertrap, syscall, sys_read, fileread, piperead, copyout]
+      sp: kernel
+    note: |
+      Pipes are the other device-like path, and they call [[copyin]] and [[copyout]]
+      directly (not the `either_` wrappers): pipe data always comes from and goes to user
+      memory.
+
+      [[piperead]] holds `pi->lock` and copies **one byte per call** to `copyout`, each with
+      its own page walks. That is slow: a 512-byte read is 512 calls to `copyout`, each
+      doing two software walks (`walkaddr`, then `walk` for the `PTE_W` check), 1024 walks
+      in all. But it is simple: the byte
+      leaves the ring buffer only if the copy succeeded (`pi->nread++` comes after), so a bad
+      user pointer loses no pipe data. As with the console, copying under a spinlock is safe
+      because `copyout` never sleeps.
+
+      [[pipewrite]] does the same in the other direction with `copyin`, one byte per
+      call, also under `pi->lock`.
+    others: |
+      The writer of this pipe may be on hart 0 in [[pipewrite]], trying to add bytes. It
+      spins on `pi->lock` while the reader copies. Each side's copy uses its *own* page
+      table (`pr->pagetable`), so the two copies never touch each other's address spaces,
+      and the lock protects only the shared ring buffer and its counters.
+
+  - title: Why no other hart can change the page table mid-copy
+    file: kernel/proc.c
+    lines: 232-254
+    focus: 236-253
+    state:
+      hart: 1
+      mode: S
+      proc: "any process growing its heap (ls itself never calls sbrk)"
+      intr: on
+      satp: kernel
+      locks: []
+      irq: 0
+      stack: [usertrap, syscall, sys_sbrk, growproc]
+      sp: kernel
+    note: |
+      Back to `ls`. (The code shown is `growproc`, which `ls` happens not to call.) Neither [[copyin]] nor [[copyout]] takes any lock while it walks `ls`'s
+      page table and copies into the physical page it found. Yet between the walk and the
+      `memmove`, could another hart unmap that page and give it to someone else?
+
+      Look at who modifies a user page table:
+
+      - [[growproc]] (shown), from `sbrk`, called by the process itself.
+      - [[vmfault]], on behalf of the process itself, from its own page fault or its own
+        copy.
+      - [[kexec]], which builds a new table and frees the old one, again in the process
+        itself.
+      - [[kfork]], which builds a brand-new table for the child (`uvmcopy`) before the child
+        is RUNNABLE, so no one else can be using it yet.
+      - [[freeproc]], when the parent's `wait` reaps the process, but only after it has
+        exited and become a [[g:zombie]].
+
+      Every xv6 process has exactly one thread. While `ls` is inside `copyout`, it is not
+      in `sbrk`, `exec` or a page fault, and it has not exited. So no code can be modifying
+      its page table: the "lock" is the fact that only the owner changes it. Not even
+      `kill` from another hart touches memory; it only sets `p->killed` (and wakes the
+      process if it is sleeping).
+    others: |
+      What other harts *can* do is fine: hart 2 may be copying into a different process's
+      memory at the same instant, through a different page table, into different
+      physical pages. The only shared structure on these paths is the free-page list,
+      and it has its lock.
+
+  - title: The price of a crossing
+    file: user/ls.c
+    lines: 27-50
+    focus: 46-50
+    state:
+      hart: 1
+      mode: U
+      proc: ls (pid 3)
+      intr: on
+      satp: user
+      locks: []
+      stack: [main, ls]
+      sp:
+        "on": user
+        switched: "`ld sp, 48(a0)` in [[userret]] ([[kernel/trampoline.S:118]]) and `sret` ([[kernel/trampoline.S:153]])"
+        detail: "back to `0x3d30`, just below the `st` the kernel filled"
+    note: |
+      Back in user mode, `st` is filled: `type 2`, `ino 2`, `size 2441`, and `ls` prints
+      `README 2 2 2441`.
+
+      What did the two crossings cost? For `open`: one software page walk and 7 bytes
+      copied one at a time. For `fstat`: two walks (`walkaddr`, then `walk` again for the
+      `PTE_W` check) and one 24-byte `memmove`. A walk is three dependent memory loads, so
+      this is cheap here. It adds up for byte-at-a-time paths like pipes, where every byte
+      pays for its own walks.
+
+      The key ideas:
+
+      - User pointers are only numbers to the kernel. The kernel page table does not map
+        them, so the kernel translates them in software.
+      - Every page is checked at copy time: below `MAXVA`, valid, `PTE_U`, and for
+        `copyout` also `PTE_W`. Failures become -1, never a kernel fault.
+      - A missing page inside `p->sz` may be lazy, so the copy functions call `vmfault`
+        themselves.
+      - `either_copyin` and `either_copyout` let one function serve kernel and user
+        callers.
+      - No lock protects the user page table during a copy, because only its single-threaded
+        owner ever changes it.
+locks:
+  - lock: "no lock: the user page table"
+    where: "[[copyin]], [[copyout]], [[copyinstr]], [[walkaddr]]"
+    protects: "Nothing needed: only the process itself changes its page table, and it is busy copying"
+  - lock: "kmem.lock (spinlock)"
+    where: "[[kalloc]], via [[vmfault]], only for a lazy page"
+    protects: "The shared free-page list"
+  - lock: "ip->lock (sleep-lock)"
+    where: "[[filestat]], around [[stati]] only"
+    protects: "The in-memory inode while its fields are snapshotted into a kernel `struct stat`"
+  - lock: "ip->lock (sleep-lock)"
+    where: "[[fileread]], held across [[readi]] and its `either_copyout`"
+    protects: "The inode and the file offset during a read"
+  - lock: "bp->lock (sleep-lock)"
+    where: "[[readi]], from `bread` to `brelse`, held across `either_copyout`"
+    protects: "The cached disk block whose bytes are being copied out"
+  - lock: "cons.lock (spinlock)"
+    where: "[[consoleread]], held across `either_copyout`"
+    protects: "The console input buffer and its indices; safe to copy out under it because `copyout` never sleeps"
+  - lock: "pi->lock (spinlock)"
+    where: "[[piperead]], [[pipewrite]], held across each 1-byte copy"
+    protects: "The pipe's ring buffer and its `nread`/`nwrite` counters"
+quiz:
+  - q: "Why doesn't `sys_fstat` check that the user pointer is valid before calling `filestat`?"
+    a: "`sys_fstat` does not know yet what the copy needs; [[copyout]] must translate each page anyway, and checks `PTE_U`, `PTE_W` and lazy allocation as it does. A separate early check would duplicate that work. (In a kernel with multithreaded processes it would also be unsafe, because another thread could unmap the page between the check and the copy; xv6 processes have one thread.)"
+  - q: "A malicious program calls `read(fd, TRAPFRAME, 512)`. Which check stops the kernel from overwriting the process's trapframe, and what does `read` return?"
+    a: "The trapframe page is mapped without `PTE_U`, so [[walkaddr]] returns 0. [[vmfault]] then refuses too, because `TRAPFRAME` is beyond `p->sz`. For a file with data left to read, [[copyout]] fails, `readi` returns -1, and so does `read`. (On the console the failed copy just ends the read, which returns 0.)"
+  - q: "`fstat(fd, (struct stat *)main)` points into `ls`'s code page, which has `PTE_U`. Why doesn't the kernel write the struct there?"
+    a: "[[copyout]] also checks the leaf PTE for `PTE_W` ([[kernel/vm.c:364]]). Code pages are mapped `R X U` without `W`, so the copy returns -1. Without that check, the kernel could be used to modify code the process itself cannot write."
+  - q: "`consoleread` calls `either_copyout` while holding `cons.lock`, a spinlock. Why is that allowed, and what change to `copyout` would make it a bug?"
+    a: "A spinlock holder must not sleep, and `copyout` never sleeps: its slowest path, `vmfault` → `kalloc`, only takes another spinlock. If `copyout` could ever wait for the disk (for example, to page user memory back in), it would sleep with `cons.lock` held, which is forbidden."
+  - q: "A program passes a buffer at `0x2f00` to `read`, inside its guard page. Walk through `copyout` and `vmfault`: which test fails in each?"
+    a: "[[walkaddr]] finds a valid PTE without `PTE_U` and returns 0. [[vmfault]] sees `0x2000 < p->sz`, but [[ismapped]] reports the PTE valid, so it returns 0 instead of allocating. `copyout` returns -1."
+  - q: "`copyout` looks up a physical page with `walkaddr`, then writes to it with `memmove`, without holding any lock. Why can't another hart free that page in between?"
+    a: "Only the process itself changes its page table (`sbrk`, `exec`, `vmfault`), and its memory is freed only after it exits, by the parent's `wait`. xv6 processes are single-threaded, so while it is inside `copyout` it cannot be doing any of those things."
