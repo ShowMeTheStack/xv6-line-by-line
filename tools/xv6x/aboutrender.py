@@ -76,6 +76,9 @@ def render(linker, problems: list[str]) -> str:
         return f'<section class="ab-sec" id="{sid}">{k}<h2>{escape(title)}</h2>{body}</section>'
 
     why = f'<div class="ab-why">{md(d["why"])}</div>'
+    contrib = '<div class="ab-team">' + "".join(
+        f'<article class="ab-card"><h3>{escape(c["name"])}</h3><p class="ab-org">{escape(c["role"])}</p><ul>'
+        + "".join(f"<li>{escape(x)}</li>" for x in c["did"]) + "</ul></article>" for c in d.get("contributors", [])) + "</div>"
     profile = f'<div class="ab-prose">{md(d["profile"])}</div>'
 
     books = "".join(
@@ -128,6 +131,7 @@ def render(linker, problems: list[str]) -> str:
 
     body = (hero
             + '<main class="ab-main">'
+            + section("team", "With contributions from", contrib, "The team")
             + section("why", "Why this site exists", why, "A note on the project")
             + section("profile", "Profile", profile)
             + section("books", "Books", f'<div class="ab-books">{books}</div>', "De Gruyter Brill, 2026")
